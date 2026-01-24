@@ -24,6 +24,7 @@ A comprehensive guide for senior and staff-level engineers covering schema desig
 15. [NULL Handling & Three-Valued Logic](#15-null-handling--three-valued-logic)
 16. [Sharding & Partitioning](#16-sharding--partitioning)
 17. [Common Anti-Patterns to Avoid](#17-common-anti-patterns-to-avoid)
+17B. [SQL Antipatterns: Bill Karwin's Complete Reference](#17b-sql-antipatterns-bill-karwins-complete-reference)
 
 ### Part 2: Database Selection & Scaling (2025)
 18. [Database Selection Guide: When to Use What](#18-database-selection-guide-when-to-use-what)
@@ -1935,6 +1936,1270 @@ CREATE VIEW v4 AS SELECT * FROM v3 WHERE w = 4;
 
 ---
 
+## 17B. SQL Antipatterns: Bill Karwin's Complete Reference
+
+This section provides a comprehensive catalog of SQL antipatterns from Bill Karwin's seminal book ["SQL Antipatterns: Avoiding the Pitfalls of Database Programming"](https://pragprog.com/titles/bksqla/sql-antipatterns/). Each antipattern follows the format: **Objective** (what you're trying to achieve), **Antipattern** (the common mistake), and **Solution** (the correct approach).
+
+---
+
+### Part I: Logical Database Design Antipatterns
+
+#### 1. Jaywalking
+
+**Objective:** Store multivalue attributes (e.g., tags, categories, permissions)
+
+**Antipattern:** Store comma-separated lists in a VARCHAR column
+
+```sql
+-- ANTI-PATTERN: Comma-separated values
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    tags VARCHAR(500)  -- "electronics,gadget,sale"
+);
+
+-- Querying is painful and inefficient
+SELECT * FROM products WHERE tags LIKE '%gadget%';  -- Can't use indexes properly
+```
+
+**Problems:**
+- Cannot use indexes efficiently
+- Cannot enforce referential integrity
+- Cannot easily count, sort, or aggregate values
+- Maximum length limits the number of values
+- Separator character might appear in data
+
+**Solution:** Create an intersection table
+
+```sql
+-- CORRECT: Intersection table
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+CREATE TABLE tags (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE
+);
+
+CREATE TABLE product_tags (
+    product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+    tag_id INTEGER REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (product_id, tag_id)
+);
+
+-- Now queries are efficient and data is validated
+SELECT p.* FROM products p
+JOIN product_tags pt ON p.id = pt.product_id
+JOIN tags t ON pt.tag_id = t.id
+WHERE t.name = 'gadget';
+```
+
+---
+
+#### 2. Naive Trees
+
+**Objective:** Store and query hierarchical data (org charts, categories, threaded comments)
+
+**Antipattern:** Use adjacency list with only `parent_id` column
+
+```sql
+-- ANTI-PATTERN: Simple adjacency list
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    parent_id INTEGER REFERENCES comments(id),
+    content TEXT
+);
+
+-- Getting entire tree requires recursive queries or multiple round-trips
+-- Deleting a node requires handling all descendants
+```
+
+**Problems:**
+- Retrieving an entire subtree requires recursive CTEs or multiple queries
+- Counting descendants is expensive
+- Deleting/moving subtrees is complex
+
+**Solutions:**
+
+**A. Path Enumeration** - Store the path from root to each node
+
+```sql
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    path VARCHAR(1000),  -- '/1/4/6/7/'
+    content TEXT
+);
+
+-- Get all ancestors
+SELECT * FROM comments WHERE '/1/4/6/7/' LIKE path || '%';
+
+-- Get all descendants
+SELECT * FROM comments WHERE path LIKE '/1/4/%';
+```
+
+**B. Nested Sets** - Store left/right boundary numbers
+
+```sql
+CREATE TABLE categories (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    nsleft INTEGER NOT NULL,
+    nsright INTEGER NOT NULL
+);
+
+-- Get all descendants (fast!)
+SELECT * FROM categories WHERE nsleft BETWEEN 2 AND 9;
+
+-- Get depth
+SELECT c.*, (COUNT(parent.id) - 1) AS depth
+FROM categories c, categories parent
+WHERE c.nsleft BETWEEN parent.nsleft AND parent.nsright
+GROUP BY c.id;
+```
+
+**C. Closure Table** - Store all ancestor-descendant relationships
+
+```sql
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    content TEXT
+);
+
+CREATE TABLE comment_tree (
+    ancestor_id INTEGER REFERENCES comments(id),
+    descendant_id INTEGER REFERENCES comments(id),
+    depth INTEGER NOT NULL,
+    PRIMARY KEY (ancestor_id, descendant_id)
+);
+
+-- Get all descendants
+SELECT c.* FROM comments c
+JOIN comment_tree t ON c.id = t.descendant_id
+WHERE t.ancestor_id = 4;
+
+-- Get all ancestors
+SELECT c.* FROM comments c
+JOIN comment_tree t ON c.id = t.ancestor_id
+WHERE t.descendant_id = 7;
+```
+
+| Approach | Query Subtree | Query Ancestors | Insert | Delete | Move Subtree |
+|----------|---------------|-----------------|--------|--------|--------------|
+| Adjacency List | Hard | Hard | Easy | Medium | Easy |
+| Path Enumeration | Easy | Easy | Easy | Easy | Hard |
+| Nested Sets | Easy | Easy | Hard | Hard | Hard |
+| Closure Table | Easy | Easy | Easy | Easy | Easy |
+
+---
+
+#### 3. ID Required
+
+**Objective:** Establish primary key conventions
+
+**Antipattern:** Blindly add `id` column to every table
+
+```sql
+-- ANTI-PATTERN: Redundant surrogate key
+CREATE TABLE product_tags (
+    id SERIAL PRIMARY KEY,  -- Unnecessary!
+    product_id INTEGER REFERENCES products(id),
+    tag_id INTEGER REFERENCES tags(id)
+);
+
+-- Now you need a unique constraint anyway
+ALTER TABLE product_tags ADD UNIQUE (product_id, tag_id);
+```
+
+**Problems:**
+- Allows duplicate relationships
+- Wastes storage
+- Adds unnecessary column
+- May encourage incorrect joins
+
+**Solution:** Use natural or compound keys when appropriate
+
+```sql
+-- CORRECT: Compound primary key
+CREATE TABLE product_tags (
+    product_id INTEGER REFERENCES products(id),
+    tag_id INTEGER REFERENCES tags(id),
+    PRIMARY KEY (product_id, tag_id)  -- Natural compound key
+);
+```
+
+**When surrogate keys ARE appropriate:**
+- When natural key is too wide (multiple columns, long strings)
+- When natural key values change frequently
+- When you need to hide business information
+- When following ORM conventions
+
+---
+
+#### 4. Keyless Entry
+
+**Objective:** Simplify database development
+
+**Antipattern:** Skip foreign key constraints
+
+```sql
+-- ANTI-PATTERN: No foreign key constraint
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    customer_id INTEGER,  -- No FK constraint!
+    total DECIMAL(10,2)
+);
+
+-- Application can insert invalid customer_id
+INSERT INTO orders (customer_id, total) VALUES (99999, 100.00);  -- No error!
+```
+
+**Problems:**
+- Orphaned rows (orders without valid customers)
+- Data corruption from application bugs
+- No cascading deletes/updates
+- Must enforce integrity in every application accessing the data
+
+**Solution:** Always declare foreign key constraints
+
+```sql
+-- CORRECT: With foreign key constraints
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE,
+    total DECIMAL(10,2)
+);
+
+-- Don't forget to index the foreign key!
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+```
+
+---
+
+#### 5. Entity-Attribute-Value (EAV)
+
+**Objective:** Support variable/dynamic attributes
+
+**Antipattern:** Use a generic attribute table
+
+```sql
+-- ANTI-PATTERN: EAV table
+CREATE TABLE entity_attributes (
+    entity_id INTEGER,
+    entity_type VARCHAR(50),
+    attribute_name VARCHAR(100),
+    attribute_value TEXT,  -- Everything becomes text!
+    PRIMARY KEY (entity_id, entity_type, attribute_name)
+);
+
+-- Querying is a nightmare
+SELECT
+    e.entity_id,
+    MAX(CASE WHEN attribute_name = 'color' THEN attribute_value END) as color,
+    MAX(CASE WHEN attribute_name = 'size' THEN attribute_value END) as size,
+    MAX(CASE WHEN attribute_name = 'weight' THEN attribute_value END) as weight
+FROM entity_attributes e
+WHERE entity_type = 'product'
+GROUP BY e.entity_id;
+```
+
+**Problems:**
+- Cannot enforce data types (everything is TEXT)
+- Cannot enforce NOT NULL or other constraints
+- Cannot use foreign key constraints
+- Queries become complex pivots
+- Poor query performance
+- Cannot enforce attribute names (typos create new "attributes")
+
+**Solutions:**
+
+**A. Single Table Inheritance** - One table with all possible columns
+
+```sql
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    type VARCHAR(50) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    -- Common attributes
+    price DECIMAL(10,2) NOT NULL,
+    -- Electronics attributes
+    voltage INTEGER,
+    warranty_months INTEGER,
+    -- Clothing attributes
+    size VARCHAR(10),
+    color VARCHAR(50),
+    material VARCHAR(100)
+);
+```
+
+**B. Class Table Inheritance** - Base table plus type-specific tables
+
+```sql
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    type VARCHAR(50) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    price DECIMAL(10,2) NOT NULL
+);
+
+CREATE TABLE electronics (
+    product_id INTEGER PRIMARY KEY REFERENCES products(id),
+    voltage INTEGER,
+    warranty_months INTEGER
+);
+
+CREATE TABLE clothing (
+    product_id INTEGER PRIMARY KEY REFERENCES products(id),
+    size VARCHAR(10),
+    color VARCHAR(50),
+    material VARCHAR(100)
+);
+```
+
+**C. Semi-Structured Data** - Use JSON/JSONB for truly dynamic attributes
+
+```sql
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    type VARCHAR(50) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    attributes JSONB DEFAULT '{}'
+);
+
+-- Query JSON attributes
+SELECT * FROM products
+WHERE attributes->>'color' = 'red'
+  AND (attributes->>'size')::int > 10;
+```
+
+---
+
+#### 6. Polymorphic Associations
+
+**Objective:** Reference multiple parent tables from one child table
+
+**Antipattern:** Use a dual-purpose foreign key with type column
+
+```sql
+-- ANTI-PATTERN: Polymorphic association
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    commentable_type VARCHAR(50),  -- 'Article', 'Photo', 'Video'
+    commentable_id INTEGER,        -- Can't have FK constraint!
+    content TEXT
+);
+
+-- No referential integrity - this is NOT a real foreign key
+```
+
+**Problems:**
+- Cannot define foreign key constraint
+- Cannot use JOIN directly
+- Must use UNION or conditional logic
+- No cascading deletes
+- Type column can have invalid values
+
+**Solutions:**
+
+**A. Exclusive Belongs-To (Nullable FKs)**
+
+```sql
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    article_id INTEGER REFERENCES articles(id),
+    photo_id INTEGER REFERENCES photos(id),
+    video_id INTEGER REFERENCES videos(id),
+    content TEXT,
+    -- Ensure exactly one parent
+    CONSTRAINT one_parent CHECK (
+        (article_id IS NOT NULL)::int +
+        (photo_id IS NOT NULL)::int +
+        (video_id IS NOT NULL)::int = 1
+    )
+);
+```
+
+**B. Common Super-Table**
+
+```sql
+CREATE TABLE commentables (
+    id SERIAL PRIMARY KEY,
+    type VARCHAR(50) NOT NULL
+);
+
+CREATE TABLE articles (
+    commentable_id INTEGER PRIMARY KEY REFERENCES commentables(id),
+    title VARCHAR(200),
+    body TEXT
+);
+
+CREATE TABLE photos (
+    commentable_id INTEGER PRIMARY KEY REFERENCES commentables(id),
+    url VARCHAR(500),
+    caption TEXT
+);
+
+CREATE TABLE comments (
+    id SERIAL PRIMARY KEY,
+    commentable_id INTEGER REFERENCES commentables(id),  -- Real FK!
+    content TEXT
+);
+```
+
+---
+
+#### 7. Multicolumn Attributes
+
+**Objective:** Store multiple values of the same attribute
+
+**Antipattern:** Create numbered columns
+
+```sql
+-- ANTI-PATTERN: Multiple columns for same attribute
+CREATE TABLE contacts (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    phone1 VARCHAR(20),
+    phone2 VARCHAR(20),
+    phone3 VARCHAR(20)  -- What if they have 4 phones?
+);
+
+-- Querying any phone is awkward
+SELECT * FROM contacts
+WHERE phone1 = '555-1234' OR phone2 = '555-1234' OR phone3 = '555-1234';
+```
+
+**Problems:**
+- Fixed maximum number of values
+- Searching requires checking all columns
+- Adding more requires schema change
+- Sparse data (most rows use 1-2 phones)
+
+**Solution:** Create a dependent table
+
+```sql
+-- CORRECT: Dependent table
+CREATE TABLE contacts (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+CREATE TABLE contact_phones (
+    id SERIAL PRIMARY KEY,
+    contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
+    phone VARCHAR(20) NOT NULL,
+    type VARCHAR(20) DEFAULT 'mobile',  -- 'mobile', 'home', 'work'
+    is_primary BOOLEAN DEFAULT false
+);
+
+-- Easy to query
+SELECT c.* FROM contacts c
+JOIN contact_phones p ON c.id = p.contact_id
+WHERE p.phone = '555-1234';
+```
+
+---
+
+#### 8. Metadata Tribbles
+
+**Objective:** Support data scalability
+
+**Antipattern:** Clone tables or columns based on data values
+
+```sql
+-- ANTI-PATTERN: Table per year
+CREATE TABLE sales_2023 (...);
+CREATE TABLE sales_2024 (...);
+CREATE TABLE sales_2025 (...);
+
+-- Or columns per value
+CREATE TABLE metrics (
+    id SERIAL PRIMARY KEY,
+    jan_value DECIMAL,
+    feb_value DECIMAL,
+    mar_value DECIMAL,
+    -- ... 12 columns total
+);
+```
+
+**Problems:**
+- Queries across time periods require UNION ALL
+- New time periods require schema changes
+- Constraints must be duplicated
+- Indexes must be duplicated
+- Reports and aggregations are complex
+
+**Solution:** Use database-managed partitioning
+
+```sql
+-- CORRECT: Native partitioning (PostgreSQL)
+CREATE TABLE sales (
+    id SERIAL,
+    sale_date DATE NOT NULL,
+    amount DECIMAL(10,2),
+    customer_id INTEGER
+) PARTITION BY RANGE (sale_date);
+
+CREATE TABLE sales_2024 PARTITION OF sales
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE TABLE sales_2025 PARTITION OF sales
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- Query as single table - optimizer handles partition pruning
+SELECT SUM(amount) FROM sales WHERE sale_date >= '2024-06-01';
+```
+
+---
+
+### Part II: Physical Database Design Antipatterns
+
+#### 9. Rounding Errors
+
+**Objective:** Store fractional numeric data
+
+**Antipattern:** Use FLOAT or DOUBLE for currency/financial data
+
+```sql
+-- ANTI-PATTERN: Using FLOAT for money
+CREATE TABLE accounts (
+    id SERIAL PRIMARY KEY,
+    balance FLOAT  -- Dangerous!
+);
+
+-- Rounding errors accumulate
+INSERT INTO accounts (balance) VALUES (0.1 + 0.2);  -- Not exactly 0.3!
+```
+
+**Problems:**
+- FLOAT uses binary representation (base-2)
+- Cannot exactly represent many decimal fractions (0.1, 0.2, etc.)
+- Rounding errors compound over time
+- Comparisons may fail unexpectedly
+
+**Solution:** Use DECIMAL/NUMERIC for exact precision
+
+```sql
+-- CORRECT: DECIMAL for exact arithmetic
+CREATE TABLE accounts (
+    id SERIAL PRIMARY KEY,
+    balance DECIMAL(15,2) NOT NULL DEFAULT 0.00  -- Up to 15 digits, 2 decimal places
+);
+
+-- Or use smallest currency unit (cents)
+CREATE TABLE accounts (
+    id SERIAL PRIMARY KEY,
+    balance_cents BIGINT NOT NULL DEFAULT 0
+);
+```
+
+---
+
+#### 10. 31 Flavors
+
+**Objective:** Restrict a column to a set of valid values
+
+**Antipattern:** Use ENUM or CHECK constraints with hardcoded values
+
+```sql
+-- ANTI-PATTERN: ENUM with values that will change
+CREATE TYPE bug_status AS ENUM ('new', 'open', 'fixed');
+
+-- Adding 'verified' requires ALTER TYPE - problematic in many databases
+-- Some databases don't support removing ENUM values at all
+```
+
+**Problems:**
+- Adding/removing values requires schema change
+- ENUM behavior varies across databases
+- Cannot query the list of valid values
+- Cannot add metadata to values (display order, description)
+
+**Solution:** Use a lookup table
+
+```sql
+-- CORRECT: Lookup table
+CREATE TABLE bug_statuses (
+    status VARCHAR(20) PRIMARY KEY,
+    description TEXT,
+    display_order INTEGER,
+    is_active BOOLEAN DEFAULT true
+);
+
+INSERT INTO bug_statuses VALUES
+    ('new', 'Newly reported', 1, true),
+    ('open', 'Under investigation', 2, true),
+    ('fixed', 'Fix implemented', 3, true),
+    ('verified', 'Fix verified', 4, true);
+
+CREATE TABLE bugs (
+    id SERIAL PRIMARY KEY,
+    status VARCHAR(20) REFERENCES bug_statuses(status) DEFAULT 'new'
+);
+```
+
+---
+
+#### 11. Phantom Files
+
+**Objective:** Store images, documents, or other files
+
+**Antipattern:** Store only file paths in database
+
+```sql
+-- ANTI-PATTERN: Path to external file
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    file_path VARCHAR(500),  -- '/uploads/doc_123.pdf'
+    uploaded_at TIMESTAMP
+);
+```
+
+**Problems:**
+- Files can be deleted outside database transaction
+- Database backup doesn't include files
+- File permissions are separate from database permissions
+- Orphaned files when database rows are deleted
+- No transactional consistency
+
+**Solutions:**
+
+**A. Store files in database (BLOB)**
+
+```sql
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    file_name VARCHAR(255),
+    mime_type VARCHAR(100),
+    content BYTEA,  -- PostgreSQL; use BLOB for MySQL
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**B. Use object storage with proper integration**
+
+```sql
+-- Track external storage with proper lifecycle management
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    storage_bucket VARCHAR(100) NOT NULL,
+    storage_key VARCHAR(500) NOT NULL,  -- S3 key or similar
+    file_name VARCHAR(255),
+    mime_type VARCHAR(100),
+    file_size BIGINT,
+    checksum VARCHAR(64),  -- SHA-256 for integrity
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (storage_bucket, storage_key)
+);
+-- Use application logic to ensure files are deleted with records
+```
+
+**When to use each:**
+- BLOB: Small files (<10MB), need ACID, limited concurrent access
+- External storage: Large files, high concurrency, CDN integration needed
+
+---
+
+#### 12. Index Shotgun
+
+**Objective:** Optimize query performance
+
+**Antipattern:** Create indexes without analysis, or create none at all
+
+```sql
+-- ANTI-PATTERN: Index everything blindly
+CREATE INDEX idx1 ON orders(customer_id);
+CREATE INDEX idx2 ON orders(order_date);
+CREATE INDEX idx3 ON orders(status);
+CREATE INDEX idx4 ON orders(customer_id, order_date);
+CREATE INDEX idx5 ON orders(customer_id, status);
+CREATE INDEX idx6 ON orders(order_date, status);
+-- Slows down all writes, wastes storage
+```
+
+**Problems:**
+- Too few indexes: slow queries
+- Too many indexes: slow writes, wasted storage
+- Wrong indexes: indexes that are never used
+- Missing covering indexes: unnecessary table lookups
+
+**Solution:** Analyze query patterns, then create targeted indexes
+
+```sql
+-- 1. Analyze slow queries with EXPLAIN ANALYZE
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE customer_id = 123 AND status = 'pending';
+
+-- 2. Check existing index usage
+SELECT indexrelname, idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE schemaname = 'public'
+ORDER BY idx_scan;
+
+-- 3. Create indexes based on actual query patterns
+-- For: WHERE customer_id = ? AND status = ?
+CREATE INDEX idx_orders_customer_status ON orders(customer_id, status);
+
+-- 4. Use covering indexes for frequently accessed columns
+CREATE INDEX idx_orders_customer_covering
+ON orders(customer_id) INCLUDE (order_date, total);
+```
+
+---
+
+### Part III: Query Antipatterns
+
+#### 13. Fear of the Unknown (NULL Handling)
+
+**Objective:** Handle missing or unknown data
+
+**Antipattern:** Treat NULL as a regular value
+
+```sql
+-- ANTI-PATTERN: Incorrect NULL comparisons
+SELECT * FROM users WHERE phone = NULL;      -- Always returns 0 rows!
+SELECT * FROM users WHERE phone <> '555';    -- Excludes NULL phones!
+
+-- Concatenation with NULL
+SELECT 'Hello ' || middle_name || '!' FROM users;  -- Returns NULL if middle_name is NULL
+```
+
+**Problems:**
+- NULL = NULL is NULL (unknown), not TRUE
+- NULL in any comparison yields NULL (not TRUE or FALSE)
+- NULL propagates through expressions
+- COUNT(*) vs COUNT(column) behave differently
+
+**Solution:** Use NULL-safe operators and functions
+
+```sql
+-- CORRECT: NULL-safe queries
+SELECT * FROM users WHERE phone IS NULL;
+SELECT * FROM users WHERE phone IS NOT NULL;
+
+-- Include NULLs in inequality
+SELECT * FROM users WHERE phone <> '555' OR phone IS NULL;
+
+-- NULL-safe equality (PostgreSQL/MySQL)
+SELECT * FROM users WHERE phone IS NOT DISTINCT FROM other_phone;
+
+-- Handle NULL in concatenation
+SELECT 'Hello ' || COALESCE(middle_name, '') || '!' FROM users;
+
+-- Default values
+SELECT COALESCE(phone, 'N/A') as phone FROM users;
+```
+
+---
+
+#### 14. Ambiguous Groups
+
+**Objective:** Get rows with aggregate values per group
+
+**Antipattern:** Select non-grouped columns without aggregates
+
+```sql
+-- ANTI-PATTERN: Which product_name is returned?
+SELECT customer_id, MAX(order_date), product_name  -- product_name is ambiguous!
+FROM orders
+GROUP BY customer_id;
+
+-- Some databases allow this (MySQL with ONLY_FULL_GROUP_BY disabled)
+-- Result is unpredictable
+```
+
+**Problems:**
+- Violates Single-Value Rule (each non-aggregate column must have one value per group)
+- Different databases handle this differently
+- Results are undefined/unpredictable
+
+**Solutions:**
+
+```sql
+-- Solution 1: Correlated subquery
+SELECT o1.customer_id, o1.order_date, o1.product_name
+FROM orders o1
+WHERE o1.order_date = (
+    SELECT MAX(o2.order_date)
+    FROM orders o2
+    WHERE o2.customer_id = o1.customer_id
+);
+
+-- Solution 2: Window function
+SELECT customer_id, order_date, product_name
+FROM (
+    SELECT customer_id, order_date, product_name,
+           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date DESC) as rn
+    FROM orders
+) ranked
+WHERE rn = 1;
+
+-- Solution 3: Aggregate all selected columns
+SELECT customer_id,
+       MAX(order_date) as latest_date,
+       STRING_AGG(DISTINCT product_name, ', ') as products  -- Aggregate the column
+FROM orders
+GROUP BY customer_id;
+```
+
+---
+
+#### 15. Random Selection
+
+**Objective:** Select random sample rows
+
+**Antipattern:** Use ORDER BY RAND()
+
+```sql
+-- ANTI-PATTERN: Full table scan + sort
+SELECT * FROM products ORDER BY RANDOM() LIMIT 1;
+
+-- For 1M rows, this scans and sorts ALL 1M rows to get 1
+```
+
+**Problems:**
+- Scans entire table
+- Sorts all rows (O(n log n))
+- Cannot use indexes
+- Very slow on large tables
+
+**Solutions:**
+
+```sql
+-- Solution 1: Random offset (if IDs are mostly contiguous)
+SELECT * FROM products
+WHERE id >= (SELECT FLOOR(RANDOM() * (SELECT MAX(id) FROM products)))
+ORDER BY id LIMIT 1;
+
+-- Solution 2: TABLESAMPLE (PostgreSQL)
+SELECT * FROM products TABLESAMPLE BERNOULLI(0.1) LIMIT 1;
+
+-- Solution 3: Materialized random sample
+CREATE MATERIALIZED VIEW random_products AS
+SELECT * FROM products ORDER BY RANDOM() LIMIT 1000;
+-- Refresh periodically: REFRESH MATERIALIZED VIEW random_products;
+```
+
+---
+
+#### 16. Poor Man's Search Engine
+
+**Objective:** Implement keyword search
+
+**Antipattern:** Use LIKE with wildcards
+
+```sql
+-- ANTI-PATTERN: Pattern matching for search
+SELECT * FROM articles WHERE body LIKE '%database%';
+
+-- Leading wildcard prevents index usage
+-- No relevance ranking
+-- No stemming (database vs databases)
+```
+
+**Problems:**
+- Leading wildcard (%) prevents index usage
+- No relevance scoring
+- No stemming or fuzzy matching
+- Case sensitivity issues
+- Very slow on large text
+
+**Solution:** Use full-text search
+
+```sql
+-- PostgreSQL full-text search
+ALTER TABLE articles ADD COLUMN search_vector tsvector;
+
+UPDATE articles SET search_vector =
+    to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(body, ''));
+
+CREATE INDEX idx_articles_search ON articles USING GIN(search_vector);
+
+-- Search with ranking
+SELECT title, ts_rank(search_vector, query) as rank
+FROM articles, to_tsquery('english', 'database & design') query
+WHERE search_vector @@ query
+ORDER BY rank DESC;
+```
+
+For large-scale search, use dedicated search engines (Elasticsearch, Meilisearch, Typesense).
+
+---
+
+#### 17. Spaghetti Query
+
+**Objective:** Get multiple results in one query
+
+**Antipattern:** Write overly complex single queries
+
+```sql
+-- ANTI-PATTERN: Everything in one query
+SELECT
+    c.name,
+    (SELECT COUNT(*) FROM orders WHERE customer_id = c.id) as order_count,
+    (SELECT SUM(amount) FROM orders WHERE customer_id = c.id) as total_spent,
+    (SELECT MAX(order_date) FROM orders WHERE customer_id = c.id) as last_order,
+    (SELECT AVG(rating) FROM reviews WHERE customer_id = c.id) as avg_rating,
+    (SELECT COUNT(*) FROM support_tickets WHERE customer_id = c.id) as ticket_count
+FROM customers c
+WHERE c.status = 'active';
+-- Multiple correlated subqueries = multiple table scans
+```
+
+**Problems:**
+- Hard to read and maintain
+- Hard to debug
+- Hard to optimize
+- Cartesian products from missing join conditions
+- Correlated subqueries multiply execution time
+
+**Solution:** Use multiple simpler queries or proper joins
+
+```sql
+-- Better: JOINs with aggregation
+SELECT
+    c.name,
+    COUNT(DISTINCT o.id) as order_count,
+    SUM(o.amount) as total_spent,
+    MAX(o.order_date) as last_order,
+    AVG(r.rating) as avg_rating,
+    COUNT(DISTINCT t.id) as ticket_count
+FROM customers c
+LEFT JOIN orders o ON c.id = o.customer_id
+LEFT JOIN reviews r ON c.id = r.customer_id
+LEFT JOIN support_tickets t ON c.id = t.customer_id
+WHERE c.status = 'active'
+GROUP BY c.id, c.name;
+
+-- Or: Multiple simple queries (often faster and more maintainable)
+-- Query 1: Basic customer info
+-- Query 2: Order statistics
+-- Query 3: Review statistics
+-- Combine in application layer
+```
+
+---
+
+#### 18. Implicit Columns
+
+**Objective:** Write concise queries
+
+**Antipattern:** Use SELECT * or omit column names in INSERT
+
+```sql
+-- ANTI-PATTERN: SELECT *
+SELECT * FROM orders WHERE customer_id = 123;
+
+-- ANTI-PATTERN: INSERT without column names
+INSERT INTO users VALUES (1, 'John', 'john@email.com', NOW());
+```
+
+**Problems:**
+- Schema changes break queries silently
+- Fetches unnecessary data (bandwidth, memory)
+- INSERT fails if column order changes
+- Harder to understand query intent
+- Prevents covering index optimization
+
+**Solution:** Always specify columns explicitly
+
+```sql
+-- CORRECT: Explicit columns
+SELECT id, order_date, total_amount, status
+FROM orders
+WHERE customer_id = 123;
+
+-- CORRECT: Named INSERT
+INSERT INTO users (id, name, email, created_at)
+VALUES (1, 'John', 'john@email.com', NOW());
+```
+
+---
+
+### Part IV: Application Development Antipatterns
+
+#### 19. Readable Passwords
+
+**Objective:** Store user credentials
+
+**Antipattern:** Store passwords in plain text
+
+```sql
+-- ANTI-PATTERN: Plain text passwords
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50),
+    password VARCHAR(100)  -- Storing "mypassword123" directly!
+);
+```
+
+**Problems:**
+- Database breach exposes all passwords
+- DBAs and developers can see passwords
+- Violates security best practices and regulations
+- Users who reuse passwords are vulnerable elsewhere
+
+**Solution:** Hash passwords with salt in application layer
+
+```sql
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL  -- bcrypt/argon2 hash
+);
+```
+
+```python
+# Application code (Python example)
+import bcrypt
+
+# When creating user
+password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+# When verifying login
+if bcrypt.checkpw(password.encode(), stored_hash):
+    # Login successful
+```
+
+---
+
+#### 20. SQL Injection
+
+**Objective:** Build dynamic queries
+
+**Antipattern:** Concatenate user input into SQL strings
+
+```python
+# ANTI-PATTERN: String concatenation
+query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
+
+# Attacker input: username = "admin'--"
+# Resulting query: SELECT * FROM users WHERE username = 'admin'--' AND password = ''
+# The -- comments out the password check!
+```
+
+**Problems:**
+- Attacker can execute arbitrary SQL
+- Can read, modify, or delete any data
+- Can bypass authentication
+- Can potentially access the underlying system
+
+**Solution:** Use parameterized queries
+
+```python
+# CORRECT: Parameterized query
+cursor.execute(
+    "SELECT * FROM users WHERE username = %s AND password_hash = %s",
+    (username, password_hash)
+)
+
+# Or use an ORM
+user = session.query(User).filter(User.username == username).first()
+```
+
+---
+
+#### 21. Pseudokey Neat-Freak
+
+**Objective:** Maintain clean primary key sequences
+
+**Antipattern:** Try to reuse deleted IDs or eliminate gaps
+
+```sql
+-- ANTI-PATTERN: Finding and filling gaps
+INSERT INTO users (id, name)
+SELECT MIN(t1.id + 1), 'New User'
+FROM users t1
+LEFT JOIN users t2 ON t1.id + 1 = t2.id
+WHERE t2.id IS NULL;
+
+-- Or resetting sequence after deletes
+SELECT setval('users_id_seq', (SELECT MAX(id) FROM users));
+```
+
+**Problems:**
+- Race conditions in concurrent systems
+- Previously deleted IDs may be referenced elsewhere (logs, external systems)
+- Expensive queries to find gaps
+- No actual benefit
+
+**Solution:** Accept gaps as normal
+
+```sql
+-- CORRECT: Let the database manage sequences
+INSERT INTO users (name) VALUES ('New User');  -- ID assigned automatically
+
+-- Primary keys are identifiers, not counters
+-- Gaps are normal and harmless
+```
+
+---
+
+#### 22. See No Evil
+
+**Objective:** Debug database issues
+
+**Antipattern:** Ignore or suppress error messages
+
+```python
+# ANTI-PATTERN: Catching and ignoring errors
+try:
+    cursor.execute(query)
+except Exception:
+    pass  # Silently fail
+
+# ANTI-PATTERN: Generic error messages
+except Exception as e:
+    print("Database error")  # Lost all useful information
+```
+
+**Problems:**
+- Cannot diagnose issues
+- Silent data corruption
+- Security issues go unnoticed
+- Debugging becomes impossible
+
+**Solution:** Log errors with full context
+
+```python
+# CORRECT: Proper error handling
+try:
+    cursor.execute(query, params)
+except DatabaseError as e:
+    logger.error(f"Database error: {e}", extra={
+        'query': query,
+        'params': params,
+        'error_code': e.pgcode if hasattr(e, 'pgcode') else None
+    })
+    raise  # Re-raise or handle appropriately
+```
+
+---
+
+#### 23. Diplomatic Immunity
+
+**Objective:** Move fast in development
+
+**Antipattern:** Treat database as second-class citizen
+
+**Common manifestations:**
+- No version control for schema changes
+- No code review for SQL
+- No testing for database logic
+- Manual deployments
+- Production access without audit trail
+
+**Solution:** Apply software engineering best practices to database
+
+```sql
+-- Version-controlled migrations (e.g., using Flyway, Alembic, Liquibase)
+-- V1__create_users_table.sql
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- V2__add_email_column.sql
+ALTER TABLE users ADD COLUMN email VARCHAR(255);
+```
+
+**Best practices:**
+- Version control all schema changes
+- Code review database migrations
+- Write tests for stored procedures and complex queries
+- Use migrations for all schema changes (never manual DDL in production)
+- Maintain separate environments (dev, staging, production)
+- Implement audit logging for sensitive operations
+
+---
+
+#### 24. Magic Beans
+
+**Objective:** Simplify application architecture
+
+**Antipattern:** Treat Active Record models as the domain model
+
+```python
+# ANTI-PATTERN: Business logic in Active Record model
+class User(ActiveRecord):
+    def place_order(self, product, quantity):
+        # Business logic mixed with data access
+        if self.balance < product.price * quantity:
+            raise InsufficientFundsError()
+
+        order = Order.create(user_id=self.id, product_id=product.id)
+        self.balance -= product.price * quantity
+        self.save()
+        return order
+```
+
+**Problems:**
+- Business logic coupled to database structure
+- Hard to test without database
+- Domain model limited by ORM capabilities
+- God objects that do too much
+
+**Solution:** Separate domain models from data access
+
+```python
+# CORRECT: Service layer with separate concerns
+class OrderService:
+    def __init__(self, user_repository, order_repository, payment_service):
+        self.user_repo = user_repository
+        self.order_repo = order_repository
+        self.payment = payment_service
+
+    def place_order(self, user_id: int, product: Product, quantity: int) -> Order:
+        user = self.user_repo.find(user_id)
+
+        if not self.payment.can_afford(user, product.price * quantity):
+            raise InsufficientFundsError()
+
+        order = Order(user_id=user.id, product_id=product.id, quantity=quantity)
+        self.order_repo.save(order)
+        self.payment.charge(user, order.total)
+
+        return order
+```
+
+---
+
+### Quick Reference: Antipattern Categories
+
+| Category | Antipattern | Key Symptom | Quick Fix |
+|----------|-------------|-------------|-----------|
+| **Logical Design** | Jaywalking | Comma-separated values in column | Intersection table |
+| | Naive Trees | Only parent_id for hierarchies | Closure table |
+| | ID Required | id column on every table | Use compound/natural keys where appropriate |
+| | Keyless Entry | Missing foreign keys | Add FK constraints + indexes |
+| | EAV | attribute_name/attribute_value columns | Proper typed columns or JSONB |
+| | Polymorphic Associations | parent_type + parent_id columns | Common super-table |
+| | Multicolumn Attributes | attribute1, attribute2, attribute3... | Dependent table |
+| | Metadata Tribbles | table_2023, table_2024... | Native partitioning |
+| **Physical Design** | Rounding Errors | FLOAT for money | DECIMAL/NUMERIC |
+| | 31 Flavors | Hardcoded ENUMs | Lookup table |
+| | Phantom Files | Only storing file paths | BLOB or managed external storage |
+| | Index Shotgun | Random indexes | Analyze queries first |
+| **Queries** | Fear of the Unknown | Incorrect NULL handling | IS NULL, COALESCE |
+| | Ambiguous Groups | Non-aggregate in GROUP BY | Window functions |
+| | Random Selection | ORDER BY RANDOM() | TABLESAMPLE or random key |
+| | Poor Man's Search | LIKE '%keyword%' | Full-text search |
+| | Spaghetti Query | Complex single query | Multiple simpler queries |
+| | Implicit Columns | SELECT * | Explicit column names |
+| **Application** | Readable Passwords | Plain text passwords | bcrypt/argon2 hashing |
+| | SQL Injection | String concatenation | Parameterized queries |
+| | Pseudokey Neat-Freak | Reusing deleted IDs | Accept gaps |
+| | See No Evil | Suppressing errors | Log with full context |
+| | Diplomatic Immunity | No DB best practices | Version control, migrations |
+| | Magic Beans | ORM as domain model | Separate service layer |
+
+---
+
 ## 18. Database Selection Guide: When to Use What
 
 Choosing the right database is one of the most critical architectural decisions. There is no one-size-fits-all solution—the choice depends on data model, consistency requirements, scale, and team expertise.
@@ -2649,6 +3914,914 @@ reserve_pool_size = 5
 
 ---
 
+## 24. Serverless PostgreSQL Platforms: Neon, Supabase, PlanetScale
+
+The serverless database landscape has matured significantly, with specialized platforms offering different value propositions.
+
+### Platform Comparison
+
+| Feature | Neon | Supabase | PlanetScale (Postgres) |
+|---------|------|----------|------------------------|
+| **Core** | Serverless PostgreSQL | BaaS with PostgreSQL | MySQL + new Postgres offering |
+| **Scale to Zero** | ✅ Yes | ❌ No | ❌ No |
+| **Database Branching** | ✅ Instant (copy-on-write) | ✅ Git-integrated | ✅ Yes |
+| **Built-in Auth** | ❌ No | ✅ Yes | ❌ No |
+| **Real-time** | ❌ No | ✅ Yes | ❌ No |
+| **Edge Functions** | ❌ No | ✅ Yes | ❌ No |
+| **Vector Support** | ✅ pgvector | ✅ pgvector | ✅ (MySQL native) |
+| **Compliance** | SOC2 Type 2 | SOC2 + HIPAA | SOC2 |
+
+### Neon: True Serverless PostgreSQL
+
+**Architecture:** Neon separates compute and storage. Compute is standard Postgres; storage is a custom multi-tenant system with copy-on-write branching.
+
+```
+Key Benefits:
+- Scale to zero (pay nothing when idle)
+- Instant database branching for dev/test
+- Sub-second cold starts
+- Autoscaling compute
+```
+
+**Recent News (2025):** Databricks acquired Neon for ~$1 billion. Over 80% of Neon databases are now created by AI agents automatically.
+
+```javascript
+// Neon with serverless driver (edge-compatible)
+import { neon } from '@neondatabase/serverless';
+
+const sql = neon(process.env.DATABASE_URL);
+
+// Works in Vercel Edge, Cloudflare Workers, etc.
+const users = await sql`SELECT * FROM users WHERE id = ${userId}`;
+```
+
+### Supabase: Firebase Alternative on PostgreSQL
+
+**Architecture:** Battery-included platform with vanilla Postgres core + middleware (PostgREST, GoTrue, Realtime, Storage).
+
+```
+Key Benefits:
+- Complete backend (auth, storage, functions)
+- Real-time subscriptions out of the box
+- Auto-generated REST & GraphQL APIs
+- 400+ extensions pre-configured
+```
+
+**Modern Extensions Included:**
+- `pg_graphql`: GraphQL queries via SQL function
+- `pg_jsonschema`: JSON Schema validation
+- `pgvector`: Vector similarity search
+- `pg_net`: HTTP requests from SQL
+- `vault`: Secrets management
+
+```sql
+-- Supabase: Auto-generated API + Real-time
+-- This table automatically gets REST API + real-time subscriptions
+
+CREATE TABLE messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    content TEXT NOT NULL,
+    user_id UUID REFERENCES auth.users(id),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable real-time for this table
+ALTER PUBLICATION supabase_realtime ADD TABLE messages;
+
+-- Enable Row Level Security
+ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can read all messages"
+    ON messages FOR SELECT USING (true);
+
+CREATE POLICY "Users can insert own messages"
+    ON messages FOR INSERT WITH CHECK (auth.uid() = user_id);
+```
+
+```javascript
+// Supabase client with real-time
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Real-time subscription
+supabase
+  .channel('messages')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' },
+    (payload) => console.log('New message:', payload.new))
+  .subscribe();
+```
+
+### PlanetScale PostgreSQL (2025)
+
+**Recent Development:** PlanetScale launched managed PostgreSQL in late 2025, built on "Metal" clusters with local NVMe drives.
+
+```
+Key Benefits:
+- "Unlimited I/O" pricing model
+- Low-latency Metal clusters
+- Database branching
+- Established MySQL expertise applied to Postgres
+```
+
+### Decision Framework
+
+```
+Choose Neon when:
+├── Serverless/edge deployment required
+├── Development workflows need instant branching
+├── Cost optimization via scale-to-zero is important
+└── AI agents creating databases programmatically
+
+Choose Supabase when:
+├── Need complete backend (auth, storage, functions)
+├── Real-time features are required
+├── Want to avoid building APIs manually
+└── Prefer managed, batteries-included approach
+
+Choose PlanetScale when:
+├── Already using PlanetScale for MySQL
+├── Need "Unlimited I/O" pricing model
+└── Prioritize raw I/O performance
+```
+
+---
+
+## 25. Modern PostgreSQL Extensions (2025)
+
+### Vector & AI Extensions
+
+#### pgvectorscale (Timescale)
+
+**Purpose:** High-performance vector search extension that complements pgvector with DiskANN-based indexing.
+
+**Performance:** 28x lower p95 latency and 16x higher throughput vs Pinecone at 75% less cost on 50M vectors.
+
+```sql
+-- Install extensions
+CREATE EXTENSION IF NOT EXISTS vector;        -- Base pgvector
+CREATE EXTENSION IF NOT EXISTS vectorscale;   -- Enhanced indexing
+
+-- Create table with vector column
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    embedding vector(1536)
+);
+
+-- Create StreamingDiskANN index (pgvectorscale)
+CREATE INDEX ON documents
+USING diskann (embedding vector_cosine_ops);
+
+-- Query with high performance
+SELECT id, content,
+       embedding <=> '[0.1, 0.2, ...]'::vector AS distance
+FROM documents
+ORDER BY embedding <=> '[0.1, 0.2, ...]'::vector
+LIMIT 10;
+```
+
+**Key Technologies:**
+- **StreamingDiskANN:** Microsoft DiskANN-inspired index for billion-scale vectors
+- **Statistical Binary Quantization (SBQ):** Better than standard binary quantization
+- **Filtered search:** Label-based filtering during vector search
+
+**Limitations:** Index build is currently single-threaded (~11 hours for 50M vectors vs 3.3 hours for Qdrant).
+
+#### pgai (Timescale)
+
+**Purpose:** AI workflows directly in PostgreSQL - embeddings, RAG, model inference.
+
+```sql
+-- Generate embeddings directly in SQL
+SELECT ai.create_embedding(
+    'openai/text-embedding-3-small',
+    'Your text to embed'
+);
+
+-- Semantic search with auto-embedding
+SELECT * FROM ai.semantic_search(
+    'documents',
+    'embedding',
+    'Find documents about machine learning',
+    limit_val => 10
+);
+```
+
+### Search & Analytics Extensions
+
+#### pg_search (ParadeDB)
+
+**Purpose:** Elasticsearch-quality full-text search inside PostgreSQL using BM25 algorithm and Tantivy (Rust-based Lucene alternative).
+
+```sql
+CREATE EXTENSION pg_search;
+
+-- Create BM25 index
+CREATE INDEX idx_products_search ON products
+USING bm25 (name, description)
+WITH (key_field = 'id');
+
+-- Full-text search with BM25 scoring
+SELECT id, name, description, paradedb.score(id) as relevance
+FROM products
+WHERE name @@@ 'wireless headphones'
+   OR description @@@ 'bluetooth audio'
+ORDER BY paradedb.score(id) DESC
+LIMIT 20;
+
+-- Hybrid search (BM25 + vector)
+SELECT *,
+    (0.5 * paradedb.score(id) + 0.5 * (1 - (embedding <=> query_vec))) as hybrid_score
+FROM products
+WHERE name @@@ 'headphones'
+ORDER BY hybrid_score DESC;
+```
+
+**Adoption:** 400,000+ deployments, used by Alibaba Cloud and Bilt Rewards ($36B+ payments processed).
+
+#### pg_duckdb (Hydra + MotherDuck)
+
+**Purpose:** Embed DuckDB's columnar analytics engine inside PostgreSQL for 10-1500x faster analytical queries.
+
+```sql
+CREATE EXTENSION pg_duckdb;
+
+-- Query Parquet files directly from S3
+SELECT
+    category,
+    SUM(amount) as total_sales,
+    COUNT(*) as transactions
+FROM read_parquet('s3://bucket/sales/*.parquet')
+GROUP BY category
+ORDER BY total_sales DESC;
+
+-- Use DuckDB syntax directly
+SELECT * FROM duckdb.query($$
+    SELECT *
+    FROM read_csv_auto('s3://bucket/data.csv')
+    WHERE amount > 1000
+$$);
+
+-- Create analytics-optimized table
+CREATE TABLE analytics_data (
+    id SERIAL,
+    event_time TIMESTAMPTZ,
+    user_id INTEGER,
+    event_type TEXT,
+    properties JSONB
+) USING duckdb;
+```
+
+**Performance:** Up to 1500x improvement for analytical queries; realistic 10x for many workloads.
+
+### Automation & Operations Extensions
+
+#### pg_cron
+
+**Purpose:** Schedule jobs directly in PostgreSQL using cron syntax.
+
+```sql
+CREATE EXTENSION pg_cron;
+
+-- Schedule daily cleanup at 3 AM
+SELECT cron.schedule(
+    'cleanup-old-sessions',
+    '0 3 * * *',
+    $$DELETE FROM sessions WHERE expires_at < NOW() - INTERVAL '7 days'$$
+);
+
+-- Schedule hourly aggregation
+SELECT cron.schedule(
+    'hourly-metrics',
+    '0 * * * *',
+    $$INSERT INTO metrics_hourly
+      SELECT date_trunc('hour', created_at), count(*)
+      FROM events
+      WHERE created_at > NOW() - INTERVAL '2 hours'
+      GROUP BY 1
+      ON CONFLICT (hour) DO UPDATE SET count = EXCLUDED.count$$
+);
+
+-- Run in different database
+SELECT cron.schedule_in_database(
+    'analytics-job',
+    '*/15 * * * *',
+    $$REFRESH MATERIALIZED VIEW CONCURRENTLY sales_summary$$,
+    'analytics_db'
+);
+
+-- List scheduled jobs
+SELECT * FROM cron.job;
+
+-- Unschedule
+SELECT cron.unschedule('cleanup-old-sessions');
+```
+
+#### pg_partman
+
+**Purpose:** Automated partition management for time-series and large tables.
+
+```sql
+CREATE EXTENSION pg_partman;
+
+-- Create parent partitioned table
+CREATE TABLE events (
+    id BIGSERIAL,
+    event_time TIMESTAMPTZ NOT NULL,
+    event_type TEXT,
+    payload JSONB
+) PARTITION BY RANGE (event_time);
+
+-- Configure automatic partition management
+SELECT partman.create_parent(
+    p_parent_table := 'public.events',
+    p_control := 'event_time',
+    p_interval := 'daily',
+    p_premake := 7  -- Create 7 days of future partitions
+);
+
+-- Auto-maintenance via pg_cron
+SELECT cron.schedule(
+    'partition-maintenance',
+    '0 1 * * *',
+    $$SELECT partman.run_maintenance()$$
+);
+```
+
+### API & Integration Extensions
+
+#### pg_graphql (Supabase)
+
+**Purpose:** GraphQL API directly from PostgreSQL schema.
+
+```sql
+CREATE EXTENSION pg_graphql;
+
+-- GraphQL is auto-generated from your schema
+-- Query via SQL function
+SELECT graphql.resolve($$
+    query {
+        users(first: 10) {
+            edges {
+                node {
+                    id
+                    email
+                    posts {
+                        edges {
+                            node {
+                                title
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+$$);
+```
+
+#### pg_jsonschema (Supabase)
+
+**Purpose:** JSON Schema validation for JSONB columns.
+
+```sql
+CREATE EXTENSION pg_jsonschema;
+
+-- Add JSON Schema validation constraint
+ALTER TABLE products
+ADD CONSTRAINT valid_metadata CHECK (
+    jsonb_matches_schema(
+        '{
+            "type": "object",
+            "properties": {
+                "weight": {"type": "number", "minimum": 0},
+                "dimensions": {
+                    "type": "object",
+                    "properties": {
+                        "length": {"type": "number"},
+                        "width": {"type": "number"},
+                        "height": {"type": "number"}
+                    },
+                    "required": ["length", "width", "height"]
+                }
+            },
+            "required": ["weight"]
+        }'::json,
+        metadata
+    )
+);
+```
+
+### Extension Ecosystem Summary
+
+| Category | Extension | Purpose | Performance Impact |
+|----------|-----------|---------|-------------------|
+| **Vector** | pgvector | Base vector operations | Baseline |
+| **Vector** | pgvectorscale | DiskANN indexing | 28x faster than Pinecone |
+| **Vector** | pgai | AI workflows in SQL | Simplifies AI pipelines |
+| **Search** | pg_search | BM25 full-text search | Elasticsearch-quality |
+| **Analytics** | pg_duckdb | Columnar analytics | 10-1500x faster |
+| **Scheduling** | pg_cron | Job scheduling | N/A |
+| **Partitioning** | pg_partman | Auto partition management | N/A |
+| **API** | pg_graphql | GraphQL from schema | Zero API code |
+| **Validation** | pg_jsonschema | JSON Schema validation | N/A |
+
+---
+
+## 26. Connection Pooling: PgBouncer vs PgCat vs Supavisor
+
+Connection pooling is critical for scaling PostgreSQL. Modern alternatives offer significant improvements over traditional PgBouncer.
+
+### Comparison Overview
+
+| Feature | PgBouncer | PgCat | Supavisor |
+|---------|-----------|-------|-----------|
+| **Language** | C (libevent) | Rust (Tokio) | Elixir (BEAM) |
+| **Threading** | Single-threaded | Multi-threaded | Multi-process (BEAM) |
+| **Max Connections** | ~1000/instance | Millions | 1 Million+ tested |
+| **Prepared Statements** | Limited | ✅ Full support | ✅ Full support |
+| **Query Load Balancing** | ❌ No | ✅ Yes | ✅ Yes |
+| **Replica Lag Awareness** | ❌ No | ✅ Yes | ✅ Yes |
+| **Hot Reload** | Requires restart | ✅ Zero downtime | ✅ Zero downtime |
+| **Multi-tenancy** | ❌ No | ✅ Yes | ✅ Yes (designed for) |
+
+### PgBouncer (Traditional Choice)
+
+**Best for:** Simple deployments, low-to-medium connection counts (<50 clients).
+
+```ini
+# /etc/pgbouncer/pgbouncer.ini
+[databases]
+mydb = host=localhost port=5432 dbname=mydb
+
+[pgbouncer]
+listen_addr = *
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+
+# Pool configuration
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 20
+min_pool_size = 5
+reserve_pool_size = 5
+
+# Performance tuning
+max_db_connections = 100
+```
+
+**Limitations:**
+- Single-threaded: CPU maxes at ~50 clients, need multiple instances
+- No built-in load balancing to replicas
+- Configuration changes require restart
+
+### PgCat (Modern Rust Alternative)
+
+**Best for:** High-throughput applications needing query routing and replica awareness.
+
+```toml
+# pgcat.toml
+[general]
+host = "0.0.0.0"
+port = 6432
+admin_username = "admin"
+admin_password = "admin"
+
+[pools.mydb]
+pool_mode = "transaction"
+default_role = "primary"
+query_parser_enabled = true
+primary_reads_enabled = false
+sharding_function = "pg_bigint_hash"
+
+[pools.mydb.users.app]
+password = "secret"
+pool_size = 20
+min_pool_size = 5
+
+[pools.mydb.shards.0]
+database = "mydb"
+servers = [
+    ["primary.db.com", 5432, "primary"],
+    ["replica1.db.com", 5432, "replica"],
+    ["replica2.db.com", 5432, "replica"],
+]
+```
+
+**Performance:**
+- 59K TPS vs PgBouncer's 44K TPS at high concurrency
+- Handles 1,250 connections within 400% CPU (4 cores)
+- PgBouncer hits 100% CPU at 50 connections (1 core)
+
+**Key Features:**
+```toml
+# Replica lag awareness
+[pools.mydb]
+replica_selection_strategy = "least_lag"
+max_replica_lag_ms = 1000  # Don't route to replicas lagging >1s
+
+# Query routing
+[pools.mydb]
+query_parser_enabled = true
+primary_reads_enabled = false  # All reads to replicas
+
+# Sharding support
+[pools.mydb]
+sharding_function = "pg_bigint_hash"
+shards = 4
+```
+
+### Supavisor (Cloud-Native Scale)
+
+**Best for:** Massive scale (1M+ connections), multi-tenant SaaS, serverless environments.
+
+**Architecture:** Built in Elixir on the BEAM VM, designed for massive concurrency with lightweight processes.
+
+```elixir
+# Supavisor configuration (simplified)
+config :supavisor,
+  # Cluster configuration
+  cluster_postgres: [
+    primary: "postgresql://primary:5432/db",
+    replicas: [
+      "postgresql://replica1:5432/db",
+      "postgresql://replica2:5432/db"
+    ]
+  ],
+  # Pool settings
+  pool_size: 20,
+  pool_mode: :transaction,
+  # Multi-tenant support
+  tenant_pool_size: 10,
+  max_tenants_per_node: 10000
+```
+
+**Unique Features:**
+- **Dynamic tenant pools:** Pools created on-demand per tenant
+- **1M+ connections tested:** Horizontal scaling across cluster
+- **Read-after-write consistency:** Smart routing ensures consistency
+- **Query cancellation:** Cancel long-running queries easily
+
+### Decision Matrix
+
+```
+Connection Count & Use Case:
+
+< 50 concurrent connections:
+└── PgBouncer (simple, proven, minimal resources)
+
+50-1000 connections + need query routing:
+└── PgCat (modern features, better throughput)
+
+1000+ connections OR multi-tenant SaaS:
+└── Supavisor (designed for massive scale)
+
+Serverless/Edge with many short-lived connections:
+└── Supavisor or PgCat
+
+Need replica load balancing + lag awareness:
+└── PgCat or Supavisor (not PgBouncer)
+```
+
+### Connection Pooling Best Practices
+
+```python
+# Application-side: Use connection pooling library
+from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
+
+# Connect through pooler, not directly to Postgres
+engine = create_engine(
+    "postgresql://user:pass@pgcat-host:6432/mydb",
+    poolclass=QueuePool,
+    pool_size=5,           # App-side pool (small, pooler handles rest)
+    max_overflow=10,
+    pool_pre_ping=True,    # Verify connections before use
+    pool_recycle=3600,     # Recycle connections hourly
+)
+
+# For serverless: Use serverless-compatible drivers
+# Neon serverless driver (works in edge)
+from neon import neon
+
+sql = neon(DATABASE_URL)
+result = await sql("SELECT * FROM users WHERE id = $1", [user_id])
+```
+
+---
+
+## 27. Local-First & Edge Databases
+
+The local-first paradigm is transforming how applications handle data, enabling offline-capable apps with real-time sync.
+
+### ElectricSQL: PostgreSQL Sync Engine
+
+**Purpose:** Real-time sync between PostgreSQL and client-side databases (SQLite, IndexedDB).
+
+**Architecture:**
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   PostgreSQL    │────▶│  Electric Sync   │────▶│  Client App     │
+│   (Source of    │     │    Service       │     │  (PGlite/SQLite)│
+│    Truth)       │◀────│  (HTTP Stream)   │◀────│                 │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+         │                                                │
+         │              Logical Replication               │
+         └────────────────────────────────────────────────┘
+```
+
+```typescript
+// ElectricSQL client setup
+import { electrify } from 'electric-sql/wa-sqlite';
+import { schema } from './generated/client';
+
+// Connect to local SQLite + Electric sync
+const electric = await electrify(db, schema, {
+  url: 'https://api.electric-sql.com',
+  auth: { token: authToken }
+});
+
+// Subscribe to a "shape" of data
+const { synced } = await electric.db.projects.sync({
+  where: { user_id: currentUser.id },
+  include: { tasks: true }
+});
+
+// Wait for initial sync
+await synced;
+
+// Now query locally (instant, no network)
+const projects = await electric.db.projects.findMany({
+  include: { tasks: true }
+});
+
+// Writes go to local first, sync in background
+await electric.db.tasks.create({
+  data: { title: 'New task', project_id: projectId }
+});
+```
+
+**Key Features:**
+- Shapes: Subscribe to subsets of data
+- Conflict resolution: Built on CRDTs
+- Works offline: Full functionality without network
+- 600,000+ weekly downloads
+
+### PGlite: PostgreSQL in WebAssembly
+
+**Purpose:** Run actual PostgreSQL in the browser, Node.js, or Deno. Only 3MB gzipped.
+
+```typescript
+// Browser usage with IndexedDB persistence
+import { PGlite } from '@electric-sql/pglite';
+
+// In-memory database
+const db = new PGlite();
+
+// Or with persistence
+const db = new PGlite('idb://my-database');
+
+// Full PostgreSQL SQL support
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS todos (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    completed BOOLEAN DEFAULT FALSE
+  )
+`);
+
+// Parameterized queries
+const result = await db.query(
+  'INSERT INTO todos (title) VALUES ($1) RETURNING *',
+  ['Buy groceries']
+);
+
+// Extensions support (including pgvector!)
+import { vector } from '@electric-sql/pglite/vector';
+
+const db = new PGlite({
+  extensions: { vector }
+});
+
+await db.exec('CREATE EXTENSION IF NOT EXISTS vector');
+await db.exec(`
+  CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    embedding vector(384)
+  )
+`);
+```
+
+**Use Cases:**
+- Unit/CI testing (instant startup/teardown)
+- Offline-first applications
+- Local development without Docker
+- AI/ML pipelines in browser
+
+### FerretDB: MongoDB API on PostgreSQL
+
+**Purpose:** MongoDB wire protocol compatibility backed by PostgreSQL (via DocumentDB extension).
+
+```javascript
+// Use standard MongoDB driver
+const { MongoClient } = require('mongodb');
+
+// Connect to FerretDB (which connects to PostgreSQL)
+const client = new MongoClient('mongodb://localhost:27017');
+await client.connect();
+
+const db = client.db('mydb');
+const collection = db.collection('users');
+
+// Standard MongoDB operations
+await collection.insertOne({
+  name: 'John',
+  email: 'john@example.com',
+  tags: ['developer', 'postgres-fan']
+});
+
+// Queries work as expected
+const users = await collection.find({ tags: 'developer' }).toArray();
+
+// Aggregation pipelines
+const result = await collection.aggregate([
+  { $match: { tags: 'developer' } },
+  { $group: { _id: '$name', count: { $sum: 1 } } }
+]).toArray();
+```
+
+**FerretDB 2.0 (2025) Improvements:**
+- 20x faster with Microsoft's DocumentDB extension
+- Vector search support (HNSW)
+- Sub-millisecond P99 latency for point lookups
+- Replication support
+
+**When to Use:**
+- Migrating from MongoDB to PostgreSQL
+- Want MongoDB DX with PostgreSQL reliability
+- Need open-source MongoDB alternative (Apache 2.0 license)
+
+### Local-First Architecture Patterns
+
+```typescript
+// Pattern: Optimistic UI with background sync
+class LocalFirstStore {
+  private local: PGlite;
+  private sync: ElectricSync;
+  private pendingWrites: Map<string, WriteOperation>;
+
+  async write(operation: WriteOperation) {
+    // 1. Write to local immediately (optimistic)
+    await this.local.exec(operation.sql);
+
+    // 2. Update UI immediately
+    this.notifyListeners(operation);
+
+    // 3. Queue for sync
+    this.pendingWrites.set(operation.id, operation);
+
+    // 4. Sync in background (non-blocking)
+    this.syncToServer(operation).catch(this.handleSyncError);
+  }
+
+  async read(query: string) {
+    // Always read from local (instant)
+    return this.local.query(query);
+  }
+}
+
+// Pattern: Conflict resolution
+const electric = await electrify(db, schema, {
+  // Last-write-wins (default)
+  conflictResolution: 'lww',
+
+  // Or custom resolution
+  conflictResolver: (local, remote) => {
+    // Merge changes intelligently
+    return { ...remote, ...local, updatedAt: new Date() };
+  }
+});
+```
+
+---
+
+## 28. PostgreSQL Storage Engines & Future
+
+### OrioleDB: Next-Generation Storage Engine
+
+**Purpose:** Modern storage engine using PostgreSQL's Table Access Method API, eliminating bloat and improving performance.
+
+**Key Innovations:**
+- **No bloat:** UNDO log instead of storing old tuples in main table
+- **No vacuum needed:** Page merging instead of garbage collection
+- **64-bit transaction IDs:** No wraparound problem
+- **Lock-less page reading:** Direct links between memory and storage pages
+
+```sql
+-- Install OrioleDB
+CREATE EXTENSION orioledb;
+
+-- Create table with OrioleDB storage
+CREATE TABLE high_write_table (
+    id BIGSERIAL PRIMARY KEY,
+    data JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+) USING orioledb;
+
+-- Or set as default for all new tables
+SET default_table_access_method = 'orioledb';
+
+CREATE TABLE another_table (
+    id SERIAL PRIMARY KEY,
+    name TEXT
+);  -- Automatically uses OrioleDB
+```
+
+**Performance (2025 benchmarks):**
+- 2x QPS on TPC-C benchmark (19,000 vs 9,500 QPS)
+- 3.3x speedup on transactional workloads
+- Significant reduction in storage bloat
+
+**Current Status:**
+- Beta (targeting GA in 2025)
+- Requires patches to PostgreSQL core
+- Supported by Supabase (OrioleDB-17 available)
+
+### Comparison: Heap vs OrioleDB
+
+| Aspect | Heap (Default) | OrioleDB |
+|--------|----------------|----------|
+| **MVCC** | Old tuples in table | UNDO log |
+| **Bloat** | Requires VACUUM | No bloat (page merging) |
+| **Transaction IDs** | 32-bit (wraparound) | 64-bit (no wraparound) |
+| **Buffer Mapping** | Required | Lock-less direct links |
+| **Write Amplification** | Higher | Lower |
+| **Maturity** | Production-ready | Beta |
+
+### The Future: Postgres as Universal Platform
+
+```
+PostgreSQL Ecosystem Evolution (2025+):
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    PostgreSQL Core                               │
+├─────────────────────────────────────────────────────────────────┤
+│  Storage Engines    │  Execution Engines   │  Data Types        │
+│  ├── Heap (default) │  ├── Native Postgres │  ├── Standard SQL  │
+│  ├── OrioleDB       │  ├── DuckDB (OLAP)   │  ├── JSONB         │
+│  └── Future...      │  └── Velox (future?) │  ├── Vector        │
+│                     │                      │  └── BSON (FerretDB)│
+├─────────────────────────────────────────────────────────────────┤
+│  Sync & Replication │  APIs & Protocols    │  Scheduling        │
+│  ├── Logical Rep    │  ├── SQL             │  ├── pg_cron       │
+│  ├── ElectricSQL    │  ├── REST (PostgREST)│  └── pg_partman    │
+│  └── BDR/Citus      │  ├── GraphQL         │                    │
+│                     │  └── MongoDB Wire    │                    │
+├─────────────────────────────────────────────────────────────────┤
+│  Connection Pooling │  Search & AI         │  Cloud Platforms   │
+│  ├── PgBouncer      │  ├── pg_search (BM25)│  ├── Supabase      │
+│  ├── PgCat          │  ├── pgvector        │  ├── Neon          │
+│  └── Supavisor      │  └── pgvectorscale   │  └── Others        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Modern PostgreSQL Stack Recommendations
+
+**For Startups (0-1M users):**
+```
+Database:    Supabase or Neon
+Pooling:     Built-in (Supavisor/Neon proxy)
+Search:      pg_search or built-in full-text
+Vector:      pgvector (sufficient at this scale)
+Analytics:   pg_duckdb for ad-hoc queries
+Scheduling:  pg_cron
+```
+
+**For Scale-ups (1M-10M users):**
+```
+Database:    Self-managed or RDS/Aurora
+Pooling:     PgCat (for query routing + replicas)
+Search:      pg_search or dedicated Elasticsearch
+Vector:      pgvector + pgvectorscale
+Analytics:   Dedicated ClickHouse/BigQuery
+Scheduling:  pg_cron + external orchestration
+Partitioning: pg_partman for large tables
+```
+
+**For Enterprises (10M+ users):**
+```
+Database:    Citus (sharding) or CockroachDB (NewSQL)
+Pooling:     Supavisor or PgCat cluster
+Search:      Dedicated search infrastructure
+Vector:      Dedicated vector DB (Milvus/Qdrant)
+Analytics:   Data warehouse (Snowflake/BigQuery)
+Real-time:   Kafka + streaming pipelines
+```
+
+---
+
 ## Summary: Key Principles for Senior/Staff Engineers
 
 ### 1. Design for the Access Patterns
@@ -2712,12 +4885,15 @@ Start simple. Add complexity only when required by actual requirements or measur
 - [SQL vs. NoSQL: Key Differences, Use Cases - Design Gurus](https://www.designgurus.io/blog/sql-vs-nosql-key-differences)
 
 ### Database Anti-Patterns
+- [SQL Antipatterns: Avoiding the Pitfalls of Database Programming - Bill Karwin (Pragmatic Programmers)](https://pragprog.com/titles/bksqla/sql-antipatterns/) - **Primary reference for Section 17B**
+- [SQL Antipatterns Volume 1 (Updated Edition) - Pragmatic Programmers](https://pragprog.com/titles/bksap1/sql-antipatterns-volume-1/)
+- [SQL Antipatterns Book Summary - DEV Community](https://dev.to/treaz/book-summary-sql-antipatterns-1a5l)
+- [An Overview of SQL Antipatterns - HackerNoon](https://hackernoon.com/an-overview-of-sql-antipatterns)
 - [Database Anti-Patterns Part 2: Silent Killers - The Architect's Notebook](https://thearchitectsnotebook.substack.com/p/ep-67-database-anti-patterns-5-signs)
 - [Common Database Design Patterns and Anti-Patterns - LinkedIn](https://www.linkedin.com/advice/1/what-some-most-common-database-design-patterns)
 - [Database Modelization Anti-Patterns - Tapoueh](https://tapoueh.org/blog/2018/03/database-modelization-anti-patterns/)
 - [Anti-Patterns in Database Design - Levitation](https://levitation.in/posts/anti-patterns-in-database-design-lessons-from-real-world-failures)
 - [Busy Database Antipattern - Microsoft Azure](https://learn.microsoft.com/en-us/azure/architecture/antipatterns/busy-database/)
-- [SQL Antipatterns Book - Pragmatic Programmers](https://pragprog.com/titles/bksqla/sql-antipatterns/)
 
 ### Big Tech Database Architectures
 - [Architecture of Giants: Data Stacks at Facebook, Netflix, Airbnb - Keen](https://blog.keen.io/architecture-of-giants-data-stacks-at-facebook-netflix-airbnb-and-pinterest/)
@@ -2760,3 +4936,58 @@ Start simple. Add complexity only when required by actual requirements or measur
 - [Top 15 Database Scaling Techniques - AlgoMaster](https://blog.algomaster.io/p/top-15-database-scaling-techniques)
 - [Understanding Database Scaling Patterns - freeCodeCamp](https://www.freecodecamp.org/news/understanding-database-scaling-patterns)
 - [Best Practices for Solving Database Scaling Problems - PingCAP](https://www.pingcap.com/article/best-practices-for-solving-database-scaling-problems/)
+
+### Serverless PostgreSQL Platforms
+- [Serverless PostgreSQL 2025: Supabase, Neon, PlanetScale - DEV Community](https://dev.to/dataformathub/serverless-postgresql-2025-the-truth-about-supabase-neon-and-planetscale-7lf)
+- [Neon vs Supabase Comparison - Bytebase](https://www.bytebase.com/blog/neon-vs-supabase/)
+- [PlanetScale vs Neon: MySQL vs PostgreSQL - Bytebase](https://www.bytebase.com/blog/planetscale-vs-neon/)
+- [Neon vs PlanetScale vs Supabase - Bejamas](https://bejamas.com/compare/neon-vs-planetscale-vs-supabase)
+- [Benchmarking Postgres - PlanetScale](https://planetscale.com/blog/benchmarking-postgres)
+
+### Modern PostgreSQL Extensions
+- [pgvectorscale: DiskANN for PostgreSQL - GitHub](https://github.com/timescale/pgvectorscale)
+- [pgvectorscale Extension Overview - DbVisualizer](https://www.dbvis.com/thetable/pgvectorscale-an-extension-for-improved-vector-search-in-postgres/)
+- [pgvector vs Pinecone at 75% Less Cost - TigerData](https://www.tigerdata.com/blog/pgvector-is-now-as-fast-as-pinecone-at-75-less-cost)
+- [ParadeDB pg_search Documentation - ParadeDB](https://www.paradedb.com/)
+- [ParadeDB 0.20.0 Release Notes](https://www.paradedb.com/blog/paradedb-0-20-0)
+- [pg_analytics DuckDB-powered Analytics - GitHub](https://github.com/paradedb/pg_analytics)
+- [pg_duckdb Extension - GitHub](https://github.com/duckdb/pg_duckdb)
+- [pg_duckdb Beta Release - MotherDuck](https://motherduck.com/blog/pgduckdb-beta-release-duckdb-postgres/)
+- [PostgreSQL and DuckDB Options - MotherDuck](https://motherduck.com/blog/postgres-duckdb-options/)
+- [pg_cron Scheduling - GitHub](https://github.com/citusdata/pg_cron)
+- [pg_cron on AWS RDS - Amazon](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_pg_cron.html)
+- [pg_partman Partition Manager - PGXN](https://pgxn.org/dist/pg_partman/doc/pg_partman.html)
+- [pg_graphql: GraphQL for PostgreSQL - Supabase](https://supabase.com/docs/guides/database/extensions/pg_graphql)
+- [pg_jsonschema Documentation - Supabase GitHub](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/database/extensions/pg_jsonschema.mdx)
+- [Supabase Postgres Extensions Overview](https://supabase.com/docs/guides/database/extensions)
+
+### Connection Pooling
+- [PgCat vs PgBouncer Comparison - pganalyze](https://pganalyze.com/blog/5mins-postgres-pgcat-vs-pgbouncer)
+- [PostgreSQL Proxy Comparison 2025 - Onidel](https://onidel.com/blog/postgresql-proxy-comparison-2025)
+- [Benchmarking PostgreSQL Connection Poolers - Tembo](https://legacy.tembo.io/blog/postgres-connection-poolers/)
+- [PgCat: Modern Proxy for PostgreSQL - Medium](https://medium.com/codable/pgcat-the-modern-proxy-solution-for-postgresql-938a41755f91)
+- [Adopting PgCat at Instacart - Tech Blog](https://tech.instacart.com/adopting-pgcat-a-nextgen-postgres-proxy-3cf284e68c2f)
+- [Supavisor: Postgres Connection Pooler - GitHub](https://github.com/supabase/supavisor)
+- [Supavisor 1.0 Release - Supabase](https://supabase.com/blog/supavisor-postgres-connection-pooler)
+- [Supavisor: Scaling to 1 Million Connections - Supabase](https://supabase.com/blog/supavisor-1-million)
+
+### Local-First & Edge Databases
+- [ElectricSQL: Local-First Sync - GitHub](https://github.com/electric-sql/electric)
+- [ElectricSQL Documentation](https://electric-sql.com/)
+- [Local-First with TanStack DB - ElectricSQL](https://electric-sql.com/blog/2025/07/29/local-first-sync-with-tanstack-db)
+- [PGlite: WASM PostgreSQL - GitHub](https://github.com/electric-sql/pglite)
+- [PGlite Documentation](https://pglite.dev/)
+- [Running PostgreSQL in Browser with WASM - InfoQ](https://www.infoq.com/news/2024/05/pglite-wasm-postgres-browser/)
+- [FerretDB 2.0 Release - FerretDB Blog](https://blog.ferretdb.io/ferretdb-releases-v2-faster-more-compatible-mongodb-alternative/)
+- [FerretDB: Open Source MongoDB Alternative - GitHub](https://github.com/FerretDB/FerretDB)
+- [FerretDB 2.0 with PostgreSQL Power - The New Stack](https://thenewstack.io/ferretdb-2-0-open-source-mongodb-alternative-with-postgresql-power/)
+- [FerretDB Cloud Announcement - InfoQ](https://www.infoq.com/news/2025/09/ferretdb-cloud-mongodb/)
+
+### PostgreSQL Storage Engines
+- [OrioleDB: Cloud-Native Storage Engine - GitHub](https://github.com/orioledb/orioledb)
+- [OrioleDB Documentation](https://www.orioledb.com/docs)
+- [OrioleDB Beta12 Benchmarks](https://www.orioledb.com/blog/orioledb-beta12-benchmarks)
+- [OrioleDB on Supabase](https://supabase.com/docs/guides/database/orioledb)
+- [Table Access Methods and Bloat - pganalyze](https://pganalyze.com/blog/5mins-postgres-bloat-table-access-methods)
+- [Why PostgreSQL Needs Better Table Engine API - OrioleDB](https://www.orioledb.com/blog/better-table-access-methods)
+- [Hydra: Serverless Analytics on Postgres](https://www.hydra.so/)
