@@ -3,6 +3,8 @@
 Production-grade GPU observability at the scale of large ML infrastructure platforms (Uber, Meta, Google).
 This series covers every layer: hardware counters → DCGM → Prometheus → dashboards → alerting → capacity planning.
 
+Designed as a **textbook with deep dives**: foundational mental models, layer-by-layer chapters, an end-to-end incident walkthrough that ties them together, and reference appendices for daily lookups.
+
 ---
 
 ## Why This Matters
@@ -14,7 +16,42 @@ without deep telemetry. This series builds the full observability stack.
 
 ---
 
+## Reading Paths
+
+Different readers want different things. Pick a path:
+
+| Path | Audience | Read in this order |
+|------|----------|--------------------|
+| **Newcomer** | First time on a GPU platform | 00 → 01 → 02 → 03 → 09 → Appendix A |
+| **Platform engineer building from scratch** | Implementing the stack | 01 → 02 → 03 → 08 → 09 → 10 → 07 → Appendix B |
+| **SRE / on-call** | Owning the pager | 00 → 06 → 07 → 10 → 16 → Appendix C |
+| **ML engineer wiring jobs into the stack** | Instrumenting workloads | 00 → 04 → 11 → 14 → 15 |
+| **Capacity / FinOps** | Cost & efficiency | 05 → 12 → 13 |
+| **Incident debugger** | Studying real failures | 16 → walk back into referenced chapters as needed |
+
+Read **Doc 00 first** regardless of path — every later chapter assumes the mental models in it.
+
+---
+
+## Callout Conventions
+
+Chapters use a small set of blockquote callouts. Skim these on a re-read:
+
+- `> **Mental model:**` — a way of thinking the chapter is trying to install
+- `> **Pitfall:**` — a footgun to avoid (we hit it; you don't have to)
+- `> **Diagnostic patterns:**` — quick "if you see X, suspect Y" tables
+- `> **First-look PromQL:**` — copy-paste queries to start an investigation
+
+---
+
 ## Document Map
+
+### 0. Mental Models — How GPUs Actually Work
+**`00-mental-models.md`**
+
+Foundational chapter. Six mental models (SM/warp/tensor cores, the GPU-util lie, HBM as the limiter, MIG/MPS/time-slicing, the profiling lock, cardinality tax) that the rest of the series assumes. Read first.
+
+---
 
 ### 1. Architecture & Stack Overview
 **`01-architecture-and-stack.md`**
@@ -271,7 +308,7 @@ without deep telemetry. This series builds the full observability stack.
 ---
 
 ### 15. Distributed Training Observability — Special Topic
-**`15-distributed-training-observability.md`**
+**`15-distributed-training-observability.md`** *(planned, not yet written)*
 
 - Collective communication profiling: NCCL ops (AllReduce, AllGather, Reduce-Scatter)
 - NCCL debug metrics: `NCCL_DEBUG=INFO` log parsing pipeline
@@ -286,16 +323,44 @@ without deep telemetry. This series builds the full observability stack.
 
 ---
 
+### 16. Incident Walkthrough — Capstone
+**`16-incident-walkthrough.md`**
+
+End-to-end trace of one realistic incident (a 7B fine-tune slowdown caused by NVLink CRC errors) through every chapter of the book: dashboards → cross-layer joins → throttle decode → forensic L5 view → XID → profile capture → RMA decision → postmortem. The synthesis exercise. Read after 01–14.
+
+---
+
+## Appendices
+
+### Appendix A — Glossary
+**`appendix-a-glossary.md`**
+
+Plain-English definitions for every acronym and term used across the series, organized by family (hardware, software, errors, workloads, LLM, distributed, observability, K8s, cost). The lookup table when chapters reference SM, GI, TTFT, AllReduce, etc.
+
+### Appendix B — DCGM Field-ID Cheat Sheet
+**`appendix-b-field-ids.md`**
+
+Every `DCGM_FI_*` field-ID grouped by family with units, types, meanings, throttle-bitfield decode table, and a copy-paste production ConfigMap. The reference for reading alert YAML and ConfigMap definitions.
+
+### Appendix C — Troubleshooting Flowcharts
+**`appendix-c-flowcharts.md`**
+
+Mermaid decision trees for the seven most common ops scenarios: GPU slow, training straggler, inference p99 spike, cardinality bomb, ECC RMA decision, DCGM stopped reporting, idle-GPU hunt. Each flowchart is paired with first-look PromQL. Print them and link from alert annotations.
+
+---
+
 ## Implementation Order (Recommended)
 
 | Phase | Documents | Goal |
 |-------|-----------|------|
+| 0 | 00, Appendix A | Internalize the mental models and the vocabulary |
 | 1 | 01, 02, 03 | Get DCGM → Prometheus → basic dashboards working |
-| 2 | 05, 06, 08 | Utilization efficiency and cardinality management |
-| 3 | 07, 10 | Hardware health alerting in production |
+| 2 | 05, 06, 08, Appendix B | Utilization efficiency, cardinality, field-ID reference |
+| 3 | 07, 10, Appendix C | Hardware health alerting + runbook flowcharts |
 | 4 | 04, 09 | Workload-specific dashboards (batch vs stateless) |
 | 5 | 11, 12 | Profiling integration and capacity planning |
 | 6 | 13, 14, 15 | Multi-tenancy, LLM, and distributed training |
+| 7 | 16 | Synthesis: walk a real incident through every layer |
 
 ---
 
