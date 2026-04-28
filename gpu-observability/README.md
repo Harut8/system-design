@@ -308,7 +308,7 @@ Foundational chapter. Six mental models (SM/warp/tensor cores, the GPU-util lie,
 ---
 
 ### 15. Distributed Training Observability — Special Topic
-**`15-distributed-training-observability.md`** *(planned, not yet written)*
+**`15-distributed-training-observability.md`**
 
 - Collective communication profiling: NCCL ops (AllReduce, AllGather, Reduce-Scatter)
 - NCCL debug metrics: `NCCL_DEBUG=INFO` log parsing pipeline
