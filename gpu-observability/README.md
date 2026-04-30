@@ -26,7 +26,8 @@ Different readers want different things. Pick a path:
 | **Platform engineer building from scratch** | Implementing the stack | 01 → 02 → 03 → 08 → 09 → 10 → 07 → Appendix B |
 | **SRE / on-call** | Owning the pager | 00 → 06 → 07 → 10 → 16 → Appendix C |
 | **ML engineer wiring jobs into the stack** | Instrumenting workloads | 00 → 04 → 11 → 14 → 15 |
-| **Capacity / FinOps** | Cost & efficiency | 05 → 12 → 13 |
+| **Capacity / FinOps** | Cost & efficiency | 05 → 12 → 17 → 13 |
+| **Data / analytics engineer** | Building the SQL layer over GPU telemetry | 01 → 08 → 17 → 12 |
 | **Incident debugger** | Studying real failures | 16 → walk back into referenced chapters as needed |
 
 Read **Doc 00 first** regardless of path — every later chapter assumes the mental models in it.
@@ -330,6 +331,22 @@ End-to-end trace of one realistic incident (a 7B fine-tune slowdown caused by NV
 
 ---
 
+### 17. Telemetry Lakehouse & SQL Analytics
+**`17-telemetry-lakehouse-and-sql-analytics.md`**
+
+The OLAP path that Prometheus cannot serve: exporters → Kafka → Hive/Iceberg → SQL. Bridges business questions ("$/useful-GPU-hour by team YoY") to raw DCGM samples.
+
+- Why two paths exist: Prometheus (alerting, weeks) vs lakehouse (analytics, years)
+- Kafka contract: schema (Avro/Proto), tag set, event-time, partition key
+- Stream pre-aggregation: `WORKLOAD_UTILIZATION_BY_DEVICE` / `_BY_HOST` / `_BY_NAMESPACE` rollups
+- Hive/Iceberg layout: `raw_gpu_metrics` + 1m/1h/1d rollup tiers + dimension tables
+- `dim_gpu_sku_cost` — the table that turns utilization into dollars
+- SQL recipes: device utilization aggregated by host daily, $/useful-GPU-hour by team, top-N expensive idle, model-family efficiency, YoY fleet utilization
+- Reconciliation: why Prom and Hive disagree, the mean-of-means trap, `sample_count` weighting
+- Retention tiers, late-event watermarks, schema evolution, backfill, PII/tenancy
+
+---
+
 ## Appendices
 
 ### Appendix A — Glossary
@@ -360,7 +377,8 @@ Mermaid decision trees for the seven most common ops scenarios: GPU slow, traini
 | 4 | 04, 09 | Workload-specific dashboards (batch vs stateless) |
 | 5 | 11, 12 | Profiling integration and capacity planning |
 | 6 | 13, 14, 15 | Multi-tenancy, LLM, and distributed training |
-| 7 | 16 | Synthesis: walk a real incident through every layer |
+| 7 | 17 | Lakehouse / SQL analytics path for FinOps and capacity |
+| 8 | 16 | Synthesis: walk a real incident through every layer |
 
 ---
 
@@ -375,5 +393,9 @@ Mermaid decision trees for the seven most common ops scenarios: GPU slow, traini
 | Alerting | Alertmanager + PagerDuty |
 | Profiling | Nsight Systems, PyTorch Profiler, Pyroscope |
 | Cost attribution | Custom recording rules + Grafana reporting |
+| Streaming bus | Kafka (Avro / Protobuf via Schema Registry) |
+| Stream aggregation | Flink, Spark Structured Streaming |
+| Lakehouse storage | Iceberg / Delta / Hudi on S3 / GCS / HDFS |
+| SQL query engine | Trino / Presto, Spark SQL, Hive |
 | LLM serving | vLLM, NVIDIA Triton Inference Server |
 | Training | PyTorch DDP/FSDP, DeepSpeed, Megatron-LM |
