@@ -735,6 +735,10 @@ For orgs at scale (typically 200+ services).
 45. **40 — IDP and golden paths.** Backstage; service catalog; scorecards; templates with observability built in.
 46. **41 — Brownfield integration.** Acquisitions; multi-vendor coexistence; deprecation; "do not consolidate" cases.
 
+### 9.2.1 Language-Specific Deep Dives
+
+47. **42 — Python observability.** Staff-level standards for Python-only observability: OTel SDK setup, structlog + contextvars, prometheus_client multiprocess, async/thread context propagation, framework instrumentation (FastAPI/Django/Flask/Celery), worker model gotchas (Gunicorn/Uvicorn), profiling (py-spy/austin), lifecycle/race/restart edge cases, anti-patterns, and the production checklist.
+
 ### 9.3 Appendices
 
 47. **Appendix A — Glossary** (full vocabulary across the folder).
