@@ -704,6 +704,43 @@ If you want to read every doc once, this order minimizes "wait, what is X?" mome
 
 For "I just want to build it" mode, follow phases 0–20 in §3 instead of reading docs end-to-end.
 
+### 9.1 Beyond-Roadmap Chapters (21+)
+
+The original roadmap was the *plumbing* and *practice* of observability. The chapters below cover what a Staff Engineer is repeatedly asked about that the original roadmap doesn't cover.
+
+26. **21 — Frontend / RUM / mobile observability.** Web Vitals, browser SDKs, mobile crash reporting, source maps, beacon transport, session replay.
+27. **22 — Service mesh observability.** Istio, Linkerd, Cilium; sidecar vs eBPF; mesh metrics vs app metrics; cross-region trace assembly.
+28. **23 — Database observability.** pg_stat_statements, slow query log, plan capture, connection pool, replica lag, per-query SLOs.
+29. **24 — Network observability.** TCP retransmits, conntrack, DNS, eBPF flow telemetry, NetFlow / VPC flow logs, who-talks-to-whom.
+30. **25 — Streaming / Kafka observability.** Consumer lag, partition skew, async-trace propagation, DLQ, schema registry.
+31. **26 — LLM and AI observability.** Token accounting, eval harness, faithfulness, RAG, agent traces, vector-DB observability.
+32. **27 — Security observability.** Audit logs, SIEM integration, MITRE ATT&CK, SRE-vs-SOC line, eBPF security.
+33. **28 — Telemetry pipeline reliability.** Observe the observer; tier-0 alerts; synthetic canaries; independent paging path.
+34. **29 — Synthetic monitoring.** HTTP / browser / multi-step checks; CI / pre-deploy gates; geographic distribution.
+35. **30 — Error tracking.** Sentry / Rollbar / Bugsnag; fingerprint grouping; release health; source maps.
+
+### 9.2 Enterprise Patterns (31+)
+
+For orgs at scale (typically 200+ services).
+
+36. **31 — FinOps for observability.** Allocation, showback, chargeback, forecasting, vendor levers.
+37. **32 — Compliance and privacy.** GDPR right-to-erasure, HIPAA, audit-log integrity, schema classification, DPAs.
+38. **33 — Federated multi-region.** Independent regions; hub-and-spoke; cross-region trace assembly; per-region SLOs.
+39. **34 — Schema and semantic-conventions governance.** OTel SemConv, attribute registry, breaking-change policy, contract tests.
+40. **35 — Telemetry lakehouse.** OTel → Kafka → Iceberg → BigQuery / Snowflake / ClickHouse; SQL on telemetry.
+41. **36 — DR for the observability stack.** RPO / RTO; cross-region replication; backfill; game days.
+42. **37 — Vendor migration patterns.** Datadog → self-hosted; dual-write; read-first; decommissioning.
+43. **38 — Continuous verification.** Chaos engineering with measurable hypotheses; deploy markers; canary verification.
+44. **39 — Build-vs-buy framework.** TCO modeling; inflection point; hybrid; annual revisit.
+45. **40 — IDP and golden paths.** Backstage; service catalog; scorecards; templates with observability built in.
+46. **41 — Brownfield integration.** Acquisitions; multi-vendor coexistence; deprecation; "do not consolidate" cases.
+
+### 9.3 Appendices
+
+47. **Appendix A — Glossary** (full vocabulary across the folder).
+48. **Appendix B — Reference architectures** (small / mid / hyperscale).
+49. **Appendix C — PromQL / LogQL / TraceQL recipe book.**
+
 ---
 
 ## 10. Common Pitfalls When Building Your Own Platform

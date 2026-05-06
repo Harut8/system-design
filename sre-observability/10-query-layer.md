@@ -1,4 +1,4 @@
-# 10 — The Query Layer: PromQL, LogQL, TraceQL, SQL
+# 10 — The Query Layer: PromQL, M3QL, LogQL, TraceQL, SQL
 
 The query layer is where storage meets the human. Every dashboard panel, every alert rule, every ad-hoc 3 a.m. investigation, every capacity report flows through it. The data sitting on disk is worth nothing until a query can pull the right slice cheaply, fast enough to support exploration. This chapter goes deep on the four query languages a Staff Engineer in this space must read fluently and write competently: **PromQL**, **LogQL**, **TraceQL**, and **SQL on telemetry**.
 
@@ -11,7 +11,7 @@ These four languages exist because the storage layer underneath each signal has 
 ## Table of Contents
 
 1. [The Big Picture: Why Four Languages](#1-the-big-picture-why-four-languages)
-2. [PromQL Deep Dive](#2-promql-deep-dive)
+2. [PromQL Deep Dive](#2-promql-deep-dive) — including [§2.11 M3QL — The Graphite-Native Cousin](#211-m3ql--the-graphite-native-cousin-of-promql)
 3. [LogQL Deep Dive](#3-logql-deep-dive)
 4. [TraceQL Deep Dive](#4-traceql-deep-dive)
 5. [SQL on Telemetry](#5-sql-on-telemetry)
@@ -317,6 +317,719 @@ errors_total / ignoring (status) requests_total
 | `up == 0` alert flaps | scrape miss vs target down | use `absent_over_time(up[5m])` or `up == bool 0` for clarity |
 | Quantile of a quantile | `quantile(0.99, p99_recording_rule)` | quantiles don't compose — re-derive from histogram |
 | Subquery in alert expression | costly + flappy | move to recording rule |
+
+### 2.11 M3QL — The Graphite-Native Cousin of PromQL
+
+M3QL is the query language native to **M3**, the open-source TSDB Uber built when their Graphite/Carbon stack hit a wall (~2015) and which now backs metrics at a few of the largest fleets in the world. M3 also speaks PromQL (with extensions) and Graphite Carbon line protocol; M3QL is its third dialect — a Graphite-compatible, **pipeline-based** query language that thinks of time series as **named flows transformed by composable functions** rather than as label-vector algebra.
+
+If you ever inherit a fleet running M3, Graphite, KairosDB, or any Graphite-compatible store, M3QL is what the dashboards and alert rules look like. It's also worth reading even if you don't run M3: many of the function shapes (`asPercent`, `holtWintersAberration`, `nPercentile`, `summarize`) are the closest thing the metrics world has to standard library functions and they keep showing up across vendors.
+
+#### 2.11.1 Mental Model — Series Names, Not Label Vectors
+
+Where PromQL identifies a series by its label set (`http_requests{service="api",route="/checkout"}`), M3QL identifies it by its **dotted name plus tags**:
+
+```
+stats.gauges.api.checkout.p99
+   ▲       ▲    ▲    ▲      ▲
+   │       │    │    │      └─ leaf metric
+   │       │    │    └──────── route
+   │       │    └─────────── service
+   │       └────────────── metric type
+   └──────────────────── prefix
+```
+
+Modern M3 layers **Graphite tags** on top: `cpu.idle;host=web01;dc=us-east1`. The query engine treats both as first-class — you can select by glob (`stats.gauges.api.*.p99`), by tag (`seriesByTag('service=api','dc=us-east1')`), or both.
+
+Where PromQL is **algebraic** ("aggregate vectors over labels"), M3QL is **functional-pipeline** ("apply transforms in series, left-to-right, like Unix pipes"). Same execution model as Graphite's render API:
+
+```
+PromQL:  sum by (service) (rate(http_requests_total[5m]))
+M3QL:    aliasByNode(
+           sumSeriesWithWildcards(
+             nonNegativeDerivative(stats.api.*.requests),
+             2),
+           2)
+         ▲                ▲                  ▲                  ▲
+         outer wrap       aggregator         counter→delta       input
+         (last applied)
+```
+
+Read M3QL **outside-in** but execute **inside-out** — the deepest function applies first.
+
+#### 2.11.2 Series Selection — Globs, Braces, seriesByTag
+
+| Syntax | What it matches |
+|---|---|
+| `stats.api.requests` | the single named series |
+| `stats.api.*.requests` | one wildcard segment between `api` and `requests` |
+| `stats.api.{checkout,cart,payment}.requests` | brace alternation — three series unioned |
+| `stats.api.[a-z]*.requests` | character-class glob |
+| `stats.api.**.requests` | recursive glob (M3 extension) |
+| `seriesByTag('service=api','dc!=staging')` | tag-based selection; supports `=`, `!=`, `=~`, `!=~` |
+| `seriesByTag('name=requests','service=~api.*')` | regex tag value (M3-specific) |
+
+`seriesByTag` is the modern primitive — it sidesteps dotted-name positional fragility and is closest in spirit to PromQL's label selectors. New deployments should prefer it.
+
+```m3ql
+# Old style — fragile if names ever get a new segment
+sum(stats.gauges.api.{checkout,cart,payment}.p99)
+
+# Tag style — same intent, migration-safe
+seriesByTag('name=p99','service=~(checkout|cart|payment)') | sum
+```
+
+#### 2.11.3 The Two Most-Confused Pairs: avg vs avgSeries, sum vs sumSeries
+
+The single most common bug in M3QL/Graphite code review is mistaking the **per-point across-series** family for the **per-series along-time** family. They look almost identical and answer entirely different questions.
+
+| Function | Reduces along | Output | PromQL equivalent |
+|---|---|---|---|
+| `averageSeries(s1,s2,…)` (alias `avg`) | **across series** at each `t` | one series, value = mean of inputs at each `t` | `avg(...)` |
+| `sumSeries(s1,s2,…)` (alias `sum`) | across series at each `t` | one series | `sum(...)` |
+| `averageSeriesWithWildcards(pat, *positions)` | across series, **collapsing dotted-name positions** | fewer series than input | `avg by (...)` |
+| `sumSeriesWithWildcards(pat, *positions)` | across series, collapsing positions | fewer series | `sum by (...)` |
+| `summarize(s, '5min', 'avg')` | **along time** per series, into 5-min buckets | same series, lower resolution | n/a — distinct concept |
+| `movingAverage(s, '5min')` | **along time** per series, sliding window | same series, same resolution | `avg_over_time(s[5m])` |
+| `averageAbove(seriesList, n)` | **filter**: keep series whose avg over window > n | subset of input series | no direct equivalent |
+
+Memorize this:
+
+> `averageSeries` averages **across the bundle** of series at each timestamp. `summarize(...,'avg')` and `movingAverage` average **along time** for each series. `averageAbove` is a *filter*, not an aggregator.
+
+Concrete example — three pods report CPU:
+
+```
+        t1    t2    t3
+pod-a:  0.10  0.20  0.30
+pod-b:  0.50  0.50  0.50
+pod-c:  0.90  0.80  0.70
+```
+
+`averageSeries(pod-a, pod-b, pod-c)` (across-series, per-timestamp):
+
+```
+fleet:  0.50  0.50  0.50    # mean at each t; per-pod identity lost
+```
+
+`summarize(<each>, '5min', 'avg')` (along-time, per-series):
+
+```
+pod-a: 0.20    pod-b: 0.50    pod-c: 0.80    # one point per 5-min bucket
+```
+
+`movingAverage(<each>, '2pt')` (along-time sliding window, per-series):
+
+```
+pod-a: NaN, 0.15, 0.25    pod-b: NaN, 0.50, 0.50    pod-c: NaN, 0.85, 0.75
+```
+
+PromQL forces you to spell which axis you mean (`avg(x)` vs `avg_over_time(x[5m])`); M3QL collapses both into similarly-named functions. Code review for "is this the right axis?" is the most valuable discipline you can enforce in an M3QL shop.
+
+#### 2.11.4 sumSeriesWithWildcards — The Closest Thing to `sum by (...)`
+
+This is the function that takes the most explanation. Suppose you have:
+
+```
+stats.api.checkout.us-east1.p99
+stats.api.checkout.us-west2.p99
+stats.api.cart.us-east1.p99
+stats.api.cart.us-west2.p99
+```
+
+You want "sum p99 across regions, grouped by service" — i.e. *collapse the region position*, keep the rest.
+
+```m3ql
+sumSeriesWithWildcards(stats.api.*.*.p99, 3)
+#                                          ▲
+#                  positions are 0-indexed; 3 = the region segment
+```
+
+Result:
+
+```
+stats.api.checkout..p99     ← position 3 collapsed (notice the empty slot)
+stats.api.cart..p99
+```
+
+Collapse multiple positions at once:
+
+```m3ql
+sumSeriesWithWildcards(stats.api.*.*.p99, 1, 3)
+# collapses both 'api' (pos 1) and the region (pos 3)
+```
+
+`averageSeriesWithWildcards` works identically but uses mean. The generic form is `aggregateWithWildcards(seriesList, func, *positions)` where `func ∈ {sum, avg, max, min, last, count, stddev, range, multiply, diff}` — a single primitive replaces a dozen named variants.
+
+For tag-style series, the modern equivalent is `aggregateGroupByTags`:
+
+```m3ql
+aggregateGroupByTags('sum', 'service', seriesByTag('name=p99'))
+# pick aggregator, pick keep-tags, supply selector — reads almost exactly like
+# PromQL's "sum by (service) (...)"
+```
+
+Or its alias `groupByTags(seriesList, callback, *tags)`. Both compile to the same plan.
+
+#### 2.11.5 The Moving-Window Family — Sliding Aggregations
+
+M3QL's moving-window functions slide a window along time per series, point-for-point at native resolution. They are the analog of PromQL's `_over_time` family:
+
+| M3QL | What it does | PromQL equivalent |
+|---|---|---|
+| `movingAverage(s, '5min')` | mean of points in trailing 5-min window | `avg_over_time(s[5m])` |
+| `movingSum(s, '5min')` | sum in trailing window | `sum_over_time(s[5m])` |
+| `movingMin(s, '5min')` | min in trailing window | `min_over_time(s[5m])` |
+| `movingMax(s, '5min')` | max in trailing window | `max_over_time(s[5m])` |
+| `movingMedian(s, '5min')` | median in trailing window | `quantile_over_time(0.5, s[5m])` |
+| `movingWindow(s, '5min', 'stddev')` | generic moving window with named aggregator (`avg`, `sum`, `min`, `max`, `median`, `stddev`, `count`) | `stddev_over_time(s[5m])` |
+| `moving(s, '5min', func)` | shorter alias for `movingWindow` | n/a |
+
+Window argument forms: `'5min'`, `'1h'`, `'30s'`, `'1d'` — string with unit. Some implementations also accept an integer point count (`movingAverage(s, 20)` = "trailing 20 samples"), which is fragile when scrape interval changes; the time-string form is the safe default.
+
+Two subtleties that surprise people:
+
+- **Edge of the window**: `movingAverage` includes the **current** sample. `movingAverage(s, '5min')` at `t=12:00:00` averages samples in `(11:55:00, 12:00:00]` — same convention as PromQL.
+- **Sparse data**: with fewer samples than the window holds, the function returns the average of *what is there*, not NaN. `avg_over_time` does the same; `rate()`-equivalents (`perSecond`) differ — they require ≥ 2 samples.
+- **`xFilesFactor`** (default 0.5 in Graphite, often 0 in M3): the fraction of points in the window that must be non-NaN for the function to emit a value at that timestamp. From M3 source:
+
+  ```go
+  if effectiveXFF(windowPoints, nans, xFilesFactor) {
+      vals.SetValueAt(i, avg)        // emit only if nan_count/total < (1 - xff)
+  }                                  // else leave NaN
+  ```
+
+  Setting `xFilesFactor=0` makes the function emit on any non-NaN sample (lenient); `0.99` requires nearly the full window (strict). Different from PromQL, which has no equivalent — `avg_over_time` always emits if ≥ 1 sample exists. Pin this explicitly when porting Graphite dashboards or correctness-critical alerts.
+
+Bigger gotcha: M3QL has **two distinct families** that beginners conflate.
+
+```
+movingAverage(s, '5min')   →  same step as input;  each point = mean of preceding 5min
+                              (smoothing, no resolution change)
+
+summarize(s, '5min', 'avg') →  one point per 5-min bucket
+                              (downsampling, lower resolution)
+```
+
+`summarize` is what you want for **dashboards spanning weeks** (downsample for performance); `movingAverage` is what you want for **smoothing a noisy signal at native resolution**. Reaching for one when you wanted the other is a frequent source of "the graph looks weird at long ranges" tickets.
+
+#### 2.11.6 Counter Math — nonNegativeDerivative and perSecond
+
+M3 stores counters as monotonically-increasing values, just like Prometheus. The `rate()` / `increase()` analogs:
+
+| M3QL | What it does | PromQL equivalent |
+|---|---|---|
+| `nonNegativeDerivative(s)` | per-step delta, treats decreases as resets (returns NaN at the reset point) | similar to `delta(s[2*step])` with reset handling |
+| `perSecond(s)` | `nonNegativeDerivative(s) / step_seconds` | `rate(s[step])` |
+| `derivative(s)` | per-step delta, **no** reset handling | `delta(s[2*step])` (raw) |
+| `integral(s)` | running cumulative sum from window start | `sum_over_time(rate(s[step])[T:step])` cumulative |
+| `scaleToSeconds(s, seconds)` | rescale a counted-per-step series to "per N seconds" | manual multiplication |
+
+`perSecond` is the right primitive for "requests per second from a counter." It is **not** a sliding-window estimate — it is the difference between consecutive samples divided by the step. This makes it more accurate than PromQL's `rate()` for short windows but more sensitive to single missing scrapes.
+
+```m3ql
+# Smoothed instantaneous rate ≈ rate(http_requests_total[5m])
+movingAverage(perSecond(stats.api.requests), '5min')
+```
+
+Counter resets — `nonNegativeDerivative` returns **NaN** at the reset point by default, unlike PromQL's `rate()` which extrapolates a zero-crossing. To make the gap visible: leave it. To paper over: `transformNull(nonNegativeDerivative(s), 0)`.
+
+**The actual reset/wraparound math.** From M3's source (`src/query/graphite/native/builtin_functions.go`):
+
+```go
+difference := value - previousValue
+if difference >= 0 {
+    return difference                              // normal forward step
+}
+if !math.IsNaN(maxValue) && maxValue >= value {
+    return (maxValue - previousValue) + value + 1  // wraparound through maxValue
+}
+return math.NaN()                                  // unknown reset → drop
+```
+
+Three regimes:
+
+1. `cur >= prev` → normal `cur - prev`.
+2. `cur < prev` **with `maxValue` provided** → assumes the counter overflowed: emits `(maxValue − prev) + cur + 1`. Useful for **fixed-width counters** like SNMP `Counter32` (`maxValue=4294967295`).
+3. `cur < prev` **without `maxValue`** → returns NaN. The default for software counters that reset to zero on restart.
+
+PromQL's `rate()` differs: it always treats `cur < prev` as a reset to zero and emits `cur` as the delta (effectively `(0 − 0) + cur`), never NaN. M3QL leans conservative; Prom leans best-effort. For SLO accounting, M3QL's NaN is honest; for live dashboards, Prom's extrapolation is friendlier.
+
+#### 2.11.7 Percentile Functions — Three Different Things, Same Word
+
+M3QL's percentile functions are the most subtly-misused family, because there are at least **four** different "percentile" operations and they look alike.
+
+| Function | What it returns | PromQL/SQL analog |
+|---|---|---|
+| `nPercentile(seriesList, n)` | for **each input series**, a single horizontal line at the nth percentile of its own samples over the query range | `quantile_over_time(0.<n>, s[<range>])` flat-lined |
+| `percentileOfSeries(seriesList, n, interpolate=False)` | a **single output series** whose value at each `t` is the nth percentile **across the bundle** of input series at `t` | `quantile by () (0.<n>, ...)` — quantile across-series, per-timestamp |
+| `removeAbovePercentile(seriesList, n)` | input series with values above the nth percentile **of each series** masked to NaN | per-series clipping; no direct PromQL |
+| `removeBelowPercentile(seriesList, n)` | symmetric — values below masked | per-series clipping |
+| `averageOutsidePercentile(seriesList, n)` | **filters whole series**: drops series whose average lies inside the nth-percentile band | series-level outlier filter |
+
+Side-by-side mental model:
+
+```
+inputs (3 series, 5 points each):
+s1: 1   2   3   4   5
+s2: 10  20  30  40  50
+s3: 100 200 300 400 500
+
+nPercentile(_, 90):
+s1: 4.6, 4.6, 4.6, 4.6, 4.6     ← 90th pct of s1's own values, flat line
+s2: 46,  46,  46,  46,  46       ← 90th pct of s2's own values
+s3: 460, 460, 460, 460, 460      ← 90th pct of s3's own values
+
+percentileOfSeries(_, 90):
+single series:  82, 164, 246, 328, 410
+                ▲    ▲    ▲    ▲    ▲
+              90th pct of [1,10,100], [2,20,200], …  at each timestamp
+              (interpolation between s2 and s3 since 90% of 3 series = 2.7)
+```
+
+The first answers "what is the long-run 90th-percentile baseline of each pod's CPU"; the second answers "at every minute, what is the 90th-percentile pod's CPU". Both useful, almost never interchangeable.
+
+A worked p99 latency query in three styles, **all returning roughly the same number**:
+
+```m3ql
+# 1. Histogram-style: percentileOfSeries across pod p99 series at each t
+percentileOfSeries(seriesByTag('name=p99','app=checkout'), 99, true)
+
+# 2. Time-window quantile per series, then aggregate across pods
+aggregateGroupByTags(
+  'avg', 'service',
+  movingWindow(seriesByTag('name=latency_ms','app=checkout'), '5min', 'median')
+)
+
+# 3. Bucketed-counter approach (the closest to PromQL's histogram_quantile)
+#    Uses pre-bucketed counters (one series per le bucket boundary)
+asPercent(
+  stats.api.checkout.latency_bucket.le_0_25,
+  stats.api.checkout.latency_bucket.le_inf
+)
+# read the boundary at which this crosses 99 — done by the panel, not by M3QL
+```
+
+M3 (unlike Prometheus) does **not** ship a built-in `histogram_quantile` for classic bucketed histograms in M3QL — you usually drop into PromQL via M3's PromQL endpoint for that. M3QL's percentile family is best for **gauge-shaped** latency series (each pod publishes its own quantile-summary metric).
+
+> **Pitfall:** `nPercentile` returning a flat horizontal line is *correct* — the function's job is to plot the threshold, not the series' values. Users who think "p99 went flat??" are reading the wrong function. Use `movingWindow(..., 'median')` or `percentileOfSeries(...)` if you want the percentile to vary over time.
+
+**The actual percentile algorithm.** From M3's source (`src/query/graphite/common/percentiles.go`), the percentile computation is:
+
+```go
+fractionalRank := (percentile / 100.0) * float64(len(series) + 1)
+rank          := int(fractionalRank)
+rankFraction  := fractionalRank - float64(rank)
+
+if !interpolate {
+    rank = rank + int(math.Ceil(rankFraction))   // round up
+}
+
+result := series[rank-1]                          // 1-indexed pick
+
+if interpolate && rank != len(series) {
+    next   := series[rank]
+    result = result + rankFraction * (next - result)   // linear interp
+}
+```
+
+This is **NIST Method R-6** ("rank = q·(n+1)"), not R-7 (NumPy/Excel default, "q·(n−1)+1"). The two diverge at small `n`:
+
+```
+input series (sorted): [10, 20, 30, 40, 50],  n=5,  q=0.99
+
+R-6 (M3/Graphite):  rank = 0.99 * 6 = 5.94  → with interp: 50 + 0.94*(NaN) = 50 (clamped)
+R-7 (NumPy):        rank = 0.99 * 4 + 1 = 4.96  → 40 + 0.96*(50-40) = 49.6
+```
+
+For series with thousands of points the difference is negligible; for sparse series (a handful of pods, short window) it can be 5–10%. If your audit/SLO calc compares M3 percentiles to a NumPy notebook and they disagree by a few percent, this is why.
+
+`interpolate=False` is the default and uses `Ceil(rankFraction)` to round rank up — i.e. picks the *higher* sorted value at the bucket boundary. Conservative for SLOs (over-reports the percentile slightly).
+
+#### 2.11.8 asPercent — Ratios with Built-In Pairing
+
+`asPercent` is one of the most-used and least-understood M3QL functions. Its three forms:
+
+```
+asPercent(seriesList)                     # each point as % of sum of seriesList at that t
+asPercent(seriesList, total=N)            # each point as % of constant N
+asPercent(seriesList, totalSeries)        # each series as % of corresponding totalSeries
+asPercent(seriesList, totalSeries, *nodes) # each series as % of total, paired by *nodes
+```
+
+Worked examples:
+
+```m3ql
+# CPU usage as % of total cluster CPU at each timestamp
+asPercent(stats.gauges.host.*.cpu)
+# → for each host series, value(t) = host_cpu(t) / sum(all_host_cpu(t)) * 100
+
+# Error ratio per service (modern tag style)
+asPercent(
+  aggregateGroupByTags('sum', 'service', seriesByTag('name=errors')),
+  aggregateGroupByTags('sum', 'service', seriesByTag('name=requests'))
+)
+# pairs by the keep-tags (service); requires both sides to share that tag
+
+# Memory usage % vs a hard 64 GB cap
+asPercent(stats.gauges.host.*.mem_bytes, total=68719476736)
+
+# Per-host cpu as % of *that host's* CPU limit, paired by hostname (position 3)
+asPercent(stats.gauges.host.*.cpu, stats.gauges.host.*.cpu_limit, 3)
+```
+
+The last form is the powerful one — `*nodes` does the **pairing** that PromQL's vector matching does. Without it, M3QL pairs first-with-first by series order, which is fragile.
+
+**The actual `asPercent` formula** (from M3 source, with NaN/zero guards):
+
+```go
+for i := 0; i < n; i++ {
+    v := series.ValueAt(i)
+    t := total.ValueAt(i)
+    if !math.IsNaN(v) && !math.IsNaN(t) && t != 0 {
+        out.SetValueAt(i, (v / t) * 100.0)
+    }   // else NaN — silent skip
+}
+```
+
+Three things to notice:
+
+- **Multiplied by 100**, not by 1. The output is a percent, not a fraction. Applying it twice gives 10000-scale numbers.
+- **`t == 0` produces NaN**, not infinity. Panels show a gap, not a spike. (Worth knowing for "ratio panel went blank" tickets — the denominator hit zero.)
+- **NaN propagates silently.** A single missing scrape on either side leaves a NaN at that timestamp — no error, no warning. Wrap in `keepLastValue()` if you need a continuous line.
+
+When `*nodes` is supplied, both the numerator and the denominator series are first **bucketed by the node values** (`getNodeOrTag(series, n)` joined with `.`), then each bucket's numerator is divided by the same bucket's denominator. The bucketing key is exactly `aggregateGroupByTags`'s key — same primitive under the hood.
+
+Equivalents:
+
+| Goal | PromQL | M3QL |
+|---|---|---|
+| `a / sum(a)` per timestamp | `a / scalar(sum(a))` | `asPercent(a)` |
+| `a / b` paired by `service` | `a / on(service) b` | `asPercent(a, b, 2)` (if `service` is at position 2) or `asPercent(a, b)` with `aggregateGroupByTags('sum','service',...)` on both sides |
+| `a / 100` constant | `a / 100` (note: returns a fraction not a %) | `asPercent(a, total=100)` |
+
+#### 2.11.9 Multi-Tag Aggregations — aggregateGroupByTags
+
+The single most useful modern M3QL function for tag-style data is `aggregateGroupByTags`. The closest analog to PromQL's `sum by (...)` style:
+
+```m3ql
+# Sum requests per (service, dc), aggregating over everything else
+aggregateGroupByTags(
+  'sum',
+  'service','dc',
+  seriesByTag('name=requests')
+)
+```
+
+Equivalents at a glance:
+
+| Goal | PromQL | M3QL (tag style) |
+|---|---|---|
+| sum across all series, drop all labels | `sum(x)` | `sumSeries(seriesByTag(...))` |
+| sum keeping `service`, `dc` | `sum by (service,dc) (x)` | `aggregateGroupByTags('sum','service','dc',seriesByTag(...))` |
+| avg keeping `service` | `avg by (service) (x)` | `aggregateGroupByTags('avg','service',seriesByTag(...))` |
+| count series per `service` | `count by (service) (x)` | `aggregateGroupByTags('count','service',seriesByTag(...))` |
+| max keeping `service`, `dc` | `max by (service,dc) (x)` | `aggregateGroupByTags('max','service','dc',seriesByTag(...))` |
+| stddev keeping `service` | `stddev by (service) (x)` | `aggregateGroupByTags('stddev','service',seriesByTag(...))` |
+| keeping all labels, no aggregation | `x` | `seriesByTag(...)` |
+
+The dotted-name analog uses position-based functions:
+
+| Goal | M3QL (dotted-name) |
+|---|---|
+| sum across the third position only | `sumSeriesWithWildcards(stats.api.*.*.x, 3)` |
+| avg across the third position only | `averageSeriesWithWildcards(stats.api.*.*.x, 3)` |
+| sum across two positions | `sumSeriesWithWildcards(pat, 2, 4)` |
+| any aggregator across positions | `aggregateWithWildcards(pat, 'max', 3)` |
+
+`aggregateSeriesLists(listA, listB, 'sum', xFilesFactor=...)` is a related primitive — it pairs `listA[i]` with `listB[i]` element-by-element and applies the aggregator. Useful for "per-pod CPU + per-pod memory pair" panels.
+
+#### 2.11.10 Aliasing — Making Output Readable
+
+PromQL keeps the label set on every series and Grafana renders them via legend format strings. M3QL outputs are dotted strings, so you must **rewrite the name** to get a useful legend.
+
+```m3ql
+aliasByNode(stats.api.*.requests, 2)
+# input series:   stats.api.checkout.requests
+# alias result:   "checkout"   ← position 2 alone
+
+aliasByNode(stats.api.*.requests, 2, 3)
+# alias result:   "checkout.requests"   ← positions joined with '.'
+
+aliasByMetric(stats.api.checkout.requests)
+# alias result:   "requests"   ← last segment
+
+aliasByTags(seriesByTag('name=requests'), 'service','dc')
+# alias result:   "checkout, us-east1"
+
+aliasSub(stats.api.*.requests, '^stats\\.api\\.([^.]+)\\.requests$', '\\1 rps')
+# alias result:   "checkout rps"
+
+alias(s, 'fleet RPS')
+# constant alias regardless of input
+```
+
+Without aliasing, panels render literal full nested query strings — every legend entry is the *query*, not the *thing*. **Always alias the outer expression.**
+
+#### 2.11.11 Filter & Rank Series — exclude, grep, highest*, weightedAverage
+
+M3QL's filters operate on **whole series**, not on individual samples. Useful for top-N panels:
+
+| Function | What it does |
+|---|---|
+| `exclude(seriesList, regex)` | drop series whose name matches |
+| `grep(seriesList, regex)` | keep only series whose name matches |
+| `highestAverage(seriesList, n)` | top-N series by average value over the range |
+| `highestCurrent(seriesList, n)` | top-N by most recent value |
+| `highestMax(seriesList, n)` | top-N by max value |
+| `lowestCurrent(seriesList, n)` | bottom-N by most recent |
+| `lowestAverage(seriesList, n)` | bottom-N by average |
+| `mostDeviant(seriesList, n)` | top-N by stddev (most volatile) |
+| `currentAbove(seriesList, n)` | drop series whose **current** value < n |
+| `currentBelow(seriesList, n)` | drop series whose current value > n |
+| `averageAbove(seriesList, n)` | drop series whose average over range < n |
+| `averageBelow(seriesList, n)` | symmetric |
+| `removeBelowValue(seriesList, n)` | mask points < n to NaN (per-point, not per-series) |
+| `removeAboveValue(seriesList, n)` | mask points > n |
+| `weightedAverage(values, weights, *nodes)` | weighted mean across two paired lists |
+
+```m3ql
+# Top 10 services by p99 latency, with friendly names
+aliasByNode(
+  highestAverage(seriesByTag('name=p99'), 10),
+  'service'
+)
+
+# CPU-weighted mean p99 latency across pods (giving busier pods more weight)
+weightedAverage(
+  seriesByTag('name=p99'),
+  seriesByTag('name=cpu'),
+  'pod'
+)
+```
+
+PromQL's equivalents are clunkier — `topk(10, ...)` does similar work but "top 10 by average over a window" requires `topk(10, avg_over_time(x[5m]))` and there is no direct stddev-based selector or weighted-average primitive.
+
+#### 2.11.12 Math Operators and Per-Series Combinators
+
+M3QL replaces PromQL's binary vector matching with explicit functions:
+
+| Goal | PromQL | M3QL |
+|---|---|---|
+| `a + b` | `a + b` (with implicit matching) | `sumSeries(a, b)` |
+| `a / b` | `a / b` | `divideSeries(a, b)` |
+| `a * b` | `a * b` | `multiplySeries(a, b)` |
+| `a - b` | `a - b` | `diffSeries(a, b)` |
+| ratio of series to sum | `a / sum(b)` | `asPercent(a, sumSeries(b))` |
+| filter NaN gaps with last value | `last_over_time(a[5m])` | `keepLastValue(a)` |
+| treat NaN as zero | `... or vector(0)` | `transformNull(a, 0)` |
+| treat NaN as something else | n/a | `transformNull(a, 999)` |
+| absolute value | `abs(x)` | `absolute(x)` |
+| log | `ln(x)` / `log2(x)` | `logarithm(x, base)` |
+| invert | `1 / x` | `invert(x)` |
+| min/max threshold per point | `clamp_min(x, n)` / `clamp_max(x, n)` | `removeBelowValue(x, n)` / `removeAboveValue(x, n)` (via NaN), or `keepLastValue` chains |
+
+#### 2.11.13 Scaling, Time-Shifting, Forecasting
+
+| Function | Purpose |
+|---|---|
+| `scale(s, n)` | multiply every point by `n` |
+| `offset(s, n)` | add `n` to every point |
+| `scaleToSeconds(s, n)` | rescale step-counted series to "per N seconds" |
+| `timeShift(s, '-1d')` | shift the series in time (week-over-week panels) |
+| `timeStack(s, '-1d', 0, 7)` | overlay 7 daily-shifted copies on one panel |
+| `holtWintersForecast(s, bootstrapInterval='7d', seasonality='1d')` | exponential-smoothing forecast |
+| `holtWintersConfidenceBands(s, delta=3, ...)` | upper/lower forecast bands at `delta` stddevs |
+| `holtWintersAberration(s, delta=3, ...)` | series of "deviation from forecast" — primitive for anomaly alerts |
+
+Holt-Winters is the closest a Graphite/M3 stack gets to anomaly detection without external tooling. The `bootstrapInterval='7d'` arg means "use the prior week to seed the model"; `seasonality='1d'` means "the cycle repeats daily."
+
+**The actual update equations** (M3 source, `holtWintersForecast`):
+
+```
+intercept_t = α · (actual_t − seasonal_{t−L}) + (1−α)(intercept_{t−1} + slope_{t−1})
+slope_t     = β · (intercept_t − intercept_{t−1}) + (1−β) · slope_{t−1}
+seasonal_t  = γ · (actual_t − intercept_t) + (1−γ) · seasonal_{t−L}
+
+forecast_t  = intercept_t + slope_t + seasonal_{t−L+1}
+```
+
+with **hard-coded constants** `α=0.1, β=0.0035, γ=0.1` and `L = seasonality / step` (the season length in points). Notice:
+
+- **`α=0.1`** means the forecast adapts slowly to changes in level — a sustained traffic shift takes ~10 sample periods to be reflected.
+- **`β=0.0035`** is *extremely* small; the trend term barely moves. This is a deliberate choice for noisy ops data, but it means H-W will under-react to genuine ramp-ups.
+- **`γ=0.1`** means the seasonal component also adapts slowly — week-of-quarter seasonality drift takes ~10 days to show up.
+- The constants are **not configurable** in M3QL. If you need tuned forecasting, export the data to Python (`statsmodels.tsa.holtwinters`) and pin α/β/γ from cross-validation.
+
+`holtWintersConfidenceBands` returns `forecast ± delta · σ_forecast` where `σ_forecast` is itself an exponentially-smoothed estimate of the residual stddev. `holtWintersAberration` is `actual − forecast` clipped to the confidence band — non-zero only when actual is outside the band. Alerts on aberration are the standard "anomaly alert" idiom but tend to fire on every minor cyclic anomaly; threshold at `delta=4` or higher for production noise tolerance.
+
+The triple-exponential model behaves badly on **irregular seasonality** (weekly business cycles, holidays). Use it for diurnal patterns; use external tooling for anything else.
+
+#### 2.11.14 Common Idioms — Cheat Sheet
+
+```m3ql
+# RPS per service, smoothed over 5 minutes
+aliasByNode(
+  movingAverage(
+    perSecond(sumSeriesWithWildcards(stats.api.*.requests, 3)),
+    '5min'),
+  2)
+
+# Error ratio per service
+asPercent(
+  aliasByNode(sumSeriesWithWildcards(stats.api.*.errors, 3), 2),
+  aliasByNode(sumSeriesWithWildcards(stats.api.*.requests, 3), 2))
+
+# Top 5 noisiest services this week (highest stddev of latency)
+aliasByTags(mostDeviant(seriesByTag('name=p99'), 5), 'service')
+
+# 7-day-ago overlay for capacity panel
+timeShift(sumSeries(stats.api.*.requests), '-7d')
+
+# Percent of fleet pods over CPU 0.8
+asPercent(
+  countSeries(removeBelowValue(stats.gauges.host.*.cpu, 0.8)),
+  countSeries(stats.gauges.host.*.cpu))
+
+# Anomaly band: current value vs Holt-Winters forecast
+holtWintersAberration(stats.api.checkout.requests)
+
+# p99 of per-pod latencies, sliding window per pod, then 95th percentile
+# of the pod fleet at each timestamp
+percentileOfSeries(
+  movingWindow(seriesByTag('name=latency_ms'), '5min', 'median'),
+  95, true)
+```
+
+#### 2.11.15 SQL Equivalents — Translating M3QL Idioms
+
+When migrating off Graphite/M3 onto a SQL telemetry store (ClickHouse most often), the translations are mechanical:
+
+| M3QL | SQL (ClickHouse-flavored) |
+|---|---|
+| `sumSeries(seriesByTag('name=requests'))` | `SELECT toStartOfMinute(ts) m, sum(value) FROM metrics WHERE name='requests' GROUP BY m` |
+| `aggregateGroupByTags('sum','service',...)` | `SELECT m, tags['service'] svc, sum(value) FROM metrics WHERE name='requests' GROUP BY m, svc` |
+| `averageSeries(...)` | `SELECT m, avg(value) FROM metrics WHERE ... GROUP BY m` |
+| `movingAverage(s, '5min')` | `avg(value) OVER (PARTITION BY series ORDER BY ts RANGE BETWEEN INTERVAL 5 MINUTE PRECEDING AND CURRENT ROW)` |
+| `summarize(s, '5min', 'avg')` | `SELECT toStartOfFiveMinutes(ts) m5, avg(value) FROM metrics GROUP BY m5` |
+| `perSecond(counter)` | `(value - lagInFrame(value) OVER (PARTITION BY series ORDER BY ts)) / dateDiff('second', lagInFrame(ts) OVER (...), ts)` |
+| `nonNegativeDerivative(c)` | `if(value >= lagInFrame(value) OVER (PARTITION BY series ORDER BY ts), value - lagInFrame(value) OVER (...), NULL)` |
+| `highestAverage(seriesList, 10)` | `... GROUP BY series ORDER BY avg(value) DESC LIMIT 10` |
+| `mostDeviant(seriesList, 10)` | `... GROUP BY series ORDER BY stddevPop(value) DESC LIMIT 10` |
+| `nPercentile(s, 99)` | `quantile(0.99)(value) OVER (PARTITION BY series)` (same value at every t) |
+| `percentileOfSeries(s, 99, true)` | `quantile(0.99)(value)` after `GROUP BY toStartOfMinute(ts)` (across-series, per-bucket) |
+| `removeAbovePercentile(s, 99)` | `if(value <= quantile(0.99)(value) OVER (PARTITION BY series), value, NULL)` |
+| `asPercent(a, b)` | `100.0 * a.v / b.v` after `JOIN ON ts AND a.tags['service'] = b.tags['service']` |
+| `asPercent(seriesList)` (no total) | `100.0 * value / sum(value) OVER (PARTITION BY ts)` |
+| `weightedAverage(v, w, *nodes)` | `sum(v.val * w.val) / sum(w.val) GROUP BY ts, <nodes>` after a JOIN on the node tags |
+| `holtWintersForecast(s)` | not native — usually delegate to a UDF or extract to Python/Pandas |
+| `seriesByTag('service=~api.*')` | `WHERE tags['service'] LIKE 'api%'` (or `match(tags['service'], '^api.*')`) |
+| `aliasByNode(s, n)` | column aliasing in SQL: `SELECT ... AS service` |
+
+Concrete side-by-side. M3QL:
+
+```m3ql
+aliasByNode(
+  movingAverage(
+    perSecond(sumSeriesWithWildcards(stats.api.*.requests, 3)),
+    '5min'),
+  2)
+```
+
+ClickHouse SQL:
+
+```sql
+WITH per_minute AS (
+  SELECT
+    toStartOfMinute(ts)         AS m,
+    splitByChar('.', name)[3]   AS service,
+    sum(value)                  AS v
+  FROM metrics
+  WHERE name LIKE 'stats.api.%.requests'
+  GROUP BY m, service
+),
+rate AS (
+  SELECT
+    m, service,
+    greatest(0, v - lagInFrame(v) OVER (PARTITION BY service ORDER BY m))
+      / 60.0                    AS rps
+  FROM per_minute
+)
+SELECT
+  m, service,
+  avg(rps) OVER (
+    PARTITION BY service ORDER BY m
+    RANGE BETWEEN INTERVAL 5 MINUTE PRECEDING AND CURRENT ROW
+  ) AS rps_smoothed
+FROM rate
+ORDER BY service, m;
+```
+
+Per-percentile example. M3QL:
+
+```m3ql
+aliasByTags(
+  percentileOfSeries(
+    seriesByTag('name=latency_ms','app=checkout'),
+    99, true),
+  'app')
+```
+
+ClickHouse SQL:
+
+```sql
+SELECT
+  toStartOfMinute(ts)                          AS m,
+  tags['app']                                  AS app,
+  quantileExactWeightedInterpolated(0.99)(value, 1) AS p99_across_pods
+FROM metrics
+WHERE name = 'latency_ms'
+  AND tags['app'] = 'checkout'
+GROUP BY m, app
+ORDER BY m;
+```
+
+Three things to notice across both translations:
+
+1. **Pipeline → CTE chain.** Every M3QL pipe stage becomes its own CTE. The execution order matches reading SQL top-down vs reading M3QL outside-in.
+2. **Position math in dotted names** becomes `splitByChar` indexing — fragile; migrations should re-shape names into proper tag columns first.
+3. **Per-series window functions** (`PARTITION BY service`) replace M3QL's implicit "applies to every series in the bundle" semantic.
+
+For migrations off Graphite/M3 onto **PromQL** instead of SQL, the pattern is also mechanical: `perSecond`→`rate`, `movingAverage`→`avg_over_time`, `aggregateGroupByTags('sum','service')`→`sum by (service)`, `aliasByTags`→Grafana legend format, `nPercentile`→`quantile_over_time`. The hard cases are the same: per-series filters (`highestAverage`, `mostDeviant`, `weightedAverage`), forecasting (`holtWintersForecast`), time-stack overlays (`timeStack`), and the across-series quantile (`percentileOfSeries`) — none of which have native PromQL forms. Plan to drop those panels onto SQL or accept a fidelity loss.
+
+#### 2.11.16 Pitfalls Specific to M3QL
+
+- **Forgetting `aliasByNode` / `aliasByTags`** — output series names are full query strings, not human-readable. Every panel needs an alias.
+- **`avgSeriesWithWildcards` vs `averageAbove`** — the first reduces dimensions, the second is a series-level filter. Names are dangerously similar.
+- **`summarize` vs `movingAverage`** — first downsamples (lower resolution); second smooths at native resolution.
+- **`nPercentile` vs `percentileOfSeries`** — first is a flat horizontal line per series; second is a single across-series series varying with `t`.
+- **`asPercent` without explicit `*nodes`** — pairs by series order, which silently breaks when series counts on either side differ.
+- **`perSecond` on gauges** — only meaningful for counters. M3 will compute it on a gauge and produce nonsense.
+- **Position indexing in dotted names** — adding a new naming segment shifts every position. Tag-based queries (`seriesByTag` + `aggregateGroupByTags`) are migration-safe; positional queries are not.
+- **`derivative` vs `nonNegativeDerivative`** — the former returns negative numbers across a counter reset; only the latter handles resets correctly.
+- **Glob fan-out** — `stats.**.requests` against millions of series fans out hugely. Equivalent to PromQL's "regex matcher with no anchored prefix"; same OOM consequence.
+- **Holt-Winters bootstrapping** — uses prior `bootstrapInterval` of data implicitly, so a query for "last 1h" actually reads "last 1h + 7d." Set query timeouts accordingly.
+- **`xFilesFactor`** in `summarize`/`aggregate` — the threshold of "fraction of points that must be non-NaN to emit a value." Default behavior across vendors disagrees; pin it explicitly when correctness matters.
+
+> **Mental model:** PromQL is **set-of-vectors algebra**. M3QL is **left-to-right pipeline of named series**. Both handle the same workloads at scale; the linguistic difference reshapes how you think about a query, not what's possible. When you see an M3QL expression you don't recognize, mentally translate it to "selector → reducer → window → alias" and the PromQL form usually pops out.
+
+#### 2.11.17 Verified Source References
+
+The math in the sub-sections above is taken directly from the M3 and Graphite source trees. If you need to chase an edge case, these are the canonical files:
+
+| Function family | M3 source | Graphite source |
+|---|---|---|
+| Percentile algorithm | `src/query/graphite/common/percentiles.go` (`GetPercentile`, `NPercentile`, `RemoveByPercentile`) | `webapp/graphite/render/functions.py` (`_getPercentile`, `nPercentile`, `removeAbovePercentile`) |
+| Counter math | `src/query/graphite/native/builtin_functions.go` (`nonNegativeDerivative`, `perSecond`) | `functions.py` (`nonNegativeDerivative`, `_nonNegativeDelta`) |
+| Aggregation + wildcard collapsing | `src/query/graphite/native/aggregation_functions.go`, `common/aggregation.go` (key built via `aggKey`/`getNodeOrTag`) | `functions.py` (`aggregateWithWildcards`, `aggKey`) |
+| `asPercent` | `src/query/graphite/native/builtin_functions.go` (`asPercent`) — formula `(v/t)*100` | `functions.py` (`asPercent`) |
+| Moving window + xFilesFactor | `common/moving.go`, `native/builtin_functions.go` (`movingWindow`, `effectiveXFF`) | `functions.py` (`movingWindow`, `xff`) |
+| Holt-Winters | `native/builtin_functions.go` (`holtWintersForecast`, `holtWintersIntercept`, `holtWintersSlope`, `holtWintersSeasonal`) — α=0.1, β=0.0035, γ=0.1 hard-coded | `functions.py` (`holtWintersAnalysis`) |
+| `summarize` (downsampling) | `native/builtin_functions.go` (`summarize`, `summarizeValues`) | `functions.py` (`summarize`) |
+
+Two practical tips for chasing behavior diffs in production:
+
+- **M3 vs Graphite drift.** The Graphite reference is Python; M3's port is Go and has been re-implemented (not transpiled). Most behavior matches, but a few defaults diverge — notably `xFilesFactor` defaults and percentile interpolation behavior. When in doubt, write a one-row test and compare both engines on the same input.
+- **"Why is my number off by epsilon?"** — Graphite-family engines round many intermediate results to 6 decimal places (see `round(delta / step, 6)` in `perSecond`). PromQL does not round. Don't stack equality alerts on derived M3QL series.
 
 ---
 
