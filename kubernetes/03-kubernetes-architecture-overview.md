@@ -2590,7 +2590,45 @@ The good news: **the API surface is identical across all of them.** A manifest y
 
 ---
 
-## 19. The Compatibility Skew Policy
+## 29. Distribution Comparison Matrix
+
+The narrative descriptions in §28 are how you'd explain distributions to someone over coffee. This table is what you reach for when you're sizing a project and need to know "who owns what, where does etcd live, what does it cost, what's exposed to me." Cross-distribution decisions are mostly made on these columns, not on feature sparkle.
+
+| Distribution | Who runs the CP? | Where does etcd live? | Who pays for the CP? | What's exposed to you? | SLA on CP availability |
+|--------------|-------------------|------------------------|----------------------|-------------------------|------------------------|
+| **kubeadm (vanilla)** | You | On your CP nodes (stacked or external) | You (compute + ops time) | Everything: SSH to apiservers, etcd ports, all knobs | None (you operate it) |
+| **EKS** | AWS | AWS-managed; you don't see it | AWS charges ~$73/cluster/month + node-hours | The kube-apiserver endpoint (URL); a few config knobs (audit, OIDC, encryption); no SSH, no etcd access | 99.95% (uptime SLA) |
+| **GKE Standard** | Google | Google-managed | Google charges ~$73/cluster/month (free for one zonal cluster per project) + node-hours | API endpoint; broader config than EKS; tight integration with GCP IAM, logging, monitoring | 99.95% (regional) / 99.5% (zonal) |
+| **GKE Autopilot** | Google | Google-managed | Per-pod billing (no node management) | Pods only; nodes are abstracted away entirely | 99.95% |
+| **AKS (free tier)** | Microsoft | Azure-managed | Free for the CP, you pay for nodes | API endpoint, AAD integration, ARM integration | No SLA on free tier |
+| **AKS (Uptime SLA)** | Microsoft | Azure-managed | ~$73/cluster/month + node-hours | Same as free + uptime SLA | 99.95% |
+| **OpenShift (self-hosted OCP)** | You | On your CP nodes; OCP runs them as DaemonSets/Deployments | You (compute) + Red Hat subscription per node | Everything, plus OpenShift-specific layers (router, OAuth, Operators) | None (you operate; Red Hat provides support) |
+| **OpenShift (ROSA / ARO)** | AWS/Azure + Red Hat | Managed by the joint service | Managed pricing | OpenShift surface + managed CP | 99.95% (ROSA) |
+| **Rancher (RKE2)** | You | On your CP nodes (stacked) | You + optional Rancher support contract | Multi-cluster management UI on top; cluster-by-cluster you have full access | None (operator runs it) |
+| **K3s** | You | Embedded SQLite (default), external etcd / kine (optional) | You; SUSE for support | Single binary; full root access; tight resource footprint | None |
+| **Talos** | You | On the CP nodes | You; Sidero for support | gRPC API only (no SSH; no shell). Talos itself is the OS layer | None |
+| **k0s** | You | etcd or kine (Postgres/MySQL/SQLite) | You; Mirantis for support | Single binary, minimal footprint, full access | None |
+
+### 29.1 The "Hidden" Differences
+
+A few things the table doesn't capture cleanly but you need to know:
+
+- **Node access on managed K8s.** EKS/GKE/AKS give you SSH to *worker* nodes (and on EKS, you can disable that with bottlerocket/launch-template restrictions). You **never** SSH to control-plane nodes.
+- **CP networking surface.** Managed offerings expose only the apiserver endpoint and a few related services (Konnectivity reverse tunnels are internal). On vanilla kubeadm, you choose whether the apiservers are public, private, or both.
+- **What you can break.** On managed, the cloud provider validates a lot of config — you can't break the CP through misconfiguration. On vanilla, you can do anything, including making the apiserver unbootable.
+- **Upgrades.** Managed: a console click or API call; the cloud rolls it. Vanilla: you run `kubeadm upgrade plan` / `apply` and drain nodes yourself. The risk profile is very different.
+- **CP backup.** Managed: not your problem (mostly — some offerings let you snapshot, some don't). Vanilla: you must `etcdctl snapshot save` on a schedule and ship it somewhere durable.
+- **Compliance certifications.** EKS/GKE/AKS/OpenShift come with SOC2, PCI, HIPAA paperwork. Vanilla: you do that work yourself.
+
+### 29.2 The Honest Recommendation
+
+For 95% of teams: **pick the managed offering of whichever cloud you're already on.** The CP-management saved time is worth the $73/month many times over, and the SLA gives you an answer to your security/SRE folks. The remaining 5% are: bare-metal, regulatory-restricted (air-gap), edge / IoT, hyperscale (you're bigger than the managed offering allows), or you have explicit reasons for owning the stack (Anthos-style multi-cloud, OpenShift for vendor support).
+
+For learning: kubeadm or kind. For edge: K3s or Talos. For "I want a Linux distro that is a Kubernetes node and nothing else": Talos.
+
+---
+
+## 30. The Compatibility Skew Policy
 
 You will upgrade Kubernetes. You will not upgrade everything at once. The **version skew policy** defines which components may legally be at different versions, by how much, and in which direction. Getting this wrong produces baffling failures. Ch 32 goes deep; here is the rule you need to remember.
 
