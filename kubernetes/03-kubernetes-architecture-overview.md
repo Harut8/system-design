@@ -656,7 +656,7 @@ The mnemonic: **etcd is existential; everything else is degradation.** Manage yo
 
 A single-node control plane is fine for `minikube`, `kind`, `k3d`, learning environments, and CI. Anything you don't want to recreate from scratch needs HA. There are two production-grade topologies.
 
-### 5.1 Stacked etcd: etcd colocated with control-plane nodes
+### 7.1 Stacked etcd: etcd colocated with control-plane nodes
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -682,7 +682,7 @@ A single-node control plane is fine for `minikube`, `kind`, `k3d`, learning envi
 
 **Cons:** etcd shares CPU, RAM, disk, and network with apiserver, scheduler, and controller-manager. Under load, the apiserver can drown its colocated etcd by being too aggressive on watch cache rebuilds; an etcd compaction can starve scheduler latency. **Losing one CP node loses one etcd member**, so the blast radius of a single failure is doubled.
 
-### 5.2 External etcd: separate etcd cluster
+### 7.2 External etcd: separate etcd cluster
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -717,7 +717,7 @@ A single-node control plane is fine for `minikube`, `kind`, `k3d`, learning envi
 
 **The rule of thumb.** Below ~50 nodes, stacked etcd is fine. Between 50 and 500, either works; pick stacked for simplicity. Above 500, go external. Above 1500, *definitely* external with dedicated NVMe per etcd member.
 
-### 5.3 The Load Balancer in Front of Apiservers
+### 7.3 The Load Balancer in Front of Apiservers
 
 In both topologies, clients (kubectl, kubelets, controllers running outside the CP) connect through a load balancer. Options:
 
@@ -911,11 +911,11 @@ There is no universal "right size" for a Kubernetes control plane; it depends on
 
 **What "Nodes" really means.** Most Kubernetes installs are bounded not by nodes but by total objects, watch fan-out, and event churn. A 100-node cluster with 50k CronJobs creates more apiserver load than a 5000-node cluster with 10k long-running Pods. Use these tiers as a starting point and measure.
 
-### 8.1 The "kubelet is also a watcher" multiplier
+### 11.1 The "kubelet is also a watcher" multiplier
 
 Every node runs a kubelet that opens an apiserver watch on Pods (filtered to its own nodename), Secrets and ConfigMaps mounted in any pod on the node, Nodes (for its own status writes), and a few others. The apiserver maintains an in-memory **watch cache** that broadcasts events. With 5000 nodes, you have ≥5000 long-lived watch connections, each receiving every event for every Pod scheduled on its node, plus all Secret/ConfigMap changes mounted on it, plus its own Node updates. *The apiserver memory and CPU for watch fan-out scales linearly with the number of nodes.* This is why "5000 nodes" needs apiservers with 32+ vCPU and 128 GiB of RAM — the watch cache alone can consume 20+ GiB.
 
-### 8.2 What you actually buy when you scale up
+### 11.2 What you actually buy when you scale up
 
 ```
 Resource axis:           Bottleneck order as you scale (roughly):
@@ -1521,7 +1521,7 @@ kubernetes/
                                          DefaultTolerationSeconds, …)
 ```
 
-### 13.1 Where to look for what
+### 20.1 Where to look for what
 
 | You want to read... | Look in... |
 |---------------------|------------|
@@ -2690,7 +2690,113 @@ The pragmatic version: **never skip a minor.** If you're at 1.28 and 1.31 is out
 
 ---
 
-## 20. TL;DR
+## 31. Architecture-Level Pitfalls and Misconceptions
+
+This is the long list of things people get wrong about Kubernetes at this level of zoom. Each one is a real misunderstanding that produces real bugs, real incidents, or real wasted engineering. If you've internalized everything in this chapter, you should disagree with every one of these — and recognize them in the wild.
+
+### 31.1 "The apiserver is the compute plane"
+
+**Wrong.** The apiserver is a *stateless REST front-end and watch fan-out hub* for etcd. It does not run your workloads. It does not even know what a "Pod" means semantically — it knows the schema, the storage layout, and the watch protocol. The "compute plane" is the worker nodes (kubelets + container runtimes). Scaling the apiserver buys you more API throughput, not more compute capacity. Conversely, adding worker nodes does not increase apiserver capacity.
+
+### 31.2 "The kubelet polls the apiserver"
+
+**Wrong.** The kubelet maintains long-lived HTTP/2 watch streams (via informers). When a Pod is created with `spec.nodeName=this-node`, the apiserver pushes the event over the existing watch connection. The kubelet sees it within milliseconds. There is no polling anywhere in the steady state — polling exists only as a fallback when the connection breaks. Misunderstanding this leads to misunderstanding pod start latency, network requirements, and what an apiserver outage means.
+
+### 31.3 "etcd is just a database; you could use Postgres / DynamoDB / Spanner"
+
+**Wrong.** etcd's API shape — MVCC with monotonic revision, range scans by prefix, streaming watch from a revision, multi-key transactions with compare-and-swap, leases with server-side TTL — is *load-bearing* for the apiserver's correctness. No general-purpose database exposes these as a unified API. `kine` is the closest thing (etcd v3 emulation on top of SQL), used by K3s, and it does not scale to production workloads. **etcd is not arbitrary**; treat it as a Kubernetes-specific kernel.
+
+### 31.4 "You can run etcd on networked block storage"
+
+**Wrong (in production).** etcd's commit path is `fsync(2)` per write. Networked block storage (EBS gp3, GCP pd-ssd, Azure Premium SSD) adds 1–5 ms of network latency *per fsync*. At 10,000 writes/sec, that's the difference between healthy etcd and a wedged cluster. **Use local NVMe.** EKS and GKE do this under the hood. If you're running etcd yourself on cloud VMs, use instance-store NVMe; if you're on bare metal, dedicated NVMe drives, with a separate disk for WAL.
+
+### 31.5 "More etcd members = more capacity"
+
+**Wrong.** etcd is not a sharded distributed database. Every member stores the full state. Every write goes through Raft to a quorum. Adding members *increases* write latency (more peers to ack) and *decreases* throughput (more replication overhead). Five members is the maximum useful size; seven is rarely warranted; nine never. If you need more capacity, you shard at the Kubernetes layer (multiple clusters), not at the etcd layer.
+
+### 31.6 "Controllers call each other"
+
+**Wrong.** Controllers communicate exclusively via the apiserver. When the Deployment controller "tells" the ReplicaSet controller to scale, it actually writes a new ReplicaSet object; the ReplicaSet controller's informer sees the event and reacts. There is no RPC between controllers, no direct memory sharing, no orchestration daemon coordinating them. **The system is fully asynchronous and message-passing through etcd.** Treating controllers as RPC-coupled produces wrong mental models for failure modes and recovery.
+
+### 31.7 "The scheduler runs the pod"
+
+**Wrong.** The scheduler makes one decision: *which Node*. It then writes `spec.nodeName` and is done. Everything after — image pull, network setup, container start, status updates — is the kubelet's job. The scheduler has no involvement in pod lifecycle, restarts, evictions, or runtime behavior. A scheduler outage delays *new* placements; it does not affect running pods at all.
+
+### 31.8 "If the apiserver is down, my pods stop running"
+
+**Wrong.** Running pods continue running. The kernel doesn't care about Kubernetes. The kubelet on each node keeps its local state and keeps containers alive. What stops is *new* activity: new scheduling, status updates, controller reconciles, kubectl commands. An apiserver outage is survivable for *runtime*; it's only catastrophic for *operations*. An *etcd* outage is different — without etcd, the apiserver can't function, and recovery may require restoring from a snapshot (data loss).
+
+### 31.9 "I can replace kube-proxy with my CNI and that's it"
+
+**Half right.** Cilium and a few other CNIs offer "kube-proxy replacement" — they handle Service VIP routing themselves (often via eBPF) and you can disable kube-proxy. But you still need *something* programming Service rules on every node; you just moved the responsibility. Confirm your CNI supports it and that you've followed its instructions (e.g., for Cilium, you set `kubeProxyReplacement: strict` and ensure the kernel supports BPF). If you simply uninstall kube-proxy without configuring a replacement, Services break.
+
+### 31.10 "CRDs are second-class compared to built-ins"
+
+**Wrong (in 2026).** CRDs go through the same apiserver, same etcd, same admission, same audit, same RBAC, same OpenAPI, same watch, same client-go. The only architectural difference is *who registers the schema* (the CRD object versus the in-tree Go code). For performance, CRDs and built-ins are identical (slightly different code paths inside the apiserver but the same etcd I/O). The "second-class" worry is dated — CRDs are how Kubernetes is extended now.
+
+### 31.11 "Aggregated APIs are how you write operators"
+
+**Wrong — usually.** 99% of operators are CRD-based. Aggregated APIs (a separate apiserver process behind kube-aggregator) are for cases where your data doesn't belong in etcd (metrics-server, custom-metrics-adapter) or where you need wholly different schema/auth/storage semantics (KCP, vCluster). If your reaction to "I need to add a new resource type" is "let me write an aggregated apiserver," reconsider — almost certainly you want a CRD with a controller. (Ch 23, ch 24.)
+
+### 31.12 "Namespaces are an isolation boundary"
+
+**Wrong.** Namespaces are a *grouping* mechanism with associated RBAC, quota, and label scoping. They are not a security boundary. By default, pods in different namespaces can reach each other over the pod network unless NetworkPolicy says otherwise. Service accounts in one namespace can be granted access to objects in another via RBAC. For hard tenant isolation, you need per-tenant clusters (or vCluster / Capsule / HNC, with caveats). Ch 25 covers tenancy.
+
+### 31.13 "kubectl apply is GitOps"
+
+**Wrong.** `kubectl apply` is one application of a manifest. GitOps is a continuous reconciliation loop where the *cluster state is the deployed state of a Git repository*. Without ArgoCD or Flux (or equivalent), there is no GitOps — there's just imperative deploys with a tool that looks declarative. The Git-as-source-of-truth, drift-detection, and auto-sync behaviors are the GitOps controller's job.
+
+### 31.14 "Helm is a deployment system"
+
+**Wrong.** Helm is a *templating engine* with a release-tracking annotation system. It renders YAML and applies it. It does not reconcile drift, does not provide rollback on failed reconcile (only on `helm rollback`), and does not enforce desired state over time. People use Helm + ArgoCD/Flux together: Helm produces manifests, the GitOps controller reconciles them.
+
+### 31.15 "Secrets are encrypted by default"
+
+**Wrong.** Secret data is **base64-encoded** by default, not encrypted. Encryption at rest in etcd is opt-in via `--encryption-provider-config`, and even when enabled, it's encrypted only at the apiserver/etcd boundary — not key-managed externally, not auditable per-access, not rotated automatically. Production secrets management uses an external system (Vault, cloud KMS, External Secrets Operator) and surfaces secrets into pods through it.
+
+### 31.16 "The control plane scales horizontally"
+
+**Half right.** The apiserver scales horizontally (run more replicas behind an L4 LB). The scheduler and controller-manager are leader-elected — only one replica is active; the others are warm standbys. So "running 3 scheduler replicas" doesn't 3× scheduling throughput. For scheduling throughput beyond what one scheduler offers, use multiple *scheduler profiles* (each handles disjoint pod sets) or sharded specialized schedulers (Volcano, KubeRay).
+
+### 31.17 "I can hot-patch the apiserver"
+
+**Wrong (mostly).** The apiserver is stateless; you can roll it (cordon one off the LB, restart, cordon back in). But "hot-patching" — replacing the binary while in-flight requests are running — is not generally supported. Always roll the apiserver fleet behind an LB; that's the supported model.
+
+### 31.18 "Pod IPs are stable"
+
+**Wrong.** Pod IPs are assigned by the CNI when the pod is created and are *not stable across pod restarts*. If your application code records a pod IP somewhere, it will get stale. Use Services (which have stable VIPs) or headless Services + DNS (which gives you a per-pod DNS name that stays valid as long as the pod exists). Never assume Pod IPs are durable.
+
+### 31.19 "Service IPs are stable forever"
+
+**Mostly right but with caveats.** A Service's ClusterIP is stable for the life of the Service. If you delete and re-create the Service with the same name, **you get a new ClusterIP** unless you explicitly specify the IP. This means immutable infrastructure approaches that recreate Services on every deploy will surprise you with IP churn. Most kube-proxy / Cilium implementations handle this gracefully (the old IP's rules are torn down, new ones added), but DNS-cache-aware clients can briefly fail.
+
+### 31.20 "Liveness probes restart unhealthy pods"
+
+**Right, but dangerous.** Liveness probes that are too aggressive (or that test something other than "the process is responsive") create cascading restart loops. Common mistakes: probing the dependency rather than the service, returning unhealthy during legitimate slow operations (long GC pauses), or using HTTP probes against an endpoint that doesn't exist. **Readiness probes** are the right tool for "is this pod ready to serve traffic"; liveness is for "is the process wedged in a way that only restart fixes." Use liveness sparingly.
+
+### 31.21 "Node taints prevent any pod from being scheduled"
+
+**Wrong.** Taints with effect `NoSchedule` prevent pods *that don't tolerate them*. Pods that explicitly tolerate the taint can land there. Daemonsets and many system pods carry blanket tolerations. So a "tainted" node is not necessarily an empty node — check what tolerations your DaemonSets have.
+
+### 31.22 "All controllers see events in the same order"
+
+**Wrong.** Each controller has its own informer and its own watch stream. Events arrive in the same order from the apiserver, but controllers process them at different speeds; one may have applied an event seconds before another sees it. This is the source of many "race condition" bugs in custom controllers. Solution: always *re-read the current state* before acting; never assume your view of the world is consistent with another controller's.
+
+### 31.23 "Once etcd is restored from snapshot, the cluster is back to that state"
+
+**Mostly right but operationally tricky.** Restoring etcd resets all Kubernetes state to the snapshot's contents, but the *real world* has moved on: pods are still running on nodes (the kubelet doesn't know etcd was rolled back), cloud LBs still exist, attached volumes are still mounted, certificates may have rotated. After an etcd restore you typically need to: (a) reconcile or recreate "orphaned" external resources, (b) restart kubelets so they re-register, (c) accept that any objects created since the snapshot are gone. Ch 04 covers this dance.
+
+### 31.24 "Webhooks are safe extension points"
+
+**Wrong by default.** A webhook with `failurePolicy: Fail` that runs as a pod creates a chicken-and-egg bootstrap problem: the webhook is needed to admit its own pod. Recovery requires bypassing the webhook (you can `kubectl delete` the webhook configuration, *if* you can still get a kubectl session). Always scope webhook `namespaceSelector` to exclude `kube-system` and the webhook's own namespace; always test the cluster-cannot-start scenario.
+
+### 31.25 "Kubernetes is self-healing"
+
+**Half right.** Kubernetes reconciles toward declared state — that's the self-healing. But it does not heal *itself*: if you delete etcd, no controller fixes that. If you misconfigure RBAC such that the controller-manager can't create pods, nothing notices and fixes it. The cluster heals declared *workloads*; the *cluster itself* is operated, not self-healing. "Day-2 operations" exist precisely because of this asymmetry.
+
+---
+
+## 32. TL;DR
 
 **Kubernetes is etcd + N controllers.** A Raft-replicated KV store wrapped by a typed REST API (the apiserver), with N stateless processes (the scheduler, controller-manager, cloud-controller-manager, kubelets, your operators) that each watch some subset of the store and reconcile real-world state toward declared state.
 
