@@ -1915,7 +1915,87 @@ Picture three queues in a PL, each able to admit 10 in-flight. A flood from user
 
 `handSize` is the number of queues a single distinguisher's requests are spread across. `queueLengthLimit` caps each queue's length. The math is `birthday-paradox-like`: the probability that any two distinguishers collide on all `handSize` queues is roughly `(handSize/totalQueues)^handSize`.
 
-### 11.5 Tuning Knobs
+### 11.5 The Shuffle-Sharding Math
+
+Why shuffle-sharding works is worth a half-page. Suppose a PriorityLevel has `totalQueues = 128` and `handSize = 8`. A request's distinguisher (e.g., `user="alice"`) deterministically hashes to a *set* of 8 queues out of 128. The request is enqueued into the **shortest** of those 8 queues at that moment.
+
+Two distinguishers fully collide (would harm each other) only if their hand sets are identical. The number of distinct hand sets is `C(128, 8) ≈ 1.43 × 10^11`. The probability that two arbitrary distinguishers share all 8 queues is ~`1 / C(128, 8)` — astronomically small.
+
+The more interesting question is: if a noisy neighbor (distinguisher N) sends X requests/sec and fills all 8 of its queues, what is the probability that another distinguisher G shares **k of N's queues**?
+
+```
+   P(G shares exactly k queues with N)
+       = C(8, k) × C(120, 8-k) / C(128, 8)
+
+   k=0: ~58.6%        (G is unaffected)
+   k=1: ~31.7%
+   k=2: ~ 8.0%
+   k=3: ~ 1.3%
+   k=4 and above: tiny
+```
+
+So even a flood from N has a >58% chance of not touching G's queues at all, and N must overlap on every one of G's 8 queues to fully starve G. With sufficient queues, the worst case is bounded.
+
+The lesson: the larger `totalQueues / handSize` gets, the better the isolation; but bigger `handSize` reduces variance (more independent queues to absorb a single distinguisher's burst). Defaults of `(128, 8)` for most PLs are a balanced choice.
+
+### 11.6 The "Width" of LIST Seats
+
+A `LIST` request can be expensive. APF accounts for this by giving a LIST a higher seat cost than a normal request. Specifically:
+
+```
+   seats(LIST) ≈ ceil(estimated objects / 100), capped at 10
+   seats(WATCH) = 1 for the duration of the watch
+   seats(everything else) = 1
+```
+
+The estimator uses the watch cache's known object count for the resource. A LIST against a 5000-object resource will consume 10 seats for the duration of the response. Five such LISTs in flight in a PL with 19 seats means new requests queue.
+
+The newer "request width" feature (alpha→beta) refines this further by also accounting for the *time* a request occupies the seat. A LIST that takes 3 seconds vs 30ms have different real costs. The metric `apiserver_flowcontrol_request_concurrency_in_use` already reflects time-weighted seat usage in recent versions.
+
+### 11.7 Defending Against Noisy Tenants
+
+A common operational pattern for a multi-tenant cluster: dedicate a low-priority PL with strict shares for tenant traffic, and add per-namespace distinguishers:
+
+```yaml
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: tenant-low
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 30
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: 256
+        handSize: 6
+        queueLengthLimit: 50
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: tenant
+spec:
+  matchingPrecedence: 1000     # low priority (high number)
+  priorityLevelConfiguration:
+    name: tenant-low
+  distinguisherMethod:
+    type: ByUser
+  rules:
+  - subjects:
+    - kind: Group
+      group:
+        name: tenants
+    resourceRules:
+    - verbs: ["*"]
+      apiGroups: ["*"]
+      resources: ["*"]
+```
+
+This caps every tenant's combined traffic at ~30/410 ≈ 7% of total concurrency; within tenant-low, ByUser distinguishers spread queue assignments via shuffle-sharding so one noisy tenant can't completely starve others.
+
+### 11.8 Tuning Knobs
 
 Most clusters never touch APF defaults. When you must:
 
@@ -2289,7 +2369,105 @@ A single thrashing controller can take a 10k-node cluster's apiserver from 5% CP
                                     APIServerIdentity, etc.
 ```
 
-### 15.5 Profiling
+### 15.5 etcd Connection Pooling
+
+The apiserver maintains a single gRPC client to etcd (per etcd endpoint, with health-aware failover across all `--etcd-servers`). HTTP/2 streams multiplex over this connection. The dispatcher in `staging/src/k8s.io/apiserver/pkg/storage/etcd3/` uses:
+
+```
+   ─ one *clientv3.Client per --etcd-servers entry (failover round-robin
+     across the list; etcd's own clientv3 handles endpoint selection)
+   ─ a long-lived watch per (resource, namespace=cluster-wide) for the
+     watch cache
+   ─ short-lived calls for Get/Put/Txn from request handlers
+```
+
+When etcd is healthy, this is invisible. When etcd has an issue:
+
+- Connection drop → clientv3 reconnects with exponential backoff. During the gap, requests pile up under the timeouts. APF queues fill. After 60s, requests fail with `etcdserver: request timeout`.
+- Slow etcd (e.g. defrag in progress) → every read/write blocks. `etcd_request_duration_seconds` spikes; `apiserver_request_duration_seconds` follows. Watch event delivery is *unaffected* on already-open watches (they are streaming, not request/response), but new watches stall.
+- etcd leader election → ~5s pause typical, longer for split-brain. Apiserver sees brief 5xx burst.
+
+`--etcd-compaction-interval` is set in etcd itself but the apiserver can also drive compaction via `--etcd-compaction-interval=5m` (which has the apiserver, not etcd, send periodic compaction RPCs based on its own clock). The apiserver-driven mode is the safer default in HA clusters.
+
+### 15.6 Resource Sharding
+
+For very large clusters, a common move is to run **separate etcd clusters** for different resources, especially `events.k8s.io/events`. Events are a high-write-rate, low-read-rate resource (Kubernetes Events are emitted by every controller and kubelet for every state transition). Putting them in their own etcd:
+
+```
+   --etcd-servers="https://main-etcd:2379"
+   --etcd-servers-overrides="/events#https://events-etcd:2379"
+   --etcd-servers-overrides="events.events.k8s.io/events#https://events-etcd:2379"
+```
+
+This way, an event storm cannot push out useful objects (Pods, Endpoints) from the main etcd's working set; defrag of one etcd does not affect the other; backups can be tiered by importance.
+
+### 15.7 A Worked Watch Trace
+
+A controller-runtime informer opening a watch on Pods:
+
+```
+   T+0    POST /api/v1/namespaces/myns/pods?
+              labelSelector=app%3Dweb&
+              resourceVersion=8421337&
+              resourceVersionMatch=NotOlderThan&
+              allowWatchBookmarks=true&
+              timeoutSeconds=580&
+              watch=true
+
+   T+1ms  AuthN: bearer SA token → user system:serviceaccount:myns:my-op
+   T+2ms  AuthZ: RBAC, ClusterRoleBinding "my-op" → ok
+   T+2ms  APF: workload-low PL, seat granted (watches consume 1 seat)
+   T+3ms  Generic handler dispatch: pods storage.
+          Storage.Watch(ctx, key="/registry/pods/myns",
+                        opts={RV=8421337, label=app=web,
+                              allowBookmarks=true})
+
+   T+3ms  Cacher.Watch:
+            - request is at RV 8421337
+            - cacher's current RV is 8421340 (ahead)
+            - ring buffer contains events from RV 8421300..8421340
+            - filter events 8421337..8421340 by label app=web
+            - 2 events match: ADDED pod-a@8421338, MODIFIED pod-b@8421339
+            - subscribe to future events
+
+   T+3ms  Response headers:
+            HTTP/2 200 OK
+            Content-Type: application/json
+            Transfer-Encoding: chunked
+            X-Kubernetes-Pf-Flowschema-Uid: workload-low
+
+   T+4ms  Stream first event chunk:
+            {"type":"ADDED","object":{kind:"Pod",
+             metadata:{name:"pod-a", resourceVersion:"8421338"},...}}\n
+
+   T+5ms  Stream second event chunk:
+            {"type":"MODIFIED","object":{kind:"Pod",
+             metadata:{name:"pod-b", resourceVersion:"8421339"},...}}\n
+
+   T+5ms  Catch-up done. Subscriber now sits idle.
+
+   T+60s  Bookmark emitted:
+            {"type":"BOOKMARK","object":{kind:"Pod",
+             metadata:{resourceVersion:"8421412"}}}\n
+          Client learns "you have observed everything ≤ 8421412".
+
+   T+120s ... live events arrive as cluster mutates ...
+
+   T+580s Server-side timeout fires. Apiserver sends:
+            (closes the HTTP/2 stream cleanly; client sees io.EOF)
+          Seat released back to APF pool.
+
+          Client's reflector reconnects with the last-seen RV:
+          POST /api/v1/.../pods?resourceVersion=8421701&watch=true
+```
+
+This trace explains several "magic" client-go behaviors:
+
+- The 580s timeout is server-side; the reflector reconnects on every cycle. This keeps connections fresh and lets the apiserver shed load if a client misbehaves.
+- The bookmark every ~minute is what lets the reflector advance its RV without an explicit LIST.
+- The catch-up at start is what makes "informer ready" usefully precise: when the reflector sees the bookmark indicating "watch has caught up to current RV", the informer can declare itself synced.
+
+### 15.8 Profiling
 
 `/debug/pprof/profile`, `/debug/pprof/heap`, `/debug/pprof/goroutine` are exposed (gated by `--profiling=true`, default true). The two most useful in practice:
 
