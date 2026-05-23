@@ -341,6 +341,126 @@ The keyword to notice is *trigger*. None of these channels carries the work; the
 
 When `HandlePodSyncs([]*v1.Pod{pod})` fires, the chosen pod worker eventually calls `kubelet.SyncPod(ctx, updateType, pod, mirrorPod, podStatus)`. That function is *the* big decision point — see §6. It is idempotent and level-triggered: calling it twice in a row on the same state should produce the same outcome on the second call.
 
+### 3.3 A trace through one syncLoop iteration
+
+Walk the kubelet through a single PLEG-driven sync, so the channels and managers land in your head:
+
+```
+T+0.000s   PLEG relist tick fires.
+           CRI: ListPodSandbox() returns 47 sandboxes.
+           CRI: ListContainers() returns 132 containers.
+           diff vs cached state: container "abc123" (pod-X, "main")
+             was Running, now Exited (exit code 1).
+           emit PodLifecycleEvent{ID: pod-X.UID, Type: ContainerDied,
+                                  Data: "abc123"}
+
+T+0.001s   syncLoop blocks in select; the PLEG event wakes it.
+           branch: case e := <-plegCh:
+             - e.Type == ContainerDied
+               → kl.cleanUpContainersInPod(pod-X.UID, "abc123")
+                 (removes finished container records older than threshold)
+             - kl.podManager.GetPodByUID(pod-X.UID) → pod
+             - HandlePodSyncs([]*v1.Pod{pod})
+
+T+0.002s   HandlePodSyncs computes podWork{
+             pod:          pod-X,
+             updateType:   SyncPodSync,
+             mirrorPod:    nil,
+           }
+           UpdatePod(podWork): pod-X's worker channel already has one update
+             queued — coalesce. The pending update is dropped; podWork takes
+             its place. Worker is currently busy with the previous sync.
+
+T+0.040s   Worker finishes previous sync. Loops, reads new podWork.
+           managePodLoop: pod's state is "running" → run syncPod(...).
+
+T+0.041s   syncPod:
+             podStatus := kl.podCache.Get(pod-X.UID)
+             podStatus.containerStatuses = [
+               {name: "init1", state: Exited(0)},
+               {name: "main",  state: Exited(1), exitCode: 1, restartCount: 2},
+             ]
+             pod.spec.restartPolicy = Always
+
+T+0.042s   computePodActions(pod, podStatus) returns:
+             {
+               SandboxID: "sandbox-xyz",     // sandbox still running
+               CreateSandbox: false,
+               KillPod: false,
+               NextInitContainerToStart: nil,
+               ContainersToStart: [0],       // index of "main" in spec
+               ContainersToKill: {},
+             }
+
+T+0.043s   Step 4: PullImage("nginx:1.27") — already cached, fast no-op.
+
+T+0.045s   Step 7: CreateContainer + StartContainer for "main":
+             CRI: CreateContainer(sandbox=sandbox-xyz, config=...)
+                  → ContainerID "def456"
+             CRI: StartContainer(def456)
+                  → ok
+
+T+0.140s   syncPod returns. Worker marks pod-X clean and waits on channel.
+
+T+0.141s   probeManager (separate goroutine) sees that "main" has changed
+           container ID. It restarts the per-container probe worker, which
+           begins ticking again with the new container ID.
+
+T+0.180s   Status manager: notice pod's container status changed
+             (restartCount 2 → 3, containerID changed). Mark pod as dirty
+             in podStatusChannel.
+
+T+0.~10s   Status manager's batch ticker fires.
+           PATCH /api/v1/namespaces/.../pods/pod-X/status
+             new container status, lastState.terminated{exitCode: 1}
+           apiserver records it.
+T+~10.05s  Watch fan-out: any controller watching this pod (e.g., the
+           Deployment controller via ReplicaSet) sees the restart count
+           bump.
+```
+
+A few takeaways from this trace:
+
+- The kubelet does ~30–40 ms of CRI work to restart a container, but the status update is delayed up to 10 s by the status manager batch interval. That delay is invisible during steady state but matters during cascading restarts.
+- The PLEG event for `ContainerDied` is the *only* signal the kubelet has that the container needs restarting. If PLEG misses an event (rare, but possible during runtime hangs), the periodic `syncCh` tick is the safety net.
+- Image was cached — pull was no-op. On a cold image, T+0.045s through `StartContainer` could be many seconds depending on registry latency.
+
+### 3.4 The PodCache: bridging PLEG events and SyncPod inputs
+
+You may notice `syncPod` reads `podStatus` from `kl.podCache.Get()`, *not* from PLEG directly. The `PodCache` (`pkg/kubelet/container/cache.go`) is a small shim:
+
+```
+                ┌───────────────────────────────────────────────────────┐
+                │  PodCache                                              │
+                │                                                       │
+                │  per-pod entry:                                       │
+                │    timestamp  time.Time                               │
+                │    status     *PodStatus                              │
+                │    err        error                                   │
+                │                                                       │
+                │  PLEG writes here every relist with fresh status.     │
+                │  syncPod (in pod worker) reads here.                  │
+                │  Get() blocks until cache timestamp >= request time.  │
+                │                                                       │
+                │  Why block? syncPod was triggered by a PLEG event at  │
+                │  time T. It needs a status snapshot >= T to be sure   │
+                │  it's seeing the event's effects. A stale cache could │
+                │  make it act on pre-event state.                      │
+                └───────────────────────────────────────────────────────┘
+```
+
+This handshake is invisible in the source until you read the cache; understanding it explains why a slow PLEG poisons the whole pod-sync pipeline. Even if syncLoop's other channels keep firing, the pod workers block on `PodCache.Get()` waiting for fresh PLEG data.
+
+### 3.5 Channel sizing and back-pressure
+
+What happens if `syncLoop`'s consumers fall behind? Look at the channel buffer sizes:
+
+- `configCh`: small buffer (~50). Back-pressures `PodConfig`'s informer; the informer slows down processing apiserver events.
+- `plegCh`: large buffer (~1000). PLEG never blocks; the events queue up.
+- `livenessManager.Updates`, `readinessManager.Updates`, `startupManager.Updates`: per-channel small buffers. Probe workers will drop updates if the channel is full (and probes are level-triggered, so a missed update gets retried on the next probe period).
+
+If `syncLoop` is fully blocked (e.g., a long-running `HandlePodCleanups` call), pod-worker dispatches stop and the node freezes for a brief window. This is rare but does happen during pathological housekeeping runs on nodes with many orphaned cgroups.
+
 ---
 
 ## 4. Pod Workers: Per-Pod Serialization
@@ -575,6 +695,49 @@ The poll loop has three failure modes evented fixes:
 
 For new clusters in 2026, enable evented PLEG and never look back.
 
+### 5.5 The evented PLEG diagram
+
+```
+                        Generic PLEG (default)                     Evented PLEG (1.27+)
+                        ──────────────────────                     ─────────────────────
+
+   ┌────────────┐                              ┌────────────┐
+   │ kubelet    │ relist tick every 1s         │ kubelet    │ subscribe once,
+   │ (1 GR)     │ ──────────────────────►      │ (1 GR)     │ receive forever
+   └─────┬──────┘                              └─────┬──────┘
+         │                                            │
+         │ ListPodSandbox()                           │ GetContainerEvents() (server stream)
+         │ ListContainers()                           │ ◄─── event ─── (push)
+         ▼                                            │ ◄─── event ─── (push)
+   ┌─────────────┐                              ┌────▼──────┐
+   │  runtime    │ scan ALL containers          │  runtime   │ push only on
+   │             │ build response               │            │ state transition
+   └─────────────┘                              └────────────┘
+
+   per-tick cost:                               per-event cost:
+     O(N containers)                              O(1)
+   per-second cost:                             per-second cost:
+     O(N) regardless of churn                     O(events_per_second)
+
+   latency to observe a transition:             latency:
+     up to 1s (next relist)                       ~few ms (push)
+```
+
+The runtime-side change to support evented PLEG is small (containerd implements it via its existing event bus). The kubelet still falls back to generic PLEG if the streaming RPC returns `Unimplemented`. There is no correctness change from operator's perspective; it's a pure efficiency upgrade.
+
+### 5.6 Useful PLEG metrics
+
+```
+kubelet_pleg_relist_duration_seconds              histogram of relist duration
+kubelet_pleg_relist_interval_seconds              histogram of time between relists (~1s expected)
+kubelet_pleg_last_seen_seconds                    unix time of the last successful relist
+kubelet_pleg_events_count_total{type=...}         counter of emitted events by type
+```
+
+`kubelet_pleg_relist_interval_seconds_bucket{le="3"}` should be effectively 100% in a healthy node. If you see it drop below 99%, look at runtime latency.
+
+`kubelet_pleg_last_seen_seconds` is the metric that drives the "PLEG is not healthy" condition. Alert when `(time() - kubelet_pleg_last_seen_seconds) > 60`.
+
 ---
 
 ## 6. The Full Pod Sync: computePodActions and SyncPod
@@ -682,6 +845,95 @@ Termination order is reverse: app containers stopped first (with `preStop` and g
 `SyncPod` is called many times per pod lifetime — on every PLEG event affecting the pod, every probe transition, every spec change, every periodic resync. It must do nothing if nothing changed. The way `computePodActions` is structured (compute everything by comparing observed-vs-desired, then act on the diff) makes that property fall out naturally.
 
 The hidden trap: state that lives outside the runtime — host directories, sysctls, kernel parameters — is *not* part of the diff. A `syncPod` that thinks it has nothing to do may have a half-mounted volume from a crashed prior attempt. The volume manager (§10) handles that with its own reconciliation loop.
+
+### 6.4 Worked example: a pod with 1 init, 1 sidecar, 2 app containers
+
+Consider:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata: {name: web, namespace: default}
+spec:
+  restartPolicy: Always
+  initContainers:
+    - name: migrate                       # regular init: runs to completion
+      image: app:1.0
+      command: ["./migrate.sh"]
+    - name: proxy                          # native sidecar (restartPolicy: Always)
+      image: envoy:1.30
+      restartPolicy: Always
+  containers:
+    - name: app                            # app container
+      image: app:1.0
+    - name: metrics                        # app container (could be a sidecar conceptually)
+      image: prom-exporter:1.0
+```
+
+Startup sequence (timeline):
+
+```
+T=0    syncLoop sees pod ADD. PodWorker spawned.
+T=10   syncPod: computePodActions:
+         no sandbox yet → CreateSandbox=true, Attempt=1
+T=15   CRI: RunPodSandbox returns sandbox id
+T=20   CRI: PullImage(app:1.0)         } parallel
+       CRI: PullImage(envoy:1.30)       } parallel
+       CRI: PullImage(prom-exporter:1.0)} parallel
+       (kubelet limits concurrency per --max-parallel-image-pulls)
+T=80   all images cached.
+T=82   CRI: CreateContainer + StartContainer "migrate" (init[0])
+T=85   syncPod returns; nothing more to do until migrate exits.
+
+T=120  PLEG observes migrate Exited(0). syncLoop queues SyncPodSync.
+T=130  syncPod: computePodActions:
+         all regular init containers done up to migrate? yes.
+         next init: "proxy" (sidecar).
+         start sidecars first, before app containers.
+       CRI: CreateContainer + StartContainer "proxy"
+T=140  proxy reports Running via PLEG.
+
+T=145  syncPod (next pass): all init+sidecars started? yes.
+       ContainersToStart = [0 (app), 1 (metrics)].
+       CRI: CreateContainer + StartContainer "app"
+       CRI: CreateContainer + StartContainer "metrics"
+
+T=150  All containers running. probeManager starts probe workers for each.
+T=160  Readiness gates resolve, status manager PATCHes pod.status:
+         conditions: PodScheduled=True, Initialized=True,
+                     ContainersReady=True, Ready=True
+```
+
+Now imagine "app" crashes 5 minutes in:
+
+```
+T=300  PLEG: ContainerDied(app, exit=1).
+T=300  syncLoop: HandlePodSyncs.
+T=300.05  syncPod: computePodActions:
+            restartPolicy=Always, ExitCode=1
+            ContainersToStart = [0 (app)]
+          CRI: CreateContainer + StartContainer "app"
+T=300.1   New container id; probeManager swaps workers.
+T=300.2   restartCount in pod.status: 0 → 1 (batched within 10s).
+          "proxy" and "metrics" untouched.
+```
+
+If `app` had restartPolicy `Never` and exited with code 0, computePodActions would mark it `done`, and once all *regular* (non-sidecar) containers in `spec.containers` complete, the pod transitions to `Succeeded`. The sidecar `proxy` would be terminated by the kubelet when the pod is wound down.
+
+### 6.5 The "ContainersToKill" reasons
+
+When the kubelet decides to kill a container that's currently running, it records *why* on each entry. The reasons land in pod events and are worth recognizing:
+
+| Reason | When triggered |
+|---|---|
+| `Container is dead` | The runtime reports it dead but it's still in our state |
+| `Container failed liveness probe` | livenessManager said so |
+| `Container failed startup probe` | startupManager said so |
+| `Container spec hash changed` | Image, env, command, or another spec field changed |
+| `Container failed to start` | A previous `StartContainer` errored; tearing down for retry |
+| `Pod is terminating` | spec.deletionTimestamp set; cleanup in progress |
+
+The `Container spec hash changed` reason is how in-place container restarts (e.g., bumping `image` on a static pod's YAML) get triggered. The kubelet computes a hash of the container's relevant spec fields and stores it as an annotation on the running container; when the hash differs from the spec's hash, kill-and-recreate.
 
 ---
 
@@ -854,6 +1106,73 @@ A few subtleties most operators get wrong:
 The general rule:
 
 > **Liveness = "is the process so broken that restart will help?".** Readiness = "should I receive traffic right now?". Startup = "am I done initializing?". They should answer different questions.
+
+### 8.4 The probe state machine
+
+```
+                       ┌─────────────────────┐
+                       │  container started   │
+                       └──────────┬──────────┘
+                                  │
+                       ┌──────────▼──────────┐
+                       │ startup probe        │   yes ─► startup probe disabled
+                       │ configured?          │          enable liveness + readiness
+                       └──────────┬──────────┘          probes immediately
+                                  │ yes
+                                  ▼
+                       ┌────────────────────────────────────────────────────┐
+                       │  startup probe ticks at periodSeconds                │
+                       │    ├── success — flip "started" flag in startupManager│
+                       │    │            stop running startup probe           │
+                       │    │            now liveness + readiness probes start│
+                       │    │            no liveness restarts before this    │
+                       │    └── failureThreshold consecutive failures        │
+                       │              ↓                                      │
+                       │            kill container (per restartPolicy)       │
+                       └────────────────────────────────────────────────────┘
+                                  │
+                                  ▼ (started=true)
+                       ┌────────────────────────────────────────────────────┐
+                       │  liveness probe ticks                                │
+                       │    ├── success — no action (or recovery from prior)  │
+                       │    └── failureThreshold consecutive failures        │
+                       │              ↓                                      │
+                       │            kill container (per restartPolicy)       │
+                       └────────────────────────────────────────────────────┘
+                       
+                       ┌────────────────────────────────────────────────────┐
+                       │  readiness probe ticks                               │
+                       │    ├── success — set containerStatus.ready = true   │
+                       │    │            include in Service endpoints         │
+                       │    └── failure — set containerStatus.ready = false  │
+                       │              ↓ no kill, just deregister              │
+                       │            EndpointSlice controller removes pod     │
+                       │            from Service endpoints                    │
+                       └────────────────────────────────────────────────────┘
+```
+
+The two probes that *restart* (startup, liveness) and the one that *deregisters* (readiness) are the entire contract.
+
+### 8.5 Failure threshold and timing math
+
+Time to detect liveness failure:
+
+```
+detection_time = (failureThreshold - 1) * periodSeconds + (1 * periodSeconds_with_timeout)
+               ≈ failureThreshold * periodSeconds   (worst-case)
+```
+
+With defaults (`periodSeconds=10, failureThreshold=3`), it takes ~30 seconds to restart a stuck container. For latency-critical workloads with fast failover, set `periodSeconds=5, failureThreshold=2` → 10s detection. But beware: flakier networks may produce false positives at those tighter thresholds.
+
+Time to be considered Ready:
+
+```
+ready_time = startup_threshold_passes + readiness_threshold_passes
+           = startupProbe.successThreshold * startupProbe.periodSeconds
+             + readinessProbe.successThreshold * readinessProbe.periodSeconds
+```
+
+A `readinessProbe.successThreshold` greater than 1 is one of the few cases where >1 makes sense (require the probe to be consistently green before exposing). For `livenessProbe.successThreshold`, the kubelet *requires* it to be 1 — recovery is always immediate.
 
 ---
 
@@ -1363,6 +1682,39 @@ If memory had been 2Gi only on NUMA1 and the policy was `single-numa-node`, the 
 
 For HPC, latency-sensitive trading, ML training with high inter-GPU bandwidth, telco DPDK workloads — yes, this is mandatory. For general microservices — leave it at `none`. The configuration cost of getting topology right (and the operational cost of pods being rejected as Failed) is real.
 
+### 15.5 Container vs pod scope: a worked example
+
+Two-container pod, one needs 2 CPUs + 1 GPU, one needs 2 CPUs (no GPU). Node: 2 NUMA nodes, the only GPU is on NUMA1.
+
+**Scope = container:**
+- Container A (2 CPUs + GPU): preferred NUMA mask 0b10 (NUMA1) — that's where the GPU is.
+- Container B (2 CPUs):       preferred NUMA mask 0b01 OR 0b10 — no GPU, either is fine.
+- Result: A pinned to NUMA1 CPUs, B pinned to NUMA0 CPUs. Pod spans NUMA, but each container's *own* work is local.
+
+**Scope = pod:**
+- Combined request: 4 CPUs + 1 GPU.
+- The GPU forces NUMA1.
+- Both containers' CPUs come from NUMA1.
+- If NUMA1 doesn't have 4 free exclusive CPUs, the policy rejects.
+
+Pod scope is much stricter; container scope is the default and almost always what you want unless the containers share a lot of state (e.g., the same shared memory segment).
+
+### 15.6 Observability
+
+The topology manager emits the `topology_manager_admission_*` metrics:
+
+```
+topology_manager_admission_requests_total           total hint evaluations
+topology_manager_admission_errors_total{type=...}   rejections by reason
+topology_manager_admission_duration_ms              histogram of decision time
+```
+
+When the policy rejects a pod, you'll see a Pod event:
+```
+Warning  TopologyAffinityError  kubelet  Resources cannot be allocated with Topology locality
+```
+followed by the pod being marked `Failed`. The scheduler controller (or a higher-level operator) is responsible for retrying.
+
 ---
 
 ## 16. Eviction Manager
@@ -1463,7 +1815,73 @@ When pressure persists, the kubelet sets `Node.status.conditions`:
 
 The scheduler reacts to these taints and stops sending new pods to a pressured node.
 
-### 16.5 Common eviction mistakes
+### 16.5 Worked example: a node under memory pressure
+
+```
+   Node: 32Gi total, kubeReserved+systemReserved = 2Gi.
+   evictionHard: memory.available<500Mi
+   evictionSoft: memory.available<1Gi   (gracePeriod 30s, maxPodGrace 60s)
+
+   Pods on node:
+     P1 (Guaranteed, request=limit=8Gi, using 7Gi)
+     P2 (Burstable,  request=2Gi limit=8Gi, using 6Gi)
+     P3 (Burstable,  request=1Gi limit=4Gi, using 3.5Gi)
+     P4 (Burstable,  request=512Mi limit=2Gi, using 1.8Gi)
+     P5 (BestEffort, no requests, using 800Mi)
+     P6 (BestEffort, no requests, using 500Mi)
+
+   Total used: 19.6Gi. Plus 2Gi reserved. Plus 0.5Gi kernel caches.
+   memory.available = 32 - 22.1 ≈ 9.9Gi. All quiet.
+
+   T+0:    A traffic spike pushes P2 to 11Gi (within its 8Gi limit? NO — P2
+           was set with limit=8Gi). Actually let's say P2 spikes to 8Gi
+           (its limit). Now total: 22.6Gi. avail: ~9Gi. Still fine.
+
+   T+30:   P3 leaks. Climbs to 4Gi (its limit). total: 23.1Gi. avail: ~8Gi.
+
+   T+60:   Kernel caches grow because workloads do disk IO. avail: 900Mi.
+           Soft threshold (1Gi) crossed.
+           eviction loop: signal crossed but only just; grace timer starts.
+
+   T+90:   Still under 1Gi. 30s grace satisfied.
+           Pick eviction target:
+             BestEffort group first.
+             P5: 800Mi usage.
+             P6: 500Mi usage.
+             → P5 (higher usage) evicted first.
+           PreStop hooks run, SIGTERM, up to 60s grace.
+
+   T+92:   P5's containers gone. ~800Mi freed.
+           avail: 1.7Gi. Recovered above soft threshold.
+
+   T+120:  Another spike. P3 keeps growing. avail: 400Mi.
+           Hard threshold (500Mi) crossed.
+           No grace. Immediate eviction.
+           Pick: BestEffort first → P6 (only remaining BestEffort) → SIGKILL.
+
+   T+121:  ~500Mi freed. avail: ~900Mi. Crossed back over hard, below soft.
+           Burstable taint added: node.kubernetes.io/memory-pressure:NoSchedule.
+
+   T+150:  Spike persists. avail drops to 400Mi again. Hard re-triggered.
+           No BestEffort pods left. Pick Burstable:
+             P2 usage above request: 8 - 2 = 6Gi (rank score 6Gi)
+             P3 usage above request: 4 - 1 = 3Gi (rank score 3Gi)
+             P4 usage above request: 1.8 - 0.5 = 1.3Gi (rank score 1.3Gi)
+           → P2 evicted (highest overage). SIGKILL.
+
+   T+151:  ~8Gi freed. avail: ~8.5Gi. Pressure cleared.
+           memory-pressure condition stays True until
+           --eviction-pressure-transition-period (5m default) elapses.
+```
+
+Notes from the trace:
+
+- BestEffort goes first regardless of how much memory they use, because they have no request — they're explicitly "I'm cheap, kill me first".
+- Among Burstable, the metric is *usage above request*, not absolute usage. P2 was Burstable but using 6Gi over its 2Gi request, so it ranks highest.
+- Guaranteed pod P1 was never touched. To evict a Guaranteed pod, eviction has to exhaust all Burstable options too.
+- After eviction, the node carries the `MemoryPressure` taint for a 5-minute window even after recovery, blocking new pods that wouldn't tolerate it. This prevents a flapping scheduling pattern.
+
+### 16.6 Common eviction mistakes
 
 | Mistake | Consequence |
 |---|---|
@@ -1474,6 +1892,45 @@ The scheduler reacts to these taints and stops sending new pods to a pressured n
 | All pods BestEffort | Every memory spike evicts random workloads |
 
 The full picture of resources and QoS is chapter 21; here, just internalize that **the eviction manager is the kubelet's hand on the lever, and the only way to keep the node alive when limits are wrong**.
+
+---
+
+### 16.7 The cgroup hierarchy the kubelet manages
+
+The kubelet creates and maintains a cgroup hierarchy under `--cgroup-root` (default `/`). On a systemd-cgroup-driver node (the modern default), the layout under `/sys/fs/cgroup/` is:
+
+```
+/sys/fs/cgroup/
+├── kubepods.slice/                         # all pods live here
+│   ├── kubepods-besteffort.slice/          # cgroup for QoS BestEffort tier
+│   │   ├── kubepods-besteffort-pod<UID>.slice/
+│   │   │   ├── cri-containerd-<id>.scope/  # one container
+│   │   │   ├── cri-containerd-<id>.scope/
+│   │   │   └── ...
+│   │   └── ...
+│   ├── kubepods-burstable.slice/           # cgroup for QoS Burstable tier
+│   │   └── kubepods-burstable-pod<UID>.slice/
+│   │       └── ...
+│   └── kubepods-pod<UID>.slice/            # Guaranteed pods live at top level
+│       └── cri-containerd-<id>.scope/
+│
+├── system.slice/                           # kubelet, runtime, system daemons
+│   ├── kubelet.service/
+│   ├── containerd.service/
+│   └── ...
+└── user.slice/                              # per-user (irrelevant for the kubelet)
+```
+
+The kubelet:
+
+- Creates `kubepods.slice` with limits derived from `(node capacity) - (kubeReserved) - (systemReserved) - (evictionHard.memory)`. This is the "allocatable" envelope.
+- Creates `kubepods-besteffort.slice` and `kubepods-burstable.slice` as middle tiers so kernel OOM and reclaim happen *within* a QoS tier first.
+- Creates a per-pod slice for each pod, with limits computed from the pod's resource requests/limits.
+- The container runtime (containerd, CRI-O) creates the per-container scopes inside the pod's slice.
+
+This three-level nesting (qos → pod → container) is why an OOM in a Burstable pod doesn't preempt Guaranteed pods: the kernel's cgroup-OOM stays within the deepest cgroup that's over its limit.
+
+`--cgroup-driver=systemd` vs `--cgroup-driver=cgroupfs`: in cgroupfs mode the kubelet manipulates `/sys/fs/cgroup` directly; in systemd mode it asks systemd to create slices via D-Bus. The modes must match between the kubelet *and* the container runtime, or the runtime tries to put containers in cgroups the kubelet didn't create and things get bizarrely broken.
 
 ---
 
@@ -1762,6 +2219,73 @@ cAdvisor is the underlying data source for both `/metrics/cadvisor` (Prometheus 
 `/metrics/cadvisor` produces ~50 series per container. On a node with 250 pods × 3 containers, that's 37,500 series per scrape per node. A 5000-node cluster: 187M series. Most of this is noise — only a fraction of the metrics are ever queried.
 
 The recommendation in production is: scrape `/metrics/cadvisor` from a smaller relabeling-aggressive Prometheus, drop labels that explode cardinality (`pod`, `container`, `image` are unavoidable; `boot_id`, `host`, anything per-pid is gratuitous), and keep retention low.
+
+### 22.3 The Node heartbeat and lease
+
+Separate from pod-status reporting, the kubelet has to *announce its own liveness* to the cluster. This is the **node heartbeat**, and how it works changed significantly over Kubernetes history.
+
+Pre-1.13:
+- Kubelet PATCHed `Node.status` every 10 seconds. A full status patch is ~10 KB. At 5000 nodes × 0.1 Hz = 500 writes/s × 10 KB = 5 MB/s into etcd just for heartbeats.
+
+1.13+:
+- Two heartbeats:
+  - **Node status update**: still happens, but only every `--node-status-update-frequency` (default 10s) *or* when status materially changes (e.g., a condition flips). On steady state this PATCH is rare.
+  - **Lease**: a separate `coordination.k8s.io/v1/Lease` object in the `kube-node-lease` namespace, one per node. Tiny (~50 bytes). Updated at `--node-status-update-frequency` (10s default). Renewed via `Lease.spec.renewTime`.
+- The node-lifecycle controller (in kube-controller-manager) watches the Lease, not the Node, to decide when to mark a Node `NotReady`.
+
+The default ratio is: full Node status update every `nodeStatusUpdateFrequency × nodeStatusReportFrequency = 10s × 5 = 50s`, plus event-triggered. Lease renew every 10s.
+
+If the controller hasn't seen a lease renewal in `--node-monitor-grace-period` (default 40s), the Node is marked `NotReady`. After `--pod-eviction-timeout` (default 5m) without recovery, pods on that node are evicted (set `deletionTimestamp`; they re-schedule elsewhere).
+
+### 22.4 cAdvisor data sources
+
+cAdvisor (now `internal/cAdvisor`) collects metrics from many sources:
+
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │  cAdvisor inside the kubelet                                  │
+   │                                                              │
+   │  Per-container data sources (per cgroup):                    │
+   │    /sys/fs/cgroup/<...>/cpu.stat       → cpu.usage_usec      │
+   │    /sys/fs/cgroup/<...>/memory.current → RSS+cache           │
+   │    /sys/fs/cgroup/<...>/memory.stat    → working set, etc.   │
+   │    /sys/fs/cgroup/<...>/io.stat        → bytes/iops per dev  │
+   │    /sys/fs/cgroup/<...>/pids.current   → process count       │
+   │                                                              │
+   │  Per-container network (via runtime or netns):                │
+   │    /proc/<pause-pid>/net/dev → ifInBytes, ifOutBytes         │
+   │                                                              │
+   │  Container filesystem (overlayfs):                           │
+   │    statfs on the rootfs upperdir                             │
+   │                                                              │
+   │  Container metadata (from CRI):                              │
+   │    image, container name, pod name, namespace, labels        │
+   │                                                              │
+   │  Polling interval: --housekeeping-interval (default 10s)      │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+The "working set" memory cAdvisor reports is `memory.usage_in_bytes - inactive_file` on v1 and `memory.current - inactive_file` on v2 — an estimate of "memory the application is actually using" excluding reclaimable cache. This is the value the eviction manager uses for ranking decisions, and the value HPA's memory-based scaling reads from metrics-server.
+
+### 22.5 What metrics-server reads
+
+metrics-server is a small aggregated API server (chapter 24) that serves the `metrics.k8s.io/v1beta1` API. Internally it does:
+
+```
+   metrics-server pod (replica per cluster, or several behind HA)
+     │
+     │ every 15s (configurable):
+     │   for each Node:
+     │     HTTPS GET https://<kubelet-IP>:10250/metrics/resource
+     │     ↑ kubelet authn/authz via apiserver
+     │
+     │ aggregate per-pod + per-node
+     ▼
+   serve at /apis/metrics.k8s.io/v1beta1/nodes  and  /pods
+     ↑ HPA, VPA, `kubectl top` read here
+```
+
+The reason `/metrics/resource` exists (as a sibling to `/metrics/cadvisor`) is that metrics-server only needs a tiny subset of cadvisor — CPU usage and memory working-set — and dropping the rest cuts the scrape volume by ~20×.
 
 ---
 

@@ -853,6 +853,59 @@ Assumed pods have a TTL (default 30 seconds). If a pod sits "assumed" longer tha
 
 ---
 
+### 5.3 NodeInfo Internals
+
+The per-node struct (`pkg/scheduler/framework/types.go`) is information-dense. Sketched:
+
+```go
+type NodeInfo struct {
+    // The underlying *v1.Node (may be nil if node info exists only because pods reference it).
+    node *v1.Node
+
+    // All pods on the node (running + assumed).
+    Pods []*PodInfo
+
+    // Subsets for fast iteration.
+    PodsWithAffinity        []*PodInfo   // pods that have podAffinity terms
+    PodsWithRequiredAntiAffinity []*PodInfo
+
+    // Aggregate resource accounting.
+    Requested        *Resource    // sum of requested resources
+    NonZeroRequested *Resource    // for pods with no CPU/mem request, use defaults (100m, 200Mi)
+    Allocatable      *Resource    // from node.status.allocatable
+
+    // Ports.
+    UsedPorts HostPortInfo
+
+    // Image cache: image name → size, last-update.
+    ImageStates map[string]*ImageStateSummary
+
+    // PVCRefCounts: PVC name → number of pods using it on this node.
+    PVCRefCounts map[string]int
+
+    // Bumped on any change; used by snapshot mechanism.
+    Generation int64
+}
+```
+
+The two `Requested` flavors deserve a note. **NonZeroRequested** exists for the case where a pod has no resource requests at all — BestEffort QoS. The scheduler still wants to *spread* such pods rather than pack them all on one node, so it pretends they request 100m CPU and 200Mi memory. This synthetic accounting is used for Score (specifically `NodeResourcesBalancedAllocation`) but NOT for Filter — Filter still sees the true (zero) requests.
+
+This is a subtle but important behavior: if you create 1000 BestEffort pods, NodeResourcesFit will let them all land on one node (sum of requests = 0); but the Score plugins will steer them apart.
+
+### 5.4 Generation Counters and Snapshot Diffs
+
+The cache tracks a generation counter per NodeInfo. When the scheduler takes a snapshot for a new cycle, it doesn't copy every NodeInfo — it copies only those whose generation increased since the last snapshot. This makes snapshots O(changed-nodes), not O(total-nodes).
+
+In a 5000-node cluster where 5 pods land per second, perhaps 5 NodeInfos change per second. Each cycle's snapshot is essentially free; the dominant cost is the snapshot scaffolding (a slice of pointers).
+
+### 5.5 The `nodeTree` Structure
+
+For zone-fair iteration, the cache maintains a `nodeTree`: a map of region → zone → list of nodes. Iteration cursors per zone advance independently; the global iteration order is `zones[0][0], zones[1][0], zones[2][0], zones[0][1], ...`. When a zone's cursor reaches the end of its list, it wraps. The starting zone for each scheduling cycle rotates so different cycles begin in different zones.
+
+This rotation is the answer to: "why does my pod sometimes land in zone A and sometimes in zone B even with no other constraints?" The Score plugins might score zone A and zone B equally (tie), and the iteration starting point determines which one the scheduler sees first.
+
+---
+
 ## 6. NodeResourcesFit: Filter and Score in Detail
 
 NodeResourcesFit is the workhorse plugin. It both filters (does the pod fit?) and scores (how full is the node?). Almost every pod that schedules touches this plugin's logic.
@@ -938,11 +991,51 @@ The user provides a list of `(utilization, score)` points; the scheduler interpo
 
 Choose `MostAllocated` for cost-optimized clusters (let nodes empty and scale down). Choose `LeastAllocated` for latency-sensitive workloads (don't let nodes get hot). RequestedToCapacityRatio is for clusters with non-monotonic preferences (e.g., "I want nodes to be 70% full, not more not less").
 
-### 6.5 Extended Resources Don't Have Defaults
+### 6.5 The "NonZero" Defaults
+
+When the scheduler scores nodes, pods with no CPU/memory requests are treated as if they requested 100m and 200Mi (the "NonZero" defaults). This affects `NodeResourcesBalancedAllocation` and the score side of `NodeResourcesFit`. It does *not* affect Filter.
+
+The reason: a node with 200 zero-request pods looks empty to Filter (sum of requests = 0) but has real CPU and memory pressure from all those processes. The NonZero defaults make Score reflect that pressure.
+
+If you have a fleet of BestEffort sidecars (a node-exporter daemon, a logging agent), expect Score to count them as ~100m CPU each — a 100-pod node "feels" like 10 cores of synthetic pressure to the scorer even though Filter sees zero. This is a feature, not a bug; the alternative (treating BestEffort as truly weightless) packs them all onto one node.
+
+### 6.6 Extended Resources Don't Have Defaults
 
 If a pod requests `nvidia.com/gpu: 1` but no nodes report that resource as allocatable, NodeResourcesFit filters out *every* node. The pod sits forever (or until a node with GPUs joins). This is the source of many "pod sits Pending" surprises: the user thought GPUs were ubiquitous, but the device plugin isn't installed on the right nodes.
 
 **Always pair GPU requests with a `nodeSelector` or `nodeAffinity` that scopes to GPU nodes.** This isn't strictly required for correctness (NodeResourcesFit handles it), but it produces better failure messages and avoids surprising the descheduler.
+
+---
+
+### 6.7 Worked Example: A 16-Core Node
+
+A node with `allocatable: cpu=16, memory=32Gi` running:
+
+| Pod | CPU req | Mem req |
+| --- | --- | --- |
+| kube-proxy (DaemonSet) | 100m | 50Mi |
+| node-exporter | 50m | 30Mi |
+| logging-agent | 200m | 200Mi |
+| app-1 | 2 | 4Gi |
+| app-2 | 2 | 4Gi |
+| app-3 | 4 | 8Gi |
+| **Sum** | **8.35** | **16.28Gi** |
+
+Filter for an incoming `cpu=4, mem=8Gi` pod:
+- CPU check: `16 - 8.35 - 4 = 3.65 >= 0` → pass.
+- Mem check: `32 - 16.28 - 8 = 7.72Gi >= 0` → pass.
+
+Score (LeastAllocated, equal weights):
+- CPU post-place: `(16 - 8.35 - 4) / 16 = 22.8%` free → contributes 22.8.
+- Mem post-place: `(32 - 16.28 - 8) / 32 = 24.1%` free → contributes 24.1.
+- Average: 23.5 → final score: 23.
+
+Compare with MostAllocated:
+- CPU post-place: `(8.35 + 4) / 16 = 77.2%` used → 77.2.
+- Mem post-place: `(16.28 + 8) / 32 = 75.9%` used → 75.9.
+- Average: 76.5 → final score: 77.
+
+Same node; same pod; vastly different scores depending on strategy. Multiplied by plugin weight against the other scoring plugins, this determines whether the pod lands here or on a different node.
 
 ---
 
@@ -1036,9 +1129,38 @@ With P pods matching the selector and N candidate nodes, the naive cost is O(P �
 
 At 5,000 nodes and 50,000 pods, pod affinity terms with `topologyKey=hostname` and broad labelSelectors are the single largest source of scheduling latency. The standard advice: **don't use pod anti-affinity for spread; use PodTopologySpread (§8).** Pod anti-affinity remains useful for genuine "must not co-locate" rules — pairs of pods where co-location is incorrect, not merely undesirable.
 
-### 7.5 Cross-Namespace Affinity
+### 7.5 The "Symmetric Matching" Rule
+
+A subtle correctness rule of pod-affinity: if pod P has anti-affinity against pods matching `app=frontend`, the scheduler does not just check existing frontend pods — it also checks *other unscheduled pods with the same rule*. This is intentional: if you create 5 frontend pods at once with `topologyKey=hostname` anti-affinity, they should land on 5 different nodes (not all on the first node that passes when each is evaluated independently).
+
+The mechanism: assumed pods. When pod #1 is reserved on node A, the cache treats it as "running on A". When pod #2's Filter runs, node A now has a frontend → anti-affinity violated → reject. So pod #2 picks node B. And so on.
+
+This works because the scheduling cycle is serial. Two parallel scheduling cycles for two anti-affined pods could both pick the same node. The serial design is the reason this stays correct.
+
+### 7.6 Cross-Namespace Affinity
 
 By default, pod-affinity rules match pods in the same namespace as the pod evaluating the rule. You can broaden the match by listing namespaces explicitly or by using a `namespaceSelector` (label-selector on Namespace objects). Cross-namespace affinity is also expensive — the plugin must consider pods across the entire cluster.
+
+---
+
+### 7.7 An Example PodAffinity Use Case
+
+Pod affinity (positive co-location) is rarer than anti-affinity but useful for:
+
+```yaml
+# A cache pod that should co-locate with its app pod for low-latency IPC.
+spec:
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels: { app: web-frontend }
+        topologyKey: kubernetes.io/hostname
+```
+
+This says: "place me on a node that already has an `app: web-frontend` pod." Combined with anti-affinity ("no two of *me* on the same node"), you can build a 1:1 sidecar-style pattern without using actual sidecars (useful when the cache process must run as a separate scheduling unit, perhaps with different resource requests or restart semantics).
+
+The startup ordering matters: if the affinity pod (cache) is created first, no frontend exists yet → it has nothing to attach to → it sits Pending. The frontend pod creates → frontend lands somewhere → cache wakes via the Pod Add event and lands on the same node. So the order is: dependent → dependency, not the other way around. This is the classic pod-affinity bootstrap problem; avoid by either creating the dependency first (manually or via init order in a Job) or by making the affinity `preferred` instead of `required`.
 
 ---
 
@@ -1136,7 +1258,42 @@ Anti-affinity is still the right tool for "literally must not be on the same nod
 
 By default (since GA), spread counts consider only nodes the pod *could* be scheduled to (i.e., nodes that pass the pod's nodeAffinity and toleration checks). You can flip these policies to `Ignore` to count all nodes regardless of whether the pod could land there. The default `Honor` is almost always correct.
 
-### 8.8 `matchLabelKeys`
+### 8.8 ASCII Walkthrough: maxSkew=1 Across Three Zones
+
+```
+INITIAL STATE                   AFTER PLACING NEW POD
+─────────────                   ──────────────────────
+
+zone a: ●●●●  (4)              zone a: ●●●●     (4) - no change candidates
+zone b: ●●●●  (4)              zone b: ●●●●●    (5) ← OK, skew=1
+zone c: ●●●   (3)              zone c: ●●●●     (4) ← OK, skew=0
+
+min=3                          if placed in c: new min=3, skew(a)=1 ✓
+maxSkew=1                      if placed in b: new min=3, skew(a)=1, skew(b)=2 ✗
+                               if placed in a: new min=3, skew(a)=2 ✗
+
+Filter allows ONLY zone c.
+```
+
+Second pod immediately after:
+```
+zone a: ●●●●     (4)
+zone b: ●●●●     (4)         min=4
+zone c: ●●●●     (4)         skews all 0
+```
+
+Now all zones are candidates. The third pod arrives:
+```
+zone a: ●●●●     (4)         placing in any zone makes that zone 5, min stays 4, skew=1 ✓
+zone b: ●●●●     (4)         all three feasible; pick by Score (zone with most spare resources)
+zone c: ●●●●     (4)
+```
+
+The fourth, fifth, and sixth pods round-robin across zones, achieving the canonical staircase pattern.
+
+This illustrates why TopologySpread "feels balanced" — once skew is zero, it's permissive; only when imbalance grows does it reject.
+
+### 8.9 `matchLabelKeys`
 
 `matchLabelKeys: [pod-template-hash]` says "only spread against pods with the same value for this label as me". For Deployments, `pod-template-hash` is unique per ReplicaSet. So each rolling-update revision spreads independently, and you don't get a transient "skewed" warning during rollouts when half the pods belong to the new revision and half to the old.
 
@@ -1206,6 +1363,41 @@ tolerations:
 ```
 
 Plus a matching `nodeSelector` or `nodeAffinity` to attract the pod to those nodes. The taint excludes; the affinity attracts. You need both — the taint alone keeps other pods off, but doesn't pull your pods on.
+
+---
+
+### 9.6 Toleration Operators
+
+A toleration has an `operator`:
+
+- `Equal` (default): match if `key`, `value`, and `effect` all match.
+- `Exists`: match if `key` exists; `value` is ignored. Use to tolerate any value of a key.
+
+A toleration with empty key + `Exists` matches every taint — that's how `system-node-critical` priority class pods get implicit tolerations (they're allowed to run on every node, regardless of taints).
+
+```yaml
+# Tolerate any taint (very permissive — use sparingly)
+tolerations:
+- operator: Exists
+```
+
+```yaml
+# Tolerate specific key with any value
+tolerations:
+- key: gpu-model
+  operator: Exists
+  effect: NoSchedule
+```
+
+### 9.7 Cordon vs Drain vs Taint
+
+These three things are often conflated:
+
+- **`kubectl cordon`** sets `node.spec.unschedulable = true`. The NodeUnschedulable Filter plugin rejects new pods. Existing pods stay.
+- **`kubectl drain`** does cordon + eviction of pods (via the eviction API, honoring PDBs).
+- **Tainting** adds a (key, value, effect) tuple to `node.spec.taints`. Pods without matching tolerations are rejected by TaintToleration.
+
+`cordon` is a quick "no new pods here" used for one-off maintenance. Tainting is the general mechanism; the unschedulable bit is just a special-cased taint (`node.kubernetes.io/unschedulable:NoSchedule`).
 
 ---
 
@@ -1318,7 +1510,42 @@ Preemption is *single-node*. The plugin never says "evict one pod from node A an
 
 If you need cross-node preemption (or gang preemption), you're in custom-scheduler territory (chapter 34).
 
-### 10.7 Preemption is Not Capacity Management
+### 10.7 Worked Preemption Example
+
+Node `n-12` has allocatable cpu=8. Current pods on it (all running):
+| Pod | Priority | CPU req |
+| --- | --- | --- |
+| daemon-1 (system-node-critical) | 2000001000 | 100m |
+| logging (default) | 0 | 200m |
+| batch-a (low) | 100 | 2 |
+| batch-b (low) | 100 | 2 |
+| webapp (medium) | 500 | 3 |
+| **Total** | | **7.3** |
+
+Pending pod `P` with priority=1000 needs cpu=4.
+
+**Step 1:** Filter rejects every node — `n-12` has only 0.7 free, others are full too. PostFilter (DefaultPreemption) kicks in.
+
+**Step 2:** Per-node victim search. On `n-12`:
+- Candidate victims (priority < 1000): logging (0), batch-a (100), batch-b (100), webapp (500). Not daemon-1 (system-node-critical > 1000).
+- Sort by priority asc, then by victim-cost (negative; smaller cost = better to kill). Order: logging, batch-a, batch-b, webapp.
+- Greedy remove until P fits: remove logging (0.7+0.2=0.9 free, P needs 4 → still no fit), remove batch-a (2.9 free → no fit), remove batch-b (4.9 free → fits!).
+- Then try to put pods back as long as P still fits. Put batch-b back? No (would go back to 2.9 free). Put logging back? Yes (4.7 free, still fits). Put batch-a back? No (would go to 2.7).
+- Final victims on `n-12`: batch-a, batch-b. Their combined priority sum: 200; min priority among victims: 100.
+
+**Step 3:** Repeat for other candidate nodes. Suppose `n-15` requires victimizing webapp (priority 500). Min-priority-victim is 500.
+
+**Step 4:** Pick the cheapest. The framework prefers nodes whose *highest-priority victim is lowest*. `n-12`'s highest-priority victim is 100; `n-15`'s is 500. Pick `n-12`.
+
+**Step 5:** PDB check. If a PDB protects batch-a/batch-b with `DisruptionsAllowed=0`, the framework downgrades `n-12` in the ranking. If all candidate nodes have PDB violations, it picks the one with the fewest (still preempting).
+
+**Step 6:** Delete batch-a and batch-b with their `terminationGracePeriodSeconds`. Set `P.status.nominatedNodeName = n-12`. Return; P stays in the queue.
+
+**Step 7:** batch-a and batch-b terminate; their pods are removed. Cluster events wake up P (or P retries via backoff). On the next scheduling attempt, `n-12` has 4.7 free; P passes Filter; P binds to `n-12`.
+
+If between steps 6 and 7 a higher-priority pod (priority 2000) lands on `n-12` and consumes the space, P is back to square one. Preemption only frees space; it doesn't reserve it.
+
+### 10.8 Preemption is Not Capacity Management
 
 A common mistake: using priority+preemption as a substitute for autoscaling. "We'll set our batch jobs to low priority; when the latency-sensitive workload spikes, it preempts them." That works once. The second time, the batch jobs are gone, the latency workload still needs more, and there's nothing left to preempt — you're out of capacity.
 
@@ -1504,6 +1731,35 @@ Resources omitted from the list get weight 0 (not counted at all). To require a 
 
 ---
 
+### 13.5 Combining Strategies via Profiles
+
+You can't have both LeastAllocated and MostAllocated in the same profile; the strategy is a single value. But you can run two profiles:
+
+```yaml
+profiles:
+- schedulerName: latency-sensitive
+  pluginConfig:
+  - name: NodeResourcesFit
+    args:
+      scoringStrategy: { type: LeastAllocated }
+
+- schedulerName: cost-optimized
+  pluginConfig:
+  - name: NodeResourcesFit
+    args:
+      scoringStrategy: { type: MostAllocated }
+```
+
+Latency-sensitive workloads (with `spec.schedulerName: latency-sensitive`) spread; batch workloads (with `cost-optimized`) pack. Both profiles share the same node tree and cache; they differ only in scoring.
+
+The risk: a latency-sensitive pod might land on a node that's currently empty but will soon be packed by batch jobs. The cluster-wide outcome isn't perfectly stable, but it's a reasonable compromise without true multi-objective optimization.
+
+### 13.6 Why You Don't See Score Numbers
+
+The scheduler does not expose per-node scores via the API. To inspect scoring, use `--v=10` on the scheduler logs — it dumps each plugin's contribution per node per cycle. Useful for debugging; never run that verbosity in production (it dwarfs the actual work).
+
+---
+
 ## 14. Performance at Scale
 
 The scheduler's performance characteristics matter most in three regimes: 1000 nodes, 5000 nodes, and 5000+ nodes (where the SIG-scalability suite officially stops testing).
@@ -1570,11 +1826,46 @@ If your scheduler can't keep up, in roughly this priority:
 4. Use scheduler profiles to split workloads — high-throughput pods get a lean profile; specialized workloads get a heavy profile.
 5. Run multiple schedulers and shard by `schedulerName`.
 
-### 14.5 The Apiserver Side
+### 14.5 Memory Layout
+
+The scheduler's memory is dominated by the cache and the queue:
+
+| Component | Size at 5000 nodes / 50000 pods |
+| --- | --- |
+| NodeInfo cache | ~1.5 GB (each NodeInfo ~ 300 KB with all pod and image refs) |
+| Snapshot history | ~200 MB (one rotating snapshot, copy-on-write structurally shared) |
+| Scheduling queue | ~50 MB (mostly QueuedPodInfo entries) |
+| Informer caches | ~500 MB (Pods, Nodes, PVs, PVCs, CSI...) |
+| Misc (goroutine stacks, framework state) | ~200 MB |
+
+Watch `process_resident_memory_bytes` and `go_memstats_*` metrics. Sudden growth often correlates with a pod-watch storm (huge churn during a controller bug).
+
+### 14.6 The Apiserver Side
 
 The scheduler is also bounded by apiserver write throughput. Each bind is a write. With 200 binds/sec you're driving 200 writes/sec to etcd, which is meaningful (etcd defaults handle low thousands, but scheduler binds compete with controller updates, node status updates, etc.).
 
 Use `--kube-api-qps` and `--kube-api-burst` to tune the scheduler's own apiserver client (defaults 50 and 100 respectively — far too low for large clusters). Bump to 300/600 or higher.
+
+---
+
+### 14.7 HA Considerations
+
+kube-scheduler is typically run as 3 replicas with leader election. Only the leader actually schedules; the others sit idle, ready to take over. The leader writes its identity to a Lease object (`kube-system/kube-scheduler`) and renews it every `leaseDuration / 2` (default 7.5s).
+
+Failover takes `leaseDuration + ε` (~15s default). During failover, no scheduling happens. Pods created in that window sit Pending until the new leader pops them from its queue (which it builds by reading the apiserver fresh — there's no shared queue between replicas).
+
+Tuning down `leaseDuration` reduces failover time but increases the risk of false-positive failovers (a slow leader gets replaced unnecessarily). Defaults are fine for nearly all clusters.
+
+### 14.8 Cold Start
+
+When the scheduler starts (fresh or after failover), it:
+
+1. Lists all Pods, Nodes, PVs, PVCs, etc., from the apiserver. This is the "informer initial sync" and takes seconds-to-minutes depending on object counts. The scheduler does *not* schedule during this window.
+2. Builds the cache from the listed objects.
+3. Establishes watches for incremental updates.
+4. Begins popping the queue.
+
+The "informer initial sync" is observable as `scheduler_unschedulable_pods` staying flat for a moment after start, then suddenly all unbound pods entering the queue at once. Cold-start latency for a 5000-node cluster: typically 30–90 seconds.
 
 ---
 
@@ -1938,6 +2229,40 @@ The `scheduler-plugins` repo provides a curated set of out-of-tree plugins (Capa
 
 ---
 
+### 19.4 The Out-of-Tree Repository Layout
+
+The reference project is `kubernetes-sigs/scheduler-plugins`. Its layout:
+
+```
+scheduler-plugins/
+├── apis/scheduling/v1alpha1/          PodGroup, ElasticQuota CRDs
+├── cmd/scheduler/                     main.go that registers plugins
+├── pkg/
+│   ├── capacityscheduling/            namespace-level quota scheduling
+│   ├── coscheduling/                  PodGroup-based gang scheduling
+│   ├── networktopologyaware/
+│   ├── noderesources/
+│   ├── noderesourcetopology/          NUMA-aware
+│   ├── preemptiontoleration/
+│   ├── trimaran/                      utilization-based scoring (LowRiskOverCommitment, TargetLoadPacking, …)
+│   └── ...
+└── manifests/                         example deployments
+```
+
+If you have a scheduling concern that the upstream plugins cover, prefer one of these to writing your own. If you have something unique, model your code after the closest sibling — they share a lot of plumbing (CRD registration, lifecycle management) that you'd otherwise reinvent.
+
+### 19.5 Maintenance Cost
+
+Custom scheduler plugins age with kube-scheduler. The framework interface is stable but not frozen — every Kubernetes minor release may add a method or change a struct field. Maintaining a custom plugin means:
+
+- A CI matrix testing against each supported Kubernetes version.
+- Rebasing your changes after upstream scheduler refactors (the framework had a major rewrite around v1.19 and smaller breaking changes after).
+- Keeping pace with upstream plugin behavior changes (e.g., when `PodTopologySpread` changed its defaulting semantics).
+
+Estimate one engineer-week per minor Kubernetes release to keep a non-trivial custom plugin healthy. If your customization could be expressed as configuration of an upstream plugin, do that instead.
+
+---
+
 ## 20. Observability and Alerts
 
 ### 20.1 The Core Metrics
@@ -2002,7 +2327,24 @@ Warning  FailedScheduling  default-scheduler  0/40 nodes are available:
 
 Read every clause. Each summarizes how many nodes failed which Filter plugin. This message is generated from the per-plugin Status messages combined and deduplicated.
 
-### 20.4 The `nominatedNodeName` Signal
+### 20.4 The `kubectl get events -w` Stream
+
+For real-time debugging:
+
+```bash
+kubectl get events -w --field-selector involvedObject.kind=Pod
+```
+
+Filter to scheduling events:
+
+```bash
+kubectl get events --field-selector reason=Scheduled,reason=FailedScheduling \
+   --sort-by='.lastTimestamp' -A
+```
+
+This is your tail -f for the scheduler's decisions. During an incident — "why are pods not landing on the new nodes I just added?" — this stream often reveals the answer faster than metrics.
+
+### 20.5 The `nominatedNodeName` Signal
 
 If preemption ran, `pod.status.nominatedNodeName` is set:
 
@@ -2011,6 +2353,22 @@ kubectl get pod <name> -o jsonpath='{.status.nominatedNodeName}'
 ```
 
 That tells you "the scheduler picked this node, kicked some pods off, and will try this node first next time." If the pod still doesn't land there, the nomination got stolen — investigate which pod won.
+
+---
+
+### 20.6 SLO Targets
+
+A reasonable SLO set for a healthy cluster:
+
+| SLI | Target |
+| --- | --- |
+| Scheduling algorithm p99 | < 100ms for pods in clusters up to 5000 nodes |
+| End-to-end pod scheduling (creation → bind) p99 | < 5s |
+| Pending pods (any non-active queue) | < 10 sustained, or < 100 transient (during deploys) |
+| Preemption attempt rate | < 0.1/s sustained |
+| Scheduler restart rate | 0/hr outside of intentional rollouts |
+
+The SIG-scalability SLO is more formal: the 99th percentile of "Pod startup latency" (creation to running) should be < 5s for pods without persistent storage on a cluster up to 5000 nodes. The scheduler contributes a small fraction of that 5s; image pull dominates.
 
 ---
 
