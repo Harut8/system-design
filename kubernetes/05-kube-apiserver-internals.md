@@ -1276,7 +1276,65 @@ In an HA control plane with three apiservers, each apiserver has its **own** wat
 - A client that reconnects to a different apiserver after a network blip may see the cache at a slightly different resourceVersion. The client must pass `resourceVersion` to keep the read monotonic; the new apiserver will wait until its cache catches up to that RV before serving (or return 410 if it cannot).
 - Memory cost is per-apiserver. Three apiservers means three full copies of cluster state in RAM.
 
-### 7.8 ConsistentList Beta and the Future
+### 7.8 The Cacher State Machine
+
+The `Cacher` is technically a state machine on the watch state from etcd. Its top-level loop:
+
+```
+                                ┌────────────────┐
+                                │  init / restart │
+                                └────────┬───────┘
+                                         │
+                                         ▼
+                              ListAndWatch from etcd
+                                         │
+                                         │ etcd returns:
+                                         │   list at revision R0
+                                         │   watch stream from R0+1
+                                         │
+                                         ▼
+                              ┌──────────────────┐
+                              │  Ready           │  serves all reads
+                              │  - store populated│  serves watches
+                              │  - reflector live │  emits bookmarks
+                              └────────┬──────────┘
+                                       │
+                                       │ etcd watch dropped
+                                       │ OR compacted RV exceeded
+                                       │
+                                       ▼
+                              ┌──────────────────┐
+                              │  Recovering      │
+                              │  - re-LIST etcd  │  during recovery, reads
+                              │  - re-open watch │  with RV<oldHigh return
+                              │  - drain old buf │  410; reads with RV>=
+                              └────────┬──────────┘  newHigh wait
+                                       │
+                                       └─────► back to Ready
+```
+
+A "compacted RV" error is what happens when the cacher's reflector falls behind etcd's compaction window (default 5 minutes of revisions). At that point the cacher must do a full relist; this is observable as a spike in `apiserver_storage_list_total` for that resource. Frequent compacted-RV errors mean either etcd's compaction is too aggressive, or your apiserver is dropping connections to etcd (network instability), or the apiserver process is paused (CPU-starved on host).
+
+### 7.9 Watch Channel Backpressure
+
+Each subscriber to the watch cache has a buffered Go channel. The cacher writes events into the channel; the subscriber's goroutine reads them. If the subscriber is slow (slow HTTP/2 writes, slow remote consumer), the channel fills. When the channel is full, the cacher has two policy options:
+
+```
+   Option A (default):  block the cacher's dispatch goroutine.
+       PROBLEM: one slow client stalls ALL clients on that resource.
+       This was the historical behavior and source of "watch cache
+       wedged" outages.
+
+   Option B (per-watcher):  if a watcher's channel is full beyond
+       a deadline, close it. The client must reconnect with a fresh
+       LIST.
+       This is now the standard behavior. Bound is configurable via
+       internal constants (~few seconds).
+```
+
+The metric `apiserver_terminated_watchers_total` counts watchers that the apiserver booted for being too slow. Spikes there usually correlate with one misbehaving consumer (a controller with a wedged reconcile loop) or with a flaky network to a remote watcher.
+
+### 7.10 ConsistentList Beta and the Future
 
 A subtle point: a `LIST` served from the cache with `resourceVersion=0` is not linearizable. For workloads where staleness matters, the apiserver historically had only "skip the cache, hit etcd for a quorum read", which is expensive. Recent work (`ConsistentList` feature, beta in 1.31) lets the cache serve linearizable lists by holding the response until the cache is known to be at least as fresh as the latest etcd revision. The mechanism is to track the etcd revision watermark, do an etcd `Get(/, count-only)` to learn the current revision, and stall the list until the cache catches up. Watch carefully for this in your version's release notes.
 

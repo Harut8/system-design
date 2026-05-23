@@ -1560,6 +1560,47 @@ allowedTopologies:
         values: [us-east-1a, us-east-1b]   # exclude 1c
 ```
 
+### 17.4 Multi-PVC Pods and Topology
+
+A Pod with two PVCs creates a topology-coupling problem: both volumes must be in the same zone (otherwise neither can be attached to the same node). The scheduler's `VolumeBinding` plugin handles this by treating the set of unbound PVCs as a co-located group.
+
+```
+Pod spec.volumes: [pvc-A, pvc-B]
+   ↓
+Scheduler PreFilter:
+   - Find a node where:
+       * pvc-A can be (re)bound: either already bound + nodeAffinity matches,
+         or unbound + the SC can provision in this node's zone
+       * pvc-B can be (re)bound: same conditions
+   - Reject nodes that can't satisfy BOTH simultaneously.
+   ↓
+Scheduler PreBind:
+   - For each unbound PVC, annotate volume.kubernetes.io/selected-node
+   - Provisioners create both volumes in the chosen zone.
+```
+
+The implementation lives in `pkg/scheduler/framework/plugins/volumebinding`. It is a Filter+Reserve plugin (it temporarily reserves nodes for the binding decision and then commits in PreBind).
+
+### 17.5 `CSIStorageCapacity`: Capacity-Aware Scheduling
+
+For local-storage drivers (TopoLVM, OpenEBS LocalPV), the scheduler needs to know which nodes have *available* capacity, not just "are topologically valid." Driver publishes `CSIStorageCapacity` objects:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: CSIStorageCapacity
+metadata:
+  name: csi-capacity-node-2-fast
+  namespace: kube-system
+storageClassName: local-fast
+capacity: 800Gi              # bytes available right now on this node
+maximumVolumeSize: 400Gi
+nodeTopology:
+  matchLabels:
+    kubernetes.io/hostname: node-2
+```
+
+When `CSIDriver.spec.storageCapacity: true`, the scheduler reads these and filters out nodes that don't have enough free space. This avoids the classic "pod scheduled to a node where local-storage is already full" failure.
+
 ---
 
 ## 18. Mount Propagation
@@ -1611,6 +1652,22 @@ Bidirectional gives the container the ability to mount things on the host. That'
 ### 18.4 The Default Trap
 
 The default is `None`. This means if you have, say, a Filebeat DaemonSet that bind-mounts `/var/lib/docker/containers` and you start a new pod after Filebeat is running, Filebeat won't see the new pod's logs — because the new pod's container-log mount didn't propagate. Solution: set `mountPropagation: HostToContainer` on the Filebeat side so it picks up new mounts dynamically.
+
+### 18.5 Linux Kernel Background
+
+Underneath, Kubernetes is just exposing the kernel's mount-propagation flags:
+
+```
+MS_PRIVATE   ←  mountPropagation: None
+MS_SLAVE     ←  mountPropagation: HostToContainer
+MS_SHARED    ←  mountPropagation: Bidirectional
+```
+
+These are set on the mount namespace at mount-creation time via `mount --make-shared` etc. The kernel propagates mount/umount events between peer mounts in the same "peer group." A `MS_SHARED` peer group is bidirectional; `MS_SLAVE` is a slave to one upstream master, getting events from it but not pushing to it; `MS_PRIVATE` is isolated.
+
+The reason `Bidirectional` requires `privileged: true` on the container is that creating a shared mount requires `CAP_SYS_ADMIN` to issue the `mount(2)` syscall with `MS_REC | MS_SHARED`. Restricted pods cannot do this.
+
+For background, see `man 7 mount_namespaces` and the linked propagation documentation.
 
 ---
 
