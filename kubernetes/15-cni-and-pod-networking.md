@@ -1266,10 +1266,13 @@ AWS allows an EC2 instance to have multiple **Elastic Network Interfaces (ENIs)*
 
 | Instance | ENIs | IPs per ENI | Max secondary IPs | Approx max pods |
 |---|---|---|---|---|
+| t3.nano | 2 | 2 | 3 | 4 |
 | t3.medium | 3 | 6 | 17 (one is reserved for the node) | 17 |
 | m5.large | 3 | 10 | 29 | 29 |
+| m5.xlarge | 4 | 15 | 58 | 58 |
 | m5.4xlarge | 8 | 30 | 234 | 234 |
 | c5.18xlarge | 15 | 50 | 737 | 737 |
+| m7i.metal-48xl | 15 | 50 | 737 | 737 |
 
 (One IP per ENI is the ENI's primary; pods get the rest.)
 
@@ -1304,6 +1307,27 @@ Without warming, every pod creation would block on an EC2 `AssignPrivateIpAddres
 - **No encapsulation tax.** Wire-rate networking.
 - **VPC flow logs include pod traffic.** Auditable. (Also: pod IPs leak.)
 - **Pod-level security groups** (EKS feature). Each pod can have its own SG.
+
+### Custom networking and the secondary-subnet trick
+
+The "VPC subnet exhausts because pods consume VPC IPs" problem has a standard workaround: **custom networking** in the VPC CNI. Pods get IPs not from the node's primary subnet but from a dedicated *secondary* subnet that you create just for pods.
+
+```
+   VPC 10.0.0.0/8
+     subnet-nodes   10.0.0.0/24    (instances live here, scarce IPs)
+     subnet-pods-a  10.1.0.0/16    (pods in AZ a, plentiful IPs)
+     subnet-pods-b  10.2.0.0/16    (pods in AZ b)
+     subnet-pods-c  10.3.0.0/16    (pods in AZ c)
+```
+
+The VPC CNI is configured (via `ENIConfig` CRD) to allocate pod IPs from the pod subnets. Each ENI on the node is created in the pod subnet rather than the node subnet. Result: node IPs come from a tiny pool, pod IPs come from a huge pool, neither saturates.
+
+Costs:
+- Operational complexity: one ENIConfig per AZ, careful labeling.
+- The node's primary ENI is in the node subnet; secondary ENIs are in the pod subnet. Routing between them is intra-VPC and free.
+- Some AWS features (e.g., security groups for pods) require this setup.
+
+This is the recommended pattern for production EKS clusters above modest size.
 
 ---
 
@@ -1507,6 +1531,44 @@ Every new pod now gets these sysctls applied inside its netns.
 4. `cnitool del mynet /var/run/netns/testns` to clean up
 
 In CI, you can spin up a kind cluster, configure your plugin in `/etc/cni/net.d`, and run integration tests against real pods.
+
+### Error reporting per the spec
+
+The CNI spec defines a structured error format. On failure, write to stdout:
+
+```json
+{
+  "cniVersion": "1.0.0",
+  "code": 7,
+  "msg": "Invalid Configuration",
+  "details": "the 'bridge' field must be specified"
+}
+```
+
+Codes (from `containernetworking/cni/pkg/types`):
+
+| Code | Meaning |
+|---|---|
+| 1 | Incompatible CNI version |
+| 2 | Unsupported field in network configuration |
+| 3 | Container unknown or doesn't exist |
+| 4 | Invalid necessary environment variables, like CNI_COMMAND, CNI_CONTAINERID, etc. |
+| 5 | I/O failure |
+| 6 | Failed to decode content |
+| 7 | Invalid network config |
+| 11 | Try again later |
+| 100+ | Plugin-specific errors |
+
+The runtime parses this, surfaces it to kubelet, which puts it in `pod.status` and the event stream. Investing in good error messages is investing in your future on-call rotation.
+
+### Production hygiene for custom plugins
+
+- **Never block forever.** A plugin that hangs holds up pod creation indefinitely. Use timeouts on every external call.
+- **Log to stderr only.** stdout is the CNI result; anything you write there breaks the JSON parser.
+- **Don't modify the prevResult in ways the next plugin doesn't expect.** Append, don't rewrite.
+- **Test the DEL path.** It's easy to forget. Use `cnitool del` repeatedly and watch for errors after the first DEL — those are idempotency bugs.
+- **Version your plugin and announce it.** Bake it into `CNI_VERSION` and into your binary's `--version` flag for debugging.
+- **Persist any state you need.** A common pattern is `/var/lib/yourplugin/<container_id>.json`. Reading prevResult on DEL is good; sometimes you need your own state too.
 
 ---
 
@@ -2393,3 +2455,76 @@ The mistakes you (and every team) will make on the first CNI deployment.
 **Decision checklist**: on EKS → AWS VPC CNI (+ Calico for policy if needed). On GKE → Dataplane v2. On AKS at scale → Azure CNI Overlay (Cilium). On-prem with BGP → Calico. On-prem with eBPF + observability ambitions → Cilium. Tiny lab → Flannel. Migrate off Weave.
 
 **The whole chapter in one sentence**: *Kubernetes specifies four pod-networking rules; CNI is a tiny executable interface; the plugin chain creates a veth, allocates an IP from some IPAM, optionally tunnels traffic across nodes (VXLAN/IPinIP) or natively routes it (BGP/native VPC), enforces NetworkPolicy if the CNI cares about that, and gets MTU right; almost every production incident is one of those steps misconfigured.*
+
+---
+
+## Appendix: Cross-Node Packet Walk, Two Ways
+
+A pod-to-pod packet from pod A (10.244.1.4 on node1, 192.168.10.1) to pod C (10.244.2.4 on node2, 192.168.10.2). Two CNIs, two paths, same four-rule contract.
+
+### Path 1: VXLAN overlay (Flannel default)
+
+```
+   T+0    pod A app calls send() on socket to 10.244.2.4:8080
+   T+1    kernel builds TCP segment, then IP packet:
+            src=10.244.1.4, dst=10.244.2.4, len=1400
+   T+2    consults pod A netns routing table:
+            default via 10.244.1.1 dev eth0
+          dst not on-link → next-hop is 10.244.1.1
+   T+3    ARP for 10.244.1.1 (gw, the cni0 bridge address)
+          → bridge replies with its MAC
+   T+4    Ethernet frame leaves veth (pod end) at MAC layer
+          enters host netns vethXXX (host end)
+   T+5    cni0 bridge receives, examines dst MAC = its own
+          → hands up to host's IP layer
+   T+6    host IP routing:
+            10.244.2.0/24 dev flannel.1 (VXLAN device)
+   T+7    sends to flannel.1; kernel VXLAN device:
+            outer src=192.168.10.1, dst=192.168.10.2 (from FDB lookup)
+            outer UDP dst=8472, src=hash(inner 5-tuple)
+            VXLAN VNI=1
+            inner Ethernet: src/dst MAC of vxlan device endpoints
+            inner IP: src=10.244.1.4, dst=10.244.2.4 (unchanged)
+            inner TCP: payload
+   T+8    encapsulated frame leaves host eth0
+   T+9    underlay routes 192.168.10.1→.10.2 (typically one hop)
+   T+10   arrives at node2 eth0
+   T+11   host sees UDP/8472 → demuxes to flannel.1 VXLAN device
+   T+12   VXLAN decap, inner frame handed up
+   T+13   IP routing on inner: 10.244.2.0/24 dev cni0
+   T+14   cni0 bridge → vethCCC (the pod C side)
+   T+15   pod C's eth0 receives, kernel delivers to socket
+   T+16   pod C app reads()
+   
+   Total ≈ 100-200 µs LAN, sub-millisecond cloud
+```
+
+### Path 2: BGP native routing (Calico BGP mode, both nodes on same L2 with BGP to ToR)
+
+```
+   T+0    pod A app calls send()
+   T+1    kernel builds packet src=10.244.1.4, dst=10.244.2.4
+   T+2    pod A netns routing:
+            default via 169.254.1.1 dev eth0 (Calico's link-local gateway)
+   T+3    no ARP needed — Calico uses proxy_arp:
+            host responds with its own MAC for 169.254.1.1
+   T+4    frame leaves veth, enters host netns vethXXX
+   T+5    host IP routing:
+            10.244.2.0/24 via 192.168.10.2 dev eth0 proto bird
+          (route learned via BGP from node2 advertising 10.244.2.0/24)
+   T+6    Ethernet frame: src=node1 MAC, dst=ToR MAC, payload = IP packet
+   T+7    leaves eth0
+   T+8    ToR switch: routes 192.168.10.2 → node2's port
+          (because we also routed the *pod IP* 10.244.2.4 via 192.168.10.2;
+           ToR has the same BGP info)
+   T+9    arrives at node2 eth0
+   T+10   host routing on node2:
+            10.244.2.4/32 dev cali12abc34 (specific veth route)
+   T+11   straight into pod C's veth
+   T+12   pod C eth0 receives, kernel delivers
+   T+13   pod C reads()
+   
+   Total ≈ 30-80 µs LAN — no encap, fewer kernel passes
+```
+
+Notice how identical the *inner packet* is in both paths: `src=10.244.1.4, dst=10.244.2.4`, unchanged. That's the four-rule contract being honored. The difference is invisible to the application — and that's exactly the point.

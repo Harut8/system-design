@@ -815,6 +815,39 @@ encryption.type: "wireguard"
 
 Changing these via Helm and `cilium upgrade` triggers an agent restart that reloads programs with the new config baked in.
 
+### 5.6 The Per-Node Interface Inventory
+
+After Cilium installs on a node, `ip link` looks like this (annotated):
+
+```
+1: lo: <LOOPBACK,UP> mtu 65536  link/loopback ...
+2: eth0: <BROADCAST,MULTICAST,UP> mtu 1500    # the host's physical NIC
+3: cilium_net@cilium_host: <BROADCAST,MULTICAST,UP> mtu 1500  # one half of the host pair
+4: cilium_host@cilium_net: <BROADCAST,MULTICAST,UP> mtu 1500  # gateway IP for pods
+5: cilium_vxlan: <BROADCAST,MULTICAST,UP> mtu 1450             # tunnel device (if tunnel mode)
+6: cilium_wg0: <POINTOPOINT,NOARP,UP> mtu 1420                # WG if encryption enabled
+7: lxcabcd1234@if2: <BROADCAST,MULTICAST,UP> mtu 1500          # host-side of pod 1's veth
+8: lxcef561234@if2: <BROADCAST,MULTICAST,UP> mtu 1500          # host-side of pod 2's veth
+9: ...                                                          # one per Pod
+```
+
+Each `lxcXXXX` interface is the host end of a veth pair; the other end is inside a Pod's netns named `eth0`. `cilium_host`/`cilium_net` is a special veth pair Cilium uses as the cluster gateway — Pods route to `cilium_host`'s IP as their default gateway, and the BPF program there decides what to do.
+
+For tunnel mode, `cilium_vxlan` is the encap interface. The BPF program on the host's TC ingress sees a packet destined for a remote Pod and `bpf_redirect()`s it into `cilium_vxlan`, which encapsulates and sends out `eth0`.
+
+`tc qdisc show` reveals the BPF attachments:
+
+```
+$ tc qdisc show dev lxcabcd1234
+qdisc clsact ffff: parent ffff:fff1
+$ tc filter show dev lxcabcd1234 ingress
+filter protocol all pref 1 bpf chain 0 handle 0x1 bpf_lxc.o:[from-container] direct-action ...
+$ tc filter show dev lxcabcd1234 egress
+filter protocol all pref 1 bpf chain 0 handle 0x1 bpf_lxc.o:[to-container] direct-action ...
+```
+
+The `direct-action` means the BPF return code (`TC_ACT_OK`, `TC_ACT_SHOT`, etc.) is interpreted directly by the qdisc, with no further classification. This is the fast path.
+
 ---
 
 ## 6. The Endpoint and Identity Model
@@ -887,6 +920,62 @@ Two reasons:
 2. **Stable across IP churn.** Roll a Deployment: every Pod gets a new IP, but the identity does not change because the labels do not change. The policy map is unchanged. Compare to per-IP enforcement, where a rolling update reprograms the entire firewall N times.
 
 The price is a more complex control plane: someone has to compute identities and distribute them. That is what the operator + agents do.
+
+### 6.5 Inspecting the Identity Space
+
+```bash
+$ kubectl get ciliumidentities.cilium.io
+NAME    NAMESPACE   AGE
+12345   shop        2d
+12346   shop        2d
+12347   kube-system 10d
+...
+
+$ kubectl get ciliumidentity 12345 -o yaml
+apiVersion: cilium.io/v2
+kind: CiliumIdentity
+metadata:
+  name: "12345"
+  labels:
+    io.cilium.k8s.policy.cluster: default
+    io.cilium.k8s.policy.serviceaccount: frontend-sa
+    io.kubernetes.pod.namespace: shop
+security-labels:
+  k8s:app: frontend
+  k8s:env: prod
+  k8s:io.cilium.k8s.policy.cluster: default
+  k8s:io.cilium.k8s.policy.serviceaccount: frontend-sa
+  k8s:io.kubernetes.pod.namespace: shop
+  k8s:version: v1.4.2
+
+$ kubectl exec -n kube-system cilium-xxxxx -- cilium-dbg identity list
+ID      LABELS
+1       reserved:host
+2       reserved:world
+3       reserved:unmanaged
+4       reserved:health
+5       reserved:init
+6       reserved:remote-node
+7       reserved:kube-apiserver
+12345   k8s:app=frontend, k8s:env=prod, ...
+12346   k8s:app=backend, ...
+```
+
+### 6.6 Identity-Relevant Labels Configuration
+
+By default Cilium uses Kubernetes labels plus namespace and service-account. You can constrain which labels count toward identity via `labels` config or `LabelsRegexFilter`. This matters because:
+
+- High-cardinality labels (`pod-template-hash`, `controller-uid`) would mint a new identity per ReplicaSet rollout, wasting the identity space and policy memory.
+- Sensitive labels you don't want propagated as policy keys (e.g., a per-tenant secret label) can be excluded.
+
+The default exclusion list already filters out `pod-template-hash`, `controller-revision-hash`, `pod-template-generation`. You add your own via:
+
+```yaml
+labels:
+  - "!k8s:my.special.noisy/label"   # exclude
+  - "k8s:io.kubernetes.pod.namespace"
+  - "k8s:app"
+```
 
 ---
 
@@ -1113,6 +1202,44 @@ SERVICE ADDRESS         BACKEND ADDRESS
                         10.244.3.91:8080 (17) (3)
 ```
 
+### 8.6 Direct Server Return (DSR)
+
+`loadBalancer.mode: dsr` is an optimization for NodePort and LoadBalancer traffic where the *reply* skips the LB node. Without DSR (the default, `snat`):
+
+```
+Client → LB-Node (SNAT to LB-Node IP, DNAT to backend) → Backend
+Client ← LB-Node (reverse SNAT, reverse DNAT)         ← Backend
+```
+
+Every packet round-trip transits the LB node twice. With DSR:
+
+```
+Client → LB-Node (DNAT to backend, encode original-dst in IP options or Geneve)
+                            ↓
+                         Backend
+                            ↓
+Client ← Backend directly (decoded original-dst as source)
+```
+
+The backend replies straight to the client, bypassing the LB node. Reply throughput is no longer limited by the LB node's NIC.
+
+Cilium's DSR comes in two flavors:
+
+- **DSR with IP Option** (`loadBalancer.dsrDispatch: opt`): the LB stores the original VIP/port in an IPv4 option (or IPv6 destination option). Backend Cilium agent reads the option, knows the original VIP, and crafts the reply with that as the source. Compact but some middleboxes drop packets with IPv4 options.
+- **DSR with Geneve** (`loadBalancer.dsrDispatch: geneve`): the LB encapsulates the packet in Geneve with the VIP in a Geneve option, sends to the backend node, which decaps and serves. Works through middleboxes but needs Geneve on the data path.
+
+DSR requires backends to be reachable from clients on the same network (otherwise asymmetric routing breaks). For internet-facing LBs it's a strong fit; for purely intra-VPC scenarios SNAT is simpler.
+
+### 8.7 The Reverse: Why a Pod's `getpeername()` Sees the Backend
+
+After connect4 rewrites the destination, the kernel's `inet_stream_connect` finishes connecting to the *real* backend IP. The Pod's socket therefore has `inet->daddr` = backend IP, not the VIP. When the application calls `getpeername(fd, &sa, &len)` to find out who it's connected to, it gets the backend's IP.
+
+For most applications this is fine. For applications that *check* the remote address (e.g., DNS clients that check that the response came from the resolver they queried), this can break.
+
+Cilium fixes it by attaching `BPF_CGROUP_INET4_GETPEERNAME` (and v6, plus `getsockname`). When called, the BPF program looks up the connection in a per-socket storage map, finds the original VIP/port, and rewrites the returned `sockaddr`. The application sees the VIP it originally connected to, even though the kernel and packets use the backend's IP.
+
+That little kindness eliminates an entire class of "why does my app think it's talking to a random Pod IP?" tickets.
+
 ---
 
 ## 9. The cgroup Hooks in Detail
@@ -1329,6 +1456,38 @@ Envoy in Cilium is *not* a per-Pod sidecar. It is either:
 
 Either way, traffic is hairpinned through Envoy on the same node — there is no extra network hop, no sidecar startup ordering, and no per-Pod resource overhead. It is the single biggest "sidecarless mesh" argument (§15).
 
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│   L7 Policy Flow                                                           │
+│                                                                            │
+│   Pod A (frontend, identity 12345)                                         │
+│        │                                                                   │
+│        │  packet to backend.shop.svc.cluster.local:8080                    │
+│        ▼                                                                   │
+│   veth (pod A) TC egress  ────► socket LB already rewrote dest to backend  │
+│        │                                                                   │
+│        │  packet flows through host                                        │
+│        ▼                                                                   │
+│   veth (pod B) TC ingress                                                  │
+│        │                                                                   │
+│        │  policy map lookup: (src=12345, dport=8080, proto=TCP, ingress=0) │
+│        ▼  → entry has proxy_port = 0xC123 (nonzero!)                       │
+│   bpf_redirect to lo:0xC123 with IP_TRANSPARENT                            │
+│        │                                                                   │
+│        ▼                                                                   │
+│   cilium-envoy (per-node DaemonSet, listening on 0xC123)                   │
+│        │  parses HTTP request: method, path, headers                       │
+│        │  evaluates L7 rules                                               │
+│        │    if allowed → forward                                           │
+│        │    if denied  → return 403, log to Hubble                         │
+│        ▼                                                                   │
+│   Envoy connects to actual backend address (also via BPF socket LB)        │
+│        ▼                                                                   │
+│   Pod B (backend)                                                          │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### 11.5 Kafka and DNS L7
 
 Cilium ships with non-HTTP L7 protocols too:
@@ -1406,6 +1565,46 @@ Note the *two* rules: one for DNS to actually do the lookup (with name filtering
 - **TTL expiry vs long connections.** If a Pod opens a long-lived connection and the DNS TTL expires, Cilium may evict the IP from the allow-set and drop the connection. The config `tofqdns-min-ttl` and `tofqdns-idle-connection-grace-period` mitigate this.
 - **Round-robin DNS surprises.** If the upstream returns a different IP each query, and the Pod doesn't re-query for a while, you might allow the wrong subset. Use long enough min-ttl.
 - **Connection-tracking via DNS.** If your app does its own caching, the DNS proxy never sees the query and the IP is never allowed. Use `enableIdentityMark` patterns or pre-populate IPs.
+
+### 12.5 The DNS Proxy: Where It Sits
+
+```
+   Pod (curl api.stripe.com)
+      │   resolv.conf says nameserver = cluster DNS VIP (10.96.0.10)
+      │
+      ▼  UDP 53 to 10.96.0.10
+   cgroup sendmsg4 hook: socket LB rewrites to a CoreDNS Pod IP
+      │
+      ▼
+   The TC egress on the Pod's veth: policy check sees this is a DNS rule
+      with L7 → bpf_redirect to local cilium-agent DNS proxy port
+      │
+      ▼
+   cilium-agent DNS proxy
+      │
+      │  - Verify the query name matches an allowed pattern for this identity
+      │  - If denied: return NXDOMAIN to the Pod
+      │  - If allowed: forward to actual CoreDNS Pod
+      ▼
+   CoreDNS
+      │  resolves api.stripe.com → 54.187.x.y
+      ▼
+   Reply to cilium-agent DNS proxy
+      │
+      │  - Parse response, extract A records
+      │  - For each IP: write (identity_for_fqdn, IP) into the cilium_ipcache
+      │      with TTL = max(response TTL, tofqdns-min-ttl)
+      │  - Forward reply to Pod
+      ▼
+   Pod opens connection to 54.187.x.y
+      │  TC egress on Pod veth: policy lookup
+      │  Source identity → list of allowed FQDN-identities
+      │  IPCache lookup of 54.187.x.y → matches an allowed FQDN-identity
+      ▼  → allow
+   Packet goes out.
+```
+
+The trick is that the FQDN policy *manifests* as a (dynamic, per-name) identity range that the IPCache distinguishes. The L4 policy on egress doesn't know about names at all; it just knows that this *identity* is allowed. The DNS proxy is what links the name to the IP to the identity.
 
 ---
 
