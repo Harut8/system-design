@@ -1054,6 +1054,15 @@ The implication is enormous:
 
 Prefix delegation (CNI feature flag) helps: the CNI requests /28 prefixes instead of individual IPs, allowing up to 110 pods per ENI on m5.large+ instances. Tune via `ENABLE_PREFIX_DELEGATION=true`.
 
+Operationally, the VPC CNI has two important runtime behaviours:
+
+- **Warm pool of pre-attached ENIs/IPs.** The CNI pre-attaches ENIs and pre-allocates IPs to reduce pod-start latency. Tune via `WARM_ENI_TARGET`, `WARM_IP_TARGET`, `MINIMUM_IP_TARGET`. Underprovisioning causes "no IPs available" errors at pod-create time; overprovisioning wastes VPC IPs. The defaults are fine for moderate workloads; high-churn batch clusters need higher warm values.
+- **Custom networking.** With `AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG=true`, each subnet can have an `ENIConfig` CRD specifying a different subnet/SG combination. Useful when pods need to live in a different subnet than nodes (e.g., for distinct security groups or for IPv6 dual-stack).
+
+A related component is the **AWS Network Policy Engine** (or, alternatively, Calico/Cilium running in policy-only mode). The VPC CNI itself doesn't enforce NetworkPolicy; you need a separate policy enforcer. The AWS Network Policy Engine is an eBPF-based engine that AWS ships with newer EKS clusters; older clusters used Calico in policy-only mode. The same NetworkPolicy resources work on either; performance characteristics differ slightly.
+
+For IPv6, AWS supports IPv6-only pods (`AWS_VPC_K8S_CNI_EXTERNALSNAT=false` + IPv6-enabled subnets) since 2021. Each pod gets a /128 from the VPC's IPv6 range. IPv4 connectivity from these pods is via NAT64 + DNS64 (an AWS-managed service); reaching IPv4-only external endpoints transparently works. This is the cleanest way to escape VPC IPv4 exhaustion at scale.
+
 ---
 
 ## 19. EBS CSI and EFS CSI
@@ -1860,6 +1869,10 @@ Two patterns for TLS certificates:
 - Azure: store in Key Vault, reference in App Gateway listener (AGIC: `appgw.ingress.kubernetes.io/appgw-ssl-certificate`).
 - Cert never enters the cluster. Renewal is the cloud's problem.
 
+An important detail about cloud-managed certs: their lifecycle is *not* managed by Kubernetes. ACM cert renewals happen on AWS's schedule (45 days before expiry, automatic for DNS-validated certs and Route 53 zones); GCP managed certs renew via Google's internal automation; Azure Key Vault certs renew per their own policy. The relevant Service/Ingress annotation just references the cert by ARN/ID; nothing in the cluster needs to be touched at renewal time. This is the major operational advantage of cloud-managed certs over cert-manager: you have one fewer thing to monitor.
+
+The downside is auditability: cluster-level changes (cert rotation, key rotation, revocation) don't go through GitOps. They happen via cloud APIs. If your security model demands every cluster-impacting change be visible in Git, you're stuck with cert-manager (and the ACME challenge complexity).
+
 **Pattern B: cert-manager + ACME (Let's Encrypt).**
 - Install [cert-manager](https://cert-manager.io). Define `ClusterIssuer` for Let's Encrypt.
 - cert-manager solves ACME challenges (HTTP-01 via an Ingress, DNS-01 via a cloud DNS provider).
@@ -1898,6 +1911,10 @@ Choose cert-manager when:
 - You want a single mechanism across clouds.
 - You need certs for mTLS (sidecar-to-sidecar) or other non-LB use cases.
 - You want SPIFFE/SPIRE-style identity certs alongside ACME.
+
+A hybrid pattern works for many large platforms: cloud-managed certs for the public-facing LB tier (where renewal automation is most valuable and ALB/App Gateway/HTTPS LB natively integrate), and cert-manager for internal certs (mTLS, internal Ingress, custom CAs). This split avoids ACME rate limits at scale (Let's Encrypt has a 50-certificates-per-week-per-registered-domain rate limit), uses the cloud's strengths for public exposure, and keeps in-cluster automation for the long tail.
+
+One more pattern worth knowing: **Trust Manager** ([cert-manager/trust-manager](https://github.com/cert-manager/trust-manager)) distributes a *trust bundle* (a CA certificate or set of certificates) to every namespace as a ConfigMap. Pods can mount the ConfigMap to trust internal CAs. This is the cleanest way to handle "every pod needs to trust our internal CA" without per-image baking. It complements cert-manager — cert-manager issues the workload certs, trust-manager distributes the CA roots.
 
 ---
 
@@ -2061,6 +2078,10 @@ Disadvantages:
 Pick ESO when: you want centralized secret materialization, low complexity, and your apps expect `Secret` objects.
 Pick Secrets Store CSI when: you want minimum etcd exposure, per-pod isolation, and live rotation matters.
 
+A third option that's gaining traction: **direct cloud-SDK calls from the application**. The app uses workload identity (IRSA/WI) to call AWS Secrets Manager / Cloud Secret Manager / Azure Key Vault directly, fetching secrets at startup. No ESO, no CSI driver, no `Secret` object in etcd. Pros: simplest infrastructure, no controller to operate, secrets stay in the cloud KMS. Cons: every app does its own fetching (with its own retry/cache logic), language SDKs must be available, and migration to a new secret store requires touching every app. This pattern works well for cloud-native greenfield apps, less well for legacy code that expects env-var-style secret injection.
+
+The fourth approach worth mentioning: **Vault Agent** (HashiCorp Vault sidecar). The agent runs as a sidecar, authenticates to Vault via the pod's projected SA token (Vault's Kubernetes auth method), and writes secrets to a shared `emptyDir` volume that the app reads. Vault is cloud-agnostic, but the operational overhead of running Vault is real. For platforms that already operate Vault, the pattern is clean; for platforms starting fresh, ESO or Secrets Store CSI are usually simpler.
+
 ---
 
 ## 38. KMS Provider Plugin and At-Rest Encryption
@@ -2115,10 +2136,19 @@ resources:
 
 The fallback `identity` is *critical* during migration: when you first turn on encryption, existing Secrets are still plaintext. The identity provider reads them. Then a `kubectl get secrets --all-namespaces -o json | kubectl replace -f -` rotates every Secret through the encryption path. After that, you can remove the identity provider (but most clusters leave it for read-safety).
 
+The plugin process and the apiserver communicate over a UNIX domain socket. The wire protocol is gRPC, defined in [`k8s.io/apiserver/pkg/storage/value/encrypt/envelope/kmsv2/v2/api.proto`](https://github.com/kubernetes/apiserver/tree/master/pkg/storage/value/encrypt/envelope/kmsv2). The plugin exposes three methods: `Encrypt(plaintext)`, `Decrypt(ciphertext)`, and `Status()`. The apiserver calls `Status()` every 10 seconds to verify the plugin is alive and the KEK is reachable; if the plugin's status goes `unhealthy`, the apiserver stops accepting writes for affected resources (Secrets, by default), preventing inconsistent state.
+
+A worked example of bootstrap order on a self-managed cluster with KMS encryption: the apiserver depends on the KMS plugin (which depends on cloud KMS, which depends on the network). If the apiserver starts before the plugin's UNIX socket is ready, the apiserver fails to bind the encryption provider and crashes. The fix is to run the KMS plugin as a *static pod* on the same node as the apiserver, with kubelet ensuring it starts first (`spec.initContainers` for cert-bootstrapping if needed, but the plugin container itself with `restartPolicy: Always`). The apiserver's manifest then references the socket path via a hostPath mount. This dance is invisible on managed offerings.
+
 Things that go wrong:
 - **KMS plugin dies → apiserver can't decrypt secrets → many things fail.** The plugin needs to be as available as the apiserver. Run it as a static pod alongside the apiserver, with restartPolicy=Always.
 - **KMS rate limits.** With KMS v1, every Secret read/write was a KMS call. At scale (5000 secrets, controllers polling) you'd hit AWS KMS's 30,000 RPS quota. KMS v2 fixes this by caching the KEK and using local DEK encryption.
 - **Cross-region KMS.** The KMS key is regional. A cluster in `us-east-1` encrypting against a KMS key in `us-west-2` works but adds latency and a cross-region dependency. Pin KMS keys to the cluster's region.
+- **Key rotation.** Cloud KMS keys can be rotated (AWS KMS rotates KMS keys annually if enabled). KMS v2 handles rotation transparently — it caches the *encrypted* DEK reference and on decrypt requests, the KMS service still decrypts old DEKs because it retains old key material. Beware of *destroying* keys; that breaks decryption of older Secrets permanently.
+- **Performance under load.** KMS v2's key cache hit rate is the single biggest knob. By default the apiserver caches up to 1000 DEKs in memory for a TTL of ~5 minutes. Watch `apiserver_envelope_encryption_dek_cache_*` metrics. A miss rate above a few percent suggests raising the cache size or the TTL.
+- **Backup considerations.** etcd snapshots contain encrypted Secrets. Restoring a snapshot to a cluster with different KMS configuration (different key, or no KMS at all) won't be able to decrypt the secrets. Backup the EncryptionConfiguration file alongside the etcd snapshots — and keep KMS keys forever (use AWS KMS's pending-deletion-window rather than immediate delete).
+
+For the truly paranoid: the **bring-your-own-key (BYOK)** mode is supported on most clouds — you import the KEK material from an HSM you control, and the cloud KMS just hosts it. The apiserver still calls cloud KMS for encrypt/decrypt operations, but the underlying material is yours. EKS, GKE, and AKS all support this for the control-plane etcd encryption keys; it's compatible with the cluster-level KMS plugin too.
 
 ---
 
@@ -2211,6 +2241,14 @@ Each managed offering has a different upgrade philosophy:
 - **kube-proxy/CCM within two minors.** More slack here.
 - **Test in non-prod first.** Every minor has subtle behavior changes (defaults flipping, gates GAing, deprecations becoming removals).
 - **CRDs are forever.** A CRD installed in 1.27 still works in 1.31, but its conversion webhook needs to stay alive.
+
+The cloud-specific upgrade hazards that show up most often:
+
+- **API removals.** Each Kubernetes minor removes a few deprecated APIs. The deprecation cycle is typically two minors of warning + one minor of removal. Pre-upgrade, run `kubectl deprecations` (via the [kubent](https://github.com/doitintl/kube-no-trouble) tool) or `pluto` to scan manifests for deprecated APIs. Common removals across recent versions: `PodSecurityPolicy` (removed in 1.25), `FlowSchema v1beta2`/`v1beta3` migrations, `batch/v1beta1 CronJob` (removed 1.25), in-tree volume plugins (removed 1.26).
+- **CSI driver compatibility.** The CSI driver must be compatible with the kubelet version. Most CSI drivers support N-2 minor versions, but if you're upgrading kubelet ahead of the driver, you can hit feature-gate mismatches.
+- **Cloud-side feature gates.** Some cloud features depend on specific Kubernetes feature gates being enabled. EKS, GKE, AKS all gate certain features (e.g., `Topology Aware Hints` GA timing) — read the release notes for the managed offering, not just upstream.
+- **Add-on compatibility.** Cluster add-ons (CCM, CSI, CNI, ingress controllers, metrics-server, kube-state-metrics, the autoscaler) all have their own minimum/maximum Kubernetes-version compatibility. Use the managed offering's add-on catalog to upgrade add-ons in lock-step with the cluster.
+- **Webhook timeouts during apiserver rolling restart.** When the apiserver upgrades, webhooks (admission, conversion) can briefly be unavailable. failurePolicy=Fail webhooks block writes during this window. Mitigate by setting `timeoutSeconds: 5` (short) and verifying webhooks are HA-deployed.
 
 ---
 
@@ -2325,6 +2363,16 @@ The accumulated wisdom from real outages. Each item lists the symptom, the cause
 
 40. **`kms` provider in EncryptionConfiguration v1 vs v2.** Symptom: cluster apiserver fails to read existing secrets after upgrade. Cause: encryption config written for v1 (single key) loaded into a v2-only apiserver. Fix: keep `identity` as a fallback during migration; rotate secrets through new provider.
 
+41. **GKE ManagedCertificate stuck `Provisioning`.** Symptom: `ManagedCertificate.status` shows `Provisioning` indefinitely; the cert never becomes `Active`. Cause: the DNS A record for the listed domain doesn't yet point to the LB IP (Google's HTTP-01 challenge can't reach the cluster), or the LB was provisioned only minutes ago and DNS propagation is incomplete. Fix: pre-create the LB and its static IP, set the DNS records, *then* create the ManagedCertificate.
+
+42. **Azure App Gateway "Backend pool unhealthy".** Symptom: the App Gateway shows backends as unhealthy in the portal; AGIC logs show the right pool members. Cause: the App Gateway probes the backend via its public-IP-mapped DNS name, but VNet routing doesn't allow that path; OR the backend pod's container port mismatches the Ingress port. Fix: use the `appgw.ingress.kubernetes.io/health-probe-*` annotations to force the probe path/port; verify NSG rules allow App Gateway subnet → backend subnet.
+
+43. **EKS Pod Identity association exists but pod doesn't get credentials.** Symptom: the EKS API shows the Pod Identity association, but `kubectl exec <pod> -- aws sts get-caller-identity` returns the node role, not the pod role. Cause: the agent DaemonSet isn't running, or the cluster's add-on isn't installed. Fix: install the `eks-pod-identity-agent` add-on; verify the DaemonSet has a Ready pod on the node hosting the workload.
+
+44. **Cloud DNS zone with split-horizon serving wrong record.** Symptom: ExternalDNS creates a record in the public zone, but in-cluster resolution returns a different value (or nothing). Cause: a private DNS zone overrides the public one for in-VPC queries. Fix: either populate the private zone too (ExternalDNS supports both zone types, configured separately), or route the cluster's DNS at the public zone explicitly.
+
+45. **CCM upgrade pause exceeds graceful shutdown.** Symptom: during CCM rolling restart, a long-running `EnsureLoadBalancer` operation is interrupted; LB ends up in an inconsistent state. Cause: CCM's `terminationGracePeriodSeconds` is shorter than the slowest cloud API call. Fix: raise to 60s; the controller framework handles graceful shutdown by completing the current reconcile before exit.
+
 ---
 
 ## 44. Operator's Cheat Sheet
@@ -2371,6 +2419,24 @@ A short reference card for the common scenarios:
 2. Verify `--domain-filter` covers the requested hostname.
 3. Verify IAM/SA has zone-edit perms.
 4. Check the txt registry — is there a stale owner-id record blocking ownership?
+
+**"Karpenter not scheduling nodes despite pending pods."**
+1. `kubectl logs -n karpenter deploy/karpenter` — look for "no compatible NodePool" or "no instance types".
+2. Check the pending pod's resource requests; if larger than the largest allowed instance type, no node fits.
+3. Verify the NodePool's `requirements` allow the pod's nodeSelector/affinity/topology constraints.
+4. Verify the NodePool's `limits` aren't already hit (`kubectl get nodepool -o yaml`).
+5. Check the EC2NodeClass refs valid subnets/SGs (look for tags `karpenter.sh/discovery=<cluster-name>`).
+
+**"PVC stuck in `Pending`."**
+1. `kubectl describe pvc <name>` — events tell you why.
+2. If "no volume plugin matched": CSI driver missing or wrong provisioner name in StorageClass.
+3. If "waiting for first consumer": `volumeBindingMode: WaitForFirstConsumer` — expected, schedule a pod.
+4. If "failed to provision": cloud-side error in CSI controller logs.
+
+**"Cloud LB endpoint suddenly empty."**
+1. `kubectl get endpointslice -l kubernetes.io/service-name=<svc>` — verify endpoints exist.
+2. If they do but the cloud target group is empty: CCM/LBC reconcile is failing. Check its logs.
+3. If endpointslices are empty: the Service selector doesn't match any pod (or all pods are NotReady).
 
 ---
 
@@ -2421,6 +2487,14 @@ The chapter has cross-referenced many repositories; here is a consolidated list 
 - [Container Storage Interface (CSI) spec](https://github.com/container-storage-interface/spec).
 - [Container Network Interface (CNI) spec](https://github.com/containernetworking/cni/blob/main/SPEC.md).
 - [Gateway API](https://gateway-api.sigs.k8s.io).
+- [SPIFFE/SPIRE](https://spiffe.io) — for workload identity that abstracts above per-cloud schemes.
+
+**Closely related K8s SIG-Cloud-Provider documents:**
+- [SIG Cloud Provider charter](https://github.com/kubernetes/community/blob/master/sig-cloud-provider/charter.md) — what SIG-Cloud-Provider owns, and what it deliberately doesn't.
+- [Out-of-tree provider docs](https://kubernetes.io/docs/concepts/architecture/cloud-controller/) — the official k8s.io guide.
+- [CCM admin docs](https://kubernetes.io/docs/tasks/administer-cluster/running-cloud-controller/) — running CCM in self-managed clusters.
+
+---
 
 ---
 
