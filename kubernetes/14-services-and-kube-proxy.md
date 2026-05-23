@@ -656,6 +656,50 @@ Per-node health is exposed at `:10256/healthz` (the liveness endpoint) and metri
 
 ---
 
+### 6.4 The Mode Selection Decision
+
+kube-proxy's mode is set per-node at startup via `--proxy-mode={iptables,ipvs,nftables,kernelspace}` (kernelspace is Windows-only). The flag is sticky for the kube-proxy process lifetime; changing modes requires restarting kube-proxy on all nodes.
+
+In a kubeadm cluster, the mode lives in the kube-proxy ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: kube-proxy, namespace: kube-system }
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    mode: "ipvs"
+    iptables:
+      minSyncPeriod: 1s
+      syncPeriod: 30s
+    ipvs:
+      scheduler: "rr"
+      syncPeriod: 30s
+      strictARP: true
+```
+
+To migrate modes:
+1. Edit the ConfigMap (`mode: nftables`).
+2. Roll the DaemonSet (`kubectl -n kube-system rollout restart ds kube-proxy`).
+3. Each kube-proxy pod, on restart, *removes the rules it installed in the old mode* (`--cleanup` invocation or the new mode's startup logic does this) and programs rules in the new mode.
+
+The transition is not perfectly atomic across the cluster — for the duration of the rollout, some nodes are on old mode and some on new. Within a single node, the swap is roughly atomic because kube-proxy restarts and the kernel rules persist briefly until the new instance reconciles. In practice this causes negligible disruption.
+
+### 6.5 Local Detector Mode
+
+kube-proxy has a configurable "local detector" that determines what counts as a *node-local* pod for the purpose of `internalTrafficPolicy: Local` and `externalTrafficPolicy: Local`. Options:
+
+- `ClusterCIDR`: a packet is local if its source IP is in the cluster pod CIDR (legacy, fragile).
+- `NodeCIDR`: per-node pod CIDR (preferred; needs the node's pod CIDR allocated).
+- `BridgeInterface`: source is local if it came from the bridge interface `cni0`.
+- `InterfaceNamePrefix`: source is from interfaces matching a prefix (e.g., `cali*` for Calico).
+
+Misconfiguration here breaks Local policy silently. If you set up a custom CNI that uses non-standard bridge naming, double-check that the local detector matches.
+
+---
+
 ## 7. kube-proxy Mode: iptables
 
 iptables mode has been the default since Kubernetes 1.2 (2016). It is by far the most-deployed mode and the model every other mode emulates.
@@ -825,6 +869,27 @@ The real fix is to switch modes. IPVS, nftables, or eBPF all replace the O(N) ma
 
 ---
 
+### 7.6 The Incremental Sync Optimization (1.26+)
+
+Pre-1.26 kube-proxy did a "full rebuild" of every chain on every reconcile: when *any* Service or EndpointSlice changed, it generated a complete `iptables-restore` blob of *all* rules for *all* services and shipped it. For 10k services, that blob was megabytes; iptables-restore took multiple seconds to parse, build, and lock-protect.
+
+KEP-3453 (Minimizing iptables-restore input size, beta in 1.26, GA in 1.27) changed this to per-chain incremental updates. When Service `web` adds a new endpoint, kube-proxy now emits only the `:KUBE-SVC-XPTPB` and `:KUBE-SEP-NEW` chain definitions and the lines that reference them, prefixed with `-X` to delete the old chain definitions and `:CHAIN -` to recreate them — a transaction of ~50 lines instead of ~500,000.
+
+For typical Service-churn workloads, this drops sync duration from seconds to tens of milliseconds. It does not fix the per-packet O(N) match cost, so the high-end scaling cliff remains.
+
+### 7.7 Why iptables Mode Persists
+
+Given all the limitations, why is iptables mode still everywhere?
+
+1. **Backwards compatibility.** It's been the default for nearly a decade. Every legacy CI script, every troubleshooting runbook, every staff engineer's mental model is calibrated to its rule format.
+2. **Universal kernel support.** Every Linux kernel post-2.4 has iptables. nftables needs 3.13+, IPVS needs the kernel modules loaded, eBPF needs 4.10+ with cgroup hooks.
+3. **Debugging familiarity.** `iptables-save | grep <vip>` is muscle memory. No equivalent for the others is as ingrained.
+4. **Tool ecosystem.** Firewalls, network observability tools, security policies — all assume iptables under the hood.
+
+For a small cluster (< 1k services), iptables mode works fine and the operator-cognitive-load argument outweighs the performance one. The cliff is real but it's at 5–10k services, not 100.
+
+---
+
 ## 8. kube-proxy Mode: IPVS
 
 IPVS (IP Virtual Server, also known as LVS — Linux Virtual Server) is a kernel module for L4 load balancing that predates Kubernetes by ~20 years. It uses a kernel hash table indexed by `(VIP, port, protocol)` for O(1) service lookup. kube-proxy's IPVS mode (`--proxy-mode=ipvs`, beta in 1.9, GA in 1.11) uses IPVS for the load balancing and a small set of iptables rules (via `ipset` for set-based matching) for the pre/post-processing.
@@ -955,6 +1020,20 @@ IPVS was the production-recommended mode for large clusters from ~2018 through ~
 
 ---
 
+### 8.6 strictARP
+
+IPVS mode requires `net.ipv4.conf.all.arp_ignore=1` and `arp_announce=2` on all nodes, because every node has every ClusterIP bound to `kube-ipvs0` and would otherwise ARP-respond for VIPs it doesn't actually serve. kube-proxy sets these via the `strictARP: true` config option.
+
+Without strictARP, you can see broken external connectivity when MetalLB or another LB controller advertises the same VIPs — multiple nodes ARP-respond, the network sees ARP storms, and L2 traffic flaps between nodes. Always enable strictARP in IPVS mode.
+
+### 8.7 Conntrack Sharing With IPVS
+
+IPVS has its own connection table (`ip_vs_conn`), but it *also* interacts with netfilter conntrack — DNAT actions in IPVS create conntrack entries the same way iptables DNAT does. So in IPVS mode you still pay the conntrack memory cost; the win is in rule-lookup, not in conntrack avoidance.
+
+This is why eBPF-mode (which skips conntrack entirely for ClusterIP) is the only mode that fundamentally fixes the conntrack-scaling problem.
+
+---
+
 ## 9. kube-proxy Mode: nftables
 
 `nftables` is the modern replacement for `iptables` — same netfilter substrate, completely different rule syntax and dispatcher. The kube-proxy nftables backend (beta in 1.29, GA in 1.33) gives you the iptables-mode mental model with O(1) dispatch via **verdict maps**.
@@ -1032,6 +1111,28 @@ For staff engineers running 1.33+, switching from iptables → nftables is the h
 
 ---
 
+### 9.4 Migration From iptables to nftables
+
+The nftables backend uses an entirely separate kernel subsystem from iptables; both can coexist without conflict (one programs `iptables-legacy` tables, the other `nftables` tables — under the hood, modern iptables-nft already routes iptables commands to the nft kernel API, but the table namespaces are distinct).
+
+Migration steps for a kubeadm-style cluster:
+
+1. **Pre-flight**: confirm kernel version (5.13+ recommended for full nftables feature parity), and that no other tools (firewalld, custom security software) are running parallel iptables rules that might conflict.
+2. **Update ConfigMap**: `mode: nftables`.
+3. **Roll DaemonSet**: `kubectl -n kube-system rollout restart ds kube-proxy`.
+4. **Verify on a node**:
+   ```
+   $ nft list table ip kube-proxy | head -20
+   $ iptables-save -t nat | grep KUBE   # should be empty after cleanup
+   ```
+5. **Watch metrics**: `sync_proxy_rules_duration_seconds` should drop dramatically. Connection success rates should stay stable.
+
+The kube-proxy nftables implementation includes a `--cleanup` mode that wipes its iptables rules from previous installations, so the transition is graceful: as each node's kube-proxy restarts, it removes old iptables rules and installs nft rules. There is a momentary window per node where neither set of rules is active (~milliseconds); existing conntrack-tracked flows continue, new connections might briefly fail on that node.
+
+For HA, roll one node at a time and monitor.
+
+---
+
 ## 10. kube-proxy Replaced: eBPF Socket-Level LB
 
 The most radical option is to **not run kube-proxy at all**. Cilium (and to a lesser degree Calico's eBPF dataplane) replaces kube-proxy with a set of eBPF programs that perform Service load balancing at a *completely different layer* of the kernel: the `connect(2)` syscall, before any packet is constructed.
@@ -1103,6 +1204,42 @@ From the application's perspective, it called `connect(VIP, 80)` and the socket 
 - **Per-flow stickiness with DSR (Direct Server Return) requires more careful design.**
 
 For most large clusters in 2025+, the choice is increasingly between nftables-mode kube-proxy and Cilium eBPF kube-proxy-free. Both are O(1); eBPF wins on conntrack avoidance but loses on debuggability.
+
+---
+
+### 10.4 The cgroup Hook Layer
+
+Linux's BPF cgroup-attach mechanism is the key enabling primitive. The kernel exposes several attach points; the ones Cilium uses for socket LB are:
+
+- `BPF_CGROUP_INET4_CONNECT` / `BPF_CGROUP_INET6_CONNECT`: invoked at `connect(2)` for TCP and connected UDP. The program receives a `bpf_sock_addr` containing the destination address and may rewrite it.
+- `BPF_CGROUP_UDP4_SENDMSG` / `BPF_CGROUP_UDP6_SENDMSG`: for unconnected UDP, invoked per `sendmsg(2)`. Rewrites work the same way.
+- `BPF_CGROUP_INET4_GETPEERNAME`: optional; when an app calls `getpeername(2)` to learn its peer, this program returns the *original VIP* rather than the rewritten backend IP — preserving the illusion that the connection is to the VIP.
+
+These hooks are attached to a cgroup, typically the root cgroup, so they apply to all processes including pods. The eBPF programs are JIT-compiled to native machine code (x86-64 or ARM64), so per-invocation overhead is on the order of tens of nanoseconds.
+
+### 10.5 The eBPF Service Map
+
+Cilium maintains the equivalent of EndpointSlices as eBPF maps:
+
+```
+cilium_lb4_services_v2: { key: (VIP, port, proto), value: backend_slot_count }
+cilium_lb4_backends_v3: { key: backend_id, value: (podIP, podPort) }
+cilium_lb4_reverse_sk:  { key: (cookie, podIP, podPort), value: (VIP, port) }
+```
+
+A connect → service lookup is a `bpf_map_lookup_elem` (O(1) hash probe) + a backend selection (random or consistent hash) + a sockaddr rewrite. The reverse map exists for `getpeername` and for return-path NAT in the rare hairpin cases.
+
+You can inspect this with the Cilium CLI:
+
+```
+$ cilium service list
+ID   Frontend          Service Type   Backend
+1    10.96.42.10:80    ClusterIP      1 => 10.244.1.10:8080  active
+                                      2 => 10.244.2.11:8080  active
+                                      3 => 10.244.3.12:8080  active
+```
+
+The mental model is: kube-proxy → user-space process programming kernel netfilter rules. Cilium eBPF → user-space process programming eBPF maps that kernel-attached eBPF programs read. Same control-plane shape, completely different data plane.
 
 ---
 
@@ -1234,6 +1371,61 @@ The asymmetry — `dst=10.96.42.10` outgoing but `src=10.244.2.11` incoming — 
 
 ---
 
+### 11.6 The Same Trace in IPVS Mode
+
+For completeness, here's what differs in IPVS mode:
+
+```
+Step 2 (PREROUTING on node-A):
+  iptables nat PREROUTING:
+    match ipset KUBE-CLUSTER-IP (10.96.42.10 is in it) → KUBE-MARK-MASQ
+    (no DNAT rules here — IPVS handles it)
+  
+  After iptables processing, packet still has dst=10.96.42.10
+  But VIP is bound to kube-ipvs0 on this host → kernel accepts as local
+  
+  IPVS LOCAL_IN hook fires:
+    lookup (10.96.42.10, 80, TCP) in IPVS virtual server hash → found
+    scheduler picks 10.244.2.11:8080
+    DNAT applied by IPVS
+    ip_vs_conn entry created (mirrors conntrack)
+    Conntrack entry also created (DNAT is recorded there too)
+    
+  Packet now has dst=10.244.2.11:8080, routed via underlay to node-B
+```
+
+Functionally identical to iptables for an application, but the dispatch was O(1) hash lookup instead of O(N) chain scan.
+
+### 11.7 The Same Trace in eBPF Mode (Cilium)
+
+```
+Step 1 (pod-A application):
+  connect("10.96.42.10", 80) syscall begins
+  
+  Kernel runs BPF_CGROUP_INET4_CONNECT program:
+    lookup (10.96.42.10, 80) in cilium_lb4_services_v2 → found
+    randomly select backend_id=2 → 10.244.2.11:8080
+    REWRITE sockaddr to (10.244.2.11, 8080)
+  
+  Socket now initialized with dst=(10.244.2.11, 8080)
+
+Step 2: SYN built with dst=10.244.2.11:8080, NO netfilter rules fire
+  (well, NetworkPolicy rules from Cilium do, but no DNAT/SNAT)
+  No conntrack entry created for the Service portion (Cilium tracks
+  the connection separately in its own map for policy purposes).
+  
+Step 3: SYN sent over underlay to node-B → pod-B as usual.
+
+Return path: pod-B replies with src=10.244.2.11:8080 dst=10.244.1.50:54321
+  Arrives at node-A, delivered to pod-A's socket.
+  Kernel checks if a getpeername hook program returns a different addr;
+  it does → pod-A's app sees the original VIP, not the backend IP.
+```
+
+The key difference: there are **zero packet-rewrites** on the wire. The packet was always destined for the backend pod; the rewrite happened in syscall-land.
+
+---
+
 ## 12. Session Affinity
 
 `spec.sessionAffinity: ClientIP` requests that all connections from a given client IP go to the same backend pod, with a timeout (default 10800s = 3 hours):
@@ -1280,6 +1472,22 @@ For purely internal pod-to-Service traffic, sessionAffinity works as expected be
 ### 12.4 When To Use It
 
 Sessionful legacy apps that hold per-IP state (e.g., shopping cart in memory, no Redis), where you cannot put the state in a shared store. Rare in modern apps. Most apps that *think* they need sessionAffinity actually need either L7 cookie affinity (Ingress / service mesh) or to externalize their session state.
+
+---
+
+### 12.5 Session Affinity Granularity
+
+`sessionAffinity: ClientIP` operates at the **/32** level by default — only exact source IP matches stick. A NATed corporate network where all clients appear as one IP looks like one "client" to affinity; a household behind CGNAT shares affinity. This is rarely a problem but is worth knowing.
+
+For finer or coarser granularity (e.g., affinity per-subnet, per-cookie, per-header), you must go to L7 (Ingress/service mesh). Service-level affinity is L4-only.
+
+### 12.6 What Happens When the Pinned Backend Dies
+
+If sessionAffinity has pinned client X to backend pod P, and P is removed from the EndpointSlice (terminating, deleted, evicted), the next connection from X falls through to a fresh random selection. The pin doesn't survive backend removal — there's nowhere for the affinity to send the traffic.
+
+In iptables mode this is implicit: the `KUBE-SEP-XXXX` chain is removed when the endpoint goes away, so the `recent` rule that referenced it no longer matches.
+
+In IPVS `sh` mode this is rougher: when the real-server set changes, the hash modulo changes, so even *non-removed* clients can be reassigned to different backends. Use `mh` (Maglev consistent hashing) if you need stable assignments through endpoint churn.
 
 ---
 
@@ -1378,6 +1586,39 @@ Use Cluster (default) when:
 If you have one pod per node (e.g., a DaemonSet exposed via LoadBalancer), Local mode is essentially "send to this node's local pod." The failover behavior is then dominated by the LB health-check interval; a pod failure means the node is unhealthy in the LB for up to a few health-check intervals (typically 10–30 seconds), causing dropped connections during that window.
 
 In contrast, Cluster mode would fail over to a pod on a *different* node almost instantly (kube-proxy's sync is sub-second), but at the cost of SNAT.
+
+---
+
+### 13.4 The healthCheckNodePort
+
+When `externalTrafficPolicy: Local` is set on a LoadBalancer or NodePort Service, kube-proxy *also* opens a separate **health-check port** (allocated automatically, usually in the same range as the NodePort) that returns:
+
+- HTTP 200 + JSON `{ "service": ..., "localEndpoints": N }` if N > 0 local endpoints exist.
+- HTTP 503 if N == 0.
+
+This is the canonical health probe for cloud LBs: configure the LB to health-check this port and `Local` policy works as advertised. Cloud-controller-managers configure this automatically when they see `externalTrafficPolicy: Local`.
+
+```
+$ kubectl get svc web -o jsonpath='{.spec.healthCheckNodePort}'
+31234
+
+$ curl http://node-with-pod:31234
+{ "service": {"namespace":"default","name":"web"}, "localEndpoints": 2 }
+
+$ curl http://node-without-pod:31234
+HTTP/1.1 503 Service Unavailable
+```
+
+You can override the port via `spec.healthCheckNodePort: <int>`. Avoid hardcoding unless you have a specific reason.
+
+### 13.5 ProxyTerminatingEndpoints + Local Policy
+
+A subtle interaction: a node has a single local pod, the pod is rolling-updated. During the brief window where the old pod is terminating and the new pod isn't ready:
+
+- Without serving-condition fallback: `localEndpoints: 0` → LB health-check fails → node taken out → outage until new pod is Ready *and* health check passes.
+- With serving-condition fallback (KEP-1669): the terminating pod is still counted as a "serving terminating" endpoint → health check passes → traffic continues, served by the terminating pod until it finishes draining or the new pod becomes Ready.
+
+This makes Local policy much more usable on single-replica-per-node deployments. Before the fallback existed, Local was risky for thin deployments; now it's the default-correct choice.
 
 ---
 
@@ -1481,6 +1722,26 @@ spec:
 
 ---
 
+### 15.5 The Cost Argument
+
+A concrete dollar example: an e-commerce cluster running across us-east-1a, 1b, 1c. Each AZ has equal pod count. Frontend pods talk to a `cart-svc` Service.
+
+Without topology hints:
+- Each frontend connection has 1/3 chance of landing on a same-AZ endpoint, 2/3 chance of crossing AZs.
+- At 10 TB/day of cart traffic, that's ~6.7 TB/day crossing AZs.
+- At $0.01/GB egress: ~$67/day ≈ $24k/year just on this one service.
+
+With topology hints:
+- Same-AZ preference → ~100% same-AZ routing.
+- 0 TB/day crossing AZs (well, modulo zone imbalance).
+- Savings: $24k/year per multi-AZ service.
+
+Multiply across a fleet of 100s of services and you're talking millions per year in cross-AZ savings. This is why topology-aware routing went from "nice-to-have" to "production default" so quickly.
+
+The catch: an autoscaling event that puts all replicas in one AZ silently breaks the routing. Monitor pod-distribution across zones (kube_pod_info aggregated by zone label) and alert on imbalance.
+
+---
+
 ## 16. Dual-Stack Services (IPv4 + IPv6)
 
 A dual-stack cluster has both IPv4 and IPv6 pod and Service CIDRs (`--service-cluster-ip-range=10.96.0.0/16,fd00::/112`). Services can be configured with `spec.ipFamilyPolicy` and `spec.ipFamilies`:
@@ -1505,6 +1766,20 @@ EndpointSlices are partitioned by `addressType`: an IPv4 slice contains pod IPv4
 kube-proxy programs rules for each family separately (iptables + ip6tables, or `inet` tables in nftables).
 
 DNS returns both A and AAAA records for dual-stack Services, and the pod's resolver picks based on its own preferences (per glibc / musl resolver order).
+
+---
+
+### 16.1 The Migration Pitfall
+
+Migrating a single-stack IPv4 cluster to dual-stack is a one-way door on Service objects: once a Service has both `ipFamilies: [IPv4, IPv6]` configured, removing one family requires recreating the Service (and reallocating its ClusterIP, which can break clients that cached it).
+
+The recommended migration approach:
+1. Enable dual-stack on the cluster (apiserver flags + CNI support + service-cluster-ip-range with both families).
+2. New Services default to `PreferDualStack` (or `SingleStack` depending on apiserver default).
+3. Existing Services are left alone (they remain SingleStack).
+4. To migrate a Service to dual-stack: change `ipFamilyPolicy` to `PreferDualStack`, leave `ipFamilies` as `[IPv4]` initially, then add IPv6: `[IPv4, IPv6]`. The apiserver allocates an IPv6 ClusterIP.
+
+Removing the IPv6 family requires a Service recreation — there's no in-place "deallocate the v6 IP" path.
 
 ---
 
@@ -1780,6 +2055,14 @@ Older Kubernetes versions had a kubelet flag `--hairpin-mode=promiscuous-bridge`
 
 ---
 
+### 22.4 Avoiding Hairpin Altogether
+
+If your application happens to talk to itself via the Service, consider whether it should. The most idiomatic fix is to talk to `localhost:8080` directly (intra-pod, no Service involved). This is faster (no kernel netfilter / no rule traversal), avoids the hairpin entirely, and removes a class of debugging headaches.
+
+Hairpin is useful as a *fail-safe* (any pod can talk to any Service VIP, including ones it backs), but for a known same-pod path, skip the indirection.
+
+---
+
 ## 23. conntrack and Service Traffic
 
 Every connection that traverses iptables/IPVS DNAT consumes one conntrack entry on the node *originating* the connection. conntrack is the kernel's connection-tracking subsystem, and it has finite memory.
@@ -1832,6 +2115,20 @@ cpu=1   ...
 ```
 
 Watch the `drop` and `early_drop` counters from `conntrack -S`; non-zero means you're hitting the limit.
+
+---
+
+### 23.4 UDP and conntrack
+
+UDP "connections" are tricky in conntrack: there's no SYN/FIN to mark start/end, so entries time out based on idle. The default `nf_conntrack_udp_timeout` is 30s, `nf_conntrack_udp_timeout_stream` is 120s. This matters for DNS-heavy workloads (each unique DNS query → conntrack entry living 30s).
+
+In a busy cluster doing 10k DNS queries/sec/node, you accumulate 300k UDP conntrack entries per node — easily hitting the default limit. Symptoms: intermittent DNS resolution failures, with the actual cause invisible unless you check conntrack stats.
+
+Mitigations:
+- Raise `nf_conntrack_max` significantly (1M or more).
+- Shorten UDP timeouts where safe.
+- Use Cilium eBPF (skips conntrack for service traffic).
+- Use a node-local DNS cache (NodeLocal DNS) so most resolutions never traverse the Service path.
 
 ---
 
@@ -1936,7 +2233,19 @@ $ curl http://<node-IP>:10249/metrics | grep sync_proxy
 
 `sync_proxy_rules_duration_seconds` p99 climbing means rule programming is slow — usually big endpoint churn or too many services for iptables mode.
 
-### 24.7 Check the Listener
+### 24.7 The "Works From One Pod But Not Another" Class of Bug
+
+A Service is reachable from `debug-pod-1` but not `debug-pod-2`, both in the same namespace. Diagnostic path:
+
+1. **NetworkPolicy on the destination Service's namespace?** Default-deny with no egress rule for the source. Check `kubectl get networkpolicy -A`.
+2. **Source pod's node has stale kube-proxy rules?** Check `iptables-save | grep <vip>` on that specific node's host netns.
+3. **DNS resolution differs?** `dig` the Service name from both pods. Same node has same `/etc/resolv.conf` but pods can have different `dnsPolicy`.
+4. **conntrack table full on source node?** `conntrack -S | grep -E 'drop|early_drop'` on the source node.
+5. **The source pod is in a different netns than expected** (hostNetwork pods don't use the cluster DNS by default).
+
+The asymmetry is almost always rooted in node-level state difference; once you locate the node-specific config drift, the fix follows.
+
+### 24.8 Check the Listener
 
 ```
 $ ss -nlpt
@@ -1944,6 +2253,43 @@ LISTEN 0 4096 *:8080 ...
 ```
 
 On a backend pod (or via `kubectl exec`), confirm the targetPort is actually open. Container *thinks* it's listening but is bound to 127.0.0.1? That's a Service-doesn't-work in disguise.
+
+---
+
+### 24.9 The Five-Minute Triage Sequence
+
+When paged about "Service X is broken", run these in order; each step localizes the failure to a different layer.
+
+```
+1. kubectl get svc X
+   → Does the Service exist? Does it have a ClusterIP? Type correct?
+
+2. kubectl get endpoints X / kubectl get endpointslices -l kubernetes.io/service-name=X
+   → Are endpoints populated? Right port? Conditions ready/serving?
+
+3. kubectl get pods -l <selector-of-X>
+   → Do matching pods exist? Are they Ready?
+
+4. From a debug pod: curl <ClusterIP>:<port>
+   → Does VIP work? If no, kube-proxy issue.
+
+5. From a debug pod: curl <podIP>:<targetPort>
+   → Does direct pod IP work? If no, CNI / app issue.
+
+6. From a debug pod: nslookup X.<ns>.svc.cluster.local
+   → Does DNS resolve to the VIP? If no, CoreDNS issue.
+
+7. On a node: iptables-save | grep <ClusterIP>  (or ipvsadm -ln | grep, or nft list)
+   → Are kernel rules programmed? If no, kube-proxy not running/syncing.
+
+8. On the source node: conntrack -L --dst <ClusterIP> | wc -l
+   → Are connections being tracked? Or is the table full?
+
+9. kubectl logs -n kube-system <kube-proxy-pod-on-source-node>
+   → Any sync errors? Lock contention?
+```
+
+90% of Service outages localize within the first 3 steps. The remaining 10% are kube-proxy or kernel-state issues that need steps 7–9.
 
 ---
 
@@ -1981,6 +2327,18 @@ Practical recommendations:
 - **Bare-metal, no eBPF expertise**: nftables mode + MetalLB for LB Services. Solid combination.
 
 The iptables-mode kube-proxy will eventually become a legacy mode preserved for old kernels and small clusters. nftables is the spiritual successor; eBPF is the leap forward.
+
+---
+
+### 25.1 Hybrid Configurations
+
+It's not strictly required to pick one mode cluster-wide. Some real-world configurations:
+
+- **kube-proxy in nftables mode + Cilium for NetworkPolicy only**: kube-proxy handles Service LB, Cilium provides L3/L4/L7 NetworkPolicy enforcement. Common for teams that want Cilium's policy engine without committing to its kube-proxy-free mode.
+- **Cilium kube-proxy-free + kube-proxy on specific nodes for legacy reasons**: rare, but possible. The two interfere via netfilter so the legacy nodes have to be isolated.
+- **Multi-mode rollouts during migrations**: nodes progressively flip from iptables to nftables. Both work during the transition because each pod's source-node determines which rules apply to its outbound traffic.
+
+The key constraint is *per-node* consistency: each node must run exactly one mode. Mixing modes on a single node is unsupported and produces undefined behavior.
 
 ---
 
