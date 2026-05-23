@@ -1457,6 +1457,41 @@ The user-visible effect: nothing, as long as the CSI driver is installed. If you
 
 `k8s.io/csi-translation-lib` is the shim. The PV controller, attach-detach controller, and kubelet volume manager all call into it when they see a legacy in-tree PV spec. It translates the in-tree fields to a synthetic CSI PV in memory, then proceeds normally. Old YAML still applies, new behavior under the hood.
 
+### 15.3 What the Translation Looks Like
+
+```
+Legacy PV (what's in etcd):                    What the translation produces in memory:
+
+  spec:                                          spec:
+    awsElasticBlockStore:                          csi:
+      volumeID: aws://us-east-1a/vol-0123           driver: ebs.csi.aws.com
+      fsType: ext4                                  volumeHandle: vol-0123
+      readOnly: false                               fsType: ext4
+                                                    readOnly: false
+                                                  nodeAffinity:
+                                                    required:
+                                                      nodeSelectorTerms:
+                                                        - matchExpressions:
+                                                            - key: topology.ebs.csi.aws.com/zone
+                                                              operator: In
+                                                              values: [us-east-1a]
+```
+
+The translation reverses on write: when the controller persists changes back to a legacy PV, the CSI fields are stripped out. This bidirectional translation is what makes migration invisible to users.
+
+### 15.4 What Was Removed (Timeline)
+
+| Version | Change |
+|---|---|
+| 1.21 | CSI migration alpha; `--feature-gates=CSIMigrationAWS=true` opts in |
+| 1.23 | CSIMigrationAWS → beta, on by default |
+| 1.25 | CSIMigrationAWS → GA |
+| 1.27 | In-tree AWS plugin code path removed; legacy specs translated only |
+| 1.30 | All in-tree cloud volume plugins removed; `vsphere`, `cinder`, `gce-pd`, `aws-ebs`, `azureDisk`, `azureFile` are gone |
+| 1.31 | `InTreePluginAWSUnregister` and friends locked on; the corresponding CSI driver MUST be installed |
+
+The upshot: any cluster on a modern version has a CSI driver running for any cloud volume. The legacy in-tree spec is just sugar on top.
+
 ---
 
 ## 16. The Driver Zoo: Cloud, Networked, Local

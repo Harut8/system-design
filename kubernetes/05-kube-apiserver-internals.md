@@ -1547,7 +1547,186 @@ SSA makes ownership explicit. Controllers declare themselves field managers (e.g
 
 Most modern operators built on controller-runtime use SSA exclusively. The `Patch(ctx, obj, client.Apply, ...)` call writes the operator's view as an SSA patch.
 
-### 9.5 The `--field-validation` Story
+### 9.5 SSA Worked Example: Three Owners, One Object
+
+A Deployment with three editors. The starting state:
+
+```yaml
+# initial object
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  managedFields:
+  - manager: deploy-tool
+    operation: Apply
+    fieldsV1:
+      f:spec:
+        f:replicas: {}
+        f:selector: {}
+        f:template:
+          f:metadata: {}
+          f:spec:
+            f:containers:
+              k:{"name":"web"}:
+                f:name: {}
+                f:image: {}
+                f:resources: {}
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.27
+        resources:
+          requests: { cpu: 100m, memory: 128Mi }
+```
+
+Step 1: HPA scales to 5.
+
+```
+   PATCH .../deployments/web?fieldManager=horizontal-pod-autoscaler
+   Content-Type: application/strategic-merge-patch+json
+   body: {"spec":{"replicas":5}}
+```
+
+HPA does not use SSA — it uses strategic merge patch. The apiserver, on storing, **assigns ownership of the changed paths to the field manager named in the query param**. After this PATCH:
+
+```yaml
+managedFields:
+- manager: deploy-tool
+  operation: Apply
+  fieldsV1:
+    f:spec:
+      # f:replicas: {}     ← REMOVED. deploy-tool lost ownership
+                            via the implicit transfer.
+      f:selector: {}
+      f:template: ...
+- manager: horizontal-pod-autoscaler
+  operation: Update
+  fieldsV1:
+    f:spec:
+      f:replicas: {}
+```
+
+Step 2: deploy-tool re-applies with `replicas: 3`.
+
+```
+   PATCH .../deployments/web?fieldManager=deploy-tool&force=false
+   Content-Type: application/apply-patch+yaml
+   body:
+     apiVersion: apps/v1
+     kind: Deployment
+     metadata: { name: web }
+     spec:
+       replicas: 3
+       selector: { matchLabels: { app: web } }
+       template:
+         metadata: { labels: { app: web } }
+         spec:
+           containers:
+           - name: web
+             image: nginx:1.27
+             resources: { requests: { cpu: 100m, memory: 128Mi } }
+```
+
+deploy-tool asserts ownership of `spec.replicas` with value 3. But `spec.replicas` is currently owned by horizontal-pod-autoscaler at value 5. The current value differs from the requested value. → 409 Conflict.
+
+```json
+   HTTP/2 409 Conflict
+   {
+     "kind": "Status",
+     "status": "Failure",
+     "reason": "Conflict",
+     "message": "Apply failed with 1 conflict: conflict with \"horizontal-pod-autoscaler\" using apps/v1: .spec.replicas",
+     "details": {
+       "causes": [{
+         "type": "FieldManagerConflict",
+         "message": "conflict with \"horizontal-pod-autoscaler\" using apps/v1",
+         "field": ".spec.replicas"
+       }]
+     }
+   }
+```
+
+The deploy tool's choices:
+
+```
+   1. Drop spec.replicas from its YAML. Then it isn't claiming
+      ownership; HPA stays unchallenged. This is the typical
+      production pattern.
+   2. Pass force=true. Ownership transfers; the value snaps to 3
+      until HPA's next scale decision.
+   3. Surface the error to the human and fail.
+```
+
+Step 3: deploy-tool re-applies WITHOUT `spec.replicas` in the YAML.
+
+```
+   PATCH .../deployments/web?fieldManager=deploy-tool&force=false
+   body:
+     apiVersion: apps/v1
+     kind: Deployment
+     metadata: { name: web }
+     spec:
+       selector: { matchLabels: { app: web } }
+       template: ...
+```
+
+Now deploy-tool's asserted paths are `f:spec.f:selector`, `f:spec.f:template.*`. Not claiming `spec.replicas`. No conflict. Stored object's `spec.replicas` stays at 5. `managedFields` end state:
+
+```yaml
+managedFields:
+- manager: deploy-tool
+  operation: Apply
+  fieldsV1:
+    f:spec:
+      f:selector: {}
+      f:template: { ... }
+- manager: horizontal-pod-autoscaler
+  operation: Update
+  fieldsV1:
+    f:spec:
+      f:replicas: {}
+```
+
+This is the steady state and the right pattern: GitOps engines drop fields that controllers own. ArgoCD's `ignoreDifferences` is largely a workaround for not using SSA correctly.
+
+### 9.6 Atomic Lists
+
+A subtle SSA wrinkle: how does ownership work for a list whose elements are not associatively keyed? Three list strategies:
+
+```
+   set:        elements are scalars, unique (like volume names).
+               Ownership is per-element.
+   map:        elements are objects with a key field (containers
+               with .name). Ownership is per-element-by-key.
+   atomic:     the entire list is treated as one value. ANY
+               element of an atomic list is owned by whoever
+               owns the list. spec.containers in early Pod
+               versions was atomic; modern Pod's containers is
+               listType=map keyed on name.
+```
+
+The `listType` is declared in the OpenAPI extension `x-kubernetes-list-type`. For CRDs, you must annotate your schema:
+
+```yaml
+spec:
+  containers:
+    type: array
+    x-kubernetes-list-type: map
+    x-kubernetes-list-map-keys: ["name"]
+    items:
+      type: object
+      ...
+```
+
+Without this annotation, SSA defaults to `atomic`, and your CRD will produce horrible "you overwrote my list element" surprises. Always declare `listType` for arrays in your CRD schemas.
+
+### 9.7 The `--field-validation` Story
 
 A related but separate feature: `--field-validation=Strict|Warn|Ignore` causes the apiserver to reject (or warn about) requests with unknown fields. This catches typos like `spec.repplicas` that would silently be discarded. As of 1.27, `Warn` is the default.
 
