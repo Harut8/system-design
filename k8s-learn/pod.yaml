@@ -1,0 +1,252 @@
+# =============================================================================
+# pod.yaml — A heavily-commented, "kitchen sink" Pod for LEARNING.
+# =============================================================================
+# A Pod is the SMALLEST deployable unit in Kubernetes. It is one-or-more
+# containers that:
+#   - share the same network namespace (same IP, same localhost, share ports)
+#   - can share storage volumes
+#   - are always scheduled together onto the SAME node
+#   - live and die together (a Pod is treated as one atomic unit)
+#
+# In real life you rarely create bare Pods — you use a Deployment/ReplicaSet
+# that CREATES Pods for you (self-healing, scaling). This file exists so you can
+# see EVERY field a Pod spec can hold. Not every field below is needed at once;
+# they are here to be read and experimented with.
+#
+# Try:   kubectl apply  -f pod.yaml
+#        kubectl get pod nginx-pod -o wide
+#        kubectl describe pod nginx-pod
+#        kubectl delete -f pod.yaml
+# =============================================================================
+
+apiVersion: v1            # Core API group ("v1"). Pods live in the core group.
+kind: Pod                 # The type of object we are creating.
+
+metadata:
+  name: nginx-pod         # Unique name WITHIN the namespace.
+  namespace: default      # Namespace = virtual cluster / scope. Omit => "default".
+  labels:                 # Key/value tags. Selectors + tooling match on these.
+    app: nginx            #   "app" is a convention, not a required key.
+    env: lab
+    tier: frontend
+  annotations:            # Like labels, but for NON-identifying metadata.
+    # Annotations hold free-form info (tool config, descriptions, git sha...).
+    # You CANNOT select on annotations, only on labels.
+    owner: "harut"
+    description: "Learning pod that runs nginx + a sidecar."
+
+spec:
+  # ---------------------------------------------------------------------------
+  # SCHEDULING & PLACEMENT
+  # ---------------------------------------------------------------------------
+  # nodeSelector: simplest way to pin a Pod to nodes with matching labels.
+  # Uncomment after labeling a node: `kubectl label node <node> disktype=ssd`
+  # nodeSelector:
+  #   disktype: ssd
+
+  # affinity: the powerful, expressive version of nodeSelector + Pod co-location.
+  affinity:
+    nodeAffinity:
+      # "preferred" = soft rule (scheduler tries, but will still schedule if unmet)
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 1                       # 1..100; higher = stronger preference
+          preference:
+            matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["amd64", "arm64"]
+    podAntiAffinity:
+      # Don't co-locate two "app=nginx" pods on the same node (spread them out).
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: nginx
+            topologyKey: kubernetes.io/hostname   # "same node" = same hostname
+
+  # tolerations: allow this Pod onto nodes that carry matching "taints".
+  # Taints repel pods; tolerations are the pod's permission slip.
+  tolerations:
+    - key: "node.kubernetes.io/not-ready"
+      operator: "Exists"
+      effect: "NoExecute"
+      tolerationSeconds: 300   # stay 5 min after node goes NotReady before eviction
+
+  # ---------------------------------------------------------------------------
+  # POD-LEVEL SECURITY CONTEXT (applies to all containers unless overridden)
+  # ---------------------------------------------------------------------------
+  securityContext:
+    runAsNonRoot: true         # refuse to start if the image would run as root
+    runAsUser: 101             # nginx-alpine's "nginx" user is uid 101
+    fsGroup: 101               # group that owns mounted volumes
+    seccompProfile:
+      type: RuntimeDefault     # apply the container runtime's default seccomp filter
+
+  # ---------------------------------------------------------------------------
+  # LIFECYCLE / RESTART / TERMINATION
+  # ---------------------------------------------------------------------------
+  restartPolicy: Always              # Always (default) | OnFailure | Never
+  terminationGracePeriodSeconds: 30  # time to shut down gracefully before SIGKILL
+  dnsPolicy: ClusterFirst            # use cluster DNS (CoreDNS) first
+  serviceAccountName: default        # identity the pod uses to talk to the API server
+  automountServiceAccountToken: true # mount that SA's token into the pod
+
+  # ---------------------------------------------------------------------------
+  # INIT CONTAINERS: run to completion, IN ORDER, BEFORE app containers start.
+  # Great for setup: waiting on a dependency, running migrations, seeding files.
+  # ---------------------------------------------------------------------------
+  initContainers:
+    - name: init-html
+      image: busybox:1.36
+      # Write a landing page into a shared volume before nginx starts.
+      command:
+        - sh
+        - -c
+        - echo "<h1>Hello from init container</h1>" > /work/index.html
+      volumeMounts:
+        - name: html
+          mountPath: /work
+
+  # ---------------------------------------------------------------------------
+  # APP CONTAINERS: this Pod runs TWO (nginx + a log sidecar). They share the
+  # network (same localhost) and the "html" volume.
+  # ---------------------------------------------------------------------------
+  containers:
+    # ------------------------- container 1: nginx --------------------------
+    - name: nginx
+      image: nginx:1.25-alpine
+      imagePullPolicy: IfNotPresent   # Always | IfNotPresent | Never
+
+      ports:
+        - containerPort: 80           # informational; documents the port
+          name: http                  # named port (Services can target "http")
+          protocol: TCP
+
+      # --- Environment variables: three ways to inject config ---
+      env:
+        - name: STATIC_VALUE          # 1) literal value
+          value: "hello"
+        - name: MY_POD_IP             # 2) from pod runtime info (downward API)
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: DB_PASSWORD           # 3) from a Secret (create it first!)
+          valueFrom:
+            secretKeyRef:
+              name: app-secret
+              key: password
+              optional: true          # don't fail to start if the secret is missing
+      envFrom:
+        - configMapRef:               # bulk-import all keys from a ConfigMap
+            name: app-config
+            optional: true
+
+      # --- Resource requests/limits: THE most important production knob ---
+      # requests = what the scheduler guarantees / reserves (used for placement).
+      # limits   = the hard ceiling. Exceeding memory => OOMKilled; CPU => throttled.
+      resources:
+        requests:
+          cpu: "100m"                 # 100 millicores = 0.1 of a CPU core
+          memory: "64Mi"
+        limits:
+          cpu: "250m"
+          memory: "128Mi"
+
+      # --- Probes: how Kubernetes knows if your container is healthy ---
+      # startupProbe: for slow-starting apps; disables the other probes until it
+      # passes (prevents a slow boot from being killed by liveness).
+      startupProbe:
+        httpGet:
+          path: /
+          port: http
+        failureThreshold: 30
+        periodSeconds: 2              # allow up to 30*2 = 60s to start
+      # livenessProbe: is it ALIVE? Fails => container is RESTARTED.
+      livenessProbe:
+        httpGet:
+          path: /
+          port: http
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 1
+        failureThreshold: 3
+      # readinessProbe: is it READY for traffic? Fails => removed from Service
+      # endpoints (NOT restarted). Use for "warming up" or dependency checks.
+      readinessProbe:
+        httpGet:
+          path: /
+          port: http
+        initialDelaySeconds: 3
+        periodSeconds: 5
+
+      # --- Per-container security hardening (overrides pod-level where set) ---
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: false   # nginx needs to write cache/pid; keep false
+        capabilities:
+          drop: ["ALL"]                 # drop all Linux capabilities, add back only needed
+
+      # --- lifecycle hooks: run commands at start/stop of the container ---
+      lifecycle:
+        preStop:
+          # Give load balancers time to stop sending traffic before nginx exits.
+          exec:
+            command: ["sh", "-c", "sleep 5; nginx -s quit"]
+
+      volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html   # serve the file the init container wrote
+        - name: tmp
+          mountPath: /tmp
+        # Because we run as NON-ROOT (uid 101), nginx cannot write to these dirs
+        # in the image (owned by root). We give it writable emptyDir volumes.
+        # fsGroup:101 (pod securityContext) makes them group-writable by nginx.
+        - name: var-run
+          mountPath: /var/run           # nginx.pid is written here
+        - name: var-cache
+          mountPath: /var/cache/nginx   # nginx temp/cache dirs
+        # NOTE: mounting a ConfigMap onto /etc/nginx/conf.d would HIDE the image's
+        # built-in default.conf and leave nginx with no server block. Only mount
+        # here once your ConfigMap actually contains a valid server config.
+        # See pod-tasks.md Task 3.4. Kept commented so the Pod runs out of the box:
+        # - name: config
+        #   mountPath: /etc/nginx/conf.d
+        #   readOnly: true
+
+    # ------------------- container 2: sidecar (tails logs) ------------------
+    - name: log-sidecar
+      image: busybox:1.36
+      # Sidecars run ALONGSIDE the main container. Classic pattern: log shipping,
+      # proxies, metrics adapters. This one just prints a heartbeat.
+      command: ["sh", "-c", "while true; do echo heartbeat $(date); sleep 30; done"]
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "50m"
+          memory: "32Mi"
+
+  # ---------------------------------------------------------------------------
+  # VOLUMES: declared once here, mounted by name in containers above.
+  # ---------------------------------------------------------------------------
+  volumes:
+    - name: html
+      emptyDir: {}                 # scratch space; lives as long as the Pod
+    - name: tmp
+      emptyDir:
+        medium: Memory             # tmpfs (RAM-backed) scratch dir
+    - name: var-run                # writable /var/run so non-root nginx can write its pid
+      emptyDir: {}
+    - name: var-cache              # writable cache dir for non-root nginx
+      emptyDir: {}
+    - name: config
+      configMap:
+        name: app-config           # mount a ConfigMap as files (create it first)
+        optional: true
+# =============================================================================
+# NOTE: some fields reference objects that must exist first (Secret "app-secret",
+# ConfigMap "app-config"). They are marked optional:true so the Pod still starts.
+# See pod-tasks.md to create them and watch the behavior change.
+# =============================================================================

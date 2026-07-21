@@ -1,0 +1,100 @@
+# =============================================================================
+# replica.yaml — A heavily-commented ReplicaSet for LEARNING.
+# =============================================================================
+# A ReplicaSet's ONE job: keep exactly N identical Pods running. If a Pod dies,
+# is deleted, or a node fails, the ReplicaSet notices and creates a replacement.
+# This is "self-healing" and "horizontal scaling."
+#
+# HOW IT WORKS (the mental model):
+#   1. selector  -> which Pods do I own? (label query)
+#   2. template  -> what should a Pod look like? (a Pod spec)
+#   3. replicas  -> how many should exist?
+#   The controller loops forever: (# pods matching selector) vs (replicas),
+#   creating or deleting Pods to close the gap.
+#
+# CRITICAL RULE: template.metadata.labels MUST match selector.matchLabels,
+# otherwise the ReplicaSet creates Pods it doesn't recognize as its own and
+# spins forever creating more. The API server will reject an obvious mismatch.
+#
+# REAL WORLD: you almost never write a ReplicaSet directly. A Deployment manages
+# ReplicaSets for you and adds rolling updates + rollback. Learn RS first so you
+# understand what a Deployment is doing underneath.
+#
+# Try:   kubectl apply -f replica.yaml
+#        kubectl get rs nginx-rs
+#        kubectl get pods -l app=nginx --show-labels
+#        kubectl delete pod <one-of-them>     # watch it get recreated!
+#        kubectl scale rs nginx-rs --replicas=5
+#        kubectl delete -f replica.yaml
+# =============================================================================
+
+apiVersion: apps/v1        # ReplicaSet lives in the "apps" API group (NOT core v1).
+kind: ReplicaSet
+metadata:
+  name: nginx-rs
+  labels:
+    app: nginx             # labels ON the ReplicaSet object itself.
+
+spec:
+  replicas: 3              # desired number of Pods. The whole point of an RS.
+
+  # minReadySeconds: a newly-created Pod must stay Ready this long before the RS
+  # counts it as "available." Guards against pods that pass readiness then crash.
+  minReadySeconds: 5
+
+  # -------------------------------------------------------------------------
+  # selector: the label query that defines "which Pods this RS owns."
+  # matchLabels is the simple form (exact key=value AND).
+  # -------------------------------------------------------------------------
+  selector:
+    matchLabels:
+      app: nginx
+    # matchExpressions is the advanced form (In, NotIn, Exists, DoesNotExist):
+    matchExpressions:
+      - key: tier
+        operator: In
+        values: ["frontend"]
+
+  # -------------------------------------------------------------------------
+  # template: the Pod blueprint. Everything under here is a normal Pod spec
+  # (same fields as pod.yaml) MINUS apiVersion/kind/name (the RS names pods).
+  # -------------------------------------------------------------------------
+  template:
+    metadata:
+      labels:
+        app: nginx         # MUST satisfy the selector above (app=nginx ...)
+        tier: frontend     #   ...and this satisfies the matchExpressions rule.
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          # Requests/limits belong in the template so EVERY replica gets them.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          readinessProbe:      # RS uses Ready status (+ minReadySeconds) for availability
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+# =============================================================================
+# EXPERIMENT: change `replicas: 3` to 4 and `kubectl apply` again — the RS
+# creates 1 more Pod. Change the image and re-apply — nothing happens to running
+# Pods! A ReplicaSet does NOT do rolling updates; only a Deployment does. That
+# single limitation is the reason Deployments exist. See replica-tasks.md.
+# =============================================================================

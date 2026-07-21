@@ -1,4 +1,3 @@
 .claude
 .mypy_cache
 *.mypy
-/k8s-learn
