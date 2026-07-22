@@ -176,12 +176,14 @@ The gotchas that bite you in real clusters. Each is a self-contained lesson: the
 - **Reproduce:** edit `pod.yaml` `initContainers[0].command` to fail:
   `["sh","-c","echo starting; exit 1"]`, then re-create the Pod.
 - **Diagnose:**
+
   ```bash
   kubectl get pod nginx-pod                       # STATUS shows Init:Error / Init:CrashLoopBackOff
   kubectl logs nginx-pod -c init-html             # logs of THIS init container by name
   kubectl logs nginx-pod -c init-html --previous  # if it already restarted
   kubectl describe pod nginx-pod                   # Init Containers section + events
   ```
+
 - **Rules:**
   - Init containers obey `restartPolicy`: with `Always`, a failed init **retries with backoff** (looks like a crashloop but in the Init phase).
   - `kubectl logs <pod>` alone won't show init logs — you MUST pass `-c <initName>`.
@@ -194,10 +196,12 @@ The gotchas that bite you in real clusters. Each is a self-contained lesson: the
 
 - **Trap:** you can't `exec` into a container that keeps dying — it's never up long enough (`container not found`). The logs you need belong to the **dead** instance.
 - **The key commands:**
+
   ```bash
   kubectl logs nginx-pod -c nginx --previous      # logs of the PREVIOUS (dead) container
   kubectl describe pod nginx-pod                    # Last State: Terminated → Reason + Exit Code
   ```
+
 - **Exit code cheat table:**
   | Exit code / reason | Meaning |
   |--------------------|---------|
@@ -207,12 +211,14 @@ The gotchas that bite you in real clusters. Each is a self-contained lesson: the
   | `143`              | SIGTERM — normal shutdown unless it can't finish in the grace period |
   | `CreateContainerConfigError` | missing ConfigMap/Secret the Pod references |
 - **When it dies too fast to inspect** — keep a copy alive:
+
   ```bash
   # ephemeral debug container sharing the pod's namespaces (k8s >= 1.25):
   kubectl debug -it nginx-pod --image=busybox --target=nginx -- sh
   # or a copy with the entrypoint overridden so it stays up:
   kubectl debug nginx-pod -it --copy-to=debug-pod --container=nginx -- sh
   ```
+
   Classic trick: override `command` to `["sleep","3600"]` in a copy, then inspect env/config/network.
 
 ---
@@ -260,11 +266,13 @@ The gotchas that bite you in real clusters. Each is a self-contained lesson: the
   2. **Object deleted** — delete the Pod and its events are cleaned up (why `describe` on a deleted Pod shows nothing).
 - **Also:** identical repeated events are **deduplicated** — one row with a `count` field (e.g. "restarted 200×" = 1 event, `count: 200`), not 200 rows.
 - **Diagnose live:**
+
   ```bash
   kubectl get events --sort-by=.lastTimestamp
   kubectl get events --field-selector involvedObject.name=nginx-pod
   kubectl get events -w
   ```
+
 - **For permanence:** ship events to a log system (event exporter → Loki/ES/Datadog); use the **API server audit log** for "who did what"; use `kubectl logs --previous` for crash forensics.
 
 ---
@@ -315,12 +323,14 @@ The gotchas that bite you in real clusters. Each is a self-contained lesson: the
   denied` → CrashLoop. Image dirs like `/var/run`, `/var/cache/nginx` are root-owned.
 - **Fix (already applied in `pod.yaml`):** mount `emptyDir` volumes at each writable path
   and set `fsGroup` so the non-root user can write:
+
   ```yaml
   securityContext: { fsGroup: 101 }
   volumeMounts:
     - { name: var-run,   mountPath: /var/run }
     - { name: var-cache, mountPath: /var/cache/nginx }
   ```
+
 - **Rule:** when hardening (non-root and/or `readOnlyRootFilesystem: true`), enumerate
   every path the process writes and back each with a writable volume. Alternatively use a
   purpose-built unprivileged image (e.g. `nginxinc/nginx-unprivileged`).
@@ -354,6 +364,7 @@ kubectl delete -f pod.yaml
 ```
 
 ## Mental model to lock in
+
 - Pod = **atomic unit** of scheduling; containers in it share network + can share volumes.
 - **initContainers** run first, in order, to completion. **containers** run together.
 - **requests** = scheduling/guarantee, **limits** = hard ceiling.

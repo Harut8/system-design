@@ -180,12 +180,14 @@ Same format as `pod-tasks.md` Level 7: **trap → reproduce → diagnose → fix
 ### EC-4 — A rollout that "hangs" is usually readiness or image, not the Deployment
 
 - **Diagnose (in order):**
+
   ```bash
   kubectl rollout status deployment/nginx-deploy   # is it progressing?
   kubectl get pods -l app=nginx                     # ImagePullBackOff? CrashLoop? not Ready?
   kubectl describe deployment nginx-deploy          # conditions: Progressing / Available
   kubectl describe pod <new-pod>                     # events for the failing new pod
   ```
+
 - **Rule:** the Deployment is fine; a new pod can't get Ready. With `maxUnavailable: 0`
   the OLD version keeps serving — so you have time. Fix forward or `rollout undo`.
 
@@ -253,20 +255,24 @@ Same format as `pod-tasks.md` Level 7: **trap → reproduce → diagnose → fix
   `DESIRED 0` — and you never scaled it. The Deployment did.
 - **Why:** a Deployment finds "its" ReplicaSets by matching **its selector against RS
   labels** (not just pods). Both objects here use bare `app=nginx`:
-  ```
+
+  ```text
   Deployment nginx-deploy   selector: {app: nginx}
   ReplicaSet nginx-rs       labels:   {app: nginx}     ← matches → adopted
   ```
+
   The Deployment adopts `nginx-rs`, sees its pod template lacks the current
   `pod-template-hash`, treats it as an **old revision**, and scales it to 0 — exactly what
   it does to any superseded revision.
 - **Diagnose (the smoking gun is in events):**
+
   ```bash
   kubectl get rs nginx-rs -o jsonpath='{.metadata.ownerReferences[*].name}{"\n"}'  # -> nginx-deploy
   kubectl get events --field-selector involvedObject.name=nginx-deploy | grep nginx-rs
   #   deployment/nginx-deploy  Scaled down replica set nginx-rs from 3 to 2
   #   ... from 2 to 1 ... from 1 to 0
   ```
+
 - **Danger:** `nginx-rs` is now **owned by the Deployment**. `kubectl delete deployment
   nginx-deploy` will **cascade-delete your hand-written `nginx-rs` too**.
 - **Why the Deployment's OWN RSes are safe:** it appends a unique `pod-template-hash` to
@@ -277,6 +283,36 @@ Same format as `pod-tasks.md` Level 7: **trap → reproduce → diagnose → fix
   (`app.kubernetes.io/name` + `app.kubernetes.io/instance`), or don't run a standalone RS
   and a Deployment with the same `app` label in the same namespace. This is the same
   selector-collision family as `replica-tasks.md` EC-1/EC-2, seen from the Deployment side.
+
+---
+
+### EC-12 — Old ReplicaSets stay at 0, they are NOT deleted (this is rollback history)
+
+- **Trap:** after changing the image you see two ReplicaSets and wonder why the old one
+  wasn't cleaned up:
+
+  ```text
+  nginx-deploy-79d497f6b7   3   3   3   ← new revision (new image), serving
+  nginx-deploy-cd4d84b57    0   0   0   ← old revision, kept at 0 (NOT deleted)
+  ```
+
+- **Why:** a rollout doesn't delete the old RS — it **scales it to 0** and keeps it. That
+  parked, empty RS still holds the previous pod template (old image), so `rollout undo`
+  can restore it by simply scaling it back up. Rollback = re-scale an old RS, not a rebuild.
+- **Diagnose:**
+
+  ```bash
+  kubectl rollout history deployment/nginx-deploy      # each old RS = one revision
+  kubectl get rs -l app=nginx -o custom-columns=\
+  'RS:.metadata.name,DESIRED:.spec.replicas,IMAGE:.spec.template.spec.containers[0].image'
+  ```
+
+- **When old RSes DO get deleted:** bounded by `revisionHistoryLimit` (we set 5; default
+  10). Once you exceed it, the Deployment garbage-collects the OLDEST parked RSes. Setting
+  `revisionHistoryLimit: 0` deletes them all immediately → no rollback (see EC-6).
+- **Rule:** an empty RS is cheap (no pods, just a small API object) and IS your undo
+  button. Kubernetes trades a little `kubectl get rs` clutter for instant rollback. Don't
+  `kubectl delete` old RSes by hand — you're deleting revision history.
 
 ---
 
@@ -296,6 +332,7 @@ kubectl delete -f deployment.yaml
 ```
 
 ## Mental model to lock in
+
 - Deployment = **ReplicaSet manager**; RS = **Pod manager**; Pod = **atomic unit**.
 - Rolling update = **new RS up, old RS down**, paced by `maxSurge` / `maxUnavailable`.
 - Rollback = re-scale an **old RS** back up (history bounded by `revisionHistoryLimit`).
@@ -303,7 +340,8 @@ kubectl delete -f deployment.yaml
 - **readiness** is the rollout's health signal — a bad new version stalls instead of
   taking down the old one (with `maxUnavailable: 0`).
 - Config (ConfigMap/Secret) changes need `rollout restart` — they don't trigger one.
-```
+
+```text
 Deployment ──▶ ReplicaSet v2 (new)  ──▶ Pods (new image)
      │
      └──────▶ ReplicaSet v1 (old, scaled to 0) ── kept for rollback

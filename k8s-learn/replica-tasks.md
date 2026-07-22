@@ -148,16 +148,20 @@ These are the ReplicaSet-specific surprises.
 - **What happened to us:** `pod.yaml`'s `nginx-pod` carries `app=nginx, tier=frontend`.
   The RS selector requires `app=nginx` AND `tier In (frontend)`. `nginx-pod` satisfies
   both → the RS counts it as one of its three and only creates 2 new pods:
-  ```
+
+  ```text
   DESIRED 3 = nginx-pod (adopted) + nginx-rs-aaaaa + nginx-rs-bbbbb
   ```
+
 - **Reproduce:** `kubectl apply -f pod.yaml` then `kubectl apply -f replica.yaml` — the RS
   creates only 2 pods.
 - **Diagnose:**
+
   ```bash
   kubectl get pods -l 'app=nginx,tier=frontend' --show-labels   # everything the RS matches
   kubectl get pod nginx-pod -o jsonpath='{.metadata.ownerReferences[*].name}{"\n"}'  # -> nginx-rs
   ```
+
   The adopted pod gets an `ownerReference` pointing at the RS.
 - **Danger:** delete the RS with the default cascade and it may delete your "standalone"
   pod too — because the RS now owns it.
@@ -233,12 +237,14 @@ kubectl delete -f replica.yaml
 ```
 
 ## Mental model to lock in
+
 - ReplicaSet = **reconcile loop**: keep `count(selector matches) == replicas`.
 - It owns Pods by **label selector**, via `ownerReferences` (adopts & culls to match).
 - `selector.matchLabels` **must** be satisfied by `template.metadata.labels`.
 - A ReplicaSet gives **self-healing + scaling**, but **no rolling updates/rollback**.
 - That gap is exactly why **Deployments** exist — a Deployment drives ReplicaSets.
-```
+
+```text
 Pod  ──owned by──▶  ReplicaSet  ──owned by──▶  Deployment
 (atomic unit)      (keeps N copies)          (rolling updates + rollback)
 ```
