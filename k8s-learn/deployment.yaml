@@ -1,0 +1,154 @@
+# =============================================================================
+# deployment.yaml — A heavily-commented Deployment for LEARNING.
+# =============================================================================
+# A Deployment is the object you ACTUALLY use in production to run stateless
+# apps. It sits ON TOP of ReplicaSets:
+#
+#     Deployment  ──manages──▶  ReplicaSet(s)  ──manage──▶  Pods
+#
+# What a bare ReplicaSet gives you: keep N pods alive (self-healing + scaling).
+# What a Deployment ADDS on top:
+#   - ROLLING UPDATES: change the pod template and it rolls pods over safely by
+#     creating a NEW ReplicaSet and scaling the old one down gradually.
+#   - ROLLBACK: it keeps a history of ReplicaSets (revisions) so you can undo.
+#   - PAUSE/RESUME, and update strategies (RollingUpdate vs Recreate).
+#
+# HOW A ROLLING UPDATE WORKS (the mental model):
+#   old RS (v1): 3 pods                new RS (v2): 0 pods
+#   → scale new up 1, old down 1, wait for Ready ... repeat ...
+#   → old RS: 0 pods                   new RS: 3 pods
+#   maxSurge / maxUnavailable control how aggressive that dance is.
+#
+# Try:   kubectl apply -f deployment.yaml
+#        kubectl get deploy,rs,pods -l app=nginx
+#        kubectl rollout status deployment/nginx-deploy
+#        kubectl set image deployment/nginx-deploy nginx=nginx:1.27-alpine
+#        kubectl rollout undo deployment/nginx-deploy
+#        kubectl delete -f deployment.yaml
+# =============================================================================
+
+apiVersion: apps/v1          # Deployment lives in the "apps" group (like ReplicaSet).
+kind: Deployment
+metadata:
+  name: nginx-deploy
+  labels:
+    app: nginx
+  annotations:
+    # kubernetes.io/change-cause is shown in `kubectl rollout history`. Set it on
+    # each change (or use `kubectl ... --record`, deprecated) to label revisions.
+    kubernetes.io/change-cause: "initial deploy nginx:1.25-alpine"
+
+spec:
+  replicas: 3                 # desired pod count (same meaning as in a ReplicaSet).
+
+  # revisionHistoryLimit: how many OLD ReplicaSets to retain for rollback.
+  # Default is 10. Set low in labs to keep `kubectl get rs` readable.
+  revisionHistoryLimit: 5
+
+  # minReadySeconds: a new pod must stay Ready this long before it counts as
+  # "available" and the rollout proceeds. Guards against pods that pass readiness
+  # then immediately crash — the rollout won't march forward on flapping pods.
+  minReadySeconds: 5
+
+  # progressDeadlineSeconds: if the rollout makes no progress for this long, the
+  # Deployment is marked "ProgressDeadlineExceeded" (Progressing=False). It does
+  # NOT auto-rollback — it just reports failure so you (or CI) can react.
+  progressDeadlineSeconds: 120
+
+  # -------------------------------------------------------------------------
+  # selector: which pods this Deployment (via its ReplicaSets) owns.
+  # IMMUTABLE after creation — you cannot change a Deployment's selector later.
+  # Must be satisfied by template.metadata.labels below.
+  # -------------------------------------------------------------------------
+  selector:
+    matchLabels:
+      app: nginx
+
+  # -------------------------------------------------------------------------
+  # strategy: HOW to replace pods when the template changes.
+  # -------------------------------------------------------------------------
+  strategy:
+    type: RollingUpdate       # RollingUpdate (default) | Recreate
+    # Recreate = kill ALL old pods, THEN create new ones (downtime; use when two
+    #            versions can't run at once, e.g. incompatible schema/locks).
+    rollingUpdate:
+      # maxSurge: how many EXTRA pods above `replicas` may exist during a rollout.
+      #   Higher = faster rollout, more resource use. Can be a number or %.
+      maxSurge: 1
+      # maxUnavailable: how many pods may be unavailable during a rollout.
+      #   0 = zero-downtime (always keep `replicas` serving; needs surge room).
+      maxUnavailable: 0
+
+  # -------------------------------------------------------------------------
+  # template: the Pod blueprint (a full Pod spec minus apiVersion/kind/name).
+  # Changing ANYTHING under here triggers a new rollout (new ReplicaSet).
+  # Changing spec.replicas does NOT (that's just a scale, not a new revision).
+  # -------------------------------------------------------------------------
+  template:
+    metadata:
+      labels:
+        app: nginx            # MUST match spec.selector.matchLabels.
+    spec:
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101        # nginx-alpine "nginx" user
+        fsGroup: 101          # makes mounted emptyDirs writable by the group
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          # Resources belong in the template so EVERY replica is scheduled/capped.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          # Probes matter DOUBLY in a Deployment: the rollout uses readiness to
+          # decide when a new pod is "good" before continuing. Bad readiness =>
+          # a bad version can't complete its rollout (this is a safety feature).
+          startupProbe:
+            httpGet: { path: /, port: http }
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          lifecycle:
+            preStop:
+              # Let load balancers stop sending traffic before nginx exits.
+              exec:
+                command: ["sh", "-c", "sleep 5; nginx -s quit"]
+          volumeMounts:
+            # Non-root nginx must be handed writable dirs (see pod-tasks EC-9).
+            - name: var-run
+              mountPath: /var/run
+            - name: var-cache
+              mountPath: /var/cache/nginx
+      volumes:
+        - name: var-run
+          emptyDir: {}
+        - name: var-cache
+          emptyDir: {}
+# =============================================================================
+# THE POINT: change `image:` above and `kubectl apply` again — unlike a bare
+# ReplicaSet, the Deployment performs a controlled rolling update and lets you
+# `kubectl rollout undo`. Watch it with `kubectl get rs -w` (old RS scales down,
+# new RS scales up). See deployment-tasks.md.
+# =============================================================================

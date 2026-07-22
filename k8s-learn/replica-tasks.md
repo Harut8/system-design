@@ -133,6 +133,93 @@ Do these AFTER `pod-tasks.md` — a ReplicaSet manages Pods, so Pods come first.
 
 ---
 
+## Level 6 — Edge Cases & Production Nuances
+
+Same format as `pod-tasks.md` Level 7: **trap → reproduce → diagnose → fix/rule**.
+These are the ReplicaSet-specific surprises.
+
+---
+
+### EC-1 — Cross-manifest adoption: an RS steals a standalone Pod (WE HIT THIS)
+
+- **Trap:** you `kubectl get rs` and see `DESIRED 3 CURRENT 3 READY 3`, but only **2**
+  `nginx-rs-xxxxx` pods exist. Where's the third? The RS **adopted a pod it never
+  created** because that pod's labels match its selector.
+- **What happened to us:** `pod.yaml`'s `nginx-pod` carries `app=nginx, tier=frontend`.
+  The RS selector requires `app=nginx` AND `tier In (frontend)`. `nginx-pod` satisfies
+  both → the RS counts it as one of its three and only creates 2 new pods:
+  ```
+  DESIRED 3 = nginx-pod (adopted) + nginx-rs-aaaaa + nginx-rs-bbbbb
+  ```
+- **Reproduce:** `kubectl apply -f pod.yaml` then `kubectl apply -f replica.yaml` — the RS
+  creates only 2 pods.
+- **Diagnose:**
+  ```bash
+  kubectl get pods -l 'app=nginx,tier=frontend' --show-labels   # everything the RS matches
+  kubectl get pod nginx-pod -o jsonpath='{.metadata.ownerReferences[*].name}{"\n"}'  # -> nginx-rs
+  ```
+  The adopted pod gets an `ownerReference` pointing at the RS.
+- **Danger:** delete the RS with the default cascade and it may delete your "standalone"
+  pod too — because the RS now owns it.
+- **Fix/rule:** selectors are cluster-wide label queries with **no respect for which file
+  or object created a pod**. Give standalone pods distinct labels (or give the RS a more
+  specific selector) so their label sets don't overlap. In production, prefer unique
+  label keys per workload (e.g. `app.kubernetes.io/name` + `app.kubernetes.io/instance`).
+
+---
+
+### EC-2 — Overlapping selectors between two controllers = a tug-of-war
+
+- **Trap:** two ReplicaSets (or an RS and a Deployment's RS) whose selectors both match the
+  same pods will each try to drive the count — creating/deleting each other's pods forever.
+- **Rule:** selectors across controllers must be **disjoint**. This is exactly why a
+  Deployment auto-injects a unique `pod-template-hash` label into every pod and into its
+  RS selector — so revisions never fight. Bare ReplicaSets have no such protection; you
+  must keep their selectors unique yourself.
+
+---
+
+### EC-3 — The RS ignores template changes for existing pods
+
+- **Trap:** edit `template...image` and `kubectl apply` — running pods keep the OLD image.
+  `kubectl get rs` even shows the new template, yet nothing rolls.
+- **Diagnose:** `kubectl get pods -o jsonpath='{.items[*].spec.containers[*].image}'` still
+  shows the old image; only pods created AFTER the change (delete one to force it) get new.
+- **Rule:** a ReplicaSet reconciles **count only**, never re-templates live pods. This one
+  limitation is the entire reason Deployments exist → use a Deployment for anything you'll
+  update.
+
+---
+
+### EC-4 — `--cascade=orphan` and re-adoption
+
+- **Trap:** `kubectl delete rs nginx-rs --cascade=orphan` leaves the pods running; you
+  think they're now independent. Re-apply the same RS and it **adopts them right back**
+  (matching labels), possibly culling extras to hit `replicas`.
+- **Rule:** orphaned pods are only "free" until another matching controller appears.
+  Adoption is automatic and based solely on labels + an empty/again-matching ownerRef.
+
+---
+
+### EC-5 — Label surgery mid-flight triggers instant reconciliation
+
+- **Trap:** `kubectl label pod <rs-pod> app=notnginx --overwrite` — the RS's owned count
+  drops, so it **immediately creates a replacement**; the relabeled pod keeps running,
+  orphaned. Net effect: you now have MORE pods than `replicas`.
+- **Rule:** changing a pod's labels can move it into or out of a selector at any moment.
+  The controller reacts in seconds. Relabel deliberately, not casually.
+
+---
+
+### EC-6 — Scaling drift: imperative `scale` vs the manifest
+
+- **Trap:** `kubectl scale rs nginx-rs --replicas=7`, then someone runs
+  `kubectl apply -f replica.yaml` (which says `replicas: 3`) — it snaps back to 3.
+- **Rule:** whatever you last `apply` wins. Keep ONE source of truth (the file / GitOps);
+  don't mix imperative `scale` with declarative `apply` on the same object.
+
+---
+
 ## Cheat sheet
 
 ```bash
