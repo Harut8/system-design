@@ -1,0 +1,494 @@
+# =============================================================================
+# resources.yaml — Heavily-commented CPU/memory RESOURCES lab for LEARNING.
+# =============================================================================
+# Everything so far (pod → replicaset → deployment) was about WHAT runs and HOW
+# MANY. This file is about HOW MUCH: how you tell Kubernetes the CPU and memory
+# a container needs, and what the cluster does when you get it wrong.
+#
+# THE TWO NUMBERS (this is the whole topic):
+#
+#   requests  ── used by the SCHEDULER. "Reserve me this much on a node."
+#                A node only accepts the pod if sum(requests) still fits.
+#                It is a BOOKING, not a cap. Nothing enforces it at runtime.
+#
+#   limits    ── used by the KUBELET/cgroups at RUNTIME. "Never exceed this."
+#                CPU over limit  -> THROTTLED  (slowed down, stays alive)
+#                Memory over limit -> OOMKilled (killed, then restarted)
+#
+#   requests = what you are GUARANTEED.   limits = what you are ALLOWED.
+#
+# WHY CPU AND MEMORY BEHAVE DIFFERENTLY (the #1 thing people miss):
+#   CPU is COMPRESSIBLE    -> can be taken away a slice at a time (throttling).
+#   Memory is INCOMPRESSIBLE -> you cannot "slow down" bytes. The only lever the
+#                             kernel has is to kill the process. Hence OOMKilled.
+#
+# UNITS:
+#   cpu: "1" = 1 core = 1000m (millicores).  "500m" = half a core.
+#   memory: Mi/Gi are binary (1Mi = 1048576 B); M/G are decimal. Prefer Mi/Gi.
+#   ephemeral-storage: node disk for the container writable layer + emptyDir/logs.
+#
+# QoS CLASS — derived, not set. Kubernetes computes it and it decides who dies
+# first when a NODE runs out of memory (eviction order):
+#   Guaranteed  every container has requests == limits for BOTH cpu and memory
+#   Burstable   at least one request set, but not the Guaranteed pattern
+#   BestEffort  no requests and no limits anywhere
+#   Eviction order under node pressure:  BestEffort → Burstable → Guaranteed
+#
+# Try:   kubectl apply -f resources.yaml
+#        kubectl get pods -n res-lab -o custom-columns=\
+#          'NAME:.metadata.name,QOS:.status.qosClass,PHASE:.status.phase'
+#        kubectl delete -f resources.yaml
+#
+# NOTE: this file creates TWO namespaces on purpose.
+#   res-lab          — plain QoS/limit demos, NO LimitRange (so BestEffort works).
+#   res-lab-guarded  — LimitRange + ResourceQuota, to show cluster-side policy.
+# Keeping them apart matters: a LimitRange in res-lab would silently inject
+# defaults and make the BestEffort demo impossible (see resources-tasks.md EC-6).
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: res-lab
+  labels:
+    purpose: resources-lab
+
+---
+# =============================================================================
+# 1. GUARANTEED QoS — requests == limits for cpu AND memory, every container.
+# =============================================================================
+# This is the strongest class: the scheduler reserves exactly what you cap at,
+# so the pod can never be "surprised" by a noisy neighbour, and it is the LAST
+# thing evicted under node memory pressure.
+# Cost: you pay for the peak all the time. Unused headroom is wasted capacity.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-guaranteed
+  namespace: res-lab
+  labels: { app: resources-lab, qos: guaranteed }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo guaranteed; sleep 3600"]
+      resources:
+        # IDENTICAL values on both sides -> Guaranteed.
+        # If you omit `limits`, they are NOT inferred; you drop to Burstable.
+        # If you set only `limits`, Kubernetes COPIES them into requests for you
+        # (limits imply equal requests) — that still yields Guaranteed.
+        requests: { cpu: "100m", memory: "64Mi" }
+        limits:   { cpu: "100m", memory: "64Mi" }
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+
+---
+# =============================================================================
+# 2. BURSTABLE QoS — requests < limits. The normal, sane default for most apps.
+# =============================================================================
+# You reserve the STEADY-STATE cost (requests) and allow spikes up to `limits`
+# when the node happens to have room. Best bin-packing efficiency.
+# Risk: the burst headroom is not guaranteed — if the node is busy you get
+# throttled back toward your request, and under memory pressure you are evicted
+# before Guaranteed pods.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-burstable
+  namespace: res-lab
+  labels: { app: resources-lab, qos: burstable }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo burstable; sleep 3600"]
+      resources:
+        requests: { cpu: "50m",  memory: "32Mi" }   # scheduled on this
+        limits:   { cpu: "500m", memory: "128Mi" }  # may burst to this
+        # RULE OF THUMB:
+        #   memory request ≈ memory limit  (memory overcommit gets you OOMKills)
+        #   cpu request  <  cpu limit      (cpu overcommit only costs latency)
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+
+---
+# =============================================================================
+# 3. BESTEFFORT QoS — nothing specified at all. First to be evicted.
+# =============================================================================
+# The scheduler treats this pod as costing ZERO, so it will happily pack it onto
+# a full node. At runtime it can use everything left over... until the node needs
+# memory, at which point this pod is killed FIRST.
+# Never do this in production. It is here so you can see the class exist.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-besteffort
+  namespace: res-lab
+  labels: { app: resources-lab, qos: besteffort }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo besteffort; sleep 3600"]
+      # NO `resources:` block at all. Not `resources: {}` with empty maps —
+      # literally nothing. One request anywhere in the pod makes it Burstable.
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+
+---
+# =============================================================================
+# 4. OOMKilled DEMO — exceed a MEMORY limit on purpose.
+# =============================================================================
+# emptyDir with `medium: Memory` is a tmpfs — a RAM-backed filesystem. Bytes you
+# write to it are charged to the CONTAINER'S memory cgroup, exactly like heap.
+# So `dd` into it is a portable way to grow memory usage with no special image.
+#
+# Expected: the container writes past 64Mi, the kernel OOM-killer fires, and the
+# pod goes CrashLoopBackOff with lastState.terminated.reason == OOMKilled (137).
+# This is the ONLY resource failure that kills you. CPU never does.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mem-oomkill
+  namespace: res-lab
+  labels: { app: resources-lab, demo: oom }
+spec:
+  restartPolicy: Always        # so you can watch the restart count climb
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000              # makes the tmpfs writable by our non-root user
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: hog
+      image: busybox:1.36
+      # Write 200Mi into a 64Mi-limited container. It dies around 64Mi.
+      command:
+        - sh
+        - -c
+        - |
+          echo "filling tmpfs; memory limit is 64Mi"
+          dd if=/dev/zero of=/ram/fill bs=1M count=200
+          echo "if you see this line, the limit was NOT enforced"
+          sleep 3600
+      resources:
+        requests: { cpu: "50m", memory: "64Mi" }
+        limits:   { cpu: "100m", memory: "64Mi" }
+      volumeMounts:
+        - name: ram
+          mountPath: /ram
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: ram
+      emptyDir:
+        medium: Memory         # tmpfs -> counts against the memory LIMIT
+        sizeLimit: 256Mi       # cap the tmpfs itself (else it can eat node RAM)
+
+---
+# =============================================================================
+# 5. CPU THROTTLE DEMO — exceed a CPU limit on purpose.
+# =============================================================================
+# This container tries to burn a full core but is capped at 100m (10% of a core).
+# Expected: it stays RUNNING forever, just slow. It is throttled by the CFS
+# quota, not killed. Compare with pod #4 — same "over the limit", opposite fate.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-throttle
+  namespace: res-lab
+  labels: { app: resources-lab, demo: throttle }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: burner
+      image: busybox:1.36
+      # A pure busy-loop: wants 1000m, allowed 100m.
+      command: ["sh", "-c", "while true; do :; done"]
+      resources:
+        requests: { cpu: "50m",  memory: "32Mi" }
+        limits:   { cpu: "100m", memory: "64Mi" }   # ~10% of one core
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+
+---
+# =============================================================================
+# 6. UNSCHEDULABLE DEMO — a request no node can satisfy.
+# =============================================================================
+# Nothing is wrong with this pod. It is a REQUESTS problem: the scheduler cannot
+# find a node with 100 free cores, so the pod sits in Pending forever with an
+# event `0/N nodes are available: Insufficient cpu`.
+# Learn to recognise this shape: Pending + FailedScheduling = capacity/requests,
+# NOT a crash. (pod-tasks.md EC-10 is the same lesson from the Pod side.)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unschedulable
+  namespace: res-lab
+  labels: { app: resources-lab, demo: pending }
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        requests:
+          cpu: "100"           # 100 CORES. No laptop node has this.
+          memory: "1Ti"
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+
+---
+# =============================================================================
+# 7. EPHEMERAL-STORAGE + resizePolicy — the two fields people forget exist.
+# =============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-and-resize
+  namespace: res-lab
+  labels: { app: resources-lab, demo: ephemeral }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "32Mi"
+          # ephemeral-storage = node disk used by the container writable layer,
+          # emptyDir (disk-backed), and container LOGS. Exceed the limit and the
+          # kubelet EVICTS the pod — a third failure mode, distinct from
+          # OOMKilled and throttling. Unbounded logs are the usual cause.
+          ephemeral-storage: "64Mi"
+        limits:
+          cpu: "200m"
+          memory: "64Mi"
+          ephemeral-storage: "128Mi"
+      # resizePolicy: what happens when you CHANGE resources on a live pod
+      # (in-place vertical scaling — beta and on by default from k8s 1.33;
+      # check with `kubectl explain pod.spec.containers.resizePolicy`).
+      # Without this feature, changing resources means the pod is REPLACED.
+      resizePolicy:
+        - resourceName: cpu
+          restartPolicy: NotRequired   # cpu can be re-cgrouped live
+        - resourceName: memory
+          restartPolicy: RestartContainer  # memory shrink needs a restart
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: scratch
+      emptyDir:
+        sizeLimit: 100Mi       # disk-backed (no `medium`) -> ephemeral-storage
+  # NOTE: newer clusters also support POD-LEVEL resources (`spec.resources`), a
+  # single budget shared by all containers instead of per-container arithmetic.
+  # Check availability: kubectl explain pod.spec.resources
+
+---
+# =============================================================================
+# 8. A Deployment with resources — where they belong in real life.
+# =============================================================================
+# You almost never write a bare Pod. Resources live in the POD TEMPLATE, so
+# every replica is scheduled and capped identically. Changing them here is a
+# TEMPLATE change -> a new revision -> a rolling update (deployment-tasks.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sized-app
+  namespace: res-lab
+  labels: { app: sized-app }
+  annotations:
+    kubernetes.io/change-cause: "initial sizing: 50m/64Mi req, 200m/128Mi lim"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: sized-app          # unique label — never reuse `app: nginx` here,
+                              # or you re-create deployment-tasks.md EC-11.
+  template:
+    metadata:
+      labels: { app: sized-app }
+    spec:
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+          resources:
+            # TOTAL CLUSTER COST = replicas × sum(container requests).
+            # 2 × 50m = 100m cpu reserved, 2 × 64Mi = 128Mi memory reserved.
+            # This arithmetic is what a ResourceQuota checks against.
+            requests: { cpu: "50m",  memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+
+---
+# =============================================================================
+# CLUSTER-SIDE POLICY — a separate namespace so it cannot pollute the demos.
+# =============================================================================
+# The pods above are the DEVELOPER's side of resources. LimitRange and
+# ResourceQuota are the PLATFORM's side: how a cluster admin stops one team
+# from starving everyone else.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: res-lab-guarded
+  labels:
+    purpose: resources-lab-policy
+
+---
+# =============================================================================
+# 9. LimitRange — per-CONTAINER defaults and bounds inside one namespace.
+# =============================================================================
+# Applied by an admission controller at CREATE time. Two distinct jobs:
+#   default / defaultRequest -> INJECT values into containers that omit them
+#   min / max                -> REJECT containers outside the allowed band
+# Effect worth internalising: once a LimitRange with defaults exists, BestEffort
+# pods are IMPOSSIBLE in this namespace — every container gets requests.
+# It only touches pods created AFTER it. Existing pods are untouched.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: container-defaults
+  namespace: res-lab-guarded
+spec:
+  limits:
+    - type: Container
+      # Injected when the container sets no `limits`.
+      default:
+        cpu: "200m"
+        memory: "128Mi"
+      # Injected when the container sets no `requests`.
+      defaultRequest:
+        cpu: "50m"
+        memory: "64Mi"
+      # Hard band. A container asking outside this is REJECTED at admission.
+      min:
+        cpu: "10m"
+        memory: "16Mi"
+      max:
+        cpu: "1"
+        memory: "512Mi"
+      # maxLimitRequestRatio: caps how much a container may overcommit.
+      # 4 here means limit ≤ 4 × request — stops "request 10m, limit 4 cores"
+      # pods that wreck node capacity planning.
+      maxLimitRequestRatio:
+        cpu: "4"
+        memory: "2"
+    - type: Pod
+      # Bounds on the SUM across all containers in one pod.
+      max:
+        cpu: "2"
+        memory: "1Gi"
+
+---
+# =============================================================================
+# 10. ResourceQuota — a per-NAMESPACE budget for the whole team.
+# =============================================================================
+# LimitRange polices ONE container. ResourceQuota polices the TOTAL.
+# Once a quota naming cpu/memory exists, every container in the namespace MUST
+# declare the quantities it constrains, or creation is rejected outright:
+#   "failed quota: must specify limits.cpu, limits.memory, requests.cpu, ..."
+# (A LimitRange with defaults is what makes that requirement painless — the two
+# objects are designed to be deployed together.)
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-budget
+  namespace: res-lab-guarded
+spec:
+  hard:
+    # Sum of all pod REQUESTS in this namespace — the scheduling budget.
+    requests.cpu: "1"
+    requests.memory: 1Gi
+    # Sum of all pod LIMITS — caps worst-case burst for the namespace.
+    limits.cpu: "2"
+    limits.memory: 2Gi
+    # Object counts are quota-able too — a cheap guard against runaway loops.
+    pods: "10"
+    count/deployments.apps: "5"
+    # Quota is charged only while a pod is NOT terminal; Succeeded/Failed pods
+    # release their reservation. Check usage any time with:
+    #   kubectl describe resourcequota team-budget -n res-lab-guarded
+
+---
+# =============================================================================
+# 11. A pod with NO resources, in the guarded namespace.
+# =============================================================================
+# Identical spec to qos-besteffort (#3) — but here the LimitRange injects
+# requests and limits at admission, so it lands as BURSTABLE, not BestEffort,
+# and its reservation is charged to the ResourceQuota.
+# Apply both and diff the two `.status.qosClass` values: same YAML, different
+# outcome, decided entirely by namespace policy.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inherits-defaults
+  namespace: res-lab-guarded
+  labels: { app: resources-lab, demo: limitrange }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      # Deliberately no `resources:` block. Watch it get one anyway:
+      #   kubectl get pod inherits-defaults -n res-lab-guarded \
+      #     -o jsonpath='{.spec.containers[0].resources}{"\n"}'
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+# =============================================================================
+# THE POINT: `requests` is a promise the SCHEDULER makes to you; `limits` is a
+# promise you make to the NODE. Break the memory limit and you are killed; break
+# the CPU limit and you are merely slowed. Get requests wrong and you never get
+# scheduled at all. See resources-tasks.md.
+# =============================================================================
