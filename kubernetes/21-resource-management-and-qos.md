@@ -357,6 +357,28 @@ CPU utilization (cores) = CPU-seconds consumed / wall-clock seconds elapsed
 
 So when `kubectl top pod` shows `CPU: 500m`, it means: "over the last measurement window, this pod consumed 0.5 CPU-seconds per wall-clock second" — equivalent to keeping one logical CPU 50% busy, or two logical CPUs 25% busy each.
 
+#### 3A.2.1 Simple Mental Model: How CPU-Seconds Work
+
+Think of **CPU-seconds** like **man-hours** on a construction site. If a job requires "160 man-hours", you can complete it with different combinations of workers (cores) and time:
+
+* **Massive Parallelism (160 Cores):** If 160 cores work at 100% capacity for just **1 real-world second**, that equals **160 CPU-seconds** ($160 \text{ cores} \times 1 \text{ second} = 160$).
+* **Single Worker (1 Core):** If you use only 1 core running at 100% capacity, it will take **160 real-world seconds** to complete the same 160 CPU-seconds of work ($1 \text{ core} \times 160 \text{ seconds} = 160$).
+* **Team of Workers (16 Cores):** If you use 16 cores running at full speed at the same time, your task will finish in **10 real-world seconds**, but it still consumes **160 CPU-seconds** ($16 \text{ cores} \times 10 \text{ seconds} = 160$).
+* **Partial Speed (4 Cores at 50%):** If 4 cores run at 50% load for **20 real-world seconds**, you consume **40 CPU-seconds** ($4 \text{ cores} \times 0.50 \text{ load} \times 20 \text{ seconds} = 40$).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ REAL-WORLD TIME VS. CPU-SECONDS                                             │
+│                                                                             │
+│ Option 1: 1 Core @ 100% load for 160 seconds   ➜  1 × 160  = 160 CPU-sec   │
+│ Option 2: 16 Cores @ 100% load for 10 seconds  ➜  16 × 10  = 160 CPU-sec   │
+│ Option 3: 160 Cores @ 100% load for 1 second   ➜  160 × 1  = 160 CPU-sec   │
+│ Option 4: 4 Cores @ 50% load for 20 seconds    ➜  4 × 0.5 × 20 = 40 CPU-sec│
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+> **Key Takeaway:** Real-world time (wall-clock time) and CPU time are distinct. **CPU-seconds = (Number of Cores Used) × (Wall-Clock Seconds) × (Average % Core Load)**.
+
 ### 3A.3 Worked Example: Single Pod, Single Container
 
 ```
