@@ -13,6 +13,7 @@ Pre-reqs: chapter 00 (Linux primitives — cgroup v2, OOM killer, CFS scheduler)
 1.  [Why Requests and Limits Exist](#1-why-requests-and-limits-exist)
 2.  [The Two-Knob Model: Scheduling vs Enforcement](#2-the-two-knob-model-scheduling-vs-enforcement)
 3.  [QoS Class Derivation](#3-qos-class-derivation)
+3A. [CPU Fundamentals: Logical vs Physical, CPU-Seconds, CFS, and Concurrency](#3a-cpu-fundamentals-logical-vs-physical-cpu-seconds-cfs-and-concurrency)
 4.  [CPU Semantics: Fractional Requests, cpu.weight, cpu.max](#4-cpu-semantics-fractional-requests-cpuweight-cpumax)
 5.  [Memory Semantics: Bytes, Reservation, memory.max](#5-memory-semantics-bytes-reservation-memorymax)
 6.  [The cgroup-v2 Tree Under kubepods.slice](#6-the-cgroup-v2-tree-under-kubepodsslice)
@@ -270,6 +271,462 @@ Three implications:
 | Guaranteed | last           | -997                | `cpu.weight = MAX` and fixed `cpu.max` if limit set | yes (with static CPU manager + int CPUs) | latency-sensitive, RT, low-latency DB |
 
 The single most important *operational* implication: **never put production workloads in BestEffort.** They are the first thing the eviction manager kills under any pressure, with no warning. A misconfigured `Deployment` with no resource block on a busy node will go into CrashLoopBackOff and you will spend two hours blaming the application before you check `kubectl get pod -o jsonpath='{.status.qosClass}'`.
+
+---
+
+## 3A. CPU Fundamentals: Logical vs Physical, CPU-Seconds, CFS, and Concurrency
+
+Before diving into how Kubernetes maps `requests.cpu` and `limits.cpu` to cgroup knobs (§4), you need a precise understanding of what "1 CPU" actually means, how the kernel accounts for CPU time, and how the CFS scheduler distributes that time across competing processes and threads. Without this, every throttling bug, every VPA recommendation, and every capacity-planning spreadsheet is built on fuzzy intuition.
+
+### 3A.1 What is a "CPU" in Kubernetes?
+
+Kubernetes defines **1 CPU = 1 logical CPU** as seen by the Linux kernel. This is the unit that appears in `requests.cpu` and `limits.cpu`. But "logical CPU" maps to different physical realities depending on the hardware:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  PHYSICAL MACHINE                                                       │
+│                                                                         │
+│  Socket 0 (physical package)          Socket 1 (physical package)       │
+│  ┌──────────────────────────┐        ┌──────────────────────────┐       │
+│  │  Physical Core 0         │        │  Physical Core 8         │       │
+│  │  ├─ Logical CPU 0 (HT0)  │        │  ├─ Logical CPU 16 (HT0) │       │
+│  │  └─ Logical CPU 1 (HT1)  │        │  └─ Logical CPU 17 (HT1) │       │
+│  │                          │        │                          │       │
+│  │  Physical Core 1         │        │  Physical Core 9         │       │
+│  │  ├─ Logical CPU 2 (HT0)  │        │  ├─ Logical CPU 18 (HT0) │       │
+│  │  └─ Logical CPU 3 (HT1)  │        │  └─ Logical CPU 19 (HT1) │       │
+│  │                          │        │                          │       │
+│  │  ...                     │        │  ...                     │       │
+│  │  Physical Core 7         │        │  Physical Core 15        │       │
+│  │  ├─ Logical CPU 14 (HT0) │        │  ├─ Logical CPU 30 (HT0) │       │
+│  │  └─ Logical CPU 15 (HT1) │        │  └─ Logical CPU 31 (HT1) │       │
+│  └──────────────────────────┘        └──────────────────────────┘       │
+│                                                                         │
+│  Total: 2 sockets × 8 physical cores × 2 hyperthreads = 32 logical CPUs│
+│  Kubernetes sees: Allocatable.cpu = 32 (minus kubeReserved)             │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+The terminology hierarchy:
+
+| Term | Definition | Example |
+| --- | --- | --- |
+| **Socket** (package) | A physical CPU chip in a motherboard slot. | A 2-socket server has 2 chips. |
+| **Physical core** | An independent execution unit with its own ALU, FPU, L1/L2 cache. | An Intel Xeon 8380 has 40 physical cores per socket. |
+| **Logical CPU** (hardware thread) | A schedulable execution context. With Hyper-Threading (Intel) or SMT (AMD), each physical core exposes 2 logical CPUs. Without HT/SMT, logical CPU = physical core. | 40 cores × 2 HT = 80 logical CPUs per socket. |
+| **vCPU** (cloud) | What the cloud provider calls a logical CPU. AWS: 1 vCPU = 1 hyperthread. GCP: 1 vCPU = 1 hyperthread. Azure: 1 vCPU = 1 hyperthread (usually). | An `m5.4xlarge` has 16 vCPUs = 16 hyperthreads = 8 physical cores. |
+
+**Critical implication**: Kubernetes `cpu: 1` does **not** mean "one physical core." It means one hyperthread's worth of compute. Two hyperthreads on the same physical core share execution resources (ALU pipelines, L1 cache, TLB). A workload pinned to logical CPUs 0 and 1 (same physical core) gets roughly **1.0–1.3×** the throughput of a single logical CPU, *not* 2×. The topology manager (§13) and static CPU manager (§11) exist precisely to give you control over this.
+
+How to see what a node has:
+
+```bash
+# On the node itself:
+$ lscpu
+Architecture:          x86_64
+CPU(s):                32          # ← this is what Kubernetes sees
+On-line CPU(s) list:   0-31
+Thread(s) per core:    2           # ← Hyper-Threading enabled
+Core(s) per socket:    8
+Socket(s):             2
+NUMA node(s):          2
+NUMA node0 CPU(s):     0-7,16-23
+NUMA node1 CPU(s):     8-15,24-31
+
+# From Kubernetes:
+$ kubectl get node worker-1 -o jsonpath='{.status.capacity.cpu}'
+32
+$ kubectl get node worker-1 -o jsonpath='{.status.allocatable.cpu}'
+31500m   # 32 - 500m kubeReserved
+```
+
+### 3A.2 CPU-Seconds: The Accounting Unit
+
+The kernel doesn't think in "CPU cores" — it thinks in **CPU-seconds** (or microseconds internally). One CPU-second means one logical CPU was busy executing instructions for one second. This is the fundamental currency.
+
+**Definition**: If a process runs on one logical CPU for `T` seconds of wall-clock time, and spends `B` seconds of that actively executing (not sleeping/waiting), it has consumed `B` CPU-seconds.
+
+The math:
+
+```
+CPU-seconds consumed = Σ (time each logical CPU spent executing this cgroup's tasks)
+
+CPU utilization (cores) = CPU-seconds consumed / wall-clock seconds elapsed
+```
+
+So when `kubectl top pod` shows `CPU: 500m`, it means: "over the last measurement window, this pod consumed 0.5 CPU-seconds per wall-clock second" — equivalent to keeping one logical CPU 50% busy, or two logical CPUs 25% busy each.
+
+### 3A.3 Worked Example: Single Pod, Single Container
+
+```
+Scenario:
+  Pod A: requests.cpu=500m, limits.cpu=1
+  Node: 4 logical CPUs
+  Measurement window: 10 seconds
+  Pod A runs a single-threaded web server.
+  During the 10s window, the server processes requests that consume
+  4.2 CPU-seconds of total CPU time.
+
+Accounting:
+  CPU-seconds consumed:  4.2
+  Wall-clock elapsed:    10s
+  Average CPU usage:     4.2 / 10 = 0.42 cores = 420m
+
+  CFS quota check (per 100ms period):
+    quota  = 1 core × 100ms = 100ms per period
+    actual = 420m average → ~42ms per period on average
+    Result: well under quota. No throttling.
+
+  kubectl top pod:
+    NAME     CPU(cores)
+    pod-a    420m
+
+  What the scheduler reserved:
+    500m of node's Allocatable → 3500m remaining for other pods.
+```
+
+### 3A.4 Worked Example: Multiple Pods Competing Over 30 Seconds
+
+```
+Scenario:
+  Node: 4 logical CPUs (4000m total compute per second)
+  
+  Pod A: requests.cpu=1000m, limits.cpu=2000m   (weight: 39,  quota: 200ms/100ms)
+  Pod B: requests.cpu=500m,  limits.cpu=1000m   (weight: 20,  quota: 100ms/100ms)
+  Pod C: requests.cpu=500m,  no limits          (weight: 20,  quota: unlimited)
+  
+  All three pods are CPU-bound (each trying to use as much CPU as possible)
+  over a 30-second window.
+
+Step 1: Total requested = 1000m + 500m + 500m = 2000m ≤ 4000m → scheduler places all three.
+
+Step 2: Runtime — all pods are CPU-bound, so contention exists.
+  Total weights: 39 + 20 + 20 = 79
+  
+  Without limits, CFS would distribute by weight:
+    Pod A share: 39/79 × 4 cores = 1.97 cores
+    Pod B share: 20/79 × 4 cores = 1.01 cores
+    Pod C share: 20/79 × 4 cores = 1.01 cores
+  
+  But limits cap Pod A and Pod B:
+    Pod A: min(1.97, 2.0) = 1.97 cores  ← under limit, no throttling
+    Pod B: min(1.01, 1.0) = 1.00 core   ← right at limit, will start throttling
+    Pod C: min(1.01, ∞)   = 1.01 cores  ← no limit, no throttling
+  
+  Leftover from Pod B's cap: 0.01 cores redistributed by weight to A and C.
+  
+  Final approximate allocation:
+    Pod A: ~1.98 cores → 1.98 × 30 = 59.4 CPU-seconds in 30s
+    Pod B: ~1.00 core  → 1.00 × 30 = 30.0 CPU-seconds in 30s
+    Pod C: ~1.02 cores → 1.02 × 30 = 30.6 CPU-seconds in 30s
+    Total:  4.00 cores → 120.0 CPU-seconds = 4 cores × 30s ✓
+
+Step 3: What if Pod A goes idle at T=15?
+  T=0 to T=15:  three-way contention (as above)
+  T=15 to T=30: only Pod B and Pod C competing, 4 cores available
+    Pod B: min(4 × 20/40, 1.0) = min(2.0, 1.0) = 1.0 core  ← still capped!
+    Pod C: min(4 × 20/40, ∞)   = 2.0 cores                  ← takes all the slack
+    Remaining 1.0 core: goes to Pod C (only uncapped consumer)
+    Pod C actually gets: 3.0 cores (the entire remainder)
+    
+  This is why no-limits pods are better neighbors: they absorb slack.
+```
+
+### 3A.5 Multiprocessing vs Multithreading: How CFS Sees Them
+
+From the kernel's perspective, the CFS scheduler schedules **tasks** (kernel-level threads). Whether your application uses multiprocessing (separate PIDs, separate address spaces) or multithreading (same PID, shared address space) doesn't matter for CPU accounting — both produce kernel tasks that CFS schedules independently.
+
+The critical difference is how they interact with **cgroups**:
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ MULTIPROCESSING (e.g., Python multiprocessing, Gunicorn prefork)          │
+│                                                                            │
+│  Container cgroup: cri-containerd-<CID>.scope                             │
+│  │                                                                        │
+│  ├── PID 1 (entrypoint / master)     ← task 1                            │
+│  ├── PID 2 (worker process 1)        ← task 2, own address space          │
+│  ├── PID 3 (worker process 2)        ← task 3, own address space          │
+│  └── PID 4 (worker process 3)        ← task 4, own address space          │
+│                                                                            │
+│  All 4 PIDs are in the SAME cgroup.                                       │
+│  cpu.max applies to the SUM of all 4 PIDs' CPU time.                      │
+│  Each process has its own memory (RSS); total counts against memory.max.  │
+│                                                                            │
+│  CPU accounting: 4 workers × 100ms wall-clock = up to 400ms CPU-time      │
+│  If cpu.max = "200000 100000" (limit 2 cores):                            │
+│    4 workers can collectively use 200ms per 100ms period.                 │
+│    Each worker gets ~50ms on average → effectively 0.5 cores each.        │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│ MULTITHREADING (e.g., Java, Go goroutines, C++ std::thread)               │
+│                                                                            │
+│  Container cgroup: cri-containerd-<CID>.scope                             │
+│  │                                                                        │
+│  └── PID 1 (JVM / Go runtime)        ← main task                         │
+│      ├── TID 1 (main thread)         ← task 1                            │
+│      ├── TID 2 (worker thread 1)     ← task 2, shared address space       │
+│      ├── TID 3 (worker thread 2)     ← task 3, shared address space       │
+│      ├── TID 4 (GC thread)           ← task 4, shared address space       │
+│      └── TID 5 (I/O thread)          ← task 5, shared address space       │
+│                                                                            │
+│  All TIDs are in the SAME cgroup (threads inherit parent's cgroup).       │
+│  cpu.max applies to the SUM of all TIDs' CPU time — identical to above.   │
+│  Memory is shared; RSS is counted once (not per-thread).                  │
+│                                                                            │
+│  CPU accounting: same as multiprocessing — CFS doesn't care.              │
+│  5 threads × 100ms wall-clock = up to 500ms CPU-time                      │
+│  If cpu.max = "200000 100000" (limit 2 cores):                            │
+│    5 threads collectively use 200ms per 100ms period.                     │
+│    Each thread gets ~40ms on average → effectively 0.4 cores each.        │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key insight**: CFS quota is a **per-cgroup aggregate** across all tasks (threads *and* processes). Whether you fork 4 processes or spawn 4 threads, the cgroup consumes CPU-seconds at the same rate. The quota doesn't care about your concurrency model.
+
+### 3A.6 The Multi-Threaded Quota Trap: A Concrete Example
+
+This is the single most common production surprise with CPU limits. Let's walk through it step by step:
+
+```
+Scenario:
+  Java application with 8 request-handling threads.
+  Each request takes 5ms of CPU time.
+  Requests arrive uniformly: 100 requests/second.
+  Pod spec: limits.cpu = 500m → cpu.max = "50000 100000" (50ms per 100ms period)
+
+Per-period accounting:
+  In a 100ms period, ~10 requests arrive.
+  If each request is handled by a separate thread simultaneously:
+    8 threads × 5ms each = 40ms CPU-time consumed in ~5ms wall-clock
+    Quota used: 40ms out of 50ms → OK, no throttling.
+    
+  But what if a brief burst of 15 requests arrives in one period?
+    8 threads handle the first 8 simultaneously:
+      8 × 5ms = 40ms CPU-time in ~5ms wall-clock. Quota remaining: 10ms.
+    Next 7 requests start, but after ~1.25ms wall-clock (7 × 1.25 ≈ 8.75ms CPU):
+      Quota exhausted! All 8 threads are FROZEN for the rest of the period.
+      
+  Timeline:
+  ├─ 0ms ──── 5ms ──── 6.25ms ──── THROTTLED ──── 100ms ─┤
+    [8 req]     [7 req]   ↑                                
+                          quota exhausted                   
+                          93.75ms of enforced idle!         
+  
+  Those 7 requests each took 5ms of CPU but ~95ms of wall-clock.
+  From the application's perspective: p99 latency jumped from 5ms to 95ms.
+  From the node's perspective: 7 other cores were completely idle.
+  
+  This is the CFS quota trap. The solution: remove limits.cpu (§10)
+  or increase it to cover burst parallelism (limits.cpu ≥ 8 × 5ms/100ms = 400m
+  per thread × 8 threads = 3200m for zero throttling under full parallelism).
+```
+
+### 3A.7 CFS Internals: How the Scheduler Actually Works
+
+The Completely Fair Scheduler (CFS) is the default Linux task scheduler (since kernel 2.6.23). Understanding its internals explains *why* CPU accounting, weights, and quotas behave the way they do.
+
+#### How CFS distributes CPU time (the weight mechanism)
+
+CFS maintains a per-CPU **red-black tree** of runnable tasks, sorted by **virtual runtime** (`vruntime`). The key idea:
+
+```
+vruntime_increment = actual_runtime / weight
+
+A task with higher weight accumulates vruntime slower → stays toward the
+left of the tree → gets picked to run more often.
+```
+
+When the scheduler needs to pick a task, it picks the *leftmost* node (lowest `vruntime`). After running for a time slice, the task's `vruntime` is updated and it's re-inserted. The effect is that tasks with higher weight naturally get more CPU time proportional to their weight.
+
+In the Kubernetes context, `cpu.weight` (derived from `requests.cpu`) feeds directly into this mechanism:
+
+```
+Pod A: requests.cpu=1000m → cpu.weight=39
+Pod B: requests.cpu=250m  → cpu.weight=10
+
+Under contention on a single CPU:
+  vruntime grows 39/10 = 3.9× slower for Pod A's tasks
+  → Pod A gets ~3.9× more CPU time than Pod B
+  → Pod A: 39/(39+10) = 79.6% of the CPU
+  → Pod B: 10/(39+10) = 20.4% of the CPU
+
+With no contention:
+  Both can run whenever they want. vruntime is irrelevant.
+  Pod B can use 100% of an idle CPU.
+```
+
+#### How CFS enforces quotas (the bandwidth controller)
+
+The CFS **bandwidth controller** (`CONFIG_CFS_BANDWIDTH`) is the mechanism behind `cpu.max`. It operates at the **cgroup level**, not per-task:
+
+```
+Data structures (simplified from kernel/sched/fair.c):
+
+struct cfs_bandwidth {
+    u64 quota;          // max CPU-time per period (from cpu.max)
+    u64 period;         // period length in ns (default 100ms)
+    u64 runtime;        // remaining runtime in current period
+    int nr_throttled;   // count of throttled runqueues
+    s64 throttled_time; // total throttled nanoseconds
+};
+```
+
+The lifecycle per period:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Period starts: runtime = quota (e.g., 50ms for limits.cpu=500m)    │
+│                                                                      │
+│  CFS picks tasks from this cgroup to run on various CPUs:           │
+│                                                                      │
+│  CPU 0: task runs 12ms → runtime = 50 - 12 = 38ms                  │
+│  CPU 2: task runs  8ms → runtime = 38 -  8 = 30ms                  │
+│  CPU 0: task runs 15ms → runtime = 30 - 15 = 15ms                  │
+│  CPU 1: task runs 10ms → runtime = 15 - 10 =  5ms                  │
+│  CPU 3: task runs  5ms → runtime =  5 -  5 =  0ms                  │
+│                                                                      │
+│  runtime == 0: THROTTLE                                              │
+│  All tasks in this cgroup are dequeued from all CPUs' runqueues.    │
+│  They cannot be scheduled until the next period.                     │
+│                                                                      │
+│  ... time passes ... no tasks from this cgroup run ...               │
+│                                                                      │
+│  Period ends: runtime is reset to quota. Tasks are re-enqueued.     │
+│  nr_throttled++. throttled_time += (time spent throttled).           │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The subtle point: **runtime is global across all CPUs**. If your cgroup has tasks running on 4 CPUs simultaneously, it burns through quota at 4× the wall-clock rate. This is *exactly* why the multi-threaded trap (§3A.6) happens.
+
+#### CFS scheduling in a two-level cgroup hierarchy
+
+Kubernetes pods live in a nested cgroup hierarchy (§6). CFS handles this via **hierarchical scheduling**:
+
+```
+kubepods.slice/ (weight: 39)
+├── kubepods-burstable.slice/ (weight: 33)
+│   ├── pod-A/ (weight: 39, i.e., requests.cpu=1)
+│   │   └── container-A/ (weight: 39)
+│   │       ├── thread-1
+│   │       └── thread-2
+│   └── pod-B/ (weight: 20, i.e., requests.cpu=500m)
+│       └── container-B/ (weight: 20)
+│           └── thread-1
+└── kubepods-besteffort.slice/ (weight: 1)
+    └── pod-C/ (weight: 1)
+        └── container-C/ (weight: 1)
+            └── thread-1
+
+Under full contention on a 4-core node:
+
+  Level 1: kubepods.slice gets all 4 cores (only pod cgroup at this level).
+  
+  Level 2: burstable vs besteffort
+    burstable weight: 33
+    besteffort weight: 1
+    burstable gets: 33/34 × 4 = 3.88 cores
+    besteffort gets: 1/34 × 4 = 0.12 cores
+  
+  Level 3 (within burstable): pod-A vs pod-B
+    pod-A weight: 39
+    pod-B weight: 20
+    pod-A gets: 39/59 × 3.88 = 2.57 cores
+    pod-B gets: 20/59 × 3.88 = 1.31 cores
+  
+  Result:
+    Pod A (req 1000m): ~2570m  ← more than requested, absorbing slack
+    Pod B (req 500m):  ~1310m  ← more than requested
+    Pod C (req 0):     ~120m   ← scraps, but it asked for nothing
+```
+
+The hierarchy ensures that QoS classes are respected *structurally*, not just by weight values. BestEffort pods are children of a low-weight parent, so they get proportionally less even if their individual weight were higher (which it isn't — it's 1).
+
+### 3A.8 GOMAXPROCS, JVM Thread Pools, and the Container CPU Problem
+
+Many language runtimes auto-detect the number of available CPUs to size their thread pools. On bare metal, this works perfectly. Inside a container, it's a footgun:
+
+```
+Problem:
+  Host has 64 logical CPUs.
+  Container has limits.cpu=2 → cpu.max = "200000 100000".
+  
+  Go runtime: GOMAXPROCS defaults to runtime.NumCPU() = 64
+    → 64 goroutines can run in parallel
+    → burns through 200ms quota in ~3ms wall-clock
+    → throttled for 97ms
+  
+  JVM: Runtime.getRuntime().availableProcessors() = 64
+    → ForkJoinPool.commonPool size = 63
+    → GC parallel threads = ~16
+    → same quota burn problem
+  
+  Python: os.cpu_count() = 64
+    → multiprocessing.Pool() defaults to 64 workers
+    → same problem, but per-process
+  
+  Node.js: os.cpus().length = 64
+    → cluster.fork() in a loop = 64 workers
+    → same problem
+
+Solution:
+  These runtimes should read the cgroup limit, not /proc/cpuinfo.
+  
+  Go 1.19+:    Automatically reads cpu.max. GOMAXPROCS = ceil(quota/period).
+               With limits.cpu=2 → GOMAXPROCS=2. Correct.
+               For older Go or when you want explicit control:
+               Use uber-go/automaxprocs: import _ "go.uber.org/automaxprocs"
+  
+  JVM 10+:     Reads cpu.max via -XX:+UseContainerSupport (default on).
+               availableProcessors() = ceil(quota/period).
+               JVM 8u191+ also supports this.
+               Override: -XX:ActiveProcessorCount=2
+  
+  Python:      os.cpu_count() still returns 64 (as of 3.13).
+               Use: len(os.sched_getaffinity(0)) for cpuset-aware count,
+               or manually read /sys/fs/cgroup/cpu.max.
+  
+  Node.js:     os.cpus().length still returns 64.
+               Manually set cluster workers: Math.min(os.cpus().length, N).
+               Or read the cgroup limit.
+```
+
+### 3A.9 CPU-Seconds in Prometheus: Connecting the Theory to Observability
+
+The cAdvisor metric `container_cpu_usage_seconds_total` is a monotonically increasing counter of CPU-seconds consumed. Everything in this section connects to it:
+
+```
+# Instantaneous CPU usage in cores (= CPU-seconds per second):
+rate(container_cpu_usage_seconds_total{container="myapp"}[5m])
+
+# This number means:
+#   0.5  → the container uses 500m (half a logical CPU) on average
+#   2.0  → the container uses 2000m (two logical CPUs) on average
+#   0.05 → the container uses 50m on average
+
+# Compare to requests to see if right-sized:
+rate(container_cpu_usage_seconds_total{container="myapp"}[5m])
+ /
+kube_pod_container_resource_requests{resource="cpu", container="myapp"}
+
+# > 1.0 means the pod is using more than it requested (bursting)
+# < 0.3 means the pod is over-provisioned (wasting scheduler capacity)
+# 0.5–0.8 is the healthy range for latency-sensitive services
+```
+
+### 3A.10 Summary Table: CPU Concepts at a Glance
+
+| Concept | What it is | Kubernetes relevance |
+| --- | --- | --- |
+| Physical core | Independent execution unit on the die | Not directly visible to K8s; matters for cache/NUMA (§13) |
+| Logical CPU | Schedulable hardware thread (with HT: 2 per physical core) | This is what `cpu: 1` means |
+| CPU-second | 1 logical CPU busy for 1 second | The unit of `container_cpu_usage_seconds_total` |
+| `cpu.weight` | CFS proportional share (1–10000) | Derived from `requests.cpu`; arbitrates under contention |
+| `cpu.max` | CFS bandwidth quota (quota/period μs) | Derived from `limits.cpu`; hard cap regardless of idle CPUs |
+| CFS period | Time window for quota accounting (default 100ms) | Shorter = less throttle latency, more overhead |
+| Throttling | Cgroup frozen until next period after quota exhausted | The reason multi-threaded apps get surprise latency spikes |
+| `GOMAXPROCS` / thread pool size | Runtime's concurrency level | Must match cgroup limit, not host CPU count |
 
 ---
 
