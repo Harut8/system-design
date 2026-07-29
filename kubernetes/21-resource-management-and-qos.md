@@ -14,6 +14,7 @@ Pre-reqs: chapter 00 (Linux primitives — cgroup v2, OOM killer, CFS scheduler)
 2.  [The Two-Knob Model: Scheduling vs Enforcement](#2-the-two-knob-model-scheduling-vs-enforcement)
 3.  [QoS Class Derivation](#3-qos-class-derivation)
 3A. [CPU Fundamentals: Logical vs Physical, CPU-Seconds, CFS, and Concurrency](#3a-cpu-fundamentals-logical-vs-physical-cpu-seconds-cfs-and-concurrency)
+3B. [Capacity Metrics: Usage, Utilization, Core-Hours, and Memory Accounting](#3b-capacity-metrics-usage-utilization-core-hours-and-memory-accounting)
 4.  [CPU Semantics: Fractional Requests, cpu.weight, cpu.max](#4-cpu-semantics-fractional-requests-cpuweight-cpumax)
 5.  [Memory Semantics: Bytes, Reservation, memory.max](#5-memory-semantics-bytes-reservation-memorymax)
 6.  [The cgroup-v2 Tree Under kubepods.slice](#6-the-cgroup-v2-tree-under-kubepodsslice)
@@ -727,6 +728,492 @@ kube_pod_container_resource_requests{resource="cpu", container="myapp"}
 | CFS period | Time window for quota accounting (default 100ms) | Shorter = less throttle latency, more overhead |
 | Throttling | Cgroup frozen until next period after quota exhausted | The reason multi-threaded apps get surprise latency spikes |
 | `GOMAXPROCS` / thread pool size | Runtime's concurrency level | Must match cgroup limit, not host CPU count |
+
+---
+
+## 3B. Capacity Metrics: Usage, Utilization, Core-Hours, and Memory Accounting
+
+When you move from "make my pod run" to "how much infrastructure does my team/service/cluster actually consume, and are we right-sized?", you need precise definitions of *usage*, *utilization*, and *cost units* — for both CPU and memory. These terms are used loosely in conversation, precisely in billing systems, and inconsistently across monitoring tools. Getting them wrong leads to chargebacks that are unfair, autoscalers that thrash, and capacity plans that are fiction.
+
+### 3B.1 CPU: Usage vs Utilization vs Allocation — Three Different Numbers
+
+These three terms are often confused but measure fundamentally different things:
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ CPU ALLOCATION (requests)                                                  │
+│   What the scheduler reserved. A bookkeeping number.                      │
+│   Does NOT change with actual load. Fixed at pod creation.                │
+│   Unit: cores (milliCPU)                                                  │
+│   Source: kube_pod_container_resource_requests{resource="cpu"}             │
+│                                                                            │
+│ CPU USAGE                                                                  │
+│   How many CPU-seconds the cgroup actually consumed per wall-clock second.│
+│   This IS the actual load. Changes constantly.                            │
+│   Unit: cores (CPU-seconds per second)                                    │
+│   Source: rate(container_cpu_usage_seconds_total[5m])                      │
+│                                                                            │
+│ CPU UTILIZATION                                                            │
+│   Usage expressed as a fraction of some reference.                         │
+│   Which reference? That's where the confusion lives.                       │
+│   Unit: percentage (0–100% or 0–N00% for multi-core)                      │
+│   Source: depends on which denominator you pick (see below)               │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The denominator problem — "utilization of *what*?":
+
+| Metric | Formula | What it answers | Range |
+| --- | --- | --- | --- |
+| **Utilization vs request** | `usage / requests.cpu` | "Is this pod right-sized?" | 0–∞ (can exceed 100% if bursting) |
+| **Utilization vs limit** | `usage / limits.cpu` | "How close to throttling?" | 0–100% (can't exceed if CFS enforced) |
+| **Utilization vs node** | `usage / node.allocatable.cpu` | "What fraction of this node is this pod consuming?" | 0–100% |
+| **Utilization vs cluster** | `Σ(usage) / Σ(node.allocatable.cpu)` | "How loaded is the entire cluster?" | 0–100% |
+
+**HPA uses utilization-vs-request** by default (`type: Resource, target.averageUtilization`). This is critical: if your pod requests 1000m but uses 200m, HPA sees 20% utilization and may scale *down* — even though the pod might be doing useful work. If your pod requests 100m but uses 500m (bursting with no limits), HPA sees 500% and scales *up* aggressively.
+
+#### Prometheus queries for each
+
+```promql
+# 1. Raw CPU usage in cores
+rate(container_cpu_usage_seconds_total{
+    container!="", container!="POD",
+    namespace="prod"
+}[5m])
+
+# 2. Utilization vs request (what HPA sees)
+rate(container_cpu_usage_seconds_total{container!="", container!="POD"}[5m])
+  /
+kube_pod_container_resource_requests{resource="cpu"}
+
+# 3. Utilization vs limit
+rate(container_cpu_usage_seconds_total{container!="", container!="POD"}[5m])
+  /
+kube_pod_container_resource_limits{resource="cpu"}
+
+# 4. Node-level utilization (all pods on the node)
+sum by (node) (rate(container_cpu_usage_seconds_total{container!=""}[5m]))
+  /
+kube_node_status_allocatable{resource="cpu"}
+
+# 5. Cluster-wide utilization
+sum(rate(container_cpu_usage_seconds_total{container!=""}[5m]))
+  /
+sum(kube_node_status_allocatable{resource="cpu"})
+
+# 6. Allocation efficiency: how much of what's reserved is actually used
+sum(rate(container_cpu_usage_seconds_total{container!=""}[5m]))
+  /
+sum(kube_pod_container_resource_requests{resource="cpu"})
+```
+
+### 3B.2 CPU Core-Hours: The Billing Unit
+
+Cloud providers and internal chargeback systems bill CPU by the **core-hour**: one logical CPU running for one hour.
+
+**Definition**:
+```
+1 core-hour = 1 logical CPU × 1 hour = 3600 CPU-seconds
+```
+
+There are two very different ways to calculate core-hours, and which one you pick determines who pays what:
+
+#### Method 1: Allocation-based (what you reserved)
+
+```
+core-hours_allocated = Σ (requests.cpu × pod_uptime_hours)
+
+Example:
+  Pod A: requests.cpu=2, ran for 24 hours
+  Pod B: requests.cpu=500m, ran for 8 hours
+  Pod C: requests.cpu=100m, ran for 24 hours
+  
+  Total = (2 × 24) + (0.5 × 8) + (0.1 × 24)
+        = 48 + 4 + 2.4
+        = 54.4 core-hours allocated
+```
+
+PromQL:
+```promql
+# Core-hours allocated over the last 24h, per namespace
+sum by (namespace) (
+    kube_pod_container_resource_requests{resource="cpu"}
+) * 24  # hours
+
+# More precise: integrate over actual pod uptime using recording rules
+# (since pods come and go throughout the day)
+sum by (namespace) (
+    increase(kube_pod_container_resource_requests{resource="cpu"}[24h:5m]) * (5/60)
+)
+```
+
+#### Method 2: Usage-based (what you actually consumed)
+
+```
+core-hours_used = Σ (CPU-seconds consumed) / 3600
+
+Example (same pods, measured usage):
+  Pod A: used avg 1.2 cores over 24 hours → 1.2 × 24 = 28.8 core-hours
+  Pod B: used avg 450m over 8 hours       → 0.45 × 8 = 3.6 core-hours
+  Pod C: used avg 30m over 24 hours       → 0.03 × 24 = 0.72 core-hours
+  
+  Total = 28.8 + 3.6 + 0.72
+        = 33.12 core-hours used
+```
+
+PromQL:
+```promql
+# Core-hours consumed over the last 24h, per namespace
+sum by (namespace) (
+    increase(container_cpu_usage_seconds_total{container!="", container!="POD"}[24h])
+) / 3600
+```
+
+#### Why the gap matters
+
+```
+Allocation-based: 54.4 core-hours
+Usage-based:      33.12 core-hours
+Efficiency:       33.12 / 54.4 = 60.9%
+Waste:            39.1% of reserved CPU sat idle
+```
+
+The 39.1% gap is real infrastructure cost. Every idle reserved core blocks the scheduler from placing other pods. This gap is what VPA (§29) and right-sizing (§30) aim to close.
+
+| Billing model | Pros | Cons | When to use |
+| --- | --- | --- | --- |
+| **Allocation-based** | Simple, predictable bills; teams know their cost upfront; encourages right-sizing (you pay for waste) | Punishes bursty workloads; teams game it by under-requesting | Internal chargeback, capacity planning |
+| **Usage-based** | Fair; you pay for what you consume; no waste penalty | Unpredictable bills; doesn't account for *reserved* capacity that others can't use; encourages over-requesting | Cloud billing (AWS/GCP on-demand), dev environments |
+| **Blended** | Max(allocation, usage) or weighted average; captures both reservation cost and actual consumption | More complex to explain and implement | Large orgs with mature FinOps |
+
+### 3B.3 Memory: Usage, Working Set, and RSS — Not the Same Thing
+
+Memory accounting is more complex than CPU because the kernel tracks multiple overlapping counters, and picking the wrong one leads to wrong eviction decisions, wrong OOM thresholds, and wrong capacity plans.
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│  MEMORY COUNTERS IN A CGROUP (cgroup v2)                                   │
+│                                                                            │
+│  memory.current                                                            │
+│    Total memory charged to this cgroup. Includes:                         │
+│    ├── RSS (Resident Set Size): anonymous pages (heap, stack, mmap)        │
+│    ├── Page cache: file-backed pages (read/written files, mmap'd files)   │
+│    ├── Kernel memory: slab, page tables, socket buffers                   │
+│    ├── tmpfs / shmem: shared memory segments                              │
+│    └── Swap (if enabled): pages swapped out but still charged             │
+│                                                                            │
+│  memory.stat (selected fields):                                            │
+│    anon          = RSS (anonymous pages only)                              │
+│    file          = page cache (file-backed pages only)                     │
+│    kernel        = kernel memory (slab + page tables + ...)                │
+│    shmem         = tmpfs / POSIX shared memory                             │
+│    inactive_anon = RSS pages not recently accessed                         │
+│    inactive_file = page cache pages not recently accessed                  │
+│                                                                            │
+│  DERIVED METRICS:                                                          │
+│    Working Set Size (WSS) = memory.current - inactive_file                 │
+│      This is what Kubernetes reports as "memory usage"                     │
+│      (via cAdvisor → metrics-server → kubectl top)                        │
+│                                                                            │
+│    RSS = memory.stat.anon                                                  │
+│      Just the anonymous (non-file-backed) pages                           │
+│                                                                            │
+│    Cache = memory.stat.file                                                │
+│      File-backed pages that the kernel CAN drop under pressure            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+Why the distinction matters enormously:
+
+| Metric | What it includes | Can the kernel reclaim it? | What happens at `memory.max`? |
+| --- | --- | --- | --- |
+| `memory.current` | Everything: RSS + cache + kernel + shmem | Partially (cache is reclaimable) | Kernel reclaims cache first, then OOM kills |
+| **Working Set** (`current - inactive_file`) | RSS + active cache + kernel + shmem | Mostly not (these are "needed" pages) | This is what *should* be compared to limits |
+| **RSS** (`memory.stat.anon`) | Only heap/stack/anonymous mmap | No (must kill the process) | RSS alone exceeding `memory.max` → guaranteed OOM |
+| **Cache** (`memory.stat.file`) | Only file-backed pages | Yes (kernel drops them freely) | Cache exceeding limit → kernel just drops pages, no OOM |
+
+**The critical insight**: A pod can have `memory.current = 3 GiB` and `memory.max = 2 GiB` simultaneously and *not* be OOM-killed — if 1.5 GiB is reclaimable page cache. The kernel reclaims cache pages as needed. But `kubectl top` reports *working set*, which excludes inactive file pages, so you see ~1.5–2 GiB — a more honest number.
+
+#### Corner case: I/O-heavy workloads
+
+```
+Scenario:
+  Pod runs a log processor that reads 100 GiB of files per hour.
+  requests.memory=512Mi, limits.memory=1Gi.
+  
+  What happens:
+    The kernel caches recently-read file pages in the cgroup's page cache.
+    memory.current quickly reaches 1Gi (memory.max).
+    BUT: most of those pages are file cache (reclaimable).
+    memory.stat.anon (RSS) is only 200Mi (the actual application heap).
+    
+    The kernel continuously evicts old cache pages to make room for new ones.
+    No OOM. No eviction. The pod is perfectly healthy.
+    
+    BUT: `container_memory_usage_bytes` (memory.current) shows 1Gi.
+    An uninformed alert on memory.current > 90% of limit fires constantly.
+    
+  Solution: alert on working_set, not memory.current:
+    container_memory_working_set_bytes < limits.memory * 0.9
+```
+
+### 3B.4 Memory Byte-Hours: The Memory Billing Unit
+
+The memory equivalent of a core-hour is a **GiB-hour** (or MiB-hour): one GiB of memory held for one hour.
+
+**Definition**:
+```
+1 GiB-hour = 1 GiB of memory reserved (or used) for 1 hour
+           = 1,073,741,824 bytes × 3600 seconds
+           = 3,865,470,566,400 byte-seconds
+```
+
+#### Allocation-based (reserved)
+
+```
+GiB-hours_allocated = Σ (requests.memory_GiB × pod_uptime_hours)
+
+Example:
+  Pod A: requests.memory=4Gi, ran 24 hours  → 4 × 24 = 96 GiB-hours
+  Pod B: requests.memory=512Mi, ran 8 hours → 0.5 × 8 = 4 GiB-hours
+  Pod C: requests.memory=256Mi, ran 24 hours → 0.25 × 24 = 6 GiB-hours
+  
+  Total = 106 GiB-hours allocated
+```
+
+PromQL:
+```promql
+# GiB-hours allocated over 24h, per namespace
+sum by (namespace) (
+    kube_pod_container_resource_requests{resource="memory"}
+) / (1024^3) * 24
+```
+
+#### Usage-based (consumed)
+
+For memory, use **working set** as the usage metric (not `memory.current`, which inflates with reclaimable cache):
+
+```promql
+# GiB-hours consumed over 24h, per namespace (using working set)
+sum by (namespace) (
+    avg_over_time(container_memory_working_set_bytes{
+        container!="", container!="POD"
+    }[24h])
+) / (1024^3) * 24
+```
+
+```
+Example (same pods, measured working set):
+  Pod A: avg working set 2.8Gi over 24h → 2.8 × 24 = 67.2 GiB-hours
+  Pod B: avg working set 400Mi over 8h  → 0.39 × 8 = 3.12 GiB-hours
+  Pod C: avg working set 100Mi over 24h → 0.098 × 24 = 2.35 GiB-hours
+  
+  Total = 72.67 GiB-hours used
+  Efficiency = 72.67 / 106 = 68.6%
+  Waste = 31.4% of reserved memory sat unused
+```
+
+### 3B.5 Why Memory Efficiency Is Harder to Optimize Than CPU
+
+CPU is *compressible*: if you over-request, the slack is used by other pods via `cpu.weight`. The cores aren't wasted — other pods absorb them.
+
+Memory is *incompressible*: if you reserve 4 GiB but use 2 GiB, those 2 GiB of *Allocatable* are **blocked** on the scheduler's books. No other pod can be placed using that headroom (the scheduler checks `Σ(requests)` ≤ `Allocatable`, not `Σ(actual)`). The memory sits physically available but logically locked.
+
+```
+4-GiB node, 3 pods:
+
+  Scheduler's view (requests):      Kernel's view (actual RSS):
+  ┌────────────────────────┐        ┌────────────────────────┐
+  │ Pod A: req 2Gi         │        │ Pod A: using 800Mi     │
+  │ Pod B: req 1Gi         │        │ Pod B: using 600Mi     │
+  │ Pod C: req 1Gi         │        │ Pod C: using 400Mi     │
+  ├────────────────────────┤        ├────────────────────────┤
+  │ Total: 4Gi (FULL)      │        │ Total: 1.8Gi (45%)     │
+  │ No more pods accepted! │        │ 2.2Gi physically free! │
+  └────────────────────────┘        └────────────────────────┘
+  
+  The scheduler says the node is full. The kernel disagrees.
+  This 55% gap is pure waste — but reducing requests risks OOM.
+```
+
+This is why memory right-sizing is both more important and more dangerous than CPU right-sizing:
+- **Reduce requests too much** → scheduler packs more pods → a traffic spike pushes actual usage above what the node has → OOM kills cascade.
+- **Reduce limits too much** → any memory spike kills the pod. Memory doesn't throttle — it kills.
+- **CPU over-request** → just wastes scheduler capacity. No crashes. Other pods still burst into the slack.
+
+### 3B.6 Corner Cases and Gotchas
+
+#### Corner case 1: Init containers inflate core-hours
+
+```
+Pod spec:
+  initContainers:
+    - name: db-migrate
+      resources:
+        requests:
+          cpu: "4"          # needs 4 cores for a 30-second migration
+          memory: "8Gi"
+  containers:
+    - name: web
+      resources:
+        requests:
+          cpu: "500m"       # steady-state needs
+          memory: "1Gi"
+
+The scheduler computes effective request as:
+  cpu: max(4, 0.5) = 4     (init and regular don't run simultaneously)
+  memory: max(8, 1) = 8Gi
+
+But for allocation-based billing:
+  If the pod runs for 24 hours, you're billed for 4 cores × 24h = 96 core-hours.
+  The init container ran for 30 seconds. The web container uses 500m.
+  Actual usage: (4 × 30/3600) + (0.5 × 24) ≈ 0.033 + 12 = 12.03 core-hours.
+  Efficiency: 12.5%!
+
+Solution: use restartPolicy: Never on init containers (1.28+ sidecar containers),
+or split the migration into a separate Job with its own resource requests.
+```
+
+#### Corner case 2: JVM heap vs container memory
+
+```
+Pod: limits.memory=2Gi
+JVM: -Xmx1536m (1.5Gi max heap)
+
+Expected: JVM uses ≤1.5Gi, container is safe.
+Reality: JVM uses ~1.5Gi heap + ~400Mi off-heap (metaspace, thread stacks,
+         direct buffers, native code, JIT compiler) = ~1.9Gi.
+         Plus kernel memory (page tables, socket buffers) = ~2.0Gi.
+         
+Result: OOM at random times. "But I set Xmx to 1.5Gi!"
+
+Rule of thumb:
+  limits.memory ≥ Xmx + (0.5 × Xmx)  for JVM workloads
+  Or use -XX:MaxRAMPercentage=75 (JVM 10+): JVM reads cgroup limit
+  and sets heap to 75% of it, leaving 25% for off-heap.
+```
+
+#### Corner case 3: Page cache doesn't count toward requests but does toward limits
+
+```
+Pod: requests.memory=1Gi, limits.memory=4Gi
+App: reads a 3Gi dataset via mmap.
+
+memory.current = 3.5Gi (1Gi RSS + 2.5Gi page cache)
+memory.stat.anon = 1Gi
+container_memory_working_set_bytes = 2Gi (active pages)
+
+Scheduler reserved 1Gi. Node has room for 3 more 1Gi pods.
+But the kernel charged 3.5Gi to this cgroup's memory.current.
+If memory.current approaches memory.max (4Gi), kernel reclaims
+page cache pages — application slows down (I/O instead of cache hit)
+but doesn't die.
+
+But if the application also grows RSS to 2Gi (leak):
+  memory.current = 4.5Gi → exceeds memory.max = 4Gi
+  Kernel tries to reclaim 0.5Gi of cache pages.
+  If only 0.5Gi cache remains and it can't reclaim enough → OOM.
+  
+Bottom line: page cache is a hidden memory consumer that's
+usually harmless but can push you into OOM during memory leaks.
+```
+
+#### Corner case 4: Measuring short-lived pods
+
+```
+Job pods that run for 30 seconds:
+  - rate() over 5m averages the usage over 5 minutes
+  - A pod that used 4 cores for 30 seconds shows as:
+    rate(container_cpu_usage_seconds_total[5m]) = 4 × 30 / 300 = 0.4 cores
+  - This is mathematically correct but operationally misleading.
+  
+For billing: use increase() instead of rate():
+  increase(container_cpu_usage_seconds_total[1h]) / 3600 = core-hours
+  This correctly captures the 30-second burst.
+
+For capacity: track the PEAK concurrent usage, not the average:
+  max_over_time(
+    sum(rate(container_cpu_usage_seconds_total{namespace="batch"}[1m]))[1h:1m]
+  )
+```
+
+#### Corner case 5: CPU steal and noisy neighbors on shared cloud instances
+
+```
+Your pod runs on an EC2 m5.xlarge (4 vCPUs, shared tenancy).
+Kubernetes sees 4 allocatable cores.
+Your pod requests 2 cores.
+
+But the hypervisor is oversubscribing the physical host.
+Your "4 vCPUs" are actually shares on a 128-core machine
+running 40 other VMs.
+
+Symptom:
+  container_cpu_usage_seconds_total shows 1.8 cores.
+  But actual throughput is 40% lower than on a dedicated host.
+  rate(node_cpu_seconds_total{mode="steal"}[5m]) > 0.05 (5% stolen).
+  
+What happened:
+  The hypervisor took CPU cycles from your VM to serve other tenants.
+  Kubernetes has NO visibility into this — cAdvisor doesn't see steal time
+  at the container level (only at the node level via node_exporter).
+  
+Your CFS quota accounting is correct (you used 1.8 cores of cgroup time),
+but the WALL-CLOCK throughput is degraded because each "core-second"
+delivered less actual work.
+
+Solution: monitor node_cpu_seconds_total{mode="steal"} and alert if > 5%.
+Consider dedicated/metal instances for latency-sensitive workloads.
+```
+
+### 3B.7 The Capacity Planning Spreadsheet: Putting It All Together
+
+Here's how to calculate whether your cluster has enough capacity and when to scale:
+
+```
+Cluster: 10 nodes × 32 logical CPUs = 320 cores total
+kubeReserved: 500m per node → 5 cores reserved
+Allocatable: 315 cores
+
+Current state (from Prometheus):
+  Σ(requests.cpu) across all pods:      220 cores (allocation)
+  Σ(actual CPU usage) across all pods:  145 cores (usage)
+  Σ(limits.cpu) across all pods:        480 cores (overcommit)
+
+Derived metrics:
+  Allocation ratio:     220 / 315 = 69.8%  (scheduler thinks 70% full)
+  Utilization ratio:    145 / 315 = 46.0%  (actual node load is 46%)
+  Allocation efficiency: 145 / 220 = 65.9% (pods use 66% of what they asked for)
+  Overcommit ratio:     480 / 315 = 152%   (limits sum to 1.5× capacity)
+
+Capacity signals:
+  Allocation > 80% → add nodes (scheduler can't place new pods)
+  Utilization > 70% → contention risk (CFS weight arbitration kicks in)
+  Efficiency < 50%  → pods are over-requesting (VPA opportunity)
+  Overcommit > 200% → high risk of cascading throttling under load
+
+Memory (parallel calculation):
+  Σ(requests.memory):  800 GiB allocated
+  Σ(working_set):      520 GiB actual
+  Allocatable memory:  960 GiB (10 × 96Gi)
+  Allocation ratio:    83.3% — TIGHT. Scheduler will reject pods soon.
+  Utilization ratio:   54.2% — plenty of physical headroom.
+  Efficiency:          65.0% — 35% waste in reservation.
+  
+  Action: either right-size memory requests (risky) or add nodes (safe).
+```
+
+### 3B.8 Summary Table: All Capacity Metrics at a Glance
+
+| Metric | CPU version | Memory version | Formula | Use case |
+| --- | --- | --- | --- | --- |
+| **Allocation** | `Σ requests.cpu` (cores) | `Σ requests.memory` (GiB) | From pod specs | Scheduler capacity, chargeback |
+| **Usage** | `rate(cpu_usage_seconds_total)` (cores) | `working_set_bytes` (GiB) | From cgroup stats | Actual load, autoscaling |
+| **Utilization (vs request)** | `usage / requests.cpu` | `working_set / requests.memory` | Usage ÷ Allocation | HPA, right-sizing |
+| **Utilization (vs capacity)** | `usage / allocatable.cpu` | `working_set / allocatable.memory` | Usage ÷ Node cap | Node saturation |
+| **Core-hours / GiB-hours** | `Σ(requests.cpu × hours)` | `Σ(requests.memory × hours)` | Allocation × time | Billing, cost reports |
+| **Efficiency** | `usage / allocation` | `working_set / allocation` | How much of reservation is used | FinOps, waste detection |
+| **Overcommit** | `Σ limits / allocatable` | `Σ limits / allocatable` | Limits ÷ Capacity | Risk assessment |
 
 ---
 
