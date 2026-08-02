@@ -1,6 +1,8 @@
 # Config & Storage Tasks — ConfigMaps, Secrets, Volumes, PV/PVC
 
-Track A module 4. Do after `deployment-tasks.md`.
+Track A module 4. Do after `env-config-secrets-tasks.md` (module 3b), which covers
+the same ConfigMaps and Secrets from the **developer/env** side — Levels 1–2 here
+are the short version of it. This file is the **storage** side.
 Read alongside: `../kubernetes/19-storage-csi-pv-pvc.md`.
 
 > The one idea: **a Pod's filesystem is assembled at start time from sources with

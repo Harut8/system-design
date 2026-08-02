@@ -2,7 +2,7 @@
 
 > **Tier 0, doc 02.** Prerequisites: [`01-memory-hierarchy-and-caches.md`](01-memory-hierarchy-and-caches.md)
 > — specifically §5 (MESI, and the store-buffer paragraph that ends it). This document is
-> the continuation of that paragraph. Also useful: `00-cpu-execution-model.md`
+> the continuation of that paragraph. Also useful: [`00-cpu-execution-model.md`](00-cpu-execution-model.md)
 > (out-of-order execution, speculation). Feeds directly into:
 > [`03-lockfree-and-reclamation.md`](03-lockfree-and-reclamation.md),
 > [`24-the-gil.md`](24-the-gil.md), [`26-free-threading.md`](26-free-threading.md),

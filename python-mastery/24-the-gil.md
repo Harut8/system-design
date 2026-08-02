@@ -349,7 +349,7 @@ goes fully dark.
 
 **3. The check is deliberately, aggressively cheap.** One relaxed atomic load and a
 well-predicted not-taken branch — a few cycles, mostly hidden by the out-of-order engine
-(`00-cpu-execution-model.md`). The design pushes all cost onto the rare path, which is
+([`00-cpu-execution-model.md`](00-cpu-execution-model.md)). The design pushes all cost onto the rare path, which is
 also why the check points were *narrowed* over time: fewer sites, each cheaper, with no
 loss of practical responsiveness.
 

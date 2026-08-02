@@ -1,6 +1,6 @@
 # 01 — The memory hierarchy: cache lines, coherence, and why Python is slow
 
-> **Tier 0, doc 01.** Prerequisites: `00-cpu-execution-model.md` (out-of-order execution,
+> **Tier 0, doc 01.** Prerequisites: [`00-cpu-execution-model.md`](00-cpu-execution-model.md) (out-of-order execution,
 > why a stall isn't always a stall). Feeds directly into: `02-atomics-and-memory-models.md`,
 > `03-lockfree-and-reclamation.md`, `16-object-memory-layout.md`,
 > [`24-the-gil.md`](24-the-gil.md), `33-optimizing-python.md`, `35-memory-optimization.md`.

@@ -41,6 +41,7 @@ Do these in order. Each row lists the practice file and what to read from
 | 1 | `pod-tasks.md` | `11-pod-internals.md`, `00-linux-primitives-for-containers.md` | ✅ exists |
 | 2 | `replica-tasks.md` | `12-workload-controllers.md` §ReplicaSet | ✅ exists |
 | 3 | `deployment-tasks.md` | `12-workload-controllers.md` §Deployment | ✅ exists |
+| 3b | `env-config-secrets-tasks.md` | `19-storage-csi-pv-pvc.md` §ConfigMap/Secret projection | ✅ **new** |
 | 4 | `config-storage-tasks.md` | `19-storage-csi-pv-pvc.md` | ✅ **new** |
 | 5 | `service-networking-tasks.md` | `14-services-and-kube-proxy.md`, `18-dns-and-coredns.md` | ✅ **new** |
 | 6 | `workload-controllers-tasks.md` | `12-workload-controllers.md`, `13-statefulset-deep-dive.md` | ✅ **new** |

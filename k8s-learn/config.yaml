@@ -1,0 +1,521 @@
+# =============================================================================
+# config.yaml — Heavily-commented ENV / CONFIGMAP / SECRET lab for LEARNING.
+# =============================================================================
+# pod → replicaset → deployment answered WHAT runs. resources.yaml answered HOW
+# MUCH. This file answers the question every real application asks next:
+# HOW DOES MY CODE GET ITS CONFIGURATION?
+#
+# THE THREE SOURCES (this is the whole topic):
+#
+#   env / envFrom      ── key=value pairs handed to the process at exec() time.
+#                         Resolved ONCE, when the container starts. NEVER updates.
+#
+#   ConfigMap          ── a plain API object holding non-secret key/value data.
+#                         Consumed as env vars OR projected as files.
+#
+#   Secret             ── the same shape, base64-wrapped, mounted as tmpfs, and
+#                         treated differently by RBAC. NOT encrypted by itself.
+#
+# THE ONE ASYMMETRY TO MEMORISE:
+#
+#   consumed as ENV   -> snapshot at container start.  Changing the ConfigMap
+#                        does NOTHING. Nothing restarts the pod for you.
+#   consumed as FILE  -> kubelet re-syncs it, ~60-90s later the file changes
+#                        under the running process.
+#
+# WHERE VALUES COME FROM (the four `valueFrom` sources):
+#   configMapKeyRef    one key out of a ConfigMap
+#   secretKeyRef       one key out of a Secret
+#   fieldRef           pod metadata (name, namespace, podIP, nodeName) — "downward API"
+#   resourceFieldRef   this container's own cpu/memory request or limit
+#
+# Try:   kubectl apply -f config.yaml
+#        kubectl get pods -n env-lab
+#        kubectl exec -n env-lab env-basics -- env | sort
+#        kubectl logs -n env-lab env-downward
+#        kubectl describe pod -n env-lab env-missing   # the failure you must recognise
+#        kubectl delete -f config.yaml
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: env-lab
+  labels:
+    purpose: env-config-lab
+
+---
+# =============================================================================
+# 1. ConfigMap — plain, non-secret configuration.
+# =============================================================================
+# `data` is map[string]string. Two kinds of entries live here, and mixing them
+# is normal but you must know which is which:
+#   SCALAR keys   (LOG_LEVEL)      -> good as env vars AND as files
+#   FILE-ISH keys (app.properties) -> only useful as a FILE; the key becomes the
+#                                     filename and the value becomes its content.
+# A key must match [-._a-zA-Z0-9]+ . Note that `.` and `-` are legal in a
+# ConfigMap key but ILLEGAL in an environment variable name — see #2.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: env-lab
+data:
+  LOG_LEVEL: "debug"
+  REGION: "eu-central-1"
+  # Referenced by $(...) expansion in pod #3. Kept deliberately boring.
+  GREETING: "hello"
+  # Quote numbers. `MAX_CONN: 25` is an int in YAML and the API server rejects
+  # the ConfigMap with "cannot unmarshal number into Go value of type string".
+  MAX_CONN: "25"
+  # A whole file as one value. The `|` keeps the newlines.
+  app.properties: |
+    server.port=8080
+    server.threads=16
+    cache.enabled=true
+
+---
+# =============================================================================
+# 2. ConfigMap with a key that is NOT a legal env var name.
+# =============================================================================
+# `feature.beta` is a perfectly valid ConfigMap key and a perfectly INVALID
+# environment variable name. When this map is pulled in with `envFrom`, the
+# kubelet SKIPS that key, starts the container anyway, and records an event with
+# reason `InvalidEnvironmentVariableNames`. No crash, no log line in your app —
+# your feature flag is simply not there. See env-config-secrets-tasks.md EC-4.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+  namespace: env-lab
+data:
+  FEATURE_A: "true"
+  feature.beta: "true"          # <- silently dropped by envFrom
+  feature-gamma: "true"         # <- silently dropped by envFrom
+
+---
+# =============================================================================
+# 3. Secret — same shape, different handling.
+# =============================================================================
+# `stringData` is a WRITE-ONLY convenience field: you type plaintext, the API
+# server base64-encodes it into `data` and `stringData` disappears. Read the
+# object back and you will only ever see `data`.
+#
+# base64 is ENCODING, not encryption. Anyone who can `get secret` in this
+# namespace has the plaintext:
+#   kubectl get secret app-secret -n env-lab -o jsonpath='{.data.DB_PASSWORD}' | base64 -d
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+  namespace: env-lab
+type: Opaque                    # the unvalidated default. Contrast with
+                                # kubernetes.io/tls, .../dockerconfigjson, which
+                                # ARE structurally validated and consumed by
+                                # specific machinery (Ingress, imagePullSecrets).
+stringData:
+  DB_PASSWORD: "hunter2"
+  API_KEY: "sk-not-a-real-key"
+
+---
+# =============================================================================
+# 4. env-basics — plain env vars, ordering, and $(VAR) expansion.
+# =============================================================================
+# `env` is a LIST of {name, value}, not a map. Order matters, and that is not a
+# detail: Kubernetes expands $(OTHER_VAR) using only variables defined EARLIER in
+# this same list. Reference one defined below and the reference is left as
+# literal text.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-basics
+  namespace: env-lab
+  labels: { app: env-lab, demo: basics }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "env | sort; echo '--- sleeping ---'; sleep 3600"]
+      env:
+        - name: SERVICE_NAME
+          value: "checkout"
+        - name: PORT
+          value: "8080"          # MUST be a string. `value: 8080` is rejected:
+                                 # "cannot unmarshal number into ... EnvVar.value"
+        # Expansion of an EARLIER variable. Kubernetes substitutes this before
+        # the container ever starts; the shell never sees $(...).
+        - name: ADDRESS
+          value: "$(SERVICE_NAME):$(PORT)"
+        # $$ escapes the expansion. This lands in the process as the literal
+        # text "$(PORT)" — useful when your config value really contains it.
+        - name: LITERAL
+          value: "$$(PORT)"
+        # Forward reference: NOT_YET is defined AFTER this line, so no expansion
+        # happens and the value stays the literal string "$(NOT_YET)".
+        - name: BROKEN_REF
+          value: "$(NOT_YET)"
+        - name: NOT_YET
+          value: "too-late"
+        # Duplicate name. The LAST one wins.
+        - name: DUP
+          value: "first"
+        - name: DUP
+          value: "second"
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+  # NOTE: leave enableServiceLinks at its default (true) here, so `env` also
+  # shows the auto-injected KUBERNETES_SERVICE_HOST / *_SERVICE_PORT variables.
+  # Pod #9 turns them off so you can see the difference.
+
+---
+# =============================================================================
+# 5. env-from-config — the four ways a ConfigMap reaches a process.
+# =============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-from-config
+  namespace: env-lab
+  labels: { app: env-lab, demo: configmap }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== env ==="; env | sort
+          echo "=== files ==="; ls -l /etc/app; cat /etc/app/app.properties
+          sleep 3600
+      # ---- (a) envFrom: pull in EVERY key of a map -------------------------
+      # Convenient and dangerous: you cannot see the resulting variable names by
+      # reading this file, and invalid names vanish silently (#2).
+      envFrom:
+        - configMapRef:
+            name: app-config
+        # `prefix` namespaces the imported keys: FEATURE_A -> FF_FEATURE_A.
+        # The prefix must itself produce legal env var names.
+        - prefix: FF_
+          configMapRef:
+            name: feature-flags
+        # `optional: true` = "start anyway if this map does not exist".
+        # Without it, a missing map blocks the container FOREVER (#8).
+        - configMapRef:
+            name: does-not-exist
+            optional: true
+      # ---- (b) env + configMapKeyRef: pick ONE key, and rename it ----------
+      # This is the readable form. Prefer it when the mapping matters.
+      env:
+        - name: APP_LOG_LEVEL           # renamed on the way in
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: LOG_LEVEL
+        # A missing KEY behaves exactly like a missing MAP: blocks startup
+        # unless marked optional. Here it is optional, so it is simply absent.
+        - name: OPTIONAL_TUNABLE
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: NOT_PRESENT
+              optional: true
+        # PRECEDENCE: envFrom is applied first, then env. `app-config` already
+        # supplied REGION=eu-central-1 via envFrom — this explicit entry WINS.
+        - name: REGION
+          value: "overridden-by-env"
+      volumeMounts:
+        - name: cfg
+          mountPath: /etc/app
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    # ---- (c) the same ConfigMap as FILES ---------------------------------
+    # Every key becomes a file. This is the only form that UPDATES while the
+    # container runs (~60-90s after you edit the map). Storage mechanics —
+    # the ..data symlink swap, subPath, projected volumes — are covered in
+    # config-storage-tasks.md; here you only need to see that it updates.
+    - name: cfg
+      configMap:
+        name: app-config
+        # `items` limits which keys are projected, and renames them.
+        # Without `items` you get ALL keys, including LOG_LEVEL etc. as files.
+        items:
+          - key: app.properties
+            path: app.properties
+
+---
+# =============================================================================
+# 6. env-secret — a Secret as env vars AND as files, side by side.
+# =============================================================================
+# Both work. They are not equivalent, and the difference is the point of the
+# whole pod: env leaks and never rotates; files do neither.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-secret
+  namespace: env-lab
+  labels: { app: env-lab, demo: secret }
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== secret as env ==="; echo "DB_PASSWORD=$DB_PASSWORD"
+          echo "=== secret as file ==="; ls -l /etc/secret; cat /etc/secret/DB_PASSWORD; echo
+          echo "=== mount type ==="; df -h /etc/secret | tail -1
+          sleep 3600
+      env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: app-secret
+              key: DB_PASSWORD
+      envFrom:
+        - prefix: SECRET_
+          secretRef:
+            name: app-secret
+      volumeMounts:
+        - name: creds
+          mountPath: /etc/secret
+          readOnly: true
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: creds
+      secret:
+        secretName: app-secret
+        defaultMode: 0400        # owner-read-only. Secrets deserve tighter modes
+                                 # than the 0644 default.
+
+---
+# =============================================================================
+# 7. env-downward — values Kubernetes computes for you.
+# =============================================================================
+# The "downward API": the pod reading its own metadata. No ConfigMap involved.
+# This is how a process learns its own name, its IP, and — crucially — its own
+# cpu/memory LIMIT, which is not otherwise visible from inside the container.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-downward
+  namespace: env-lab
+  labels: { app: env-lab, demo: downward, team: platform }
+  annotations:
+    build/commit: "abc1234"
+spec:
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== identity ==="; env | grep -E '^(POD|NODE|SA)_' | sort
+          echo "=== my own limits ==="; env | grep -E '^(CPU|MEM)_' | sort
+          echo "=== labels/annotations (volume only) ==="; cat /etc/podinfo/labels; echo
+          sleep 3600
+      env:
+        # fieldRef accepts ONLY this short whitelist for env vars:
+        #   metadata.name / metadata.namespace / metadata.uid
+        #   spec.nodeName / spec.serviceAccountName
+        #   status.hostIP / status.podIP / status.podIPs
+        - name: POD_NAME
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }
+        - name: POD_NAMESPACE
+          valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+        - name: POD_IP
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }
+        - name: NODE_NAME
+          valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+        - name: SA_NAME
+          valueFrom: { fieldRef: { fieldPath: spec.serviceAccountName } }
+        # LABELS AND ANNOTATIONS ARE NOT IN THAT LIST. `metadata.labels['team']`
+        # in an env var is rejected by the API server. Labels reach a container
+        # only through a downwardAPI VOLUME (mounted below) — which, unlike env,
+        # also updates when you relabel the pod.
+        #
+        # resourceFieldRef: this container's own request/limit, in units you pick
+        # via `divisor`. THE fix for runtimes that read the NODE's cpu count
+        # instead of the cgroup limit (old JVMs, Go's default GOMAXPROCS,
+        # nproc-based worker pools) and then spawn 64 threads on a 200m limit.
+        - name: CPU_LIMIT_MILLI
+          valueFrom:
+            resourceFieldRef:
+              containerName: app     # required; may be a DIFFERENT container
+              resource: limits.cpu
+              divisor: "1m"          # express the answer in millicores
+        - name: MEM_LIMIT_MI
+          valueFrom:
+            resourceFieldRef:
+              containerName: app
+              resource: limits.memory
+              divisor: "1Mi"
+        - name: CPU_REQUEST_MILLI
+          valueFrom:
+            resourceFieldRef:
+              containerName: app
+              resource: requests.cpu
+              divisor: "1m"
+      resources:
+        requests: { cpu: "50m",  memory: "32Mi" }
+        limits:   { cpu: "200m", memory: "64Mi" }
+        # WARNING: with NO limit set, resourceFieldRef does not fail — it quietly
+        # falls back to the NODE's allocatable. Your app then sizes itself for a
+        # 64-core machine. Always pair resourceFieldRef with a real limit.
+      volumeMounts:
+        - name: podinfo
+          mountPath: /etc/podinfo
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+  volumes:
+    - name: podinfo
+      downwardAPI:
+        items:
+          - path: labels
+            fieldRef: { fieldPath: metadata.labels }
+          - path: annotations
+            fieldRef: { fieldPath: metadata.annotations }
+
+---
+# =============================================================================
+# 8. env-missing — the failure mode you must be able to name on sight.
+# =============================================================================
+# This pod references a key that does not exist, without `optional: true`.
+# Expected: the pod is SCHEDULED and stays Pending with the container in
+# `CreateContainerConfigError`. It is retried forever. There are no logs,
+# because no container ever started.
+#
+# Compare with a missing ConfigMap used as a VOLUME: that gives
+# `ContainerCreating` + a FailedMount event instead. Two different symptoms,
+# same root cause — always read `kubectl describe pod` events first.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-missing
+  namespace: env-lab
+  labels: { app: env-lab, demo: broken }
+spec:
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      env:
+        - name: NEEDED
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: DOES_NOT_EXIST      # add `optional: true` and it starts fine
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+
+---
+# =============================================================================
+# 9. configured-app — how all of this looks in a real Deployment.
+# =============================================================================
+# The shape you will actually write: non-secret config via envFrom, credentials
+# via secretKeyRef, live-reloadable config as a mounted file, identity via the
+# downward API.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: configured-app
+  namespace: env-lab
+  labels: { app: configured-app }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: configured-app
+  template:
+    metadata:
+      labels: { app: configured-app }
+      annotations:
+        # THE ROLLOUT TRIGGER. Kubernetes does NOT restart pods when a ConfigMap
+        # or Secret changes — nothing does, unless you build it. Changing this
+        # annotation changes the pod TEMPLATE, which is what a Deployment
+        # actually watches, so a config change produces a normal rolling update.
+        # Helm writes {{ include (print $.Template.BasePath "/cm.yaml") . | sha256sum }};
+        # by hand, `kubectl rollout restart` does the same job.
+        checksum/config: "replace-me-when-app-config-changes"
+    spec:
+      terminationGracePeriodSeconds: 10
+      # Stop the kubelet injecting one pair of *_SERVICE_HOST/_PORT variables per
+      # Service in this namespace. Harmless at 3 services; at 500 it bloats every
+      # container's environment and can collide with your OWN variable names —
+      # a Service called `db` produces DB_PORT=tcp://10.0.0.1:5432, which will
+      # not be the integer your config parser expected.
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "env | sort; sleep 3600"]
+          envFrom:
+            - configMapRef: { name: app-config }       # bulk, non-secret
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: DB_PASSWORD                        # explicit, so it is
+              valueFrom:                               # greppable in review
+                secretKeyRef: { name: app-secret, key: DB_PASSWORD }
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef:
+                  containerName: app
+                  resource: limits.cpu
+                  divisor: "1"        # whole cores, rounded UP by the kubelet
+          resources:
+            requests: { cpu: "50m",  memory: "32Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          volumeMounts:
+            - name: cfg
+              mountPath: /etc/app     # mount the DIRECTORY, never subPath a file
+                                      # you expect to change (config-storage EC-7)
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: cfg
+          configMap: { name: app-config }
+# =============================================================================
+# THE POINT: env vars are a photograph taken at exec() time — accurate, and
+# instantly out of date. Files are a live feed. Choose per value: things that
+# never change (service name, region) are fine as env; anything rotated (certs,
+# credentials, feature flags) belongs in a mounted file, or you are one
+# unnoticed restart away from an outage. See env-config-secrets-tasks.md.
+# =============================================================================
