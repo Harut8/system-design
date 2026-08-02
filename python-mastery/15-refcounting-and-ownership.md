@@ -417,20 +417,41 @@ its workers.
 
 **The mitigations, in order of effectiveness:**
 
-1. **`gc.freeze()` before forking.** Moves all currently-tracked objects into a permanent
-   generation the collector won't touch, so GC traversal doesn't dirty pages either. The
+1. **Keep bulk data out of Python objects.** A NumPy array or `mmap` buffer has *one*
+   refcount for the whole thing, so COW works as intended. Ten million Python objects have
+   ten million counters spread across every page. **This is the mitigation that addresses
+   the dominant cost**, and the measurement below is why it is ranked first.
+2. **`gc.freeze()` before forking.** Moves all currently-tracked objects into a permanent
+   generation the collector won't touch, so **GC traversal** doesn't dirty pages. The
    standard incantation:
    ```python
    # in the parent, after loading everything, before forking
    gc.collect()
    gc.freeze()
    ```
-   This is the Instagram technique, and it is the single highest-value line of code in a
-   pre-forking Python server.
-2. **Immortal objects (§9)** removed a large slice of this problem in 3.12 for free.
-3. **Keep bulk data out of Python objects.** A NumPy array or `mmap` buffer has *one*
-   refcount for the whole thing, so COW works as intended. Ten million Python objects have
-   ten million counters spread across every page.
+   This is the Instagram technique. Know precisely what it does and does not do:
+
+   > **Measured** (600,000 dicts, forked child, child's own RSS growth, reproduced twice
+   > — see [`07-virtual-memory.md`](07-virtual-memory.md) §7):
+   >
+   > | child does | no freeze | `gc.freeze()` | benefit |
+   > |---|---|---|---|
+   > | only `gc.collect()` | 200.8 MB | 0.8 MB | **~245×** |
+   > | only **reads** the graph | 198.7 MB | 198.8 MB | **1.0× — none** |
+   >
+   > `gc.freeze()` eliminates the *collector's* writes. It does **nothing** about
+   > `Py_INCREF`/`Py_DECREF` on ordinary reads, which is the write traffic that actually
+   > privatises your heap. A worker that merely walks a large object graph pays the full
+   > COW cost with or without it.
+
+   So it is a genuine win — the 245× is real and worth having — but it is not, as an
+   earlier draft of this document claimed, "the single highest-value line of code in a
+   pre-forking Python server." It closes one of two write sources, and usually not the
+   larger one.
+3. **Immortal objects (§9)** removed a large slice of this problem in 3.12 for free —
+   `None`, small ints, and interned strings no longer take refcount writes at all
+   ([`30-concurrency-correctness.md`](30-concurrency-correctness.md) §16.4 classifies that
+   path).
 
 Point 3 is the real lesson: the fork problem is not really about `fork`, it is about
 **per-object metadata density**. See

@@ -406,14 +406,25 @@ object sits on. And the GC makes it worse: a collection pass walks every tracked
 
 The mitigations, in order:
 
-1. **`gc.freeze()` right after loading and just before forking.** It moves everything
-   currently alive into a permanent generation the collector never traverses, so GC stops
-   writing to those pages. This is the single highest-leverage line in a pre-forking
-   server's boot path.
+1. **Move the big thing out of the object graph**: a NumPy array, an `mmap`, or Arrow
+   buffers have one refcount for megabytes of payload, so CoW actually holds. **This is
+   first because it is the only one that addresses the dominant write source** — see the
+   measurement under item 3.
 2. **Immortal objects (PEP 683)** already remove the refcount writes for `None`, `True`,
    `False`, small ints and interned strings — a CoW fix as much as a coherence one.
-3. **Move the big thing out of the object graph**: a NumPy array, an `mmap`, or Arrow
-   buffers have one refcount for megabytes of payload, so CoW actually holds.
+3. **`gc.freeze()` right after loading and just before forking.** It moves everything
+   currently alive into a permanent generation the collector never traverses, so **the GC**
+   stops writing to those pages.
+
+   > **Measured** (600,000 dicts, forked child, reproduced twice — full experiment in
+   > [`07-virtual-memory.md`](07-virtual-memory.md) §7): a child that only runs
+   > `gc.collect()` grows **200.8 MB → 0.8 MB (~245×)** with `gc.freeze()`. A child that
+   > merely **reads** the graph grows **198.7 MB vs 198.8 MB — no benefit at all.**
+   >
+   > `gc.freeze()` closes the collector's writes, not `Py_INCREF`'s. An earlier draft of
+   > this document called it "the single highest-leverage line in a pre-forking server's
+   > boot path"; that overstated it. It is worth doing, and it is not the one that saves
+   > you.
 4. **Don't fork it at all** — load the data in a separate process and share it via
    `multiprocessing.shared_memory` or the filesystem page cache.
 

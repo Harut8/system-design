@@ -799,9 +799,24 @@ Where it can still reach you:
   real OS resources. Inversion is possible here.
 - **Through C extensions** that create their own threads with explicit priorities.
 - **Through the OS scheduler on asymmetric cores.** This machine has 5 performance and 6
-  efficiency cores. macOS may schedule a lock-holding thread onto an E-core while a
-  waiter sits on a P-core — a hardware analogue of priority inversion. I did not attempt
-  to measure this (see §22).
+  efficiency cores, so macOS can schedule a lock-holding thread onto an E-core while a
+  waiter sits on a P-core — a hardware analogue of priority inversion.
+
+  > **This has since been measured.** [`06-processes-threads-scheduling.md`](06-processes-threads-scheduling.md)
+  > §11–§12 clamps one of two CPU-bound Python threads to the efficiency cluster and finds
+  > the effect is **much worse than the hardware penalty alone**. Total throughput fell
+  > only 6.6%, but the demoted thread dropped to **39 units against 344 running alone —
+  > an 8.8× starvation stacked on top of its ~6–7× core penalty.** The GIL hands off
+  > fairly between equals (1194 vs 1199) and **winner-take-all between unequals**: a
+  > thread that runs slower acquires the GIL less often, which makes it slower still.
+  >
+  > Reproduced independently here: `os.setpriority(os.PRIO_DARWIN_THREAD, 0,
+  > os.PRIO_DARWIN_BG)` — pure stdlib, no `ctypes` — demotes a thread to the E-cluster
+  > and costs it **5.93×** throughput.
+  >
+  > This is a genuine priority-inversion analogue reachable from pure Python, and it
+  > contradicts the "you cannot create the priority differences" framing above. You can:
+  > macOS QoS is one `os.setpriority` call away.
 - **In containers**, via cgroup CPU quota. A throttled cgroup can leave a lock holder
   descheduled for tens of milliseconds. This is the realistic modern version of the
   problem and it is a *container configuration* bug, not a Python one.
