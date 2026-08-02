@@ -160,13 +160,13 @@ Status starts empty; fill it in as you go.
 | 27 | `27-multiprocessing-and-subinterpreters.md` | fork/spawn/forkserver, pickling costs, `shared_memory`, COW and refcount write-amplification, **PEP 684 per-interpreter GIL**, **PEP 734 `concurrent.interpreters`** | ⬜ |
 | 28 | [`28-asyncio-internals.md`](28-asyncio-internals.md) | `async def` as one `co_flags` bit, `await` disassembled (`GET_AWAITABLE`/`SEND`/`END_SEND`), **await-chain cost measured: +1 `PY_RESUME` and +1 `PY_YIELD` per nesting level, per suspension**, one loop iteration exactly, the ready deque & timer heap, kqueue/epoll & the self-pipe, `Future`/`Task`, cancellation & `uncancel()`, `TaskGroup`/`ExceptionGroup`, eager tasks, uvloop's architectural edge | ✅ **written** |
 | 29 | `29-async-patterns-and-pitfalls.md` | backpressure, structured concurrency, blocking-the-loop detection, sync↔async bridges, timeouts & deadlines, anyio/trio comparison, thread/process executors | ⬜ |
-| 30 | `30-concurrency-correctness.md` | data race vs race condition, deadlock/livelock/starvation, priority inversion, lock ordering, Python's (under-specified) memory model, testing & fuzzing concurrent code | ⬜ |
+| 30 | [`30-concurrency-correctness.md`](30-concurrency-correctness.md) | data race vs race condition (**pure Python can't have the former**), **the same bug measured across 5 interpreters: 42.7% lost on 3.9, 0% on 3.11–3.14, 57.4% free-threaded**, **the 22 bytecodes where a thread may switch** (and PR #18334, which closed the window by accident), the measured atomicity table, check-then-act, Python's absent memory model, deadlock/livelock/starvation with production signatures, **lock convoying (0.37× at 16 threads)**, **starvation proved to be a GIL artifact, not a lock one**, priority inversion, lock ordering (`RankedLock`), cooperative vs preemptive (**p99 306 ms vs 7.6 ms**), clock drift, false sharing & NUMA, **wait-freedom in depth** — helping, Herlihy's consensus hierarchy, Kogan–Petrank, and **the free-threaded `Py_INCREF` classified wait-free on all three paths** (and only lock-free on pre-LSE ARM), transactional memory (**no `FEAT_TME` on this CPU**), **WebAssembly — why `_CHECK_PERIODIC` polls for Ctrl-C, PEP 776, and the main thread where `Atomics.wait` is illegal so blocking synchronization cannot exist**, work-stealing (**`ThreadPoolExecutor` has none**), scheduler fuzzing & free-threaded CI | ✅ **written** |
 | **T5** | **Performance engineering** | | |
 | 31 | [`31-measurement-methodology.md`](31-measurement-methodology.md) | clock resolution, **the hostile laptop measured (P/E cores)**, the noise catalogue, **this machine's noise floor**, `timeit` traps, `pyperf` properly, statistics that matter, microbenchmark lies, **"the experiment that fooled me"**, production A/B, a decision framework, house rules | ✅ **written** |
 | 32 | [`32-profiling.md`](32-profiling.md) | **the 5.09× distortion measured** (profilers reorder, not just inflate), sampling vs deterministic, **`sys.monitoring` vs `setprofile` measured**, tool inventory, the `_PyEval_EvalFrameDefault` non-answer, memory's four questions, **off-CPU analysis**, production profiling, the workflow | ✅ **written** |
 | 33 | `33-optimizing-python.md` | algorithmic first, data layout, allocation reduction, attribute-lookup cost, comprehension vs loop, interning, batching across the C boundary | ⬜ |
 | 34 | `34-going-native.md` | NumPy internals (strides, views, dtypes), BLAS, Numba, Cython, Rust/PyO3, SIMD, Arrow & zero-copy, releasing the GIL for real parallelism | ⬜ |
-| 35 | `35-memory-optimization.md` | measuring RSS truthfully, leak vs fragmentation vs cache, COW-friendly forking, object-graph analysis, arena return behaviour, memory budgets per container | ⬜ |
+| 35 | `35-memory-optimization.md` | measuring RSS truthfully, leak vs fragmentation vs cache, COW-friendly forking, zero-copy, mmap, memory-mapped files, object-graph analysis, arena return behaviour, memory budgets per container | ⬜ |
 | **T6** | **Type system & API design** | | |
 | 36 | `36-type-system-foundations.md` | gradual typing, nominal vs structural, **variance** (co/contra/invariant), `Any`/`Never`/`Unknown`, narrowing & flow analysis, deliberate soundness gaps | ⬜ |
 | 37 | [`37-generics-and-protocols.md`](37-generics-and-protocols.md) | variance from first principles, **PEP 695** syntax & inferred variance, bounds vs constraints, **696** defaults, **612** ParamSpec, **646** TypeVarTuple, Protocols & **`runtime_checkable`'s broken promise**, `Self`, overloads, TypedDict/Literal/Annotated, `@dataclass_transform`, **PEP 649 lazy annotations**, erasure, **honest unsoundness**, **measured mypy/pyright/ty/pyrefly divergence** | ✅ **written** |
@@ -472,6 +472,14 @@ you're actually running before quoting any of this.
    release. Check the release notes, always.
 7. **Stopping at rung 3.** The whole ladder in §14 exists because fluent explanation
    feels identical, from the inside, to understanding.
+8. **Concluding that a race is absent because you couldn't reproduce it.**
+   [`30-concurrency-correctness.md`](30-concurrency-correctness.md) §3 measures the
+   textbook `x += 1` race losing **42.7%** of its updates on 3.9, **0%** on 3.11–3.14,
+   and **57.4%** on the free-threaded build — the *same source file*. Since 3.10, CPython
+   only checks the eval breaker at ~22 instructions (calls, loop back-edges, `RESUME`),
+   so most read-modify-write windows contain no switch point at all. A GIL-build test
+   suite is not evidence of thread safety; it is evidence about where the check points
+   happen to be.
 
 ---
 
