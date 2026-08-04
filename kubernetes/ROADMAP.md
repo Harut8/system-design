@@ -371,6 +371,8 @@ These chapters are placeholders; we'll fill them one by one. Each is sized to ma
 | **36** | `36-garbage-collection-and-object-lifecycle.md` | OwnerReferences (controller=true, blockOwnerDeletion), finalizers, cascade policies (Background/Foreground/Orphan), the garbage collector controller's ownership graph, TTL-after-finished controller | finalizer footguns · GC graph cycles · orphan-and-adopt patterns |
 | **37** | `37-cloud-provider-integration.md` | Cloud Controller Manager, in-tree → out-of-tree migration, node controller (lifecycle, addresses, taints), route controller, service controller (LoadBalancer provisioning), volume controller (legacy), IRSA / Workload Identity / Azure AD Pod Identity | provider plugin model · cloud LB reconciliation race · cross-zone egress costs |
 | **38** | `38-building-a-kubernetes-from-scratch.md` | Capstone: design a minimal K8s-equivalent (we'll call it `minik8s.py` in spirit of `simpledb.py`) that ties chapters 00–37 together. Builds in the order of §3. | the kubelet you can read in one sitting · the apiserver in 500 LoC · why your toy will hit etcd before networking |
+| **44** | `44-secrets-and-configmaps-deep-dive.md` | ConfigMap & Secret API objects, etcd Base64 vs KMS v2 envelope encryption, env vs volume mounts, atomic symlink tree swaps, subPath bind-mount traps, immutable: true scalability, Secret Store CSI vs External Secrets Operator, rotation patterns | KMS v2 envelope encryption gRPC flow · atomic symlink renameat(2) tree · subPath static inode trap · immutable watch reduction math · fsnotify reloaders |
+
 
 ---
 
