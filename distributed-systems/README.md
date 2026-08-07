@@ -27,8 +27,9 @@
 19. [Phase 17 — Distributed AI/ML Training & LLM Serving Infrastructure](#phase-17--distributed-aiml-training--llm-serving-infrastructure)
 20. [Phase 18 — Specialized Advanced Topics & Internet-Scale Systems](#phase-18--specialized-advanced-topics--internet-scale-systems)
 21. [Canonical Distributed Systems Reading List (Landmark Papers)](#canonical-distributed-systems-reading-list-landmark-papers)
-22. [Complete 45-Chapter Index & Execution Roadmap](#complete-45-chapter-index--execution-roadmap)
-23. [Principal-Level Architectural Trade-off Matrix](#principal-level-architectural-trade-off-matrix)
+22. [Learn-by-Doing: Hands-On Mini-Projects & Reference Repositories](#learn-by-doing-hands-on-mini-projects--reference-repositories)
+23. [Complete 45-Chapter Index & Execution Roadmap](#complete-45-chapter-index--execution-roadmap)
+24. [Principal-Level Architectural Trade-off Matrix](#principal-level-architectural-trade-off-matrix)
 
 ---
 
@@ -74,7 +75,7 @@ Modern distributed systems operate across physical datacenters, hardware switche
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                               COORDINATION, SECURITY & CONTROL PLANE                                     │
 │  ┌─────────────────────────────────┐ ┌────────────────────────────────┐ ┌──────────────────────────────┐  │
-│  │ Consensus & Metadata (etcd/ZK)  │ │ Membership & Failure Detection │ │ Decentralized Authz          │  │
+│  │ Metadata & Lock Store (etcd/ZK) │ │ Gossip & Failure Detection     │ │ Decentralized Authz          │  │
 │  │ (Raft / Paxos / SMR)            │ │ (SWIM / Phi Accrual)           │ │ (Zanzibar / OPA / SPIRE)     │  │
 │  └─────────────────────────────────┘ └────────────────────────────────┘ └──────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -431,6 +432,53 @@ User Prompt ───> [ Continuous Batching Scheduler ]
 | **Storage Architecture**| *Ceph: A Scalable, High-Performance Distributed File System* (Weil et al., 2006) | Introduced CRUSH algorithm for dynamic object placement without central metadata server. |
 | **Compute Scheduling**| *Large-scale cluster management at Google with Borg* (Verma et al., 2015) | Ancestor of Kubernetes; cluster scheduling, cgroups isolation, and allocations. |
 | **Internet-Scale Graph**| *TAO: Facebook’s Distributed Data Store for the Social Graph* (Bronson et al., 2013) | Graph caching and geo-replication at massive scale. |
+
+---
+
+## Learn-by-Doing: Hands-On Mini-Projects & Reference Repositories
+
+Studying production source code and building toy implementations is the most effective path to internalizing staff-level distributed systems. Below is a curated collection of reference codebases, mini-projects, and university course labs categorized by subsystem.
+
+### 1. Consensus & State Machine Replication
+* [eliben/raft (Go)](https://github.com/eliben/raft/blob/main/part1/raft.go) — Minimal, pedagogical 3-part implementation of the Raft consensus algorithm in Go by Eli Bendersky.
+* [MIT 6.5840 / 6.824 Labs (Go)](https://github.com/mit-pdos/6.5840) — Iconic university labs: MapReduce, Raft consensus engine, fault-tolerant KV service, and multi-shard KV store.
+* [etcd-io/raft (Go)](https://github.com/etcd-io/raft) — Production-grade, battle-tested Raft engine used in etcd, Kubernetes, and CockroachDB.
+* [hashicorp/raft (Go)](https://github.com/hashicorp/raft) — Production Raft implementation powering HashiCorp Consul and Nomad.
+
+### 2. Storage Engines & Key-Value Engines (LSM, Bitcask, B-Tree)
+* [aneshas/gocask (Go)](https://github.com/aneshas/gocask) — Clean Go implementation of the Bitcask append-only log-structured Key-Value engine paper.
+* [codecrafters-io/build-your-own-sqlite](https://github.com/codecrafters-io/build-your-own-sqlite) — Step-by-step guide to building a relational SQL database engine with B-Tree indexes and page layouts.
+* [codecrafters-io/build-your-own-redis](https://github.com/codecrafters-io/build-your-own-redis) — Building an in-memory key-value database with RESP protocol parsing, concurrency, and persistence.
+* [tikv/tikv storage (Rust)](https://github.com/tikv/tikv/tree/master/src/storage) — Production transactional storage engine of TiKV (Raft + RocksDB in Rust).
+* [cockroachdb/pebble (Go)](https://github.com/cockroachdb/pebble) — Production RocksDB-inspired LSM key-value engine written in Go for CockroachDB.
+* [dgraph-io/badger (Go)](https://github.com/dgraph-io/badger) — High-performance LSM-tree implementation of the WISCKEY paper (separating keys from values) in pure Go.
+
+### 3. Distributed Messaging & Event Streaming
+* [buildthingsuseful/build-your-own-kafka](https://github.com/buildthingsuseful/build-your-own-kafka) — Guide to building a custom distributed commit-log event streaming broker.
+* [quangh33/Go-Kafka (Go)](https://github.com/quangh33/Go-Kafka) — Minimal lightweight Kafka clone with topic partition commit log mechanics in Go.
+* [travisjeffery/jocko (Go)](https://github.com/travisjeffery/jocko) — Kafka clone in Go using Serf for gossip discovery and Raft for metadata consensus.
+* [nats-io/nats-server (Go)](https://github.com/nats-io/nats-server) — Production ultra-fast, lightweight pub/sub and messaging system written in Go.
+
+### 4. Distributed Databases & Locking Services
+* [BitTigerInst/miniCassandra (Java)](https://github.com/BitTigerInst/miniCassandra) — Mini Cassandra/Dynamo implementation demonstrating consistent hash rings, read repair, and gossip.
+* [shubham-arora-18/distributed_locking_service (Python)](https://github.com/shubham-arora-18/distributed-locking-service/tree/main/distributed_locking_service) — Distributed lock manager implementation.
+* [pingcap/talent-plan (Rust / Go)](https://github.com/pingcap/talent-plan) — PingCAP's practical training program for building LSM storage engines (`kvs`) and distributed transactional KV stores (`tinykv`).
+
+### 5. Distributed Filesystems & Object Storage
+* [ShreevathsaBK/Mimic-HDFS (Python)](https://github.com/ShreevathsaBK/Mimic-HDFS) — Simulation of HDFS metadata architecture (NameNode, DataNode heartbeats, block reporting).
+* [minio/minio (Go)](https://github.com/minio/minio) — Production high-performance S3-compatible object storage server written in Go.
+* [seaweedfs/seaweedfs (Go)](https://github.com/seaweedfs/seaweedfs) — Fast distributed object and blob storage engine based on Facebook's Haystack design paper.
+
+### 6. Distributed AI / GPU Training & LLM Serving Infrastructure
+* [vllm-project/vllm (Python / C++ / CUDA)](https://github.com/vllm-project/vllm) — Production high-throughput LLM serving engine featuring PagedAttention and continuous batching.
+* [PyTorch Distributed Examples (Python)](https://github.com/pytorch/examples/tree/main/distributed) — Official tutorials for PyTorch DDP, RPC, Ring-AllReduce, and Pipeline Parallelism.
+* [NVIDIA/Megatron-LM (Python)](https://github.com/NVIDIA/Megatron-LM) — Canonical NVIDIA research implementation of Tensor & Pipeline Parallelism for giant language models.
+* [ggerganov/llama.cpp (C / C++)](https://github.com/ggerganov/llama.cpp) — High-performance bare-metal LLM inference engine with customized SIMD (AVX2/AVX-512/Neon) and CUDA/Metal backends.
+* [ray-project/ray (Python / C++)](https://github.com/ray-project/ray) — Unified framework for scaling distributed Python, AI training, and reinforcement learning workloads.
+* [triton-inference-server/server (C++)](https://github.com/triton-inference-server/server) — NVIDIA's enterprise GPU multi-model inference serving system.
+
+### 7. Deterministic Simulation Testing & Unique Engines
+* [tigerbeetle/tigerbeetle (Zig)](https://github.com/tigerbeetle/tigerbeetle) — Ultra-fast financial accounting database written from scratch in Zig, utilizing VSR consensus and built-in Deterministic Simulation Testing (DST).
 
 ---
 
