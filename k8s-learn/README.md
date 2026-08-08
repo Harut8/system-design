@@ -68,7 +68,13 @@ The order matters here more than anywhere else. See "the one idea" at the bottom
 | 3 | `operator-tasks.md` | `23-crds-operators-and-controller-runtime.md` | ✅ exists |
 | 4 | `admission-tasks.md` | `06-admission-control-deep-dive.md` | ⬜ todo |
 | 5 | `scheduling-framework-tasks.md` | `34-custom-schedulers-and-scheduler-framework.md` | ⬜ todo |
-| 6 | `device-plugin-tasks.md` | `10-kubelet-internals.md` §device manager, `21-resource-management-and-qos.md` §extended resources | ⬜ todo — **your endgame** |
+| 6 | `device-plugin-tasks.md` | `10-kubelet-internals.md` §device manager, `21-resource-management-and-qos.md` §extended resources | ⬜ todo |
+| 7 | `gpu-platform-tasks.md` | `09-kube-scheduler-internals.md`, `34-custom-schedulers…`, all of `../gpu-observability/` | ✅ **new — the endgame** |
+
+**Module 7 is the capstone.** Five projects — DCGM→Prometheus, capacity & utilization
+dashboard, capacity planner, GPU job queue, custom GPU scheduler — built on a simulated
+200-node fleet, no GPUs required for four of the five. It is a miniature of what a frontier-lab
+capacity or Kubernetes-platform team owns. Pair it with `../gpu-observability/tasks.md`.
 
 ---
 
@@ -121,6 +127,12 @@ day to day.
 **Phase 3 — specialise toward GPU (6–8 weeks).** `admission` →
 `scheduling-framework` → `device-plugin`, reading `06`, `34`, `10`. Feed DCGM in.
 Compare requested vs. actually used. Publish it.
+
+**Phase 4 — the capstone (~4 months at 8–10h/week).** `gpu-platform-tasks.md`,
+run alongside `../gpu-observability/tasks.md`. Five projects, ordered by
+dependency. If you only do two, do projects **1 and 3** — telemetry plus cost
+attribution is the capacity-engineering role, and neither needs
+scheduler-framework depth. Projects 4 and 5 are the Kubernetes-platform role.
 
 **Throughout — Track C**, one document a week, in the order listed.
 
