@@ -1,0 +1,201 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 3 /Kids [ 5 0 R 7 0 R 9 0 R ] >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [ 1 /fi 2 /fl 3 /ffi ] >> >>
+endobj
+4 0 obj
+<< /Length 1375  >>
+stream
+BT
+/F1 9.00 Tf
+1 0 0 1 72.00 742.00 Tm
+(Northwind Data Systems — Condential) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 56.00 Tm
+(Page 1 of 3 — Internal distribution only) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 700.00 Tm
+(Reading order is not stored in the) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 685.00 Tm
+(file. A content stream places glyph) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 670.00 Tm
+(runs at coordinates, and any notion) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 655.00 Tm
+(of a first and second column is) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 640.00 Tm
+(reconstructed from the geometry by) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 625.00 Tm
+(whichever extractor you happen to) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 610.00 Tm
+(be running. Two extractors will) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 595.00 Tm
+(disagree, and neither will warn you.) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 700.00 Tm
+(Margin requirements for the retail) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 685.00 Tm
+(portfolio were revised in February) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 670.00 Tm
+(following the regulator's guidance) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 655.00 Tm
+(on concentration limits. The revised) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 640.00 Tm
+(figure is fourteen percent against) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 625.00 Tm
+(the previous eleven, applied to all) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 610.00 Tm
+(positions held longer than thirty) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 595.00 Tm
+(days.) Tj
+ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 1212  >>
+stream
+BT
+/F1 9.00 Tf
+1 0 0 1 72.00 742.00 Tm
+(Northwind Data Systems — Condential) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 56.00 Tm
+(Page 2 of 3 — Internal distribution only) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 700.00 Tm
+(The organi-) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 685.00 Tm
+(zational cost of this is that a bug) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 670.00 Tm
+(report reading the text is wrong) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 655.00 Tm
+(cannot be triaged without knowing) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 640.00 Tm
+(which extractor produced it, which) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 625.00 Tm
+(means the parser version has to be) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 610.00 Tm
+(recorded on every chunk it emits.) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 700.00 Tm
+(Counterparty exposure is measured) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 685.00 Tm
+(gross rather than net, which the) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 670.00 Tm
+(committee reviewed and elected to) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 655.00 Tm
+(retain on the grounds that netting) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 640.00 Tm
+(agreements are not enforceable in) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 625.00 Tm
+(two of the jurisdictions where the) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 610.00 Tm
+(book has material exposure.) Tj
+ET
+
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 986  >>
+stream
+BT
+/F1 9.00 Tf
+1 0 0 1 72.00 742.00 Tm
+(Northwind Data Systems — Condential) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 56.00 Tm
+(Page 3 of 3 — Internal distribution only) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 700.00 Tm
+(A xed threshold for column) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 685.00 Tm
+(detection fails on the rst document) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 670.00 Tm
+(with three columns, and a document) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 655.00 Tm
+(with a full-width table spanning) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 640.00 Tm
+(both columns defeats the gutter) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 625.00 Tm
+(heuristic entirely.) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 700.00 Tm
+(The stress scenario assumes a two) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 685.00 Tm
+(hundred basis point parallel shift) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 670.00 Tm
+(combined with a fifteen percent) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 655.00 Tm
+(decline in collateral values, held) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 640.00 Tm
+(for a rolling ninety day window.) Tj
+ET
+
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000129 00000 n 
+0000000298 00000 n 
+0000001726 00000 n 
+0000001852 00000 n 
+0000003117 00000 n 
+0000003243 00000 n 
+0000004281 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+4407
+%%EOF

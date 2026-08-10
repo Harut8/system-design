@@ -1,0 +1,37 @@
+# Production tooling for `bakeoff.py`. NOT required by the lab itself — every module
+# outside `bakeoff.py` is stdlib-only and runs with no virtualenv at all.
+#
+#     uv venv .venv && uv pip install -r requirements-bakeoff.txt
+#     .venv/bin/python bakeoff.py
+#
+# Every adapter degrades to "not installed" when its library is absent, so you can
+# install a subset and still get a comparison. Versions are unpinned on purpose: the
+# question this harness answers is "what does the library I actually have do to my
+# documents", and pinning would answer it for a version you do not run.
+
+# --- Splitters ------------------------------------------------------------------
+langchain-text-splitters     # RecursiveCharacterTextSplitter, Markdown/HTML header splitters
+llama-index-core             # SentenceSplitter, HierarchicalNodeParser, SentenceWindow, CodeSplitter
+semchunk                     # small, fast, tokenizer-aware recursive splitter
+chonkie                      # token/sentence/recursive/semantic/code chunkers in one API
+
+# --- Parsers --------------------------------------------------------------------
+pymupdf                      # tier 1, fastest; `page.get_text("blocks")` is the interesting mode
+pypdf                        # tier 1, pure python, the most common default
+pdfminer.six                 # tier 1, layout-aware option (`LAParams`)
+unstructured                 # element-based parsing; `chunk_by_title` is its chunker
+markdown                     # unstructured's partition_md needs it and does not declare it
+beautifulsoup4               # HTML main-content extraction comparison
+lxml                         # bs4's fast backend
+
+# --- Measurement ----------------------------------------------------------------
+tiktoken                     # the real cl100k tokenizer, to measure this lab's estimator error
+datasketch                   # reference MinHash, to check the one in dedup.py
+
+# --- Deliberately not installed by default --------------------------------------
+# docling                    # pulls torch (~2 GB). Worth it for the structured document
+#                            # model and HybridChunker; add it when you want tier 2.
+# sentence-transformers      # needed for a real SemanticChunker run (all-MiniLM-L6-v2,
+#                            # the model in Chroma's second table). ~90 MB download.
+# langchain-experimental     # SemanticChunker itself; needs an embeddings object, so it
+#                            # is only meaningful with sentence-transformers or an API key.

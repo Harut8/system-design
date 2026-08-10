@@ -1,0 +1,66 @@
+"""Manifest validation for the ingestion pipeline.
+
+The assertions here exist because of ticket 44821: an upstream export emitted an
+empty manifest, every task reported success, and the load stage wrote four hundred
+rows where two million were expected.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
+
+MIN_DECLARED_ROWS = 100_000
+DEVIATION_THRESHOLD = 0.40
+
+
+class ManifestError(ValueError):
+    """Raised when a manifest cannot be trusted enough to load from."""
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """A declaration of what an export contains, before any of it is read."""
+
+    export_id: str
+    declared_rows: int
+    byte_size: int
+    checksum: str
+
+    @property
+    def is_empty(self) -> bool:
+        return self.declared_rows == 0
+
+
+def validate_absolute(manifest: Manifest) -> None:
+    """Reject manifests that are implausible on their own terms.
+
+    This is the cheap check. It catches the total-failure case — an empty or
+    truncated export — without needing any history to compare against.
+    """
+    if manifest.is_empty:
+        raise ManifestError(f"{manifest.export_id}: manifest declares zero rows")
+    if manifest.declared_rows < MIN_DECLARED_ROWS:
+        raise ManifestError(
+            f"{manifest.export_id}: {manifest.declared_rows} rows below floor"
+        )
+
+
+def validate_relative(manifest: Manifest, trailing_median: float) -> None:
+    """Reject manifests that deviate sharply from recent history.
+
+    The absolute check above would not have caught a partial export that still
+    cleared the floor. This one would, and it is the check the incident review
+    actually asked for.
+    """
+    if trailing_median <= 0:
+        log.warning("no history for %s; skipping relative check", manifest.export_id)
+        return
+    deviation = abs(manifest.declared_rows - trailing_median) / trailing_median
+    if deviation > DEVIATION_THRESHOLD:
+        raise ManifestError(
+            f"{manifest.export_id}: {manifest.declared_rows} rows deviates "
+            f"{deviation:.0%} from trailing median {trailing_median:.0f}"
+        )

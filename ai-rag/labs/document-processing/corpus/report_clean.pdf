@@ -1,0 +1,110 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 2 /Kids [ 5 0 R 7 0 R ] >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [ 1 /fi 2 /fl 3 /ffi ] >> >>
+endobj
+4 0 obj
+<< /Length 1197  >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 72.00 700.00 Tm
+(Northwind Data Systems) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 685.00 Tm
+(Ingestion Reliability Review) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 655.00 Tm
+(This review covers the twelve months to March 2024. It summarises the incidents) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 640.00 Tm
+(recorded against the ingestion service, the changes made in response, and the) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 625.00 Tm
+(residual risks the team has accepted rather than mitigated.) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 595.00 Tm
+(Three incidents in the period were classed as data loss. In each case the loss) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 580.00 Tm
+(was silent: the pipeline reported success and the absence of data was noticed by) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 565.00 Tm
+(a human reading a dashboard rather than by any automated check.) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 535.00 Tm
+(The common cause was the same in all three. Each stage validated that it had) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 520.00 Tm
+(completed, and no stage validated that it had produced a plausible quantity of) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 505.00 Tm
+(output. A job that processes zero records successfully processes zero records.) Tj
+ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 1021  >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 72.00 700.00 Tm
+(Changes made) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 670.00 Tm
+(Row-count assertions were added at the manifest boundary and at the load) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 655.00 Tm
+(boundary. Both compare against a trailing median rather than a fixed floor,) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 640.00 Tm
+(because a fixed floor is wrong for every table except the one it was set for.) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 610.00 Tm
+(Extraction-yield gates were added to the parsing stage. A document producing) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 595.00 Tm
+(fewer than one hundred characters per page is now routed to the OCR queue) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 580.00 Tm
+(instead of being indexed as an empty document.) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 550.00 Tm
+(Residual risks) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 520.00 Tm
+(The team has accepted that documents in the quarantine bucket are drained) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 505.00 Tm
+(manually and that no service level objective covers quarantine age.) Tj
+ET
+
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000123 00000 n 
+0000000292 00000 n 
+0000001542 00000 n 
+0000001668 00000 n 
+0000002742 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+2868
+%%EOF

@@ -1,0 +1,123 @@
+From thread44821
+Message-ID: <thread44821.1@northwind.example>
+From: Priya Raman <priya@northwind.example>
+To: platform@northwind.example
+Subject: Batch job wrote no data Tuesday
+Date: Thu, 14 Mar 2024 09:01:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Team,
+
+The batch job stopped writing to the warehouse on Tuesday afternoon. The morning
+dashboard was empty and the on-call engineer was paged at 06:20.
+
+Airflow shows success on every task, which is why this took an hour to find.
+
+Priya
+
+From thread44821
+Message-ID: <thread44821.2@northwind.example>
+From: Marcus Bell <marcus@northwind.example>
+To: platform@northwind.example
+Subject: Re: Batch job wrote no data Tuesday
+Date: Thu, 14 Mar 2024 09:02:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+In-Reply-To: <thread44821.1@northwind.example>
+References: <thread44821.1@northwind.example>
+
+The partition exists but holds about four hundred rows against a usual two
+million. So the job ran and processed almost nothing.
+
+Tracing it to the upstream export now.
+
+Marcus
+
+On an earlier date, they wrote:
+> Team,
+>
+> The batch job stopped writing to the warehouse on Tuesday afternoon. The morning
+> dashboard was empty and the on-call engineer was paged at 06:20.
+>
+> Airflow shows success on every task, which is why this took an hour to find.
+>
+> Priya
+
+From thread44821
+Message-ID: <thread44821.3@northwind.example>
+From: Marcus Bell <marcus@northwind.example>
+To: platform@northwind.example
+Subject: Re: Batch job wrote no data Tuesday
+Date: Thu, 14 Mar 2024 09:03:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+In-Reply-To: <thread44821.2@northwind.example>
+References: <thread44821.1@northwind.example> <thread44821.2@northwind.example>
+
+Confirmed: the export emitted an empty manifest. The export itself succeeded,
+so nothing alerted anywhere in the chain.
+
+Marcus
+
+On an earlier date, they wrote:
+> The partition exists but holds about four hundred rows against a usual two
+> million. So the job ran and processed almost nothing.
+>
+> Tracing it to the upstream export now.
+>
+> Marcus
+>
+> On an earlier date, they wrote:
+> > Team,
+> >
+> > The batch job stopped writing to the warehouse on Tuesday afternoon. The morning
+> > dashboard was empty and the on-call engineer was paged at 06:20.
+> >
+> > Airflow shows success on every task, which is why this took an hour to find.
+> >
+> > Priya
+
+From thread44821
+Message-ID: <thread44821.4@northwind.example>
+From: Priya Raman <priya@northwind.example>
+To: platform@northwind.example
+Subject: Re: Batch job wrote no data Tuesday
+Date: Thu, 14 Mar 2024 09:04:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+In-Reply-To: <thread44821.3@northwind.example>
+References: <thread44821.1@northwind.example> <thread44821.2@northwind.example> <thread44821.3@northwind.example>
+
+Adding a row-count assertion on the manifest before the load step, plus a
+trailing-seven-day-median deviation check at forty percent.
+
+Backfill for Tuesday and Wednesday is queued. Total data-loss window was about
+thirty-one hours.
+
+Priya
+
+On an earlier date, they wrote:
+> Confirmed: the export emitted an empty manifest. The export itself succeeded,
+> so nothing alerted anywhere in the chain.
+>
+> Marcus
+>
+> On an earlier date, they wrote:
+> > The partition exists but holds about four hundred rows against a usual two
+> > million. So the job ran and processed almost nothing.
+> >
+> > Tracing it to the upstream export now.
+> >
+> > Marcus
+> >
+> > On an earlier date, they wrote:
+> > > Team,
+> > >
+> > > The batch job stopped writing to the warehouse on Tuesday afternoon. The morning
+> > > dashboard was empty and the on-call engineer was paged at 06:20.
+> > >
+> > > Airflow shows success on every task, which is why this took an hour to find.
+> > >
+> > > Priya
+

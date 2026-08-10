@@ -1,0 +1,28 @@
+Support call transcript, ticket 44821. Recorded line. Transcription is automatic and
+unpunctuated in places. No speaker labels were captured by the telephony bridge, which
+is the normal case for this vendor and the reason this file has no structure at all.
+
+so the issue started tuesday afternoon when the batch job stopped writing to the
+warehouse we noticed because the morning dashboard was empty and the on call engineer
+got paged at six twenty. we looked at the airflow logs first and there was nothing
+obviously wrong the dag showed success on every task which is what confused us for the
+first hour or so.
+
+then we checked the actual table and the partition for tuesday was there but it had
+about four hundred rows instead of the usual two million. so the job ran it just
+processed almost nothing. we traced it back to the upstream export which had silently
+started emitting an empty manifest file. the export itself succeeded so nothing alerted.
+
+the fix was to add a row count assertion on the manifest before the load step. if the
+manifest declares fewer than a hundred thousand rows the task fails loudly instead of
+loading whatever it found. we also backfilled tuesday and wednesday. total data loss
+window was about thirty one hours.
+
+what i would want going forward is a check that compares each days row count against
+the trailing seven day median and pages if it deviates by more than say forty percent.
+that would have caught this in the first hour rather than the fifth. we have that for
+revenue tables already it just was never added for this one.
+
+the other thing worth writing down is that the dashboard being empty was the actual
+detection mechanism. a human noticed. that is not a monitoring strategy it is luck and
+it means anything that breaks on a weekend goes undetected until monday morning.

@@ -1,10 +1,30 @@
-.claude
-.mypy_cache
-*.mypy
-*.pdf
+# --- OS / editor ---------------------------------------------------------------
 .DS_Store
+.claude/
+.idea/
+.vscode/
+
+# --- Python bytecode and caches --------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.mypy
+
+# --- Virtualenvs -----------------------------------------------------------------
+# Labs create their own venv for optional tooling (see
+# ai-rag/labs/document-processing/requirements-bakeoff.txt).
+.venv/
+venv/
+gilvenv/
+
+# --- Personal, not for publication -----------------------------------------------
 OUTREACH-KIT.md
 personal-roadmap.md
-gilvenv
-*.pdf__pycache__/
-*.pyc
+
+# Note: *.pdf is deliberately NOT ignored. ai-rag/labs/document-processing/corpus/
+# contains generated PDF fixtures that must be committed for the lab to run without a
+# generation step.

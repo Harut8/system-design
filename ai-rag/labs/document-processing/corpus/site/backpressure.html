@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <title>Backpressure in ingestion pipelines — Northwind Data Systems</title>
+  <meta charset="utf-8">
+</head>
+<body>
+<nav class="site-nav">
+  <a href="/">Home</a> <a href="/docs">Docs</a> <a href="/blog">Blog</a>
+  <a href="/pricing">Pricing</a> <a href="/contact">Contact</a>
+</nav>
+<div class="cookie-banner">
+  We use cookies to improve your experience. By continuing to browse this site you
+  agree to our use of cookies. Read our cookie policy for details.
+</div>
+<article>
+  <h1>Backpressure in ingestion pipelines</h1>
+  <p>A pipeline without backpressure does not fail gracefully; it fails all at once, at the stage with the smallest buffer, usually at three in the morning.</p>
+  <p>The useful mental model is that every stage has a queue, and the queue you did not configure is the one with the default depth chosen by a library author.</p>
+  <p>Measuring queue depth per stage is cheap and it turns an incident narrative into an arithmetic problem about which stage is slower than its upstream.</p>
+</article>
+<aside class="related">
+  <h3>Related articles</h3>
+  <ul><li><a href="/a">Scaling ingestion</a></li><li><a href="/b">Index sizing</a></li></ul>
+</aside>
+<footer>
+  <p>Copyright 2024 Northwind Data Systems. All rights reserved.</p>
+  <p>Registered in England and Wales, company number 08812441. VAT GB 187 4421 09.</p>
+  <p>Terms of service | Privacy policy | Modern slavery statement | Accessibility</p>
+</footer>
+</body>
+</html>
