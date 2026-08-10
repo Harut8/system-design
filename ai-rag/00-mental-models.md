@@ -1150,7 +1150,10 @@ land the raw per-query, per-k rows in DuckDB rather than a spreadsheet from the 
 the intended home for eval results per the README's P0 design), since every later exercise
 in this list adds more rows to the same table. Success criterion: you can state, in one
 sentence, your recall ceiling at the k you actually plan to ship — e.g., "recall@10 is
-0.72 on this golden set."
+0.72 on this golden set." For how to *read* the resulting curve — what the ceiling means,
+why the curve's shape matters more than its values, and why the search-UI intuition that
+"bigger k just costs the user some scrolling" is wrong for RAG — see
+[`labs/golden-set/README.md`](labs/golden-set/README.md) §7.1.
 
 **3. Implement the oracle-context test and split failures into retrieval vs. generation.**
 *(~1 day; unblocks `06-context-engineering.md` and `07-generation-and-structured-output.md`)*

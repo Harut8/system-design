@@ -247,3 +247,57 @@ Exercise 2 consumes `golden-set.v1.jsonl`: for each query, retrieve at k ∈ {1,
 land the per-query, per-k rows in DuckDB. Report the hit rule (`any_overlap`) and the
 multi-hop rule ("any" or "all") next to every number, or the number is not fully
 specified.
+
+### 7.1 Reading a recall@k curve, in plain language
+
+> **The numbers in this subsection are made up.** They are a worked example of how to
+> *read* a curve, not a measurement of anything — this lab has not run a retriever yet.
+> When you have your own curve from exercise 2, these numbers get replaced by yours,
+> each with the one-sentence account of how it was measured that README §6 requires.
+
+Recall@k answers one question: **if I take the top k results, how often is the answer
+in there?** Nothing more. A worked curve, with what each row would mean:
+
+| Metric | Illustrative value | In a search UI | In a RAG prompt |
+|---|---|---|---|
+| **Recall@1** | 0.52 (52%) | Half of users find their answer as the #1 result — no scrolling, instant. Critical where screen space is tiny: voice, mobile, a chat widget. | Cheapest possible context: one chunk, minimum input tokens, minimum distraction. |
+| **Recall@3** | 0.71 (71%) | Most users find it in the top 3 — minimal scrolling, all above the fold. Good balance of precision against user effort. | The usual sweet spot: enough evidence to be right most of the time, still a small prompt. |
+| **Recall@5** | 0.83 (83%) | Most users find it within the top 5; some scrolling. The standard benchmark point for retrieval systems. | A normal shipped budget. Note 17% of queries are already unanswerable at this k. |
+| **Recall@10** | 0.91 (91%) | Nearly all relevant documents are eventually retrieved, but it takes real scrolling to get there. Useful as a coverage number. | 10 chunks of input tokens on *every* request, forever, plus 5 extra distractors the model has to read past. |
+
+**Three things this curve tells you, in order of usefulness:**
+
+1. **The ceiling.** Recall@k at the k you actually ship is the hard cap on end-to-end
+   correctness (`00` §4). Ship k=5 with the numbers above and 17% of queries cannot be
+   answered correctly no matter how good the model or the prompt is. That is the single
+   most useful sentence you can say about a retrieval system.
+2. **The shape, not the values.** A curve that climbs steeply from 0.52 to 0.91 means the
+   right chunks *are* being found and merely ranked badly — a ranking problem, fixed with
+   a reranker or better fusion (failure class (c)). A curve that is flat and low
+   everywhere — 0.40 at k=1 and still 0.45 at k=50 — means the chunks are not findable at
+   all, and no amount of reranking touches it: that is a chunking, embedding, or
+   ingestion problem (classes (a)/(b)). Same four points, completely different week of
+   work.
+3. **The gap between generous k and shipped k.** Recall@50 minus recall-at-what-survives-
+   reranking-and-truncation is exactly the size of failure class (c) — evidence retrieval
+   found and the budget threw away. Exercise 8 is that measurement.
+
+**Where the search-UI intuition breaks down for RAG.** In a search interface, a bigger k
+costs the *user* effort — scrolling. In a RAG pipeline nobody scrolls: every one of those
+k chunks is pasted into the prompt, so a bigger k costs **input tokens on every request
+forever** (`00` §9's dominant cost term) and adds distractor chunks that measurably
+degrade the answer (`00` §11's context rot). So recall@10 = 0.91 is not straightforwardly
+"better" than recall@3 = 0.71 — it is +20 points of ceiling bought with roughly 3× the
+per-query context bill and a noisier prompt. Which trade wins is a decision, and you can
+only make it with both numbers in front of you.
+
+**Two things a recall number is not:**
+
+- **It is not precision.** Recall@10 = 0.91 says the answer is somewhere in those ten
+  chunks. It says nothing about the other nine being junk. Report a token-efficiency
+  measure next to it (`02` §11.4's IoU) or you will conclude that retrieval quality is
+  fine while the generator drowns in irrelevant context.
+- **It is not comparable across hit rules or chunkings.** Recall computed with
+  `any_overlap` is a different quantity from recall computed with `span_containment`, and
+  neither is comparable to a run at a different chunk size. State the rule with the
+  number every time (`02` §11.2) — this is why the manifest pins `build_hit_rule`.
