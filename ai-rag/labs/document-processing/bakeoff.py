@@ -483,10 +483,10 @@ def splitter_adapters(max_tokens: int) -> dict[str, object]:
         out["llamaindex: Hierarchical"] = li_hierarchical
 
     if have("semchunk") and have("tiktoken"):
-        import semchunk
+        from semchunk.semchunk import chunkerify
         import tiktoken
 
-        chunker = semchunk.chunkerify(tiktoken.get_encoding("cl100k_base"), max_tokens)
+        chunker = chunkerify(tiktoken.get_encoding("cl100k_base"), max_tokens)
         out["semchunk"] = lambda t: list(chunker(t))
 
     if have("chonkie"):
@@ -500,10 +500,10 @@ def splitter_adapters(max_tokens: int) -> dict[str, object]:
             # not in a cautionary tale: same parameter name, same value, ~5x the
             # chunk count. Read your library's unit before you read its benchmarks.
             default = RecursiveChunker(chunk_size=max_tokens)
-            out["chonkie: Recursive (default=chars)"] = lambda t: [c.text for c in default(t)]
+            out["chonkie: Recursive (default=chars)"] = lambda t: [c.text for c in default.chunk(t)]
 
             tokenwise = RecursiveChunker(tokenizer="cl100k_base", chunk_size=max_tokens)
-            out["chonkie: Recursive (cl100k)"] = lambda t: [c.text for c in tokenwise(t)]
+            out["chonkie: Recursive (cl100k)"] = lambda t: [c.text for c in tokenwise.chunk(t)]
         except Exception:
             pass
 

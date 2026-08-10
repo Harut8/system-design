@@ -62,8 +62,8 @@ keeps every claim honest by construction.
 | [`00-mental-models.md`](00-mental-models.md) | The retrieval→generation pipeline as a data system; where correctness actually lives | **written** — labs unrun |
 | [`01-embeddings-and-representation.md`](01-embeddings-and-representation.md) | Model choice, dimensionality, domain adaptation, multilingual, drift | **written** — labs unrun |
 | [`02-chunking-and-document-processing.md`](02-chunking-and-document-processing.md) | Parsing, chunk strategies, contextual/late chunking, parent-doc | **written** — labs unrun |
-| `03-indexing-and-vector-stores.md` | HNSW parameters in anger, quantization, filtered search, pgvector vs dedicated | planned |
-| `04-retrieval-hybrid-and-reranking.md` | BM25 + dense, RRF fusion, cross-encoder rerankers, latency budget | planned |
+| [`03-indexing-and-vector-stores.md`](03-indexing-and-vector-stores.md) | HNSW parameters in anger, quantization, filtered search, pgvector vs dedicated | **written** — labs unrun |
+| [`04-retrieval-hybrid-and-reranking.md`](04-retrieval-hybrid-and-reranking.md) | BM25 + dense, RRF fusion, cross-encoder rerankers, latency budget | **written** — labs unrun |
 | `05-query-understanding.md` | Rewriting, decomposition, multi-query, HyDE, routing | planned |
 | `06-context-engineering.md` | Window budgeting, compaction, citation, memory, long-context tradeoffs | planned |
 | `07-generation-and-structured-output.md` | Structured outputs, schema validation, retries, determinism | planned |
