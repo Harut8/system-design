@@ -2,13 +2,13 @@
   "build_hit_rule": "any_overlap",
   "canonical_version": "canon-v1",
   "chunker_version": "md-struct-v1",
-  "corpus_chars": 303111,
-  "corpus_commit": "48df07f67ca340a1371493cd7d11fae381a91726",
-  "corpus_digest": "779f78a84217161f674850e7a064df6c0a7f7a282399ad6b906c4363f17de0af",
+  "corpus_chars": 303378,
+  "corpus_commit": "6aa12a458c58c94a11556c8d445c9631315299a5",
+  "corpus_digest": "4289e3f4994d256a167c29772948e7acb3919904fcd3598346ff74073d649733",
   "docs": {
     "00-mental-models.md": {
-      "chars": 86238,
-      "sha256": "24dcb0772b7f1d8aa993f6a6986ee5644fac8640447e4b8a8bd195aaac7fafbb"
+      "chars": 86505,
+      "sha256": "6542607b2187dcead856b28ea10ba1f1a28c96052841a2c6c31eb82a593f6a89"
     },
     "01-embeddings-and-representation.md": {
       "chars": 97684,

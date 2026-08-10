@@ -301,3 +301,88 @@ only make it with both numbers in front of you.
   `any_overlap` is a different quantity from recall computed with `span_containment`, and
   neither is comparable to a run at a different chunk size. State the rule with the
   number every time (`02` §11.2) — this is why the manifest pins `build_hit_rule`.
+
+### 7.2 What's "good enough" to ship
+
+There is no universal threshold, and anyone quoting one without asking what your system
+does is guessing. But "it depends" is not an answer either, so: here is how to *derive*
+your threshold, and a table of starting numbers to beat while you do.
+
+**Derive it from the correctness you're promising.** `00` §4's inequality rearranges
+into a requirement:
+
+```
+P(correct) ≤ P(retrieved) × P(used correctly | retrieved)
+
+    ⇒   required recall@k_shipped  ≥  target_correctness / faithfulness
+```
+
+`faithfulness` is measurable today with the oracle-context test (exercise 3): feed the
+known-correct chunk directly and see how often the model still gets it right. For a good
+model on clean, non-conflicting context it usually lands around 0.90–0.95 — **measure
+yours, don't borrow that range**. Then:
+
+| You promise | Measured faithfulness | Recall@k_shipped you actually need |
+|---|---|---|
+| 80% correct | 0.90 | ≥ 0.89 |
+| 90% correct | 0.90 | ≥ 1.00 — not achievable; fix retrieval *and* faithfulness first |
+| 90% correct | 0.95 | ≥ 0.95 |
+| 95% correct | 0.95 | ≥ 1.00 — not achievable without an abstain path |
+
+That second row is the useful one. It shows why "recall@5 = 0.83, ship it" is incoherent
+next to a claim of 90% accuracy, and it does so before anyone has argued about prompts.
+
+**Starting thresholds, by k.** Heuristics for a general-purpose text corpus with hybrid
+retrieval and a reranker — numbers to beat and then replace with your own, not acceptance
+criteria and not measured on this lab's corpus:
+
+| k | Weak — go fix ingestion/chunking | Typical | Good | What this k is for |
+|---|---|---|---|---|
+| **@1** | < 0.35 | 0.35–0.55 | > 0.55 | Single-answer surfaces: voice, a chat widget, an agent that takes the first tool result at face value |
+| **@3** | < 0.55 | 0.55–0.75 | > 0.75 | The common shipped budget — small prompt, low cost per query |
+| **@5** | < 0.65 | 0.65–0.85 | > 0.85 | Standard reporting point; a generous shipped budget |
+| **@10** | < 0.75 | 0.75–0.92 | > 0.92 | Coverage; usually past the point where extra tokens pay for themselves |
+| **@50** (pre-rerank) | **< 0.95 — stop** | 0.95–0.98 | > 0.98 | Candidate generation. Not a quality target: a **hard floor** |
+
+**The @50 row is the only one close to a rule.** Stage one exists to not lose the answer
+(`00` §7). Whatever stage one drops is gone permanently — no reranker, prompt, or model
+recovers it. So if recall@50 is below ~0.95, every hour spent on reranking, fusion
+weights, or prompts is spent on the wrong stage, and the fix is upstream: chunking,
+hybrid retrieval, embedding choice, or ingestion coverage. Treat that as the first gate
+you check and the last one you're allowed to fail.
+
+**Scale the target to what a wrong answer costs.** Same math, different `target_correctness`:
+
+| System | Reasonable target | And also |
+|---|---|---|
+| Internal doc search, engineer in the loop | recall@5 ≈ 0.80 | The user can rephrase; a miss costs a few seconds |
+| Customer-facing support assistant | recall@5 ≥ 0.90 | Plus citations, plus a handoff path when evidence is thin |
+| Medical, legal, financial advice | recall@k as high as you can buy | Plus mandatory citations, plus an **abstain path** — past ~0.95, buying recall gets exponentially expensive, and "I don't have a source for that" is worth more than the last 3 points |
+
+The abstain path is the part people skip. Above roughly 0.95 the cheapest way to raise
+*correctness* is usually to stop answering when retrieval scores are weak, not to chase
+recall toward 1.0.
+
+**Ratios beat absolute values for deciding what to work on.** These need no threshold
+table at all, and they point at a stage:
+
+| Signal | What it means | What to do |
+|---|---|---|
+| recall@1 / recall@10 < 0.6 | The answer is being found and ranked badly | Add or improve the reranker; tune fusion. Cheapest win available |
+| recall@1 / recall@10 > 0.85 | Ranking is already good | Further reranking work is wasted; gains must come from candidate generation |
+| recall@50 ≈ recall@10 | Depth is exhausted — more candidates find nothing new | Representation/chunking/ingestion problem (classes (a)/(b)), not a ranking one |
+| recall@50 − recall@k_shipped is large | Retrieval found it, budget or reranker discarded it | Class (c): rerank quality, truncation policy, or a bigger context budget |
+| Recall high, answers still wrong | Evidence is present and unused | Class (d): run the oracle test, work on prompt and faithfulness |
+
+**Gate CI on regressions, not on absolute thresholds.** Absolute numbers move whenever
+the corpus or query mix changes, so a hard `recall@5 >= 0.85` gate eventually fails for
+reasons that have nothing to do with the change under review. The durable gate is: block
+the merge if recall at the shipped k drops and the bootstrap CI on the delta excludes
+zero (exercise 6). Keep one absolute floor alongside it — recall@50 ≥ 0.95 — because that
+one is structural rather than tuned.
+
+**Do not apply any of this to 60 queries without checking the interval first.** At this
+size one query is 1.7 points, and a 95% bootstrap CI is roughly ±10 points — wide enough
+that 0.80 and 0.90 are not distinguishable. Thresholds this precise need hundreds of
+labelled queries. With 60, report the interval, compare against your own previous run,
+and resist the urge to read three-decimal-place meaning into it.

@@ -1153,7 +1153,10 @@ sentence, your recall ceiling at the k you actually plan to ship — e.g., "reca
 0.72 on this golden set." For how to *read* the resulting curve — what the ceiling means,
 why the curve's shape matters more than its values, and why the search-UI intuition that
 "bigger k just costs the user some scrolling" is wrong for RAG — see
-[`labs/golden-set/README.md`](labs/golden-set/README.md) §7.1.
+[`labs/golden-set/README.md`](labs/golden-set/README.md) §7.1. For deciding whether a
+given curve is good enough to ship — deriving the required recall from the correctness
+you're promising, per-k starting thresholds, and the one structural floor (stage-one
+recall below ~0.95 makes every downstream fix futile) — see §7.2 there.
 
 **3. Implement the oracle-context test and split failures into retrieval vs. generation.**
 *(~1 day; unblocks `06-context-engineering.md` and `07-generation-and-structured-output.md`)*
