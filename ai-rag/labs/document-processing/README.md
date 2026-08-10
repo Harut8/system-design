@@ -36,10 +36,11 @@ uv venv .venv && uv pip install -r requirements-bakeoff.txt
 2. [The corpus, and what each fixture is for](#2-the-corpus-and-what-each-fixture-is-for)
 3. [The pipeline](#3-the-pipeline)
 4. [What the run actually shows](#4-what-the-run-actually-shows)
-5. [The bake-off: what production tooling misses](#5-the-bake-off-what-production-tooling-misses)
-6. [Build log — the bugs, and what each one taught](#6-build-log--the-bugs-and-what-each-one-taught)
-7. [What this deliberately is not](#7-what-this-deliberately-is-not)
-8. [Where to go next](#8-where-to-go-next)
+5. [The bake-off: results](#5-the-bake-off-results)
+6. [Which tool, for which case](#6-which-tool-for-which-case)
+7. [Build log — the bugs, and what each one taught](#7-build-log--the-bugs-and-what-each-one-taught)
+8. [What this deliberately is not](#8-what-this-deliberately-is-not)
+9. [Where to go next](#9-where-to-go-next)
 
 ---
 
@@ -241,90 +242,417 @@ compare content you were trying to avoid comparing.
 
 ---
 
-## 5. The bake-off: what production tooling misses
+## 5. The bake-off: results
 
 `bakeoff.py` runs the same fixtures through whatever is installed. Every check is a
-known-answer test. Findings from the current run:
+**known-answer test** — the fixture was built to contain the defect, so a library that
+misses it is wrong rather than unlucky. Results below are the current run with all 11
+adapters present.
 
-**PDF reading order.** Two fixtures, identical rendered pages, differing only in the
-order of their `Tj` operators:
+### 5.1 PDF reading order
+
+Two fixtures, **identical rendered pages and identical text**, differing only in the
+order their `Tj` operators appear in the content stream. `report_twocol.pdf` writes the
+whole left column then the right; `report_twocol_interleaved.pdf` writes row-band by
+row-band across the gutter, which is what LaTeX and word processors actually emit.
 
 | parser | column-ordered emission | row-band emission |
 |---|---|---|
 | this lab (gutter detection) | separate | separate |
 | pypdf | separate | **INTERLEAVED** |
-| pymupdf (text) | separate | **INTERLEAVED** |
-| pymupdf (blocks, as-is) | separate | **INTERLEAVED** |
+| pymupdf (`text`) | separate | **INTERLEAVED** |
+| pymupdf (`blocks`, as-is) | separate | **INTERLEAVED** |
 | pymupdf (`sort=True`) | **INTERLEAVED** | **INTERLEAVED** |
 | pymupdf (per-column clip) | separate | separate |
 | pdfminer.six | separate | separate |
 
-Three things worth keeping:
-
-- **pdfminer.six recovers columns in both.** Its `LAParams` layout analysis groups by
-  position. pypdf and PyMuPDF's default text mode follow *emission order*.
-- **`sort=True` does not rescue PyMuPDF** — and makes the easy fixture worse. It sorts
-  *blocks*, and PyMuPDF has already merged both columns into one block, so the
-  interleaving lives inside a block where block sorting cannot reach it.
-- **Per-column clip rectangles work**, and finding those rectangles is your job. That
-  is the practical content of the tier-1/tier-2 boundary in §3.3.
-
-**Broken encodings — the most important finding here.** `subset_broken.pdf` has a font
-with no usable glyph map:
-
-| parser | chars | script sanity | control chars |
-|---|---|---|---|
-| this lab | 394 | **0.17** | 327 |
-| pymupdf | 394 | **0.17** | 327 |
-| pypdf | 1379 | **1.00** | 0 |
-
-pypdf renders unmapped glyphs as their literal names — `/g1/g2/g3…` — which is clean
-printable ASCII. **A mojibake gate calibrated on PyMuPDF output scores that file 1.00
-and waves it straight into the index.** So `script_sanity` is parser-dependent, and
-`parse.glyph_leakage()` exists because of this run. "We have a mojibake check" is not
-the same as "we would catch this", and that is one more reason `parser_version` belongs
-on every chunk.
-
-**Empty text layers.** Every library returns `""` for `scan.pdf` without complaint.
-That is *correct* behaviour and exactly the problem: the gate is yours to add.
-
-**Splitters, at a nominal 128-token budget.** None of the general-purpose splitters
-keeps a table intact, and none repeats a header row — none of them knows it is a table.
-Two rows do report "table intact" (`MarkdownHeaderTextSplitter`, `HierarchicalNodeParser`)
-and both do it by **not enforcing a size budget at all**: their max chunk runs to 366
-and 491 tokens against a 128 setting. Structure-aware splitting still needs a size
-fallback, or you trade a split table for silent truncation (§5.1's C1).
-
-**Units.** `chonkie.RecursiveChunker` defaults to `tokenizer="character"`, so
-`chunk_size=128` means 128 *characters*: 21 chunks where the same number in cl100k
-tokens gives 4. That is §13's anti-pattern 2 in a shipped default, not a cautionary
-tale — check your library's unit before you read its benchmarks.
-
-**Code.** Chunks that no longer parse as Python, from `service.py.txt`:
+The first body line of page 1 under row-band emission, as pypdf sees it:
 
 ```
-langchain: recursive(tiktoken)      7 chunks,  4 do not parse
-langchain: from_language(PYTHON)   10 chunks,  7 do not parse
-llamaindex: SentenceSplitter        6 chunks,  3 do not parse
-semchunk                            7 chunks,  5 do not parse
-this lab: parse_code (AST)          5 chunks,  0 do not parse
+'Reading order is not stored in the Margin requiremen…'
+ └── left column ──────────────────┘ └── right column ──
 ```
 
-LangChain's language-aware splitter is better than generic separators — it splits on
-`\nclass ` and `\ndef ` — but it is still separator matching, not parsing, so it has no
-notion of nesting. Code has a free, exact parser; using anything else is a choice.
+**What this means.** A parser that passes column 1 and fails column 2 is ordering by
+*emission*, not by position. Most real two-column PDFs emit row-band by row-band, so
+that parser will interleave on your corpus even though it looked fine on your test file.
 
-**Tokenizer.** This lab's dependency-free estimator runs **8.8% mean absolute error**
-against real cl100k across the corpus — but the mean hides the shape. Prose lands
-within a few percent (`book.md` −0.4%, `handbook.md` +3.9%); the outliers are
-`service.py.txt` at **+24%** and `revenue.csv` at **−16%**, i.e. exactly the
-identifier-dense and delimiter-dense content §5.4 says behaves differently. Enough to
-demonstrate that chars-per-token is a property of content type; **not** enough to set a
-chunk size against a hard context limit, where a 24% underestimate is a truncation.
+- **pdfminer.six is the only default that gets both right.** Its `LAParams` layout
+  analysis groups text by position rather than by stream order.
+- **`sort=True` does not rescue PyMuPDF** and makes the easy fixture *worse*. It sorts
+  *blocks*; PyMuPDF has already merged both columns into a single block, so the
+  interleaving lives inside a block where block sorting cannot reach.
+- **Per-column clip rectangles work.** Finding those rectangles is your job — that is
+  the practical content of the tier-1/tier-2 boundary in §3.3.
+
+### 5.2 Broken encodings — the finding that changed the pipeline
+
+`subset_broken.pdf` ships a font with no usable glyph map. `subset_ok.pdf` is the same
+page with resolvable names.
+
+| parser | chars | script sanity | control chars | glyph leak | gate |
+|---|---|---|---|---|---|
+| this lab | 394 | **0.17** | 327 | 0% | CAUGHT |
+| pymupdf (`text`) | 394 | **0.17** | 327 | 0% | CAUGHT |
+| pymupdf (`blocks`) | 392 | **0.17** | 326 | 0% | CAUGHT |
+| pymupdf (`sort=True`) | **163** | 1.00 | 0 | 0% | **MISSED** |
+| pypdf | 1379 | **1.00** | 0 | 100% | CAUGHT (by leak) |
+| pdfminer.six | 3078 | **1.00** | 1 | 87% | CAUGHT (by leak) |
+
+**No library raises, warns, or returns an error.** All of them return text of plausible
+length. And they fail in three *different shapes*:
+
+```
+control characters   this lab, pymupdf     script_sanity sees it (0.17)
+/g1/g2/g3 names      pypdf                 sanity 1.00 — clean printable ASCII
+(cid:6) markers      pdfminer.six          sanity 1.00 — clean printable ASCII
+```
+
+**So a mojibake gate calibrated against one parser's failure shape misses the other
+two.** That is why `parse.glyph_leakage()` exists alongside `script_sanity()` and why
+both run in `gate()`. It is also the most concrete argument in this lab for putting
+`parser_version` on every chunk: change the parser and you change *what your gates are
+able to see*.
+
+Two more things in that table:
+
+- **pypdf is flagged on `subset_ok.pdf` as well, and that is correct.** pypdf does not
+  resolve `uniXXXX` glyph names either, so it returns 3,117 characters of
+  `/uni0043/uni006C…` for the *good* file. The control is only a control for parsers
+  that can read the font at all.
+- **`sort=True` returns 163 characters where every other mode returns 394** — it
+  silently drops 60% of the page, with clean sanity and a clean leak score. No single
+  gate catches every shape; an extraction-yield comparison against a *sibling parser*
+  is what catches this one.
+
+### 5.3 Empty text layers
+
+Every library returns `""` for `scan.pdf` and **returns normally**. That is correct
+behaviour — there genuinely is no text — and it is exactly the problem: zero chunks,
+zero vectors, zero errors, and the document silently ceases to exist. The gate is yours
+to add; no parser will do it for you.
+
+### 5.4 The compounding failure: a parse bug disabling a normalizer rule
+
+The fixture breaks `organi-` / `zational` across two lines. De-hyphenation (§4.1) fires
+on `(\w)-\n(\w)`, so it needs the continuation to still be the **next line** after
+parsing.
+
+```
+naive     hyphen line: 'The organi- Counterparty exposure is measured'
+naive     de-hyphenation fires: False
+columns   hyphen line: 'The organi-'
+columns   de-hyphenation fires: True
+```
+
+Same extractor, same normalizer, two reading orders. Under naive ordering `The organi-`
+is joined with the *right column's* text on the same line, so `zational` is no longer
+the next line and the repair rule can never match. **A parser defect silently disabled a
+normalizer rule two stages downstream**, and the term stays unsearchable in both
+branches. Fixing the normalizer would not have helped. This is §1's ceiling chain with a
+second-order effect, and it is the single best argument in the lab for fixing parsing
+first.
+
+`pymupdf (sort=True)` shows the same `repaired=False`, for the same reason.
+
+Separately: every parser emits the ligature codepoint `ﬁ` as-is. That is **correct** —
+it is what the file says. Expansion is the normalizer's job and does not happen unless
+you do it.
+
+### 5.5 Splitters — chunk shape at a nominal 128-token budget
+
+`book.md`, 26,848 characters:
+
+| splitter | n | p50 | max | orphans | ms |
+|---|---|---|---|---|---|
+| this lab: recursive | 61 | 86 | 128 | 0 | 18.5 |
+| langchain: `recursive(chars)` | 75 | 74 | 122 | 0 | 0.1 |
+| langchain: `recursive(tiktoken)` | 61 | 85 | 125 | 0 | 5.8 |
+| langchain: `+sentence seps` | 75 | 74 | 122 | 0 | 0.1 |
+| langchain: `MarkdownHeaderTextSplitter` | 37 | 151 | **280** | 0 | 0.8 |
+| llamaindex: `SentenceSplitter` | 52 | 115 | 126 | 0 | 6.2 |
+| llamaindex: `HierarchicalNodeParser` | 242 | 55 | **491** | 5 | 27.8 |
+| semchunk | 61 | 85 | 126 | 0 | 5.1 |
+| chonkie: `Recursive` (default) | 317 | 18 | 35 | **286** | 0.9 |
+| chonkie: `Recursive` (cl100k) | 48 | 121 | 130 | 0 | 1.4 |
+
+Two rows deserve attention.
+
+**The two structure-aware splitters do not enforce a size budget at all.** Their max
+chunk runs to 280 and 491 tokens against a 128 setting. On a real corpus that means
+chunks the embedding provider silently truncates (§5.1's C1). Structure-aware splitting
+is the right default *and* it still needs a size fallback — which is what this lab's
+`structural()` does by recursing into any element over budget.
+
+**`chonkie.RecursiveChunker` defaults to `tokenizer="character"`.** `chunk_size=128`
+therefore means 128 *characters*: **317 chunks with 286 orphans**, against **48 chunks
+with none** when the same number is interpreted as cl100k tokens. A **6.6× difference
+in chunk count, and a 286-to-0 difference in orphans, from one undeclared default** —
+§13's anti-pattern 2 living in a shipped library rather than in a cautionary tale.
+Check your splitter's unit before you read anyone's benchmarks, including this table.
+
+### 5.6 Tables — does the splitter cut through one?
+
+`metrics.md` holds a 4-row table that must survive intact or its rows lose their column
+headers.
+
+| splitter | verdict |
+|---|---|
+| this lab: recursive | SPLIT — 1 row chunk with no header |
+| langchain: `recursive(chars)` | SPLIT — 1 row chunk with no header |
+| langchain: `recursive(tiktoken)` | SPLIT — 2 row chunks with no header |
+| langchain: `+sentence seps` | SPLIT — 1 row chunk with no header |
+| langchain: `MarkdownHeaderTextSplitter` | table intact¹ |
+| llamaindex: `SentenceSplitter` | SPLIT — 1 row chunk with no header |
+| llamaindex: `HierarchicalNodeParser` | table intact¹ |
+| semchunk | SPLIT — 1 row chunk with no header |
+| chonkie (both configs) | SPLIT — 2 row chunks with no header |
+
+¹ *by not enforcing a size budget — see §5.5. A splitter that never splits anything
+passes this test trivially and fails the context limit instead.*
+
+**No general-purpose text splitter repeats the header row**, because none of them knows
+it is a table. That is the free fix from §3.4, and it requires a parser that emits a
+table *element* — which is why this lab's `parse.py` returns typed elements rather than
+a string.
+
+### 5.7 Code — does the splitter cut through a function?
+
+`service.py.txt`: two module-level functions and a class. Chunks that no longer parse as
+Python:
+
+| splitter | chunks | do not parse |
+|---|---|---|
+| this lab: recursive | 8 | 6 |
+| langchain: `recursive(chars)` | 8 | 6 |
+| langchain: `recursive(tiktoken)` | 7 | 4 |
+| langchain: `from_language(PYTHON)` | 10 | 7 |
+| llamaindex: `SentenceSplitter` | 6 | 3 |
+| llamaindex: `HierarchicalNodeParser` | 23 | 16 |
+| semchunk | 7 | 5 |
+| chonkie: `Recursive` (cl100k) | 5 | 3 |
+| **this lab: `parse_code` (AST)** | **5** | **0** |
+
+"Does not parse" is a proxy, not proof — but a chunk that is not valid Python has been
+cut where no reader would cut it. LangChain's `from_language(PYTHON)` is better than
+generic separators (it splits on `\nclass ` and `\ndef `) but it is still separator
+matching, not parsing, so it has no notion of nesting and scores worse here than the
+plain tiktoken splitter. **Code has a free, exact parser; using anything else is a
+choice to discard structure you already have.**
+
+### 5.8 Notation survival
+
+| variant | x² | ½ | Ⅻ | µ | Ａ | US | ﬁ |
+|---|---|---|---|---|---|---|---|
+| source file | ok | ok | ok | ok | ok | ok | present |
+| this lab: `canonicalize` | ok | ok | ok | ok | ok | ok | **expanded** |
+| `NFKC` (the reflex) | **LOST** | **LOST** | **LOST** | **LOST** | **LOST** | ok | expanded |
+| `NFKC` + `.lower()` (the habit) | **LOST** | **LOST** | **LOST** | **LOST** | **LOST** | **LOST** | expanded |
+| unstructured: `partition_md` | ok | ok | ok | ok | ok | ok | present |
+
+The last column is the one that *should* change: expanding `ﬁ` → `fi` is the
+compatibility mapping you want, and leaving it makes the term unreachable by any BM25
+query for `classification`. Every other column must survive. NFKC destroys five of them
+in one line, and `.lower()` then merges `US` into `us` — both are one-line "cleanups" a
+reviewer waves through.
+
+### 5.9 HTML chrome and duplication
+
+| extractor | chars kept | chrome left |
+|---|---|---|
+| this lab: tag/class filter | 492 | no |
+| bs4: `get_text()` | 995 | **yes** |
+| bs4: after `decompose(nav, footer, aside…)` | 701 | no |
+| unstructured: `partition_html` | 901 | **yes** |
+
+Chrome is 34–38% of each page. The cookie banner sits in a plain
+`<div class="cookie-banner">`, so tag-based stripping alone misses it — which is §3.5's
+argument for running corpus-level repeated-block detection *as well*. It needs no
+per-site rules and it found 6 blocks appearing on >30% of the five pages.
+
+MinHash agreement, this lab vs `datasketch` at 128 permutations:
+
+```
+chrome-heavy page A vs B    true=0.336   this lab=0.367   datasketch=0.305
+A vs itself                 true=1.000   this lab=1.000   datasketch=1.000
+```
+
+Both sit inside the ±0.088 standard error that 128 permutations buys — which is exactly
+why a 0.80 threshold is defensible and distinguishing 0.85 from 0.90 is not.
+
+`thread.eml`: 3,826 raw characters → 813 after stripping quoted replies at parse time.
+**66% of the file was quotation.** A splitter run over the raw file indexes the same
+paragraph up to four times.
+
+### 5.10 Tokenizer
+
+This lab's dependency-free estimator against real cl100k, per document:
+
+| document | cl100k | estimate | error | chars/token |
+|---|---|---|---|---|
+| `book.md` | 5,783 | 5,757 | −0.4% | 4.64 |
+| `transcript.txt` | 375 | 367 | −2.1% | 4.85 |
+| `site/*.html` | ~145 | ~150 | +2–5% | 4.9–5.1 |
+| `statement.pdf` | 150 | 130 | −13.3% | 2.37 |
+| `revenue.csv` | 318 | 267 | **−16.0%** | 2.20 |
+| `service.py.txt` | 433 | 538 | **+24.2%** | 4.61 |
+
+Mean absolute error 8.8%. The mean hides the shape: prose lands within a few percent,
+and the outliers are exactly the identifier-dense and delimiter-dense content §5.4 of
+the chapter is about. **chars/token ranges from 2.20 to 5.05 across this corpus** — a
+character-based splitter set to one number produces token counts differing by more than
+2× across these files.
+
+### 5.11 Parse speed
+
+Median of 20 warm runs on the 3-page `report_twocol.pdf`:
+
+| parser | ms/page | note |
+|---|---|---|
+| this lab | 0.43 | no font decoding, uncompressed streams |
+| pymupdf | 0.53 | C library |
+| pypdf | 0.68 | pure Python |
+| pdfminer.six | **2.23** | ~4× slower, and the only one that gets columns right |
+
+**Treat these as ordering, not as magnitudes.** The fixture is a small uncompressed
+synthetic PDF with one base-14 font. Real PDFs with embedded subset fonts, compressed
+streams and images shift these numbers a lot — but the ranking (PyMuPDF fastest,
+pdfminer slowest because it is doing more) holds in every published comparison I have
+seen and is explained by what each one actually does.
+
+The tradeoff is the point: **pdfminer.six costs ~4× the CPU and is the only default that
+recovers columns.** On a single-column corpus that is 4× for nothing; on a multi-column
+corpus it is 4× for the difference between usable and unusable text.
 
 ---
 
-## 6. Build log — the bugs, and what each one taught
+## 6. Which tool, for which case
+
+The bake-off produces facts about libraries. This section turns them into defaults.
+Everything here is a **starting point to measure from**, not a ranking — §11.6 is
+explicit that the answer depends on your corpus *and* your query distribution.
+
+### 6.1 By document class
+
+| Your corpus is mostly… | Parse with | Chunk with | The thing that will bite you |
+|---|---|---|---|
+| **Markdown / MDX / rST** | native — no library needed | `MarkdownHeaderTextSplitter` **plus a size fallback** | the header splitter has no size cap (§5.5); a long section becomes one 500-token chunk |
+| **HTML** (docs sites, wikis, KBs) | `unstructured.partition_html` or bs4, **plus corpus-level repeated-block detection** | header-aware, then recursive within a section | chrome is 30–40% of bytes and tag rules miss `<div class="cookie-banner">` (§5.9) |
+| **Born-digital PDF, single column** | PyMuPDF (fastest) or pypdf | recursive **with sentence separators** | paragraph breaks are lost in extraction, so `\n\n` never fires — add `.`/`?`/`!` to the separator list |
+| **PDF, multi-column** (papers, reports, filings) | **pdfminer.six**, or PyMuPDF + per-column clip rects | structure-aware if your parser gives you elements | pypdf and PyMuPDF default text mode interleave columns (§5.1); `sort=True` does not fix it |
+| **Scanned PDF / images** | OCR or a VLM — out of scope here | n/a until text exists | every library returns `""` and returns *normally* (§5.3) |
+| **PDF with tables** (financial, spec sheets, clinical) | tier 2 — Docling, `unstructured` `hi_res`, or a cloud API | index row-wise sentences, return the full table (§3.4) | no text splitter keeps a table intact or repeats headers (§5.6) |
+| **Spreadsheets / CSV** | load into DuckDB or Postgres | **do not chunk rows into prose** — index a table *description* | vector search never aggregates, never joins, never exhausts (§3.6) |
+| **Source code** | the language's own AST (`ast`, tree-sitter) | AST boundaries + enclosing context (file path, class signature, imports) | `from_language()` is separator matching, not parsing — 7/10 chunks unparseable (§5.7) |
+| **Email / tickets / chat** | strip quoted replies **at parse time**; keep thread as metadata | one chunk per message, thread id in payload | 66% duplication if you skip it (§5.9) |
+| **Books, manuals, long structured docs** | native | **parent/child** — small children, section parents | budget tokens *after* parent expansion, never `k` before it (§7.4) |
+| **Maths / chemistry / legal / CJK** | anything, but normalize with **NFC only** | anything | one `NFKC` call destroys `x²`, `½`, `Ⅻ`, `µ`, full-width forms (§5.8) |
+| **Transcripts, OCR output, unstructured text** | plain | recursive with sentence separators | this is the one place overlap genuinely earns its cost — there are no author-drawn boundaries to use instead (§5.5 of the chapter) |
+| **Mixed corpus** (the real case) | route by media type; one parser per class | pick per class, **stamp `parser_version` and `chunker_version` on every chunk** | a single global chunk size is wrong for prose *and* code at once — chars/token spans 2.2–5.1 (§5.10) |
+
+### 6.2 By tool — when to reach for it, and what to watch
+
+**PDF parsing**
+
+- **PyMuPDF** — reach for it by default on volume. Fastest (0.53 ms/page here), and
+  `get_text("blocks")` hands you coordinates so you can do your own layout work.
+  *Watch:* default text mode follows emission order and interleaves columns;
+  `sort=True` is a trap that makes it worse; on a broken font it can silently drop 60%
+  of a page. Import as `pymupdf`, not the deprecated `fitz`.
+- **pypdf** — reach for it when you want zero binary dependencies and a permissive
+  install. *Watch:* interleaves columns, and it does not resolve `uniXXXX` or `/gN`
+  glyph names — it emits them as literal text, so a font-subset PDF comes out as clean
+  ASCII gibberish that no script-based gate catches.
+- **pdfminer.six** — reach for it when your corpus is **multi-column** and you do not
+  want to write layout code. The only default here that gets both reading-order
+  fixtures right. *Watch:* ~4× slower; emits `(cid:N)` for unmapped glyphs, which is
+  the same clean-ASCII trap in a different spelling.
+- **Docling / `unstructured` `hi_res` / Marker / MinerU** — tier 2. Reach for them when
+  **tables matter** or the layout is genuinely complex. Not installed by default here
+  (Docling pulls torch); this lab exists partly to show what you are buying.
+
+**Chunking**
+
+- **LangChain `text-splitters`** — the ubiquitous default, and fine, *if* you configure
+  two things: use `from_tiktoken_encoder` so `chunk_size` means tokens, and add `.`
+  `?` `!` to the separator list. Chroma's evaluation could not use the stock default at
+  all. `MarkdownHeaderTextSplitter` is genuinely good for structure; pair it with a
+  size fallback.
+- **LlamaIndex `node_parser`** — reach for it when you want §7's patterns off the
+  shelf: `HierarchicalNodeParser` + `AutoMergingRetriever`, `SentenceWindowNodeParser`,
+  parent/child. This is the best reason to use LlamaIndex for ingestion specifically.
+  *Watch:* `HierarchicalNodeParser` returns all levels, so chunk counts and max sizes
+  look alarming until you realise you are seeing parents and leaves together.
+- **semchunk** — reach for it when you want *only* good tokenizer-aware recursive
+  splitting with no framework. Matched this lab's output almost exactly (61 chunks,
+  p50 85) at a fraction of the code.
+- **chonkie** — reach for it to try many strategies quickly behind one API.
+  *Watch, seriously:* `tokenizer="character"` is the default, so `chunk_size` is
+  characters until you say otherwise — a ~50× difference in chunk count here.
+- **Write your own** — worth it exactly when you have structure a general splitter
+  cannot see: tables that need header repetition, code that needs an AST, documents
+  where the heading path should be prepended. That is `split.py`, and it is ~400 lines.
+
+**Measurement**
+
+- **tiktoken** — always, for counting. A rule-of-thumb estimator is 8.8% off on
+  average and 24% off on code (§5.10); against a hard context limit that is a
+  truncation.
+- **datasketch** — MinHash + LSH at corpus scale. The hand-rolled version in
+  `dedup.py` agrees with it inside the ±0.088 error that 128 permutations buys, and
+  exists to make the mechanism readable, not to compete.
+
+### 6.3 What to run first on your own corpus
+
+In this order, because each step's answer changes the next:
+
+1. **`bakeoff.py --only pdf`, but on your files.** Swap `ROOT` for a directory of your
+   twenty ugliest documents. You are looking for which of §3.2's failure modes are
+   present and at what rate — that is §15's lab 1, and it is the highest-yield hour
+   available.
+2. **Calibrate the gates.** `min_yield` and `min_sanity` in `parse.gate()` are
+   placeholders. Set them so they flag the documents you judged broken by eye and only
+   those. A threshold copied from a document is a number you invented.
+3. **`bakeoff.py --only tokenizer`** to learn your corpus's chars/token by content
+   type, then set chunk size in *tokens* under your embedding model's tokenizer.
+4. **`bakeoff.py --only splitters`** to see what your current splitter does to your
+   tables and your code. If you ship a mixed corpus, the answer is usually "route by
+   type" rather than "tune one number".
+5. **Only then** build the golden set ([`../golden-set/`](../golden-set/)) and start
+   comparing chunkings on quality. Everything before this point is measurable without a
+   model; nothing after it is.
+
+### 6.4 The defaults I would ship
+
+If someone handed me a mixed enterprise corpus tomorrow and wanted a starting
+configuration rather than a research project:
+
+```
+route by media type, never one parser for everything
+  PDF          pdfminer.six if multi-column is common, else PyMuPDF
+               + extraction-yield gate + script-sanity gate + glyph-leak gate
+               + tier 2 (Docling) for the table-heavy subset only
+  HTML         unstructured or bs4, + corpus repeated-block detection per domain
+  Markdown     native, header-aware
+  code         AST, never a text splitter
+  spreadsheets route to a query engine; index a description
+  email        strip quotes at parse time
+
+normalize   NFC + an audited ligature/invisible list. Never NFKC. Never lowercase
+            on the dense branch; lowercase freely on the lexical branch.
+
+chunk       structure-aware with a recursive fallback, 256–512 tokens measured in
+            the embedding model's tokenizer, zero overlap where structure exists,
+            heading path prepended to embed_text, table headers repeated.
+
+identify    content-addressed IDs over embed_text, with parser/normalizer/chunker
+            versions on every chunk, and a content comparison in the update diff.
+
+then        measure, and change one thing at a time against a span-labelled
+            golden set. Everything above is a prior, not a result.
+```
+
+## 7. Build log — the bugs, and what each one taught
 
 Every one of these passed by accident before it passed on purpose. Each is now pinned
 by a named test.
@@ -382,7 +710,7 @@ finding that changed the pipeline rather than a test. See §5.
 
 ---
 
-## 7. What this deliberately is not
+## 8. What this deliberately is not
 
 **Not a benchmark, and it produces no ranking.** Chunk counts and split behaviour are
 facts about a library. Whether they matter to *your* retrieval is §15's lab 5, which
@@ -409,7 +737,7 @@ travel.
 
 ---
 
-## 8. Where to go next
+## 9. Where to go next
 
 **To use this on your own documents**, the smallest useful step is lab 1: point
 `parse.py` at twenty of your ugliest files, read the extracted text *by eye*, and

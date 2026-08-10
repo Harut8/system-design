@@ -146,10 +146,20 @@ def script_sanity(text: str, sample: int = 20_000) -> float:
     return ok / len(s)
 
 
-# Glyph names leaking into extracted text: `/uni0041`, `/g17`, `/cid42`, `/C0_3`.
-# Not mojibake — perfectly good ASCII — which is exactly why a script-based gate
-# cannot see it.
-_GLYPH_NAME_LEAK = re.compile(r"/(?:uni[0-9A-Fa-f]{4}|g\d+|cid\d+|[A-Z]\d+_\d+)")
+# Glyph identifiers leaking into extracted text. Each library has its own spelling for
+# "I could not map this glyph", and every one of them is clean printable ASCII — which
+# is exactly why a script-based gate cannot see any of them:
+#
+#   pypdf          /uni0043  /g17          (the glyph name, verbatim)
+#   pdfminer.six   (cid:6)                 (the character ID, in its own notation)
+#   others         /C0_3     /cid42
+#
+# All three forms are in this pattern because the bake-off found all three on the same
+# broken fixture. A detector that knows only one library's spelling passes the other
+# two straight into the index.
+_GLYPH_NAME_LEAK = re.compile(
+    r"/(?:uni[0-9A-Fa-f]{4}|g\d+|cid\d+|[A-Z]\d+_\d+)|\(cid:\d+\)"
+)
 
 
 def glyph_leakage(text: str, sample: int = 20_000) -> float:

@@ -40,7 +40,9 @@ score.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import logging
 import sys
 import time
@@ -58,8 +60,11 @@ ROOT = Path(__file__).parent / "corpus"
 # Third-party chatter drowns the comparison table. These are the libraries' own advice
 # messages ("chunk size is small", "fitz is deprecated"), not findings about the corpus.
 warnings.filterwarnings("ignore")
-logging.getLogger("llama_index").setLevel(logging.ERROR)
-logging.getLogger("llama_index.core.node_parser").setLevel(logging.ERROR)
+# `logging.disable` rather than per-logger levels: these libraries bind their handlers
+# at import time, so redirecting stderr inside the call does not reach them and naming
+# each logger only works until the next release renames one. Errors still surface —
+# `_run_split` and `_run_pdf` catch and report exceptions themselves.
+logging.disable(logging.WARNING)
 
 
 def have(module: str) -> bool:
@@ -340,32 +345,85 @@ def section_pdf() -> None:
                     continue
                 text = r.text
             sanity = PA.script_sanity(text)
+            leak = PA.glyph_leakage(text)
             ctrl = sum(1 for c in text if unicodedata.category(c) in ("Cc", "Co", "Cn")
                        and c not in "\n\r\t")
+            caught = "CAUGHT" if (sanity < 0.80 or leak > 0.20) else "MISSED"
             print(f"    {name:<26} chars={len(text.strip()):>4} sanity={sanity:.2f} "
-                  f"control_chars={ctrl:>3}")
-    print("\n  No library flags the broken file. All of them return plausible-length text.")
-    print("  This is the case the sanity gate exists for, and no parser will do it for you.")
+                  f"ctrl={ctrl:>3} glyph-leak={leak:>4.0%}  gate: {caught}")
+    print("\n  Read the CAUGHT/MISSED column as 'would this pipeline have noticed', not as")
+    print("  a score for the parser. Three things are in it:")
+    print()
+    print("  1. NO library raises or warns on the broken file. Every one returns text of")
+    print("     plausible length, and they fail in three DIFFERENT shapes:")
+    print()
+    print("       control characters   this lab, pymupdf   → script_sanity sees it (0.17)")
+    print("       /g1/g2/g3 names      pypdf               → sanity 1.00, clean ASCII")
+    print("       (cid:6) markers      pdfminer.six        → sanity 1.00, clean ASCII")
+    print()
+    print("     A gate calibrated against one parser's failure shape misses the other two.")
+    print("     That is why glyph_leakage() runs alongside script_sanity() in gate(), and")
+    print("     it is a concrete reason `parser_version` belongs on every chunk: change")
+    print("     the parser and you change what your gates are able to see.")
+    print()
+    print("  2. pypdf is flagged on subset_ok.pdf too, and that is CORRECT rather than a")
+    print("     false positive. pypdf does not resolve `uniXXXX` glyph names either, so it")
+    print("     returns 3,117 characters of /uni0043/uni006C… for the *good* file. The")
+    print("     control is only a control for parsers that can read the font at all.")
+    print()
+    print("  3. pymupdf(sort=True) returns 163 characters where every other mode returns")
+    print("     394 — it silently drops most of the page. Clean sanity, clean leak score,")
+    print("     and 60% of the document gone. No single gate catches every failure shape;")
+    print("     an extraction-yield check against a *sibling parser* is what catches this.")
 
-    h2("Ligatures and hyphenation (§3.2, §4.1) — do they arrive repaired?")
+    h2("Ligatures and hyphenation (§3.2, §4.1) — do they arrive repairable?")
+    print("  The fixture breaks `organi-` / `zational` across two lines of the left column.")
+    print("  De-hyphenation (§4.1) fires on `(\\w)-\\n(\\w)`, so it needs the continuation to")
+    print("  still be the NEXT LINE after the parse.\n")
     data = (ROOT / "report_twocol.pdf").read_bytes()
     for name, fn in adapters:
         if fn is None:
             doc = PM.extract(data)
-            text = "\n".join(PM.page_text(doc))
+            text = "\n".join(
+                PM.page_text(doc, reading_order="columns",
+                             drop_lines=PM.detect_running_lines(doc))
+            )
         else:
             r = _run_pdf(name, fn, data)
             if r.error:
                 continue
             text = r.text
         lig = sum(text.count(l) for l in N.LIGATURES)
-        hyphen = "organi-" in text.replace("\n", "\n")
         canon = N.canonicalize(text)
-        print(f"  {name:<28} ligatures={lig:>2} split-hyphen={str(hyphen):<5} "
-              f"→ after normalize: ligatures={sum(canon.count(l) for l in N.LIGATURES)}, "
-              f"repaired={'organizational' in canon}")
-    print("\n  Parsers emit the ligature codepoint as-is — correctly, it is what the file says.")
-    print("  Repair is the normalizer's job (§4.1) and it does not happen unless you do it.")
+        print(f"  {name:<32} ligatures={lig:>2} → after normalize: "
+              f"ligatures={sum(canon.count(l) for l in N.LIGATURES):>2}, "
+              f"hyphen repaired={str('organizational' in canon):<5}")
+
+    # The compounding failure, isolated. This is the same extractor and the same
+    # normalizer; only the reading order differs.
+    doc = PM.extract(data)
+    naive = "\n".join(PM.page_text(doc, reading_order="naive"))
+    columns = "\n".join(
+        PM.page_text(doc, reading_order="columns", drop_lines=PM.detect_running_lines(doc))
+    )
+    print()
+    print("  Same extractor, same normalizer, two reading orders:")
+    for label, text in (("naive", naive), ("columns", columns)):
+        line = next((l for l in text.split("\n") if "organi" in l), "")
+        print(f"    {label:<8} hyphen line: {line[:52]!r}")
+        print(f"    {label:<8} de-hyphenation fires: {'organizational' in N.canonicalize(text)}")
+
+    print()
+    print("  This is the compounding failure worth taking away. Under naive reading order")
+    print("  `The organi-` is joined with the RIGHT column's text on the same line, so the")
+    print("  continuation `zational` is no longer the next line and the de-hyphenation rule")
+    print("  can never match. A parser defect silently disabled a normalizer rule two")
+    print("  stages downstream, and the term stays unsearchable — §1's ceiling chain with")
+    print("  a second-order effect. Fixing the normalizer would not have helped.")
+    print()
+    print("  Note also that every parser emits the ligature codepoint as-is. That is")
+    print("  CORRECT — it is what the file says. Expansion is the normalizer's job (§4.1)")
+    print("  and it does not happen unless you do it.")
 
 
 # Phrases known to belong to one column or the other, in document order. Checking
@@ -471,6 +529,7 @@ def splitter_adapters(max_tokens: int) -> dict[str, object]:
             splitter = SentenceSplitter(chunk_size=max_tokens, chunk_overlap=0)
             return [n.get_content() for n in splitter.get_nodes_from_documents([LIDocument(text=text)])]
 
+        out["llamaindex: SentenceSplitter"] = li_sentence
 
         def li_hierarchical(text: str) -> list[str]:
             from llama_index.core.node_parser import HierarchicalNodeParser
@@ -511,9 +570,19 @@ def splitter_adapters(max_tokens: int) -> dict[str, object]:
 
 
 def _run_split(name: str, fn, text: str) -> SplitResult:
+    """Run one splitter, capturing whatever it decides to print at us.
+
+    Several libraries emit advice on every call — LlamaIndex's `TokenTextSplitter`
+    uses a bare `print()` for "metadata length is close to chunk size", which no
+    logging configuration can suppress. At ten adapters x three fixtures that buries
+    the table it is printed next to. Captured, not silenced: exceptions are still
+    caught and reported in the `error` field below.
+    """
+    sink = io.StringIO()
     t0 = time.perf_counter()
     try:
-        chunks = [c for c in fn(text) if c and c.strip()]
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            chunks = [c for c in fn(text) if c and c.strip()]
     except Exception as exc:
         return SplitResult(name, error=f"{type(exc).__name__}: {exc}"[:70])
     return SplitResult(name, chunks, ms=(time.perf_counter() - t0) * 1000)
