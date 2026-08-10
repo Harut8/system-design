@@ -1089,6 +1089,57 @@ criterion: every record has at least one verified chunk id, and you can regenera
 deterministically if the corpus is re-chunked (i.e., chunk ids are stable identifiers, not
 array indices).
 
+> **Worked: [`labs/golden-set/`](labs/golden-set/)** — 60 questions over the four chapters
+> in this folder, with the builder that produces the labels and the 20-assertion test
+> suite that keeps them from rotting. Read that directory's README for the full method
+> and build log, including what a production golden set does differently. The four
+> decisions worth carrying into your own are below.
+
+**How to build one so it survives its own corpus.** The naive version of this exercise —
+type 50 questions into a spreadsheet, paste in the chunk ids your retriever printed — is
+worse than not doing it, because it produces a number that looks like measurement and
+decays into fiction the first time anything upstream changes. Four decisions prevent
+that, and none of them cost more than an hour up front:
+
+1. **Label spans, not chunk ids.** A chunk id only exists relative to a chunking
+   (`02-chunking-and-document-processing.md` §11.2). Store `(doc_id, char_start,
+   char_end)` into the *canonical text* of the corpus, and derive the chunk ids from
+   (span × chunking × hit rule) at build time. Spans survive a re-chunk because the
+   corpus is the thing that didn't change; chunk ids don't. This is what actually makes
+   the exercise's own success criterion — "you can regenerate the file deterministically
+   if the corpus is re-chunked" — achievable rather than aspirational.
+2. **Author quotes; let the builder compute offsets.** Nobody can review
+   `char_start: 48122`, and every offset shifts when a paragraph above it is edited. So
+   the human writes a short exact quote and the builder resolves it, treating both a
+   missing quote and an ambiguous one (two occurrences) as build errors. That is the
+   whole mechanism by which an edited corpus produces a failed build instead of a label
+   that quietly points at the wrong paragraph.
+3. **Write down the expansion rule and the hit rule, and never report a number without
+   them.** A short quote anchors; something has to decide how far the labelled span
+   extends around it, and something has to decide when a chunk counts as containing that
+   span (`02` §11.2's table: any overlap, containment, coverage ≥ τ, union coverage ≥ τ).
+   Both choices move recall by more than most of the pipeline changes you'll be trying to
+   measure, so "recall@10" without them is not a fully specified metric — the same point
+   §6 makes about the "any vs. all" definition for multi-hop queries.
+4. **Content-address the chunk ids.** `sha256(doc_id, chunker_version, chunk_text)`, per
+   `02` §9.1. With position-addressed ids, inserting one paragraph at the top of a
+   document renames every chunk below it and invalidates every derived label in the same
+   motion.
+
+Then treat the whole thing as a test suite from the first commit, not a data file: the
+labels themselves are an experiment, and an unexamined experiment yields a confident
+number about nothing. Two failures from the worked build make the case concretely. Two
+anchors didn't resolve on the first run — quotes transcribed across a line wrap — and the
+builder refused to write a partial set rather than silently dropping two records and
+making this week's recall incomparable to last week's. More instructive: the first
+span-expansion rule was "expand to the enclosing paragraph," which on Markdown numbered
+lists (no blank lines between items) swallowed the *entire list* for fourteen records —
+a 3,245-character span covering a dozen unrelated facts. Every test passed. Every label
+was "correct." Recall@k computed against those labels would have been inflated for a
+reason nothing downstream would ever have surfaced. It was caught by printing the
+resolved spans and reading them, which is the one step in this exercise that cannot be
+automated and is always the first one skipped.
+
 **2. Implement recall@k and sweep k ∈ {1, 5, 10, 20, 50}.** *(~half a day; unblocks
 `04-retrieval-hybrid-and-reranking.md`)*
 For each query in the golden set, run retrieval at each k and check whether any
