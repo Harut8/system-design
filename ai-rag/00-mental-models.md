@@ -1156,7 +1156,10 @@ why the curve's shape matters more than its values, and why the search-UI intuit
 [`labs/golden-set/README.md`](labs/golden-set/README.md) §7.1. For deciding whether a
 given curve is good enough to ship — deriving the required recall from the correctness
 you're promising, per-k starting thresholds, and the one structural floor (stage-one
-recall below ~0.95 makes every downstream fix futile) — see §7.2 there.
+recall below ~0.95 makes every downstream fix futile) — see §7.2 there. §7.3–7.4 do the
+same for MRR, including why it is never reported alone (three systems with very different
+failure profiles all score 0.50) and why it is blind to multi-hop queries by
+construction.
 
 **3. Implement the oracle-context test and split failures into retrieval vs. generation.**
 *(~1 day; unblocks `06-context-engineering.md` and `07-generation-and-structured-output.md`)*

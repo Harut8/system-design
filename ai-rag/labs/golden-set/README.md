@@ -386,3 +386,105 @@ size one query is 1.7 points, and a 95% bootstrap CI is roughly ±10 points — 
 that 0.80 and 0.90 are not distinguishable. Thresholds this precise need hundreds of
 labelled queries. With 60, report the interval, compare against your own previous run,
 and resist the urge to read three-decimal-place meaning into it.
+
+### 7.3 MRR, in plain language
+
+> Same warning as §7.1: **every number in this subsection is illustrative.** Nothing
+> here has been measured on this corpus.
+
+Recall asks *"is the answer in the top k?"* MRR asks *"how high up is it?"* — and it is
+the metric people misread most often, because its scale is not linear and its name
+sounds like it means something it doesn't.
+
+**Mean Reciprocal Rank** = for each query, find the rank of the **first** answer-bearing
+chunk, take `1/rank`, and average across queries. A query with no hit in the top k
+contributes **0**.
+
+```python
+def reciprocal_rank(ranked_chunk_ids: list[str], answer_bearing: set[str]) -> float:
+    """Per-query RR. Queries that miss contribute 0.0 — dropping them inflates MRR,
+    which is the most common way this metric is quietly overstated."""
+    for rank, cid in enumerate(ranked_chunk_ids, start=1):
+        if cid in answer_bearing:
+            return 1.0 / rank
+    return 0.0
+```
+
+What each rank is worth, which is the whole intuition:
+
+| Answer found at rank | Contributes | Moving up one rank gains |
+|---|---|---|
+| 1 | 1.000 | — |
+| 2 | 0.500 | **+0.500** |
+| 3 | 0.333 | +0.167 |
+| 5 | 0.200 | +0.050 |
+| 10 | 0.100 | +0.011 |
+| not in top k | 0.000 | — |
+
+**MRR is almost entirely a measurement of the top two or three positions.** Fixing a
+query from rank 2 to rank 1 is worth 45× as much as fixing one from rank 10 to rank 9.
+That is a feature when a human reads a ranked list, and a distortion when the consumer
+is a generator that reads all k chunks regardless of order.
+
+**The trap: MRR is not average position.** MRR = 0.5 does *not* mean "the answer is
+typically second." The mean of reciprocals is not the reciprocal of the mean, and wildly
+different systems produce the same 0.5:
+
+| System | Behaviour | MRR |
+|---|---|---|
+| A | Every query's answer at rank 2 | 0.50 |
+| B | Half the queries at rank 1, half missed entirely | 0.50 |
+| C | Most at rank 1, a long tail at ranks 5–10 | ≈ 0.50 |
+
+A is mediocre-but-reliable, B is broken for half your users, C is good with a hard tail.
+Identical MRR, three different weeks of work. **This is why MRR is never reported
+alone** — pair it with recall@k, which separates A from B immediately (A: recall@5 =
+1.0; B: recall@5 = 0.5).
+
+**What MRR is and isn't good for:**
+
+- **Good for**: ranked lists a human reads; a single-shot agent that takes the top tool
+  result; measuring a reranker, whose entire job is reordering.
+- **Bad for**: multi-answer and multi-hop queries. MRR stops at the *first* hit and is
+  blind to whether the other required chunks were ever retrieved — so for this lab's 5
+  `hop: multi` records, MRR is actively misleading. Report MAP or nDCG there, or score
+  those records separately.
+- **In RAG specifically**: less decisive than recall, because all k chunks go into the
+  prompt regardless of order — but not irrelevant, for two reasons. Position in context
+  measurably affects whether the model uses evidence (`00` §11's context-rot territory),
+  and a high MRR means you can **ship a smaller k**, which directly cuts the dominant
+  per-query cost (`00` §9). MRR is how you find out whether k=3 is affordable.
+
+### 7.4 MRR thresholds and sanity rules
+
+Starting bands for **MRR@10** on a general text corpus with hybrid retrieval and a
+reranker — same status as §7.2's table: numbers to beat, not acceptance criteria.
+
+| MRR@10 | Reading | What it usually means |
+|---|---|---|
+| < 0.35 | Weak | The answer, when found, is buried. Ranking work has a large payoff — check recall@10 first to confirm it's being found at all |
+| 0.35–0.55 | Typical for dense-only, no reranker | A cross-encoder reranker is the standard next step |
+| 0.55–0.75 | Good | Answer usually at rank 1–2. A smaller shipped k is probably affordable |
+| > 0.75 | Strong | Mostly rank 1. Further ranking work is low-yield; spend the effort on candidate generation or faithfulness |
+
+**Sanity rules that catch bugs, worth more than the bands above:**
+
+| Rule | Why | If it fails |
+|---|---|---|
+| `recall@1 ≤ MRR ≤ recall@k` | Rank-1 hits contribute 1.0 each; nothing can contribute more | You have a scoring bug — usually missed queries being dropped instead of scored 0 |
+| `MRR@10 == recall@1` | Only possible if every hit is at rank 1 or absent | Almost always means ranks beyond 1 aren't being read |
+| A reranker raises MRR a lot, recall@candidate_k not at all | Correct behaviour — reordering cannot add documents it wasn't given | If recall@50 *rises* after reranking the same 50 candidates, the measurement is wrong |
+| High recall@10, low MRR | The answer is found but ranked badly | Reranker/fusion work — the cheapest win in retrieval |
+| High MRR, low recall@10 | Bimodal: easy queries land at rank 1, hard ones are never found | Stop averaging; break the set down by query type and look at the failing stratum |
+
+**State the k and the miss convention with every MRR number.** MRR@10 and MRR@100 are
+different quantities, and whether unanswered queries count as 0 or are excluded can move
+the figure by tens of points. Same discipline as the hit rule in §7.2 — an MRR without
+`@k` and a miss convention next to it is not a fully specified metric.
+
+**Sample-size caveat, sharper than recall's.** MRR's reciprocal weighting means one query
+moving from rank 3 to rank 1 shifts the mean of 60 queries by ~0.011, while one query
+going from miss to rank 1 shifts it by ~0.017 — the metric is noisier per query than
+recall precisely because its per-query values are spread across a continuous range.
+Bootstrap the CI (exercise 6) before believing any MRR difference below ~0.05 at this
+set size.
