@@ -6,4 +6,5 @@
 OUTREACH-KIT.md
 personal-roadmap.md
 gilvenv
-*.pdf
+*.pdf__pycache__/
+*.pyc

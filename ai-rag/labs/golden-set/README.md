@@ -34,9 +34,9 @@ pytest -q                    # same assertions, if you have pytest
 
 Current build, from the manifest — every number here is a count, not a measurement:
 
-- 4 documents, 298,659 canonical characters, corpus commit `8d90a54`
-- 261 chunks at `max_chars=1800`, chunker `md-struct-v1`
-- 60 records (55 single-hop, 5 multi-hop), 65 answer spans, mean span 502 chars
+- 4 documents, 302,826 canonical characters (corpus commit is pinned in the manifest)
+- 265 chunks at `max_chars=1800`, chunker `md-struct-v1`
+- 60 records (55 single-hop, 5 multi-hop), 65 answer spans, mean span 508 chars
 - label distribution: `00` 26, `02` 20, `01` 13, `README` 6
 - 54 records resolve to exactly one chunk, 5 to two, 1 to three
 - span union coverage is 1.0 for every span under the `any_overlap` build rule
@@ -144,9 +144,14 @@ no blank lines between items, so fourteen records anchored in the chapters' summ
 lists expanded to the *entire list* — a 3,245-character span covering a dozen unrelated
 facts. Every test still passed. Every label was still "correct." And recall@k computed
 against those labels would have been inflated for a reason nothing in the pipeline would
-ever have reported. The fix is §2.3's three-case rule; mean span length went from
-inflated to 502 characters, and `test_block_expansion_stops_at_list_and_table_boundaries`
-now pins it.
+ever have reported. The fix is §2.3's three-case rule; mean span length dropped to ~500
+characters, and `test_block_expansion_stops_at_list_and_table_boundaries` now pins it.
+
+**Then the gate fired for real, unprompted.** Writing the §16 explanation in
+`00-mental-models.md` edited a paragraph one of the labels was anchored to. The next
+build refused with `quote not found`, naming the record; re-anchoring it took one line.
+That is the entire argument for this design in miniature — the corpus changed, and the
+system said so, instead of quietly scoring against a label pointing at deleted text.
 
 The lesson is the one `31-measurement-methodology.md` keeps making: the labels are
 themselves an experiment, and an unexamined experiment produces a confident number

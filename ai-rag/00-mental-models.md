@@ -1228,8 +1228,12 @@ into a number for your own corpus.
 
 ---
 
-**Rung ledger.** Per README §6, this document sits on **rung 3 — studied** until the lab
-exercises above are actually run. The formulas, the failure taxonomy, and the diagnostic
+**Rung ledger.** Exercise 1 is built: [`labs/golden-set/`](labs/golden-set/) is **rung 2 —
+implemented** (60 labelled queries over this folder's four chapters, a deterministic
+builder, and a test suite that fails when the labels go stale). It produces labels, not
+quality numbers — the first rung-1 figure arrives when exercise 2 runs a retriever against
+them. Per README §6, this document itself sits on **rung 3 — studied** until the remaining
+lab exercises above are actually run. The formulas, the failure taxonomy, and the diagnostic
 procedure in this chapter are reasoning, not measurement — none of it counts as rung 1
 until it produces a number from your own corpus with a stated method of computation. Once
 exercises 1–9 are done, the *numbers they produce* — your recall@k curve, your
