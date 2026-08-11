@@ -705,8 +705,26 @@ before the right and all three preserve emission order. The test was passing for
 reason unrelated to layout analysis. `report_twocol_interleaved.pdf` emits row-band by
 row-band, as real producers do, and three of the four parsers then fail.
 
-**10. The mojibake gate is parser-dependent** — also found by the bake-off, and the
-finding that changed the pipeline rather than a test. See §5.
+**10. The mojibake gate is parser-dependent** — found by the bake-off, and the finding
+that changed the pipeline rather than a test. `script_sanity` catches the corruption
+only when the parser falls back to raw bytes and produces control characters. pypdf
+emits the glyph *names* as literal ASCII instead, scoring 1.00. Hence
+`parse.glyph_leakage()`. See §5.2.
+
+**11. …and one detector was not enough either.** The first `glyph_leakage()` knew
+pypdf's spelling (`/g1`, `/uni0043`) and missed pdfminer.six's, which writes `(cid:6)`
+for the same condition — also clean ASCII, also sanity 1.00, also straight into the
+index. Three parsers, three spellings of "I could not map this glyph", and none of them
+an error. *A gate is only as good as the failure shapes it has actually seen; every
+parser you add is a new shape to check.*
+
+**12. A parser bug can disable a normalizer rule two stages downstream.** De-hyphenation
+matches `(\w)-\n(\w)`, so it needs the continuation to still be the next line. Under
+naive reading order `The organi-` gets joined with the *right column's* text, so
+`zational` is no longer the next line and the rule can never fire — the term stays
+unsearchable and no amount of work on the normalizer helps. Found by noticing a
+`repaired=False` in a column I had added for a different reason. *This is the clearest
+thing in the lab about why §1's ordering claim is an ordering claim.*
 
 ---
 

@@ -164,7 +164,16 @@ def test_glyph_name_leakage_is_detected() -> None:
 
     uni_style = "/uni0043/uni006C/uni0069/uni006E/uni0069/uni0063/uni0061/uni006C"
     assert PA.glyph_leakage(uni_style) > 0.5, "uniXXXX form not detected"
+
+    # pdfminer.six spells the same failure differently: `(cid:6)` rather than `/g6`.
+    # Found by running the broken fixture through all three parsers — a detector that
+    # knows only pypdf's spelling passes pdfminer's output straight into the index.
+    cid_style = "(cid:6) (cid:16)!(cid:7) (cid:25)\"#$ (cid:4)!(cid:3) (cid:17)%(cid:6)"
+    assert PA.script_sanity(cid_style) > 0.9, "premise changed: this text looks clean"
+    assert PA.glyph_leakage(cid_style) > 0.5, "pdfminer (cid:N) form not detected"
+
     assert PA.glyph_leakage("ordinary prose with a / slash in it") < 0.05
+    assert PA.glyph_leakage("see figure 3 (cid is not a word here)") < 0.05
 
 
 def test_naive_reading_order_interleaves_columns() -> None:
