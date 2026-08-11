@@ -82,6 +82,7 @@ keeps every claim honest by construction.
 | `appendix-a-glossary.md` | | planned |
 | `appendix-b-metric-definitions.md` | Every eval and cost metric, with its exact formula | planned |
 | `appendix-c-eval-recipe-book.md` | Copy-pasteable eval setups | planned |
+| [`appendix-d-doc-processing-benchmarks.md`](appendix-d-doc-processing-benchmarks.md) | Parser, chunker, embedding, vector store benchmarks and best choices by use case | **written** |
 
 ---
 
