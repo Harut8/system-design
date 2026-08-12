@@ -264,7 +264,27 @@ you need a baseline to benchmark layout models against.
 ## 5. Parser decision matrix
 
 Use this to shortlist, not to decide. The decision comes from running your shortlist against your
-own documents in `labs/document-processing/`.
+own documents in `labs/document-processing/`, where `bakeoff.py` implements the tiers above as
+swappable adapters over a corpus whose right answer is known by construction:
+
+```
+bakeoff.py --list                            # adapters by tier, and the document classes below
+bakeoff.py --only pdf --tier 1 2             # every parser, both tiers, same bytes
+bakeoff.py --only probe --doc invoice        # one document class, parse → gate → chunk
+bakeoff.py --only probe --doc invoice --parser docling --chunker semchunk
+```
+
+Three results from that lab qualify the table below, and all three are things a benchmark score
+cannot express (§3.3):
+
+- **Marker outscores Docling by 26 points on olmOCR-Bench and interleaves a two-column page that
+  Docling reads correctly.** Edit similarity barely moves when column *order* is wrong, because
+  every token is still present.
+- **Docling defeats the extraction gates you would use at tier 1.** On a PDF with an unreadable
+  font it renders the page and returns clean, plausible, unverifiable text — perfect script
+  sanity, no glyph leakage, nothing to alert on.
+- **MinerU and Marker cannot be installed in the same virtualenv** (`transformers<5` vs `>=5.12`),
+  so a two-tool shortlist drawn from this table may not be installable as a pair.
 
 | Constraint | First choice | Second choice | Avoid |
 |---|---|---|---|

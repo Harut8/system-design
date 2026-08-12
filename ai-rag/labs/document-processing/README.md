@@ -247,8 +247,24 @@ compare content you were trying to avoid comparing.
 
 `bakeoff.py` runs the same fixtures through whatever is installed. Every check is a
 **known-answer test** — the fixture was built to contain the defect, so a library that
-misses it is wrong rather than unlucky. Results below are the current run with all 11
-adapters present.
+misses it is wrong rather than unlucky. §5.1–§5.11 are the default run: all 13 adapters
+present, **tier 1 only**. §5.12 and §5.13 add the layout models behind `--tier 2`.
+
+```
+bakeoff.py                                  the default run — tier 1, every section
+bakeoff.py --list                           adapters, tiers, and document classes
+bakeoff.py --only pdf --tier 1 2            add Docling and Marker to the parser tables
+bakeoff.py --only probe --doc invoice       one document class, end to end
+bakeoff.py --only probe --doc invoice \
+           --parser docling --chunker semchunk --show-chunks 3
+bakeoff.py --only splitters --max-tokens 512 --chunker langchain
+```
+
+`--only probe` is the mode to reach for when the question is "how does my stack do on
+*this kind of document*" rather than "what do these libraries do in general". It takes a
+document class from §6.1, runs parse → gate → normalize → chunk across every parser and
+chunker you name, and prints that class's known answers next to the result. `--list`
+shows the classes and how many checks each carries.
 
 ### 5.1 PDF reading order
 
@@ -496,13 +512,16 @@ This lab's dependency-free estimator against real cl100k, per document:
 | `site/*.html` | ~145 | ~150 | +2–5% | 4.9–5.1 |
 | `statement.pdf` | 150 | 130 | −13.3% | 2.37 |
 | `revenue.csv` | 318 | 267 | **−16.0%** | 2.20 |
+| `invoice.pdf` | 335 | 275 | **−17.9%** | 2.95 |
 | `service.py.txt` | 433 | 538 | **+24.2%** | 4.61 |
 
-Mean absolute error 8.8%. The mean hides the shape: prose lands within a few percent,
-and the outliers are exactly the identifier-dense and delimiter-dense content §5.4 of
-the chapter is about. **chars/token ranges from 2.20 to 5.05 across this corpus** — a
-character-based splitter set to one number produces token counts differing by more than
-2× across these files.
+Mean absolute error 9.3% across 20 documents. The mean hides the shape: prose lands
+within a few percent, and the outliers are exactly the identifier-dense and
+delimiter-dense content §5.4 of the chapter is about — `revenue.csv` and `invoice.pdf`
+are almost entirely numbers, dates and reference codes, which tokenize at roughly half
+the characters-per-token of English prose. **chars/token ranges from 2.20 to 5.05 across
+this corpus** — a character-based splitter set to one number produces token counts
+differing by more than 2× across these files.
 
 ### 5.11 Parse speed
 
@@ -525,6 +544,162 @@ The tradeoff is the point: **pdfminer.six costs ~4× the CPU and is the only def
 recovers columns.** On a single-column corpus that is 4× for nothing; on a multi-column
 corpus it is 4× for the difference between usable and unusable text.
 
+### 5.12 Tier 2 — what a layout model buys, and what it costs
+
+`bakeoff.py --tier 2` adds Docling, Marker v2 and `unstructured`'s `hi_res` and `auto`
+strategies to every table above. Appendix D §2.1 puts them one tier up from everything
+in §5.1–§5.11: instead of reconstructing text from glyph coordinates with heuristics, a
+detection model segments the page into regions and text is extracted per region.
+
+Reading order first, since that is where tier 1 fails hardest:
+
+| parser | tier | column-ordered emission | row-band emission |
+|---|---|---|---|
+| pdfminer.six | 1 | kept separate | kept separate |
+| pymupdf (per-column clip) | 1 | kept separate | kept separate |
+| pypdf, pymupdf (text/blocks) | 1 | kept separate | **INTERLEAVED** |
+| unstructured (`fast`) | 1 | *returns nothing at all* | *returns nothing at all* |
+| unstructured (`auto`) | 2 | kept separate | kept separate |
+| unstructured (`hi_res`) | 2 | kept separate | kept separate |
+| **Docling** | 2 | kept separate | kept separate |
+| **Marker v2** | 2 | kept separate | **INTERLEAVED** |
+
+Four things in that table are worth more than the tier boundary it was built to show.
+
+**1. Marker v2 fails the row-band fixture.** Appendix D §3.2 has Marker as the
+open-source accuracy leader at ~76% on olmOCR-Bench, ahead of Docling at ~50%, and here
+it interleaves the columns that Docling recovers. That is not a contradiction, it is
+what a single-score benchmark cannot tell you: edit similarity over a whole page barely
+moves when the *order* of two correct columns is wrong, because every token is still
+present. Appendix D §3.3 lists exactly this as the first thing benchmarks miss. **A
+parser can be 26 points better on the leaderboard and worse on your failure mode.**
+
+**2. `unstructured`'s cheapest tier returns nothing, silently.** `strategy="fast"`
+produces **zero elements on every PDF in this corpus** — not an error, not a warning, an
+empty list. `auto` and `hi_res` both work on the same bytes. The saving grace is that
+`auto` is what appendix D §4.3 recommends and `auto` detects the empty result and
+escalates, which is the per-document tier selection working as advertised. But a
+pipeline pinned to `fast` for cost reasons indexes an empty corpus and reports success.
+*Caveat:* these are minimal synthetic PDFs, and `fast` may want font metadata they do
+not carry — treat this as "verify your strategy on your own files", not as a general
+claim about the library.
+
+**3. Docling is the only parser that read the invoice.** See §5.13.
+
+**4. Tier 2 does not run on hope.** Docling raises on Apple Silicon unless its
+accelerator is pinned to CPU — the layout model requests a float64 tensor and MPS has no
+float64. Marker's fallback path wants a `llama-server` binary and raises `SpawnError`
+without it. `unstructured`'s `hi_res` needs four packages the base install does not pull
+plus two Homebrew formulae. And **MinerU cannot be installed next to Marker at all**:
+`marker-pdf` 2.0 requires `transformers>=5.12.1`, `mineru` 3.4.4 requires
+`transformers<5.0.0`, and installing the second breaks the first with an `ImportError`
+from inside a model file rather than an error from pip. Two rows of appendix D §2.2's
+shortlist are un-installable as a pair.
+
+**Speed, measured warm.** Median of 3 runs on the 3-page `report_twocol.pdf`, after a
+discarded warm-up call, CPU only (Apple Silicon, no CUDA):
+
+| parser | tier | ms/page (warm) | vs pymupdf |
+|---|---|---|---|
+| pymupdf | 1 | 0.53 | 1× |
+| pdfminer.six | 1 | 2.23 | 4× |
+| marker v2 | 2 | 59.7 | 113× |
+| docling | 2 | 205 | 387× |
+| unstructured (`auto`) | 2 | 1,195 | 2,254× |
+| unstructured (`hi_res`) | 2 | 1,504 | 2,838× |
+
+Read these as ordering, and read the *cold* number separately: the first call to Docling
+in a fresh process took **97 seconds**, and to Marker **34 seconds**, because that is
+when the model weights load. In a batch job the warm number is what you pay; in a
+request path or a Lambda, the cold one is. Appendix D quotes 0.5–5 pages/sec for this
+tier on GPU — nothing here contradicts that, it just is not the device most people
+develop on.
+
+**Where tier 2 is actively more dangerous.** On `subset_broken.pdf` — the PDF whose font
+ships no usable `ToUnicode` CMap:
+
+| parser | chars | script sanity | glyph leak | would the gate fire? |
+|---|---|---|---|---|
+| this lab, pymupdf | 394 | 0.17 | 0% | **CAUGHT** (control characters) |
+| pypdf | 1,379 | 1.00 | 100% | **CAUGHT** (`/gN` names leak) |
+| pdfminer.six | 3,078 | 1.00 | 87% | **CAUGHT** (`(cid:N)` leaks) |
+| unstructured (all three) | 0 | 0.00 | 0% | **CAUGHT** (empty) |
+| **Docling** | **992** | **1.00** | **0%** | **MISSED** |
+
+Docling returns 992 characters of clean, well-formed, plausible text from a document
+whose text layer is unreadable — because it does not need the text layer. It renders the
+page and reads the pixels. Every signal §5.2 built its gate from is gone: the sanity
+score is perfect, nothing leaks, the length is reasonable. **The tier that fixes your
+reading-order problem removes your ability to detect the encoding problem**, and it does
+so silently. If you move to tier 2, the extraction-yield and script-sanity gates in
+`parse.gate()` stop being sufficient and you need a different check — agreement with a
+sibling tier-1 parser is the cheapest one that still works.
+
+The same mechanism shows up benignly on `scan.pdf`: every tier-1 parser returns `""`,
+and Docling returns `<!-- image -->\n\n<!-- image -->`. That is *better* reporting — it
+says "there were two images and no text" — and it is 30 characters, so a naive
+`len(text) > 0` yield gate now passes a document with no readable content in it.
+
+Ligatures move too. Every tier-1 parser hands over `classiﬁcation` with the ligature
+codepoint intact, which is correct — it is what the file says — and §4.1's normalizer
+expands it. Docling and `unstructured` return **zero** ligature codepoints: they expand
+during extraction. The result is the same here, but the stage that did it changed, and
+`parser_version` on the chunk is what lets you tell which.
+
+### 5.13 The invoice — where tier 2 earns its cost
+
+`bakeoff.py --only probe --doc invoice --tier 1 2` runs one document class end to end.
+The invoice is the class where the payload is *association* rather than text: labels
+next to values, line items next to amounts, and two addresses belonging to two different
+companies. Every parser below extracts every token. The question is only what stayed
+attached to what.
+
+| parser | tier | invoice no. | bill-to intact | ship-to intact | line item → amount | totals |
+|---|---|---|---|---|---|---|
+| this lab (columns) | 1 | ✗ | ✗ | ✗ | ok | ok |
+| pypdf | 1 | ✗ | ✗ | ✗ | ok | ok |
+| pymupdf (text) | 1 | ok | ✗ | ✗ | ok | ok |
+| pymupdf (per-column clip) | 1 | ok | ok | ok | **✗** | ok |
+| pdfminer.six | 1 | ok | ok | ok | **✗** | ok |
+| unstructured (`fast`) | 1 | ✗ | ✗ | ✗ | ✗ | ✗ |
+| unstructured (`auto`) | 2 | ok | ✗ | ok | ✗ | ok |
+| unstructured (`hi_res`) | 2 | ✗ | ✗ | ok | ✗ | ok |
+| marker v2 | 2 | ✗ | ✗ | ✗ | ok | ok |
+| **Docling** | 2 | **ok** | **ok** | **ok** | **ok** | **ok** |
+
+**The trade-off in rows 4 and 5 is the finding.** `pdfminer.six` and per-column clipping
+are §5.1's answer to column interleaving, and they are the two tier-1 rows that recover
+the two address blocks — then they are the *only* rows that break the line items. The
+same column-splitting that separates bill-to from ship-to also cuts the line-item grid
+down its middle, so `Ingestion connector license` and `5,400.00` end up in different
+columns. **The tier-1 fix for one half of the page is the tier-1 bug for the other
+half**, because a single global reading-order rule cannot be right for a page that is
+two-column at the top and tabular in the middle. That is precisely what a layout model
+is for: it segments regions and applies a different rule inside each.
+
+Docling passes all five, and the reason is visible in its output — it returns the line
+items as an actual Markdown table:
+
+```
+|   # | Description                         |   Qty |   Unit Price |   Amount |
+|-----|-------------------------------------|-------|--------------|----------|
+|   1 | Ingestion connector license, annual |    12 |       450.00 | 5,400.00 |
+|   2 | Document parser add-on, tier 2      |     4 |     1,250.00 | 5,000.00 |
+```
+
+No tier-1 parser in this lab produces a grid, because none of them has the concept.
+`export_to_markdown()` is a lossy view of what Docling actually returns — the real output
+is a `DoclingDocument`, a typed tree whose table cells are addressable — which is why
+appendix D §4.1 calls structure-aware splitting trivial against it. The comparison above
+is therefore *unfair to Docling in the direction that matters*: it scores the string,
+and the reason to run Docling is the object.
+
+**None of this says buy tier 2.** It says: on a born-digital single-column corpus tier 2
+buys nothing measurable here and costs 100–2,800× the CPU per page; on an invoice it is
+the difference between five known answers and two; and on a font-broken document it takes
+away a gate you were relying on. Route by document class (§6.1), and stamp
+`parser_version` on every chunk so you can tell which of these you were running.
+
 ---
 
 ## 6. Which tool, for which case
@@ -543,6 +718,7 @@ explicit that the answer depends on your corpus *and* your query distribution.
 | **PDF, multi-column** (papers, reports, filings) | **pdfminer.six**, or PyMuPDF + per-column clip rects | structure-aware if your parser gives you elements | pypdf and PyMuPDF default text mode interleave columns (§5.1); `sort=True` does not fix it |
 | **Scanned PDF / images** | OCR or a VLM — out of scope here | n/a until text exists | every library returns `""` and returns *normally* (§5.3) |
 | **PDF with tables** (financial, spec sheets, clinical) | tier 2 — Docling, `unstructured` `hi_res`, or a cloud API | index row-wise sentences, return the full table (§3.4) | no text splitter keeps a table intact or repeats headers (§5.6) |
+| **Invoices, forms, statements** | tier 2 or a cloud prebuilt model — no tier-1 option passes (§5.13) | don't chunk: one record per document, index the fields, return the page | every token survives and only the *associations* break, so no yield or sanity gate fires (§5.13) |
 | **Spreadsheets / CSV** | load into DuckDB or Postgres | **do not chunk rows into prose** — index a table *description* | vector search never aggregates, never joins, never exhausts (§3.6) |
 | **Source code** | the language's own AST (`ast`, tree-sitter) | AST boundaries + enclosing context (file path, class signature, imports) | `from_language()` is separator matching, not parsing — 7/10 chunks unparseable (§5.7) |
 | **Email / tickets / chat** | strip quoted replies **at parse time**; keep thread as metadata | one chunk per message, thread id in payload | 66% duplication if you skip it (§5.9) |
@@ -568,9 +744,33 @@ explicit that the answer depends on your corpus *and* your query distribution.
   want to write layout code. The only default here that gets both reading-order
   fixtures right. *Watch:* ~4× slower; emits `(cid:N)` for unmapped glyphs, which is
   the same clean-ASCII trap in a different spelling.
-- **Docling / `unstructured` `hi_res` / Marker / MinerU** — tier 2. Reach for them when
-  **tables matter** or the layout is genuinely complex. Not installed by default here
-  (Docling pulls torch); this lab exists partly to show what you are buying.
+- **Docling** — tier 2, and the one to try first: MIT, widest format support, and the
+  only parser here that read the invoice correctly (§5.13) and returned its line items as
+  a real table. Reach for it when **structure is the payload** — tables, forms, anything
+  where association matters more than prose. *Watch:* pin the accelerator to CPU on Apple
+  Silicon or it raises on a float64 tensor MPS cannot make; 205 ms/page warm and ~97 s to
+  load weights cold; and it **defeats your encoding gate** — it renders the page, so a
+  font-broken PDF comes back as 992 characters of clean, confident, unverifiable text
+  (§5.12). Its real output is a `DoclingDocument` tree; `export_to_markdown()` throws away
+  the reason you ran it.
+- **Marker v2** — tier 2, GPL-3.0, and the appendix D accuracy leader (~76% olmOCR-Bench
+  vs Docling's ~50%). On this corpus it **interleaves the row-band two-column fixture that
+  Docling recovers** (§5.12) — a reminder that a whole-page edit-similarity score is
+  nearly blind to reading order. Reach for it on PDF-dominant corpora where you have
+  measured it on your own layouts and the licence is acceptable. *Watch:* its fallback
+  path wants a `llama-server` binary and raises `SpawnError` without one.
+- **`unstructured`** — the per-document tier selector, and the easiest way to implement
+  §3.3's routing: `fast` / `hi_res` / `ocr_only` / `auto` behind one call. *Watch:*
+  `strategy="fast"` returned **zero elements on every PDF in this corpus** without
+  raising; `auto` caught that and escalated, which is the argument for `auto`. `hi_res`
+  needs `pi_heif`, `pdf2image`, `unstructured-inference` and `unstructured_pytesseract`
+  plus poppler and tesseract from Homebrew, none of which the base install pulls, and it
+  is the slowest option measured here at ~1.5 s/page.
+- **MinerU** — appendix D §2.2 shortlists it beside Marker, and **the two cannot share a
+  virtualenv**: `marker-pdf` 2.0 needs `transformers>=5.12.1`, `mineru` 3.4.4 needs
+  `<5.0.0`. Installing the second breaks the first with an `ImportError` from inside a
+  model file. No adapter here for that reason; run it in its own environment behind a
+  subprocess boundary if you need both.
 
 **Chunking**
 
@@ -741,8 +941,14 @@ or a routing decision. That is a deliberate scope choice, backed by §11.4: reca
 barely separates chunking strategies while token efficiency separates them by an order
 of magnitude, and token efficiency does not need a model.
 
-**Tier 1 only.** No layout model, no VLM. The lab's job is to show precisely what tier
-1 cannot recover so a tier-2 comparison (lab 2) has an honest baseline to beat.
+**The pipeline is tier 1 only; the bake-off is not.** Everything in `parse.py`,
+`pdfmini.py` and the rest of the lab is stdlib geometric extraction, and that is the
+point — it shows precisely what tier 1 cannot recover. `bakeoff.py --tier 2` runs Docling,
+Marker and `unstructured` `hi_res` against the same known answers (§5.12, §5.13) so the
+baseline has something to be measured against, but nothing in the pipeline itself calls a
+model. **No VLM at any point** — tier 3 is out of scope here, and §5.12's warning about
+losing the encoding gate gets worse at that tier, where output also stops being
+deterministic and §9's content-addressed IDs stop working.
 
 **No semantic or LLM-based chunking in the core pipeline.** Both need a model call per
 document, both give up the determinism that makes content-addressed IDs work, and §6.4's

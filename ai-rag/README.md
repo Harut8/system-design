@@ -67,7 +67,7 @@ keeps every claim honest by construction.
 | `05-query-understanding.md` | Rewriting, decomposition, multi-query, HyDE, routing | planned |
 | `06-context-engineering.md` | Window budgeting, compaction, citation, memory, long-context tradeoffs | planned |
 | `07-generation-and-structured-output.md` | Structured outputs, schema validation, retries, determinism | planned |
-| `08-evaluation-methodology.md` | Golden sets, recall@k / MRR / nDCG, faithfulness, LLM-as-judge calibration, significance | planned |
+| [`08-evaluation-methodology.md`](08-evaluation-methodology.md) | Golden sets, recall@k / MRR / nDCG, faithfulness, LLM-as-judge calibration, significance | **written** — labs unrun |
 | `09-eval-infrastructure-and-ci.md` | Eval as a pipeline: datasets, versioning, regression gates, dashboards | planned |
 | `10-llm-observability-and-tracing.md` | OTEL GenAI semconv, span design, trace↔eval linkage, sampling | planned |
 | `11-token-accounting-and-cost.md` | Per-request/tenant/model attribution, budget enforcement, unit economics | planned |
@@ -182,8 +182,9 @@ drops.
 subsequent change is a guess. It is also the part of the stack most people skip, which is why
 most RAG systems cannot answer "did that change help?"
 
-Reads: `../python-mastery/31-measurement-methodology.md`, `../python-mastery/43-testing-strategy.md`,
-`../databases/21-in-process-olap-duckdb-chdb.md`.
+Reads: [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (written — it *is* the spec for
+this project; §19's labs are P0's task list), `../python-mastery/31-measurement-methodology.md`,
+`../python-mastery/43-testing-strategy.md`, `../databases/21-in-process-olap-duckdb-chdb.md`.
 
 ### P1 — Retrieval service
 

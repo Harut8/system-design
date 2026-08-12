@@ -72,6 +72,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import make_fixtures as MF  # the generator's data doubles as DOC_CLASSES' known answers
 import normalize as N
 import parse as PA
 import split as SP
@@ -1071,9 +1072,6 @@ def section_duplication(opts: Options) -> None:
 # The checks import their expected values from `make_fixtures`, so the fixture and the
 # assertion about it cannot drift apart. Editing a line item in the generator changes
 # what the check expects, by construction.
-
-import make_fixtures as MF  # noqa: E402  — fixture data doubles as the known answers
-
 
 @dataclass(frozen=True)
 class DocClass:
