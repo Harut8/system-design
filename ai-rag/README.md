@@ -83,6 +83,7 @@ keeps every claim honest by construction.
 | `appendix-b-metric-definitions.md` | Every eval and cost metric, with its exact formula | planned |
 | `appendix-c-eval-recipe-book.md` | Copy-pasteable eval setups | planned |
 | [`appendix-d-doc-processing-benchmarks.md`](appendix-d-doc-processing-benchmarks.md) | Parser, chunker, embedding, vector store benchmarks and best choices by use case | **written** |
+| [`appendix-e-deployment-and-compute.md`](appendix-e-deployment-and-compute.md) | Compose vs Kubernetes, model serving, GPU sizing and scheduling, pipeline orchestration, compute cost | **written** |
 
 ---
 
@@ -163,6 +164,7 @@ of is worth less than no number at all.
 | Working reference implementations | `../databases/failure_detection_phi_accrual.py`, `../databases/failure_detection_gossip.py` |
 | Scale-tiered service patterns to imitate | `../implementation/distributed-counter/`, `../implementation/fastapi-rbac/` |
 | Deployment, when it's time | `../k8s-learn/README.md` (Track A only — do not detour into Track C) |
+| **The RAG-specific deployment delta — written, so read it before the two rows above** | [`appendix-e-deployment-and-compute.md`](appendix-e-deployment-and-compute.md) (§15 maps every substrate doc worth reading, so you enter `../kubernetes/` with a question rather than a reading list) |
 
 ---
 

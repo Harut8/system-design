@@ -15,7 +15,7 @@ llama-index-core             # SentenceSplitter, HierarchicalNodeParser, Sentenc
 semchunk                     # small, fast, tokenizer-aware recursive splitter
 chonkie                      # token/sentence/recursive/semantic/code chunkers in one API
 
-# --- Parsers --------------------------------------------------------------------
+# --- Parsers, tier 1 (geometric extraction) ---------------------------------------
 pymupdf                      # tier 1, fastest; `page.get_text("blocks")` is the interesting mode
 pypdf                        # tier 1, pure python, the most common default
 pdfminer.six                 # tier 1, layout-aware option (`LAParams`)
@@ -28,9 +28,40 @@ lxml                         # bs4's fast backend
 tiktoken                     # the real cl100k tokenizer, to measure this lab's estimator error
 datasketch                   # reference MinHash, to check the one in dedup.py
 
+# --- Parsers, tier 2 (layout models) ----------------------------------------------
+# Appendix D §2.1's second tier: a detection model segments the page into regions and
+# text is extracted per region. Only reached by `bakeoff.py --tier 2`, because these
+# download model weights on first use and cost tens of seconds per page on CPU.
+#
+# Uncomment to install. Together they add roughly 4 GB, most of it torch.
+#
+# docling                    # MIT. Appendix D §4.1. The one to try first: permissive
+#                            # licence, widest format support, and `res.document` is a
+#                            # typed tree rather than a string.
+# marker-pdf                 # GPL-3.0 — check that before you ship it. Appendix D §4.2.
+#
+# Two things this lab measured that the tables do not tell you:
+#
+#   * **Docling needs its accelerator pinned to CPU on Apple Silicon.** Left on `AUTO`
+#     the layout model requests a float64 tensor, MPS has no float64, and the whole
+#     conversion raises. `bakeoff.py`'s adapter pins it.
+#   * **MinerU cannot be installed alongside Marker.** `marker-pdf` 2.0 requires
+#     `transformers>=5.12.1,<6`; `mineru` 3.4.4 requires `transformers<5.0.0`. Both
+#     resolve cleanly alone, and installing the second breaks the first with an
+#     ImportError from inside a model file rather than an error from pip. If you need
+#     both, use two virtualenvs and a subprocess boundary. MinerU therefore has no
+#     adapter here — see the note above `_unstructured` in `bakeoff.py`.
+#
+# `unstructured`'s tier-2 path (`strategy="hi_res"`) needs extra system dependencies
+# that the base package does not pull:
+#
+# pi_heif                    # imported unconditionally by unstructured.partition.pdf
+# pdf2image                  # ditto; also needs poppler (`brew install poppler`)
+# unstructured-inference     # the layout model itself
+# unstructured_pytesseract   # OCR agent; also needs `brew install tesseract`
+#                            # without it hi_res raises "Could not get the OCRAgent instance"
+
 # --- Deliberately not installed by default --------------------------------------
-# docling                    # pulls torch (~2 GB). Worth it for the structured document
-#                            # model and HybridChunker; add it when you want tier 2.
 # sentence-transformers      # needed for a real SemanticChunker run (all-MiniLM-L6-v2,
 #                            # the model in Chroma's second table). ~90 MB download.
 # langchain-experimental     # SemanticChunker itself; needs an embeddings object, so it

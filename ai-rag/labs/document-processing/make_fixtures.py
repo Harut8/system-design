@@ -783,6 +783,137 @@ def statement_pages() -> list[P.PageSpec]:
     return [P.PageSpec(runs=runs)]
 
 
+# Line items, and the arithmetic that has to survive extraction. Written as data so
+# `bakeoff.py`'s invoice checks and this generator cannot drift apart: the totals below
+# are computed, not typed, so a fixture edit can never produce an invoice that does not
+# add up.
+INVOICE_ITEMS = [
+    ("Ingestion connector license, annual", 12, 450.00),
+    ("Document parser add-on, tier 2", 4, 1250.00),
+    ("Onboarding and integration services", 32, 180.00),
+    ("Priority support, twelve months", 1, 3600.00),
+    ("Sandbox environment, non-production", 2, 620.00),
+]
+INVOICE_TAX_RATE = 0.0825
+INVOICE_FREIGHT = 145.00
+
+INVOICE_SUBTOTAL = sum(qty * unit for _, qty, unit in INVOICE_ITEMS)
+INVOICE_TAX = round(INVOICE_SUBTOTAL * INVOICE_TAX_RATE, 2)
+INVOICE_TOTAL = INVOICE_SUBTOTAL + INVOICE_TAX + INVOICE_FREIGHT
+
+# The two address blocks. They sit side by side at the same y, they are addresses of
+# *different* legal entities, and that is the whole fixture: an extractor that reads
+# across the page rather than down a block produces a bill-to address whose first line
+# belongs to one company and whose postcode belongs to another. Unlike the two-column
+# report, nothing about the resulting text looks wrong — it is a plausible address.
+INVOICE_BILL_TO = [
+    "Contoso Financial Services plc",
+    "Attn: Accounts Payable",
+    "400 Harbour Street, Floor 9",
+    "Dublin 2, D02 XY45, Ireland",
+]
+INVOICE_SHIP_TO = [
+    "Contoso Data Centre Operations",
+    "Attn: Facilities Manager",
+    "17 Kilcarbery Park, Unit C",
+    "Dublin 22, D22 KF88, Ireland",
+]
+
+# Label/value pairs, again side by side. `Invoice Number` sits at x=72 with its value at
+# x=196; `Payment Terms` sits at x=330 with its value at x=444. Row-band order emits
+# label, value, label, value — so label-to-value adjacency survives, and what breaks is
+# the *end* of the value. A key-value reader that takes everything after the first colon
+# gets `NW-2024-0731 Payment Terms: Net 30` as the invoice number. That is the shape
+# this class fails in: not a missing field, an over-long one.
+INVOICE_FIELDS_LEFT = [
+    ("Invoice Number", "NW-2024-0731"),
+    ("Invoice Date", "2024-07-31"),
+    ("Purchase Order", "PO-88213"),
+]
+INVOICE_FIELDS_RIGHT = [
+    ("Payment Terms", "Net 30"),
+    ("Due Date", "2024-08-30"),
+    ("Currency", "USD"),
+]
+
+
+def _money(value: float) -> str:
+    return f"{value:,.2f}"
+
+
+def invoice_pages() -> list[P.PageSpec]:
+    """An invoice: the document class where *association* is the whole payload.
+
+    Appendix D §5 shortlists tier 2 for "table-heavy" and cloud APIs for "enterprise,
+    regulated", and an invoice is where both rows land. It is worth its own fixture
+    because it fails differently from every other PDF here. `report_twocol.pdf` fails
+    loudly — interleaved columns produce sentences that alternate between two subjects
+    and a human spots it in one glance. An invoice fails *quietly*: every token that
+    should be present is present, the totals are all there, and the only thing lost is
+    which number belongs to which label. `450.00` next to the wrong description is not
+    detectable by any script-sanity or extraction-yield gate in this lab, because
+    nothing about the text is malformed.
+
+    Three associations have to survive, and each has its own known answer:
+
+    1. **Label to value** — `Invoice Number` → `NW-2024-0731`, not → `Net 30`.
+    2. **Address block to entity** — bill-to is a finance office in Dublin 2, ship-to
+       is a data centre in Dublin 22. Splicing them yields a valid-looking address
+       that would route a physical delivery to the wrong site.
+    3. **Line item to amount** — description, quantity, unit price and amount are four
+       runs at four x-positions and one y. Read in scan order they become a number
+       soup in which `12`, `450.00` and `5,400.00` are adjacent to the wrong text.
+
+    Everything is emitted in **row-band order** — every run on one y before any run on
+    the next, left to right — because that is what invoice generators actually produce.
+    The arithmetic ties out (line amounts sum to the subtotal; subtotal + tax + freight
+    is the total), so a parser that drops or duplicates a row is caught by addition
+    rather than by opinion.
+    """
+    runs: list[P.TextRun] = []
+
+    def row(*cells: tuple[float, str], y: float, size: float = 10.5) -> None:
+        """Emit one row band, left to right — the producer's natural order."""
+        for x, text in cells:
+            if text:
+                runs.append(P.TextRun(x, y, text, size))
+
+    runs.append(P.TextRun(72, 742, "NORTHWIND DATA SYSTEMS", 13.0))
+    row((72, "Unit 4, Eastgate Business Park, Cork, Ireland"),
+        (400, "INVOICE"), y=726, size=9.0)
+
+    for i, (left, right) in enumerate(zip(INVOICE_FIELDS_LEFT, INVOICE_FIELDS_RIGHT)):
+        y = 690 - 16 * i
+        row((72, f"{left[0]}:"), (196, left[1]),
+            (330, f"{right[0]}:"), (444, right[1]), y=y)
+
+    row((72, "Bill To"), (330, "Ship To"), y=630, size=9.0)
+    for i, (bill, ship) in enumerate(zip(INVOICE_BILL_TO, INVOICE_SHIP_TO)):
+        row((72, bill), (330, ship), y=612 - 15 * i)
+
+    item_cols = (72.0, 92.0, 340.0, 400.0, 490.0)
+    row(*zip(item_cols, ("#", "Description", "Qty", "Unit Price", "Amount")),
+        y=530, size=9.0)
+    for i, (desc, qty, unit) in enumerate(INVOICE_ITEMS):
+        row(*zip(item_cols, (str(i + 1), desc, str(qty), _money(unit),
+                             _money(qty * unit))),
+            y=510 - 18 * i)
+
+    for i, (label, value) in enumerate((
+        ("Subtotal", INVOICE_SUBTOTAL),
+        (f"Sales tax ({INVOICE_TAX_RATE:.2%})", INVOICE_TAX),
+        ("Freight", INVOICE_FREIGHT),
+        ("Total Due", INVOICE_TOTAL),
+    )):
+        row((400, label), (490, _money(value)), y=396 - 16 * i)
+
+    row((72, "Remit to IBAN IE29 NWDS 9311 5212 3456 78. Late payment interest accrues"),
+        y=320, size=9.0)
+    row((72, "at 8% per annum above the ECB main refinancing rate from the due date."),
+        y=308, size=9.0)
+    return [P.PageSpec(runs=runs)]
+
+
 def scan_pages() -> list[P.PageSpec]:
     """Two pages that are images of a document. No text operator is emitted at all.
 
@@ -846,6 +977,7 @@ def write_all() -> list[tuple[str, int]]:
         P.write_pdf(two_column_interleaved_pages(), differences=ligature_diff),
     )
     emit("statement.pdf", P.write_pdf(statement_pages(), differences=ligature_diff))
+    emit("invoice.pdf", P.write_pdf(invoice_pages(), differences=ligature_diff))
     emit("scan.pdf", P.write_pdf(scan_pages()))
 
     subset_enc = P.build_subset_encoding(BROKEN_LINES)

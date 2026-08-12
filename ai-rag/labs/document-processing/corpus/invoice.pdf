@@ -1,0 +1,229 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [ 5 0 R ] >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [ 1 /fi 2 /fl 3 /ffi ] >> >>
+endobj
+4 0 obj
+<< /Length 3757  >>
+stream
+BT
+/F1 13.00 Tf
+1 0 0 1 72.00 742.00 Tm
+(NORTHWIND DATA SYSTEMS) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 726.00 Tm
+(Unit 4, Eastgate Business Park, Cork, Ireland) Tj
+/F1 9.00 Tf
+1 0 0 1 400.00 726.00 Tm
+(INVOICE) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 690.00 Tm
+(Invoice Number:) Tj
+/F1 10.50 Tf
+1 0 0 1 196.00 690.00 Tm
+(NW-2024-0731) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 690.00 Tm
+(Payment Terms:) Tj
+/F1 10.50 Tf
+1 0 0 1 444.00 690.00 Tm
+(Net 30) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 674.00 Tm
+(Invoice Date:) Tj
+/F1 10.50 Tf
+1 0 0 1 196.00 674.00 Tm
+(2024-07-31) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 674.00 Tm
+(Due Date:) Tj
+/F1 10.50 Tf
+1 0 0 1 444.00 674.00 Tm
+(2024-08-30) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 658.00 Tm
+(Purchase Order:) Tj
+/F1 10.50 Tf
+1 0 0 1 196.00 658.00 Tm
+(PO-88213) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 658.00 Tm
+(Currency:) Tj
+/F1 10.50 Tf
+1 0 0 1 444.00 658.00 Tm
+(USD) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 630.00 Tm
+(Bill To) Tj
+/F1 9.00 Tf
+1 0 0 1 330.00 630.00 Tm
+(Ship To) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 612.00 Tm
+(Contoso Financial Services plc) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 612.00 Tm
+(Contoso Data Centre Operations) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 597.00 Tm
+(Attn: Accounts Payable) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 597.00 Tm
+(Attn: Facilities Manager) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 582.00 Tm
+(400 Harbour Street, Floor 9) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 582.00 Tm
+(17 Kilcarbery Park, Unit C) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 567.00 Tm
+(Dublin 2, D02 XY45, Ireland) Tj
+/F1 10.50 Tf
+1 0 0 1 330.00 567.00 Tm
+(Dublin 22, D22 KF88, Ireland) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 530.00 Tm
+(#) Tj
+/F1 9.00 Tf
+1 0 0 1 92.00 530.00 Tm
+(Description) Tj
+/F1 9.00 Tf
+1 0 0 1 340.00 530.00 Tm
+(Qty) Tj
+/F1 9.00 Tf
+1 0 0 1 400.00 530.00 Tm
+(Unit Price) Tj
+/F1 9.00 Tf
+1 0 0 1 490.00 530.00 Tm
+(Amount) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 510.00 Tm
+(1) Tj
+/F1 10.50 Tf
+1 0 0 1 92.00 510.00 Tm
+(Ingestion connector license, annual) Tj
+/F1 10.50 Tf
+1 0 0 1 340.00 510.00 Tm
+(12) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 510.00 Tm
+(450.00) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 510.00 Tm
+(5,400.00) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 492.00 Tm
+(2) Tj
+/F1 10.50 Tf
+1 0 0 1 92.00 492.00 Tm
+(Document parser add-on, tier 2) Tj
+/F1 10.50 Tf
+1 0 0 1 340.00 492.00 Tm
+(4) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 492.00 Tm
+(1,250.00) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 492.00 Tm
+(5,000.00) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 474.00 Tm
+(3) Tj
+/F1 10.50 Tf
+1 0 0 1 92.00 474.00 Tm
+(Onboarding and integration services) Tj
+/F1 10.50 Tf
+1 0 0 1 340.00 474.00 Tm
+(32) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 474.00 Tm
+(180.00) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 474.00 Tm
+(5,760.00) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 456.00 Tm
+(4) Tj
+/F1 10.50 Tf
+1 0 0 1 92.00 456.00 Tm
+(Priority support, twelve months) Tj
+/F1 10.50 Tf
+1 0 0 1 340.00 456.00 Tm
+(1) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 456.00 Tm
+(3,600.00) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 456.00 Tm
+(3,600.00) Tj
+/F1 10.50 Tf
+1 0 0 1 72.00 438.00 Tm
+(5) Tj
+/F1 10.50 Tf
+1 0 0 1 92.00 438.00 Tm
+(Sandbox environment, non-production) Tj
+/F1 10.50 Tf
+1 0 0 1 340.00 438.00 Tm
+(2) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 438.00 Tm
+(620.00) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 438.00 Tm
+(1,240.00) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 396.00 Tm
+(Subtotal) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 396.00 Tm
+(21,000.00) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 380.00 Tm
+(Sales tax \(8.25%\)) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 380.00 Tm
+(1,732.50) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 364.00 Tm
+(Freight) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 364.00 Tm
+(145.00) Tj
+/F1 10.50 Tf
+1 0 0 1 400.00 348.00 Tm
+(Total Due) Tj
+/F1 10.50 Tf
+1 0 0 1 490.00 348.00 Tm
+(22,877.50) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 320.00 Tm
+(Remit to IBAN IE29 NWDS 9311 5212 3456 78. Late payment interest accrues) Tj
+/F1 9.00 Tf
+1 0 0 1 72.00 308.00 Tm
+(at 8% per annum above the ECB main refinancing rate from the due date.) Tj
+ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000117 00000 n 
+0000000286 00000 n 
+0000004096 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+4222
+%%EOF

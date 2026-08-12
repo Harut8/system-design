@@ -95,6 +95,7 @@ is known:
 | `report_twocol.pdf` | PDF, 2 column | Column interleaving, running head *and* page-numbered footer, `organi-\nzational`, ligatures. |
 | `report_twocol_interleaved.pdf` | PDF, 2 column | Same page, emitted row-band by row-band. The version real producers make. |
 | `statement.pdf` | PDF table | A 6×5 grid drawn as positioned glyph runs. No table object exists. |
+| `invoice.pdf` | PDF form + line items | Side-by-side label/value pairs, two addresses of different companies, a 5-row line-item grid. Every token survives extraction and only the *associations* break. |
 | `scan.pdf` | PDF, image only | Extracts to `""`. Zero chunks, zero errors. |
 | `subset_broken.pdf` | PDF, no ToUnicode | 129 characters of plausible-length garbage. |
 | `subset_ok.pdf` | PDF, control | Byte-identical layout, resolvable glyph names. The A/B partner. |

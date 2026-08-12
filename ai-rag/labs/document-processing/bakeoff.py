@@ -1,9 +1,9 @@
 """Run production tooling over the same fixtures and score what each one misses.
 
     uv venv .venv && uv pip install -r requirements-bakeoff.txt
-    .venv/bin/python bakeoff.py                 # everything installed
-    .venv/bin/python bakeoff.py --only pdf      # one section
-    .venv/bin/python bakeoff.py --list          # adapters and their availability
+    .venv/bin/python bakeoff.py                     # the default run: tier 1, every section
+    .venv/bin/python bakeoff.py --list              # adapters, tiers, document classes
+    .venv/bin/python bakeoff.py --help              # every filter
 
 Most teams do not write a chunker; they configure LangChain's or LlamaIndex's and read
 PDFs with PyMuPDF or pypdf. So the question that actually matters is not "what is the
@@ -21,15 +21,32 @@ Every check below is a **known-answer test**, not a preference:
 | Empty text layer | `scan.pdf` | Extracts to `""`. Does the library say so, or return success? |
 | Broken encoding | `subset_broken.pdf` | 129 chars of garbage. Does anything complain? |
 | Ligature / hyphen | `report_twocol.pdf` | `classiﬁcation`, `organi-\\nzational` must be repaired. |
+| Field association | `invoice.pdf` | Every label keeps its own value and every line its own amount. |
 | Table integrity | `metrics.md` | 4-row table. Splitting it mid-grid loses the header. |
 | Code integrity | `service.py.txt` | 2 functions + 1 class. Splitting mid-function is wrong. |
 | Notation | `notation.md` | `x²`, `Ⅻ`, `½` must survive the loader. |
 | Duplication | `site/*.html`, `thread.eml` | 5 pages share chrome; the thread quotes itself 4 deep. |
 | Tokenizer | all | `tiktoken` is ground truth for this lab's estimator. |
 
+**Answering it for one document class.** Appendix D §5 shortlists a parser per
+constraint and then tells you to run that shortlist against your own documents. The
+`probe` section is that sentence made executable — one class, end to end, through
+whichever parsers and chunkers you name:
+
+    bakeoff.py --only probe --doc invoice
+    bakeoff.py --only probe --doc invoice --parser docling --chunker semchunk --show-chunks 3
+    bakeoff.py --only pdf --tier 1 2            # add the layout models to the parser table
+
+`--list` prints the document classes, the fixture standing in for each, and how many
+known-answer checks it carries.
+
+**Tier 2 is opt-in.** `--tier 2` adds Docling, Marker and `unstructured`'s `hi_res`
+path. They download model weights on first use and cost tens of seconds per page on
+CPU, so the default run is tier 1 and reproduces the numbers quoted in the README.
+
 **A missing adapter is not a failure.** Anything not installed prints `not installed`
 and is skipped, so a partial install still produces a comparison. Nothing here calls a
-network or an API key.
+network or an API key, beyond the one-time model download `--tier 2` triggers.
 
 **What this is not.** It is not a benchmark and it does not produce a ranking. Chunk
 counts and split behaviour are facts about a library; whether they matter to *your*
@@ -40,7 +57,9 @@ score.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import logging
@@ -48,8 +67,10 @@ import sys
 import time
 import unicodedata
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import normalize as N
 import parse as PA
@@ -86,12 +107,30 @@ def skip(name: str, module: str) -> None:
     print(f"  {name:<34} not installed  (pip install {module})")
 
 
+@dataclass
+class Options:
+    """Everything the CLI can vary, threaded through every section.
+
+    The defaults reproduce the run whose output is quoted in the README, so `bakeoff.py`
+    with no arguments stays the reproducible artifact and every flag is a deviation
+    from it. `tiers` defaults to tier 1 alone because tier 2 downloads model weights
+    and costs tens of seconds per page — opt in with `--tier 2`.
+    """
+
+    tiers: set[int] = field(default_factory=lambda: {1})
+    parsers: list[str] = field(default_factory=list)
+    chunkers: list[str] = field(default_factory=list)
+    docs: list[str] = field(default_factory=list)
+    max_tokens: int = 128
+    show_chunks: int = 0
+
+
 # --------------------------------------------------------------------------------
 # Tokenizer ground truth
 # --------------------------------------------------------------------------------
 
 
-def section_tokenizer() -> None:
+def section_tokenizer(opts: Options) -> None:
     """How wrong is this lab's token estimator? (§5.4)"""
     h1("TOKENIZER — this lab's estimator vs real cl100k")
     if not have("tiktoken"):
@@ -220,37 +259,190 @@ def _pdfminer(data: bytes) -> str:
     return extract_text(io.BytesIO(data))
 
 
+# --------------------------------------------------------------------------------
+# Tier 2 — layout models (appendix D §2.1)
+# --------------------------------------------------------------------------------
+# Everything above reconstructs text from glyph coordinates with hand-written
+# heuristics. Everything below runs a detection model over a rendered page, gets back
+# regions typed as paragraph / table / figure, and extracts within each region. That is
+# the whole tier boundary, and §5.1's per-column clip rectangles are the twenty lines
+# you write to fake it.
+#
+# Three practical differences the table below will show, none of which is accuracy:
+#
+#   * **Cost.** Tier 1 is milliseconds; these are tens of seconds per page on CPU.
+#     Appendix D quotes 0.5–5 pages/sec on GPU; this lab measures CPU, so read the
+#     `ms` column as an upper bound, not as the number you would run in production.
+#   * **Determinism.** Still deterministic — these are detection models, not VLMs — so
+#     §9's content-addressed IDs survive. Tier 3 is where that stops being true.
+#   * **First-run weight.** Each downloads model weights on first use (hundreds of MB)
+#     and none of them says so before it starts. That is why they are opt-in behind
+#     `--tier 2` rather than part of the default run.
+#
+# Each is wrapped so an import failure, a missing weight file or an unsupported device
+# degrades to a reported error rather than aborting the comparison.
+
+_TIER2_CACHE: dict[tuple[str, str], str] = {}
+_MODELS: dict[str, Any] = {}
+
+
+def _docling(data: bytes) -> str:
+    """Docling → Markdown, via the `DoclingDocument` model (appendix D §4.1).
+
+    The accelerator is pinned to CPU deliberately. Left on `AUTO` this raises on Apple
+    Silicon — the layout model asks for a float64 tensor and MPS has no float64 — which
+    is a good example of appendix D §3.3's point 4: the throughput number in a
+    benchmark table assumes a device you may not have.
+
+    `export_to_markdown()` is a *lossy view* of the real output. The reason to run
+    Docling is `res.document`, a typed tree of headings, tables and lists that §6.3's
+    structure-aware splitting can walk directly. Comparing its Markdown against
+    pypdf's plain text — which is what this harness does — measures the one thing
+    Docling is not for. Read the tier-2 rows as "did the layout model recover the
+    structure", and remember the structure survives in the object, not in this string.
+    """
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+    from docling.datamodel.base_models import DocumentStream, InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
+    if "docling" not in _MODELS:
+        options = PdfPipelineOptions()
+        options.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU)
+        _MODELS["docling"] = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+        )
+    converter = _MODELS["docling"]
+    result = converter.convert(DocumentStream(name="doc.pdf", stream=io.BytesIO(data)))
+    return result.document.export_to_markdown()
+
+
+def _marker(data: bytes) -> str:
+    """Marker v2 → Markdown (appendix D §4.2). GPL-3.0; check that before you ship it.
+
+    `create_model_dict()` loads several hundred MB of weights, so the converter is
+    built once and cached for the process. Marker accepts a `BytesIO`, which is worth
+    noting because the other two want a path or a temp directory.
+    """
+    from marker.converters.pdf import PdfConverter
+    from marker.models import create_model_dict
+    from marker.output import text_from_rendered
+
+    if "marker" not in _MODELS:
+        _MODELS["marker"] = PdfConverter(artifact_dict=create_model_dict())
+    rendered = _MODELS["marker"](io.BytesIO(data))
+    out = text_from_rendered(rendered)
+    return out[0] if isinstance(out, tuple) else str(out)
+
+
+# MinerU (appendix D §2.2) has no adapter here, and the reason is worth more than the
+# row would have been: **it cannot share a virtualenv with Marker.** `marker-pdf` 2.0
+# requires `transformers>=5.12.1,<6`; `mineru` 3.4.4 requires `transformers<5.0.0`.
+# Both are listed side by side in appendix D §2.2 as tier-2 options, both resolve
+# cleanly on their own, and installing the second silently breaks the first — the
+# failure surfaces as an `ImportError` from deep inside a model file, not from pip.
+#
+# The general point survives the specific versions: tier-2 parsers pin heavy ML stacks
+# and a shortlist of two can be un-installable as a pair. Price that before you plan a
+# bake-off, and if you need both, run them in separate environments behind a subprocess
+# boundary rather than trying to resolve one.
+
+
+def _unstructured(data: bytes, strategy: str) -> str:
+    """`unstructured` with an explicit `strategy` — its per-document tier selector.
+
+    This is the one library that spans the boundary: `fast` is tier 1 (it calls
+    pdfminer underneath), `hi_res` runs a layout model, `ocr_only` goes to Tesseract.
+    Running `fast` and `hi_res` side by side prices the tier-2 upgrade within a single
+    API, which is appendix D §4.3's argument for reaching for it first.
+    """
+    from unstructured.partition.pdf import partition_pdf
+
+    elements = partition_pdf(file=io.BytesIO(data), strategy=strategy)
+    return "\n".join(str(e) for e in elements)
+
+
+@dataclass(frozen=True)
+class PdfAdapter:
+    """One way of turning PDF bytes into text, with the tier it belongs to.
+
+    `fn is None` marks this lab's own path, which is called differently (it needs the
+    `pdfmini` document, not just the text) and is always present.
+    """
+
+    name: str
+    tier: int
+    fn: object = None
+    module: str = ""
+
+
 def _run_pdf(name: str, fn, data: bytes) -> PdfResult:
+    """Run one adapter, memoized on (adapter, bytes).
+
+    The cache is not an optimization detail — it is what makes tier 2 usable here. Each
+    section re-parses the same handful of fixtures, so a full run asks each adapter for
+    `report_twocol_interleaved.pdf` six times. At thirty seconds a call that is three
+    minutes of recomputing an identical answer per adapter.
+    """
+    key = (name, hashlib.sha256(data).hexdigest())
+    if key in _TIER2_CACHE:
+        return PdfResult(name, _TIER2_CACHE[key], 0.0, note="cached")
     t0 = time.perf_counter()
     try:
         text = fn(data)
     except Exception as exc:  # a library that raises is *better* than one that lies
         return PdfResult(name, "", (time.perf_counter() - t0) * 1000, error=f"{type(exc).__name__}: {exc}")
+    _TIER2_CACHE[key] = text
     return PdfResult(name, text, (time.perf_counter() - t0) * 1000)
 
 
-def pdf_adapters() -> list[tuple[str, object]]:
-    out: list[tuple[str, object]] = [("this lab (tier 1, columns)", None)]
+def pdf_adapters(tiers: set[int] | None = None, name_filter: list[str] | None = None) -> list[PdfAdapter]:
+    """Every installed PDF adapter matching the requested tiers and name substrings."""
+    out: list[PdfAdapter] = [PdfAdapter("this lab (tier 1, columns)", 1)]
     if have("pypdf"):
-        out.append(("pypdf", _pypdf))
+        out.append(PdfAdapter("pypdf", 1, _pypdf, "pypdf"))
     if have("pymupdf"):
-        out.append(("pymupdf (text)", lambda d: _pymupdf(d, "text")))
-        out.append(("pymupdf (blocks, as-is)", lambda d: _pymupdf(d, "blocks")))
-        out.append(("pymupdf (sort=True)", _pymupdf_sorted))
-        out.append(("pymupdf (per-column clip)", _pymupdf_clipped))
+        out.append(PdfAdapter("pymupdf (text)", 1, lambda d: _pymupdf(d, "text"), "pymupdf"))
+        out.append(PdfAdapter("pymupdf (blocks, as-is)", 1, lambda d: _pymupdf(d, "blocks"), "pymupdf"))
+        out.append(PdfAdapter("pymupdf (sort=True)", 1, _pymupdf_sorted, "pymupdf"))
+        out.append(PdfAdapter("pymupdf (per-column clip)", 1, _pymupdf_clipped, "pymupdf"))
     if have("pdfminer"):
-        out.append(("pdfminer.six", _pdfminer))
+        out.append(PdfAdapter("pdfminer.six", 1, _pdfminer, "pdfminer"))
+    if have("unstructured"):
+        out.append(PdfAdapter("unstructured (fast)", 1, lambda d: _unstructured(d, "fast"), "unstructured"))
+        # `auto` is tier 2 because that is where it can end up: it tries the cheap path
+        # and escalates. Worth its own row precisely because the escalation is invisible
+        # — the same call costs 3 ms or 10 s depending on the document.
+        out.append(PdfAdapter("unstructured (auto)", 2, lambda d: _unstructured(d, "auto"), "unstructured"))
+        out.append(PdfAdapter("unstructured (hi_res)", 2, lambda d: _unstructured(d, "hi_res"), "unstructured"))
+    if have("docling"):
+        out.append(PdfAdapter("docling", 2, _docling, "docling"))
+    if have("marker"):
+        out.append(PdfAdapter("marker v2", 2, _marker, "marker"))
+
+    if tiers is not None:
+        out = [a for a in out if a.tier in tiers]
+    if name_filter:
+        needles = [n.lower() for n in name_filter]
+        out = [a for a in out if any(n in a.name.lower() for n in needles)]
     return out
 
 
-def section_pdf() -> None:
+def section_pdf(opts: Options) -> None:
     """Reading order, empty text layers, and broken encodings across real parsers."""
-    h1("PDF PARSERS — the same bytes through every tier-1 library you have")
+    tiers = "+".join(str(t) for t in sorted(opts.tiers))
+    h1(f"PDF PARSERS — the same bytes through every tier-{tiers} library you have")
 
-    adapters = pdf_adapters()
-    for module in ("pypdf", "fitz", "pdfminer"):
+    adapters = pdf_adapters(opts.tiers, opts.parsers)
+    if not adapters:
+        print("  no adapter matches the current --tier/--parser filters")
+        return
+    for module in ("pypdf", "pymupdf", "pdfminer", "docling", "marker", "unstructured"):
         if not have(module):
-            skip(f"pdf: {module}", {"fitz": "pymupdf", "pdfminer": "pdfminer.six"}.get(module, module))
+            skip(f"pdf: {module}", {"pdfminer": "pdfminer.six", "marker": "marker-pdf"}.get(module, module))
+    if 2 in opts.tiers:
+        print("  tier 2 runs a layout model per page: expect tens of seconds per document")
+        print("  on CPU, and a model download on first use. Results are memoized per run.")
 
     h2("Reading order on a two-column page (§3.2)")
     print("  KNOWN ANSWER: the left column is about PDF reading order; the right is about")
@@ -270,20 +462,21 @@ def section_pdf() -> None:
 
     fixtures = ["report_twocol.pdf", "report_twocol_interleaved.pdf"]
     print(f"  {'parser':<32} {'column-ordered emission':<30} {'row-band emission'}")
-    for name, fn in adapters:
+    for adapter in adapters:
         verdicts = []
         for fixture in fixtures:
             data = (ROOT / fixture).read_bytes()
-            if fn is None:
+            if adapter.fn is None:
                 doc = PM.extract(data)
                 running = PM.detect_running_lines(doc)
                 text = "\n".join(PM.page_text(doc, reading_order="columns", drop_lines=running))
                 verdicts.append(_reading_order_verdict(text))
             else:
-                r = _run_pdf(name, fn, data)
+                r = _run_pdf(adapter.name, adapter.fn, data)
                 verdicts.append(f"ERROR {r.error[:20]}" if r.error else _reading_order_verdict(r.text))
         short = [v.split("—")[0].strip()[:28] for v in verdicts]
-        print(f"  {name:<32} {short[0]:<30} {short[1]}")
+        label = f"{adapter.name} [t{adapter.tier}]"
+        print(f"  {label:<32} {short[0]:<30} {short[1]}")
 
     print()
     print("  pdfminer.six recovers the columns in BOTH fixtures — its LAParams layout")
@@ -294,14 +487,14 @@ def section_pdf() -> None:
     print("  per-column clip rectangles fix it, and finding those rectangles is your job.")
     print()
     print("  first body line of page 1, row-band fixture:")
-    for name, fn in adapters:
+    for adapter in adapters:
         data = (ROOT / "report_twocol_interleaved.pdf").read_bytes()
-        if fn is None:
+        if adapter.fn is None:
             doc = PM.extract(data)
             text = "\n".join(PM.page_text(doc, reading_order="columns",
                                           drop_lines=PM.detect_running_lines(doc)))
         else:
-            r = _run_pdf(name, fn, data)
+            r = _run_pdf(adapter.name, adapter.fn, data)
             if r.error:
                 continue
             text = r.text
@@ -310,20 +503,20 @@ def section_pdf() -> None:
              if len(ln.strip()) > 20 and "Northwind" not in ln and "Page " not in ln),
             "",
         )
-        print(f"    {name:<32} {line.strip()[:52]!r}")
+        print(f"    {adapter.name:<32} {line.strip()[:52]!r}")
 
     h2("Empty text layer (§3.2) — scan.pdf: does the library tell you?")
     print("  KNOWN ANSWER: two pages of image, zero text. Every parser should return ''.")
     print("  The question is whether that is reported as a condition or as success.\n")
     data = (ROOT / "scan.pdf").read_bytes()
-    for name, fn in adapters:
-        if fn is None:
+    for adapter in adapters:
+        if adapter.fn is None:
             doc = PM.extract(data)
             text = "\n".join(PM.page_text(doc))
             gate = PA.gate(PA.parse_file(ROOT / "scan.pdf", ROOT))
-            print(f"  {name:<28} chars={len(text.strip()):>4}  → routed to {gate.route!r}")
+            print(f"  {adapter.name:<28} chars={len(text.strip()):>4}  → routed to {gate.route!r}")
             continue
-        r = _run_pdf(name, fn, data)
+        r = _run_pdf(adapter.name, adapter.fn, data)
         status = f"ERROR {r.error}" if r.error else f"chars={len(r.text.strip()):>4}  → returned normally"
         print(f"  {r.name:<28} {status}")
     print("\n  Every library returns the empty string without complaint. That is correct")
@@ -334,12 +527,13 @@ def section_pdf() -> None:
     for fixture in ("subset_ok.pdf", "subset_broken.pdf"):
         data = (ROOT / fixture).read_bytes()
         print(f"  {fixture}")
-        for name, fn in adapters:
-            if fn is None:
+        for adapter in adapters:
+            name = adapter.name
+            if adapter.fn is None:
                 doc = PM.extract(data)
                 text = "\n".join(PM.page_text(doc))
             else:
-                r = _run_pdf(name, fn, data)
+                r = _run_pdf(name, adapter.fn, data)
                 if r.error:
                     print(f"    {name:<26} ERROR {r.error[:44]}")
                     continue
@@ -381,21 +575,21 @@ def section_pdf() -> None:
     print("  De-hyphenation (§4.1) fires on `(\\w)-\\n(\\w)`, so it needs the continuation to")
     print("  still be the NEXT LINE after the parse.\n")
     data = (ROOT / "report_twocol.pdf").read_bytes()
-    for name, fn in adapters:
-        if fn is None:
+    for adapter in adapters:
+        if adapter.fn is None:
             doc = PM.extract(data)
             text = "\n".join(
                 PM.page_text(doc, reading_order="columns",
                              drop_lines=PM.detect_running_lines(doc))
             )
         else:
-            r = _run_pdf(name, fn, data)
+            r = _run_pdf(adapter.name, adapter.fn, data)
             if r.error:
                 continue
             text = r.text
         lig = sum(text.count(l) for l in N.LIGATURES)
         canon = N.canonicalize(text)
-        print(f"  {name:<32} ligatures={lig:>2} → after normalize: "
+        print(f"  {adapter.name:<32} ligatures={lig:>2} → after normalize: "
               f"ligatures={sum(canon.count(l) for l in N.LIGATURES):>2}, "
               f"hyphen repaired={str('organizational' in canon):<5}")
 
@@ -478,7 +672,7 @@ class SplitResult:
     ms: float = 0.0
 
 
-def splitter_adapters(max_tokens: int) -> dict[str, object]:
+def splitter_adapters(max_tokens: int, name_filter: list[str] | None = None) -> dict[str, object]:
     """Every splitter available, normalized to `f(text) -> list[str]`."""
     out: dict[str, object] = {}
 
@@ -566,6 +760,9 @@ def splitter_adapters(max_tokens: int) -> dict[str, object]:
         except Exception:
             pass
 
+    if name_filter:
+        needles = [n.lower() for n in name_filter]
+        out = {k: v for k, v in out.items() if any(n in k.lower() for n in needles)}
     return out
 
 
@@ -588,9 +785,9 @@ def _run_split(name: str, fn, text: str) -> SplitResult:
     return SplitResult(name, chunks, ms=(time.perf_counter() - t0) * 1000)
 
 
-def section_splitters() -> None:
+def section_splitters(opts: Options) -> None:
     """Chunk shape, and the two integrity checks with known answers."""
-    h1("SPLITTERS — chunk shape across libraries, at a nominal 128-token budget")
+    h1(f"SPLITTERS — chunk shape across libraries, at a nominal {opts.max_tokens}-token budget")
 
     for module, pip in (
         ("langchain_text_splitters", "langchain-text-splitters"),
@@ -601,10 +798,13 @@ def section_splitters() -> None:
         if not have(module):
             skip(f"splitter: {module}", pip)
 
-    adapters = splitter_adapters(128)
+    adapters = splitter_adapters(opts.max_tokens, opts.chunkers)
+    if not adapters:
+        print("  no splitter matches the current --chunker filter")
+        return
     tk = SP.DEFAULT_TOKENIZER
 
-    for fixture in ("transcript.txt", "book.md", "notation.md"):
+    for fixture in _pick(("transcript.txt", "book.md", "notation.md"), opts.docs):
         text = N.canonicalize((ROOT / fixture).read_text(encoding="utf-8"))
         h2(f"{fixture} — {len(text):,} chars")
         print(f"  {'splitter':<32} {'n':>4} {'p50':>5} {'max':>5} {'orph':>5} {'ms':>7}")
@@ -631,7 +831,7 @@ def section_splitters() -> None:
     print("  passes this test trivially and fails the context limit instead.\n")
     text = N.canonicalize((ROOT / "metrics.md").read_text(encoding="utf-8"))
     header_line = "| Region | Q1 revenue | Q2 revenue | Q1 margin | Q2 margin | Headcount |"
-    for name, fn in splitter_adapters(64).items():
+    for name, fn in splitter_adapters(64, opts.chunkers).items():
         r = _run_split(name, fn, text)
         if r.error:
             continue
@@ -660,7 +860,7 @@ def section_splitters() -> None:
                 broken += 1
         return broken
 
-    for name, fn in splitter_adapters(96).items():
+    for name, fn in splitter_adapters(96, opts.chunkers).items():
         r = _run_split(name, fn, code)
         if r.error:
             continue
@@ -703,7 +903,7 @@ def section_splitters() -> None:
 # --------------------------------------------------------------------------------
 
 
-def section_notation() -> None:
+def section_notation(opts: Options) -> None:
     """Does the toolchain preserve x², Ⅻ, ½ — or quietly fold them? (§4.2)"""
     h1("NOTATION SURVIVAL — what the loaders do to mathematics, numerals and case")
 
@@ -765,7 +965,7 @@ def section_notation() -> None:
 # --------------------------------------------------------------------------------
 
 
-def section_duplication() -> None:
+def section_duplication(opts: Options) -> None:
     """Chrome removal and near-duplicate detection, against known answers."""
     h1("DUPLICATION — chrome extraction and near-duplicate detection")
 
@@ -858,6 +1058,293 @@ def section_duplication() -> None:
     print("  quoted blocks and keep the thread structure as metadata.")
 
 
+# --------------------------------------------------------------------------------
+# Document classes — appendix D §5's shortlist, made runnable
+# --------------------------------------------------------------------------------
+# Appendix D's decision matrix shortlists a parser per constraint and tells you to
+# "run your shortlist against your own documents in labs/document-processing". This is
+# the table that makes that sentence executable: each row names the fixture that stands
+# in for a document class, the tool appendix D would shortlist, and — where the class
+# has a crisp known answer — the checks that say whether the shortlisted tool actually
+# delivered it on this corpus.
+#
+# The checks import their expected values from `make_fixtures`, so the fixture and the
+# assertion about it cannot drift apart. Editing a line item in the generator changes
+# what the check expects, by construction.
+
+import make_fixtures as MF  # noqa: E402  — fixture data doubles as the known answers
+
+
+@dataclass(frozen=True)
+class DocClass:
+    """One document class: what stands in for it, what to reach for, what to verify."""
+
+    name: str
+    fixtures: tuple[str, ...]
+    shortlist: str  # appendix D §5 / README §6.1 first choice
+    chunk_with: str
+    bites: str  # the failure this class is prone to
+    checks: tuple[tuple[str, Callable[[str], bool]], ...] = ()
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _blocks_contiguous(text: str, block: list[str], other: list[str]) -> bool:
+    """Did `block` survive as one run, or did `other` get spliced into it?
+
+    Same positional test as `_reading_order_verdict`, for the same reason: a per-line
+    adjacency check passes trivially on any parser that emits one run per line.
+    """
+    flat = _flat(text)
+    positions = [flat.find(line) for line in block]
+    if any(p < 0 for p in positions) or positions != sorted(positions):
+        return False
+    intruders = [p for p in (flat.find(line) for line in other) if p >= 0]
+    return not any(min(positions) < p < max(positions) for p in intruders)
+
+
+def _invoice_field(text: str) -> bool:
+    """`Invoice Number` must yield exactly `NW-2024-0731`, not that plus its neighbour.
+
+    The value is read as "everything up to the first line break after the label",
+    skipping any blank lines between the two. Both halves of that matter, and the
+    second was a bug here first: a parser that emits the label and the value as
+    separate elements — which is what a layout model does, and what you *want* — has
+    a blank line between them, and a naive `line.split(":")` scores it as a failure
+    for being correct. The failure this check is looking for is the opposite one: the
+    value running on into the neighbouring column's label.
+    """
+    index = text.find("Invoice Number")
+    if index < 0:
+        return False
+    after = text[index + len("Invoice Number"):].lstrip(": \t\r\n")
+    return after.split("\n", 1)[0].strip() == "NW-2024-0731"
+
+
+def _invoice_line_items(text: str) -> bool:
+    """Every description must still sit next to its own amount.
+
+    "Next to" is bounded by the description's own length plus room for the quantity and
+    unit price. A parser that reads column-wise puts all five descriptions together and
+    all five amounts together, which fails this by hundreds of characters while losing
+    no tokens at all — the failure mode no yield or sanity gate in this lab can see.
+    """
+    flat = _flat(text)
+    for desc, qty, unit in MF.INVOICE_ITEMS:
+        d = flat.find(desc)
+        a = flat.find(f"{qty * unit:,.2f}")
+        if d < 0 or a < d or a - d > len(desc) + 40:
+            return False
+    return True
+
+
+def _invoice_totals(text: str) -> bool:
+    flat = _flat(text)
+    return all(
+        f"{v:,.2f}" in flat
+        for v in (MF.INVOICE_SUBTOTAL, MF.INVOICE_TAX, MF.INVOICE_FREIGHT, MF.INVOICE_TOTAL)
+    )
+
+
+DOC_CLASSES: dict[str, DocClass] = {
+    "invoice": DocClass(
+        "invoice", ("invoice.pdf",),
+        shortlist="tier 2 (Docling / Marker) or a cloud prebuilt model (appendix D §2.3)",
+        chunk_with="do not chunk — one record per document; index fields, return the page",
+        bites="every token survives and only the associations are lost; no gate sees it",
+        checks=(
+            ("label→value  (Invoice Number is NW-2024-0731 and nothing else)", _invoice_field),
+            ("bill-to block intact  (no ship-to line spliced in)",
+             lambda t: _blocks_contiguous(t, MF.INVOICE_BILL_TO, MF.INVOICE_SHIP_TO)),
+            ("ship-to block intact  (no bill-to line spliced in)",
+             lambda t: _blocks_contiguous(t, MF.INVOICE_SHIP_TO, MF.INVOICE_BILL_TO)),
+            ("line item → its own amount  (all 5)", _invoice_line_items),
+            ("all four totals present", _invoice_totals),
+        ),
+    ),
+    "multicolumn": DocClass(
+        "multicolumn", ("report_twocol.pdf", "report_twocol_interleaved.pdf"),
+        shortlist="pdfminer.six (tier 1) or a layout model (tier 2)",
+        chunk_with="structure-aware if the parser returns elements, else recursive",
+        bites="pypdf and PyMuPDF interleave columns; sort=True does not fix it (§5.1)",
+        checks=(("columns kept separate",
+                 lambda t: _reading_order_verdict(t) == "columns kept separate"),),
+    ),
+    "financial-table": DocClass(
+        "financial-table", ("statement.pdf", "metrics.md"),
+        shortlist="tier 2 — table structure is the deciding metric (appendix D §3.3)",
+        chunk_with="row-wise sentences for the index, full table for the answer (§3.4)",
+        bites="edit-similarity benchmarks score a destroyed grid as a pass",
+    ),
+    "scanned": DocClass(
+        "scanned", ("scan.pdf",),
+        shortlist="OCR or a VLM — every parser here returns '' and returns normally",
+        chunk_with="nothing until text exists",
+        bites="success and emptiness are indistinguishable without a yield gate (§5.3)",
+        checks=(("extracts to empty", lambda t: len(t.strip()) == 0),),
+    ),
+    "broken-font": DocClass(
+        "broken-font", ("subset_broken.pdf", "subset_ok.pdf"),
+        shortlist="any — the point is the gate, not the parser",
+        chunk_with="n/a — quarantine before chunking",
+        bites="three parsers fail in three different shapes; one gate catches one (§5.2)",
+    ),
+    "html": DocClass(
+        "html", ("site/backpressure.html", "site/deletes.html"),
+        shortlist="unstructured.partition_html or bs4, plus repeated-block detection",
+        chunk_with="header-aware, then recursive within a section",
+        bites="chrome is 30–40% of bytes and tag rules miss <div class='cookie-banner'>",
+    ),
+    "email": DocClass(
+        "email", ("thread.eml",),
+        shortlist="strip quoted replies at parse time; keep the thread as metadata",
+        chunk_with="one chunk per message, thread id in the payload",
+        bites="66% duplication if you skip it (§5.9)",
+    ),
+    "code": DocClass(
+        "code", ("service.py.txt",),
+        shortlist="the language's own AST (`ast`, tree-sitter)",
+        chunk_with="AST boundaries plus enclosing context",
+        bites="from_language() is separator matching, not parsing (§5.7)",
+    ),
+    "notation": DocClass(
+        "notation", ("notation.md",),
+        shortlist="anything, but normalize with NFC only",
+        chunk_with="anything",
+        bites="one NFKC call destroys x², ½, Ⅻ, µ and full-width forms (§5.8)",
+    ),
+    "spreadsheet": DocClass(
+        "spreadsheet", ("revenue.csv",),
+        shortlist="load into DuckDB or Postgres",
+        chunk_with="do not chunk rows into prose — index a table description",
+        bites="vector search never aggregates, never joins, never exhausts (§3.6)",
+    ),
+    "longform": DocClass(
+        "longform", ("book.md", "handbook.md"),
+        shortlist="native — no library needed",
+        chunk_with="parent/child: small children, section parents",
+        bites="budget tokens after parent expansion, never k before it (§7.4)",
+    ),
+    "transcript": DocClass(
+        "transcript", ("transcript.txt",),
+        shortlist="plain",
+        chunk_with="recursive with sentence separators",
+        bites="the one place overlap earns its cost — no author-drawn boundaries exist",
+    ),
+}
+
+
+def _pick(candidates, filters: list[str]):
+    """Filter by case-insensitive substring; no filter means everything."""
+    if not filters:
+        return list(candidates)
+    needles = [f.lower() for f in filters]
+    return [c for c in candidates if any(n in str(c).lower() for n in needles)]
+
+
+def section_probe(opts: Options) -> None:
+    """One document class, end to end, through the parsers and chunkers you named.
+
+    This is the section to reach for when the question is "how does my stack do on
+    *this kind of document*" rather than "what do these libraries do in general" — it
+    runs parse → gate → normalize → chunk on one class and prints that class's known
+    answers next to the result. `--doc invoice --parser docling --chunker semchunk` is
+    the shape appendix D §5 asks you to run against your own corpus.
+    """
+    classes = [c for name, c in DOC_CLASSES.items() if not opts.docs or _pick([name], opts.docs)]
+    if not classes:
+        print(f"  no document class matches {opts.docs!r}")
+        print(f"  available: {', '.join(DOC_CLASSES)}")
+        return
+
+    adapters = pdf_adapters(opts.tiers, opts.parsers)
+    chunkers = splitter_adapters(opts.max_tokens, opts.chunkers)
+    tk = SP.DEFAULT_TOKENIZER
+    import pdfmini as PM
+
+    for cls in classes:
+        h1(f"PROBE — {cls.name}")
+        print(f"  fixtures      {', '.join(cls.fixtures)}")
+        print(f"  parse with    {cls.shortlist}")
+        print(f"  chunk with    {cls.chunk_with}")
+        print(f"  what bites    {cls.bites}")
+
+        for fixture in cls.fixtures:
+            path = ROOT / fixture
+            if not path.exists():
+                print(f"\n  {fixture}: missing — run `python3 make_fixtures.py`")
+                continue
+            data = path.read_bytes()
+            h2(f"{fixture} — parse")
+
+            texts: dict[str, str] = {}
+            if path.suffix == ".pdf":
+                for adapter in adapters:
+                    if adapter.fn is None:
+                        doc = PM.extract(data)
+                        text = "\n".join(PM.page_text(
+                            doc, reading_order="columns",
+                            drop_lines=PM.detect_running_lines(doc)))
+                        ms = 0.0
+                    else:
+                        r = _run_pdf(adapter.name, adapter.fn, data)
+                        if r.error:
+                            print(f"  {adapter.name:<30} ERROR {r.error[:44]}")
+                            continue
+                        text, ms = r.text, r.ms
+                    texts[adapter.name] = text
+                    print(f"  {adapter.name:<30} [t{adapter.tier}] {len(text):>6,} chars {ms:>8.0f} ms")
+            else:
+                # Non-PDF classes have exactly one parser in this lab: its own router.
+                parsed = PA.parse_file(path, ROOT)
+                texts["this lab: parse_file"] = parsed.raw_text
+                print(f"  {'this lab: parse_file':<30} [t1] {len(parsed.raw_text):>6,} chars"
+                      f"   route={PA.gate(parsed).route!r}")
+                if opts.parsers:
+                    print("  (--parser only applies to PDF fixtures)")
+
+            if cls.checks and texts:
+                h2(f"{fixture} — known answers")
+                width = max(len(label) for label, _ in cls.checks)
+                print(f"  {'parser':<30} " + " ".join(f"{i + 1:>3}" for i in range(len(cls.checks))))
+                for name, text in texts.items():
+                    marks = []
+                    for _, check in cls.checks:
+                        try:
+                            marks.append(" ok" if check(text) else "  X")
+                        except Exception:
+                            marks.append("err")
+                    print(f"  {name:<30} " + " ".join(f"{m:>3}" for m in marks))
+                print()
+                for i, (label, _) in enumerate(cls.checks):
+                    print(f"    {i + 1}. {label:<{width}}")
+
+            if not chunkers or not texts:
+                continue
+            h2(f"{fixture} — chunk at {opts.max_tokens} tokens")
+            print(f"  {'parser × chunker':<52} {'n':>4} {'p50':>5} {'max':>5} {'orph':>5}")
+            for parser_name, text in texts.items():
+                canonical = N.canonicalize(text)
+                if not canonical.strip():
+                    print(f"  {parser_name + ' × (any)':<52} nothing to chunk")
+                    continue
+                for chunker_name, fn in chunkers.items():
+                    r = _run_split(chunker_name, fn, canonical)
+                    label = f"{parser_name} × {chunker_name}"
+                    if r.error:
+                        print(f"  {label:<52} ERROR {r.error}")
+                        continue
+                    counts = sorted(tk.count(c) for c in r.chunks)
+                    p50 = counts[len(counts) // 2] if counts else 0
+                    orphans = sum(1 for c in counts if c < 24)
+                    print(f"  {label:<52} {len(r.chunks):>4} {p50:>5} "
+                          f"{counts[-1] if counts else 0:>5} {orphans:>5}")
+                    for chunk in r.chunks[: opts.show_chunks]:
+                        print(f"      | {_flat(chunk)[:96]}")
+
+
 SECTIONS = {
     "tokenizer": section_tokenizer,
     "pdf": section_pdf,
@@ -866,47 +1353,127 @@ SECTIONS = {
     "duplication": section_duplication,
 }
 
+# `probe` is deliberately outside SECTIONS: it is the one section that answers a
+# question about *your* document class rather than about the libraries in general, so
+# a bare `bakeoff.py` should not run it. Ask for it by name.
+SECTIONS_OPTIONAL = {"probe": section_probe}
+
 ADAPTERS = [
-    ("pypdf", "pypdf", "PDF tier 1, pure python — the most common default"),
-    ("pymupdf", "pymupdf", "PDF tier 1, fastest; get_text('blocks') is layout-aware"),
-    ("pdfminer", "pdfminer.six", "PDF tier 1 with LAParams layout analysis"),
-    ("langchain_text_splitters", "langchain-text-splitters", "RecursiveCharacterTextSplitter et al"),
-    ("llama_index.core", "llama-index-core", "SentenceSplitter, HierarchicalNodeParser"),
-    ("semchunk", "semchunk", "small tokenizer-aware recursive splitter"),
-    ("chonkie", "chonkie", "many chunkers behind one API"),
-    ("unstructured", "unstructured", "element-based parsing for md/html/email"),
-    ("bs4", "beautifulsoup4", "HTML main-content extraction"),
-    ("tiktoken", "tiktoken", "real cl100k tokenizer — ground truth for §5.4"),
-    ("datasketch", "datasketch", "reference MinHash"),
+    ("pypdf", 1, "pypdf", "PDF tier 1, pure python — the most common default"),
+    ("pymupdf", 1, "pymupdf", "PDF tier 1, fastest; get_text('blocks') is layout-aware"),
+    ("pdfminer", 1, "pdfminer.six", "PDF tier 1 with LAParams layout analysis"),
+    ("unstructured", 1, "unstructured", "element-based parsing; `fast`=t1, `hi_res`=t2"),
+    ("docling", 2, "docling", "layout model → DoclingDocument; MIT (appendix D §4.1)"),
+    ("marker", 2, "marker-pdf", "layout model → Markdown; GPL-3.0 (appendix D §4.2)"),
+    ("langchain_text_splitters", 0, "langchain-text-splitters", "RecursiveCharacterTextSplitter et al"),
+    ("llama_index.core", 0, "llama-index-core", "SentenceSplitter, HierarchicalNodeParser"),
+    ("semchunk", 0, "semchunk", "small tokenizer-aware recursive splitter"),
+    ("chonkie", 0, "chonkie", "many chunkers behind one API"),
+    ("bs4", 0, "beautifulsoup4", "HTML main-content extraction"),
+    ("tiktoken", 0, "tiktoken", "real cl100k tokenizer — ground truth for §5.4"),
+    ("datasketch", 0, "datasketch", "reference MinHash"),
 ]
+
+USAGE = """\
+examples:
+  bakeoff.py                                    the default run (tier 1, every section)
+  bakeoff.py --list                             adapters, tiers, and document classes
+  bakeoff.py --only pdf --tier 1 2              add the layout models to the parser table
+  bakeoff.py --only probe --doc invoice         one class, end to end, every parser
+  bakeoff.py --only probe --doc invoice \\
+             --parser docling --chunker semchunk --show-chunks 3
+  bakeoff.py --only splitters --max-tokens 512 --chunker langchain
+"""
+
+
+def _print_list() -> None:
+    print("adapters (install with: uv pip install -r requirements-bakeoff.txt)\n")
+    for module, tier, pip, what in ADAPTERS:
+        mark = "OK " if have(module) else "-- "
+        label = f"tier {tier}" if tier else "      "
+        print(f"  {mark} {label}  {pip:<26} {what}")
+
+    print("\nPDF parser adapters matching --parser / --tier:\n")
+    for adapter in pdf_adapters({1, 2}):
+        print(f"  tier {adapter.tier}  {adapter.name}")
+
+    print("\nsplitter adapters matching --chunker:\n")
+    for name in splitter_adapters(128):
+        print(f"          {name}")
+
+    print("\ndocument classes matching --doc (appendix D §5, README §6.1):\n")
+    for name, cls in DOC_CLASSES.items():
+        checks = f"{len(cls.checks)} known-answer check(s)" if cls.checks else "no checks yet"
+        print(f"  {name:<17} {', '.join(cls.fixtures)}")
+        print(f"  {'':<17} shortlist: {cls.shortlist}")
+        print(f"  {'':<17} {checks}")
+
+    print(f"\nsections: {', '.join(SECTIONS)}, {', '.join(SECTIONS_OPTIONAL)}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bakeoff.py",
+        description=__doc__.split("\n\n")[0] if __doc__ else None,
+        epilog=USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--list", action="store_true",
+                   help="show adapters, tiers, splitters and document classes, then exit")
+    p.add_argument("--only", nargs="+", metavar="SECTION", default=None,
+                   help=f"sections to run: {', '.join(SECTIONS)}, {', '.join(SECTIONS_OPTIONAL)}")
+    p.add_argument("--tier", nargs="+", type=int, choices=(1, 2), default=[1], metavar="N",
+                   help="parser tiers to include (default: 1). Tier 2 runs layout models: "
+                        "model download on first use, tens of seconds per page on CPU")
+    p.add_argument("--parser", nargs="+", default=[], metavar="SUBSTR",
+                   help="only PDF parsers whose name contains one of these (e.g. docling pymupdf)")
+    p.add_argument("--chunker", nargs="+", default=[], metavar="SUBSTR",
+                   help="only splitters whose name contains one of these (e.g. semchunk langchain)")
+    p.add_argument("--doc", nargs="+", default=[], metavar="NAME",
+                   help="restrict to document classes or fixtures matching these substrings")
+    p.add_argument("--max-tokens", type=int, default=128, metavar="N",
+                   help="chunk budget for the splitter comparison and probe (default: 128)")
+    p.add_argument("--show-chunks", type=int, default=0, metavar="N",
+                   help="with --only probe, print the first N chunks of each combination")
+    return p
 
 
 def main(argv: list[str]) -> int:
-    if "--list" in argv:
-        print("adapter status (install with: uv pip install -r requirements-bakeoff.txt)\n")
-        for module, pip, what in ADAPTERS:
-            print(f"  {'OK ' if have(module) else '-- '} {pip:<28} {what}")
+    args = build_parser().parse_args(argv)
+
+    if args.list:
+        _print_list()
         return 0
     if not ROOT.exists():
         print("corpus/ is missing — run `python3 make_fixtures.py` first", file=sys.stderr)
         return 1
 
-    chosen = list(SECTIONS)
-    if "--only" in argv:
-        wanted = argv[argv.index("--only") + 1 :]
-        chosen = [s for s in wanted if s in SECTIONS]
-        if not chosen:
-            print(f"available sections: {', '.join(SECTIONS)}", file=sys.stderr)
-            return 1
+    known = {**SECTIONS, **SECTIONS_OPTIONAL}
+    chosen = list(SECTIONS) if args.only is None else [s for s in args.only if s in known]
+    if not chosen:
+        print(f"available sections: {', '.join(known)}", file=sys.stderr)
+        return 1
 
-    installed = sum(1 for m, _, _ in ADAPTERS if have(m))
-    print(f"bake-off: {installed}/{len(ADAPTERS)} adapters available "
-          f"(`--list` for details, `--only <section>` to narrow)")
+    opts = Options(
+        tiers=set(args.tier),
+        parsers=args.parser,
+        chunkers=args.chunker,
+        docs=args.doc,
+        max_tokens=args.max_tokens,
+        show_chunks=args.show_chunks,
+    )
+
+    installed = sum(1 for m, _, _, _ in ADAPTERS if have(m))
+    print(f"bake-off: {installed}/{len(ADAPTERS)} adapters available, "
+          f"tier {'+'.join(str(t) for t in sorted(opts.tiers))} "
+          f"(`--list` for details, `--help` for filters)")
     for name in chosen:
-        SECTIONS[name]()
+        known[name](opts)
     print()
     return 0
 
 
+# MinerU and `unstructured`'s hi_res path spawn worker processes, and a spawned worker
+# re-imports this module. Without this guard the workers would re-run the bake-off.
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))

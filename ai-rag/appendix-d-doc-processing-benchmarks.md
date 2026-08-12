@@ -12,6 +12,9 @@
 > you need to verify any choice made here against your own corpus),
 > [`15-ingestion-pipelines-and-freshness.md`](15-ingestion-pipelines-and-freshness.md) (parser and
 > chunker throughput directly determine ingestion SLOs),
+> [`appendix-e-deployment-and-compute.md`](appendix-e-deployment-and-compute.md) (where the tools
+> chosen here actually run, what hardware they need, and what they cost — §9.3 shows the parser
+> tier choice moving total ingestion cost by three to four orders of magnitude),
 > [`labs/document-processing/`](labs/document-processing/) (the bake-off lab that makes every claim
 > here falsifiable against your own documents).
 >
