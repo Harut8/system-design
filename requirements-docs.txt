@@ -1,0 +1,6 @@
+# Docs site toolchain. Used by scripts/stage-docs.sh + .github/workflows/pages.yml.
+# Nothing here is needed to read or edit the notes -- only to build the HTML site.
+mkdocs==1.6.1
+mkdocs-material==9.7.7
+mkdocs-awesome-nav==3.3.0
+pymdown-extensions==11.0.1

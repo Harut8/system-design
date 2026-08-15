@@ -1,0 +1,18 @@
+# Top-level navigation order and section titles.
+# Everything below a section is ordered automatically -- the notes use numeric
+# filename prefixes (00-, 01-, ...), so the default ascending sort is correct.
+nav:
+  - index.md
+  - System Design Guide: SYSTEM-DESIGN-GUIDE.md
+  - Python & Systems Internals: python-mastery
+  - Databases & Storage: databases
+  - Distributed Systems: distributed-systems
+  - Kubernetes & Containers: kubernetes
+  - Kubernetes Labs: k8s-learn
+  - SRE & Observability: sre-observability
+  - GPU Observability: gpu-observability
+  - AI & RAG: ai-rag
+  - Design Tasks: tasks
+  - Design Solutions: solutions
+  - Reference Implementations: implementation
+  - "*"

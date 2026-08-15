@@ -1,0 +1,124 @@
+site_name: System Design Notes
+site_description: >-
+  Working notes on systems engineering -- CPython and OS internals, database
+  and storage engines, distributed systems, Kubernetes, SRE and GPU
+  observability, and retrieval-augmented generation.
+site_url: https://harut8.github.io/system-design/
+repo_url: https://github.com/Harut8/system-design
+repo_name: Harut8/system-design
+edit_uri: edit/main/
+
+# Built from the staging tree produced by scripts/stage-docs.sh -- run that
+# before `mkdocs build` or `mkdocs serve`. Both paths are gitignored.
+docs_dir: .docs-build
+site_dir: .docs-site
+
+# Lab corpus files are generated parser fixtures, not notes.
+exclude_docs: |
+  ai-rag/labs/*/corpus/
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+
+plugins:
+  - search
+  - awesome-nav
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+# MathJax, for the handful of notes using $$...$$ blocks.
+extra_javascript:
+  - js/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Harut8
+      name: Harut8 on GitHub
+
+validation:
+  nav:
+    omitted_files: info
+    not_found: warn
+  links:
+    # Links to chapters that aren't written yet (python-mastery has gaps at
+    # 14, 18, 21, 23, 27, 33-34, 36, 38-41, 44-45). Kept at warn so the CI log
+    # tracks the backlog.
+    not_found: warn
+    unrecognized_links: warn
+    absolute_links: info
+    # Demoted to info: many notes have a hand-written "Table of Contents" whose
+    # links use short slugs (#2-reasons) while the heading generates the full
+    # slug (#2-the-five-reasons-to-migrate). ~570 instances across 110 files.
+    # These are already broken when viewing the notes on GitHub; fixing them is
+    # a content change, not a site-config one.
+    anchors: info

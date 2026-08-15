@@ -18,8 +18,14 @@ __pycache__/
 # Labs create their own venv for optional tooling (see
 # ai-rag/labs/document-processing/requirements-bakeoff.txt).
 .venv/
+.venv-docs/
 venv/
 gilvenv/
+
+# --- Docs site build artifacts ---------------------------------------------------
+# scripts/stage-docs.sh writes .docs-build/, `mkdocs build` writes .docs-site/.
+.docs-build/
+.docs-site/
 
 # --- Personal, not for publication -----------------------------------------------
 OUTREACH-KIT.md

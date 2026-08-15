@@ -1,0 +1,67 @@
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.md"
+      - "**.MD"
+      - "**/.nav.yml"
+      - docs/**
+      - mkdocs.yml
+      - requirements-docs.txt
+      - scripts/stage-docs.sh
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # stage-docs.sh selects files via `git ls-files`, which needs the
+          # repo metadata but not the history.
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install docs toolchain
+        run: pip install -r requirements-docs.txt
+
+      - name: Stage notes into a single docs tree
+        run: ./scripts/stage-docs.sh
+
+      # Not --strict: the notes carry pre-existing broken links to unwritten
+      # chapters, and a hard failure there would block every deploy. Warnings
+      # stay visible in this step's log.
+      - name: Build site
+        run: mkdocs build
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: .docs-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
