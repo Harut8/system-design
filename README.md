@@ -21,6 +21,7 @@ several have runnable code alongside them.
 | [`gpu-observability/`](gpu-observability/README.md) | DCGM internals, GPU cluster telemetry, utilization efficiency, failure detection, LLM inference and training observability | 23 |
 | [`ai-rag/`](ai-rag/README.md) | Embeddings, chunking, vector indexes, hybrid retrieval and reranking, evaluation methodology, plus labs | 9 + labs |
 | [`tasks/`](tasks/) · [`solutions/`](solutions/) · [`implementation/`](implementation/) | Design problems at four scale tiers (10k → 10m), worked solutions, and reference implementations | — |
+| [`primitives/`](primitives/README.md) | The reusable decisions extracted out of the worked solutions — one sheet per design, so the next design costs less than the last | 1 |
 | [`SYSTEM-DESIGN-GUIDE.md`](SYSTEM-DESIGN-GUIDE.md) | Cross-cutting reference tying the tracks together | — |
 
 ## Building the site locally

@@ -25,6 +25,7 @@ CONTENT_DIRS=(
   implementation
   k8s-learn
   kubernetes
+  primitives
   python-mastery
   solutions
   sre-observability

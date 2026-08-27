@@ -14,5 +14,6 @@ nav:
   - AI & RAG: ai-rag
   - Design Tasks: tasks
   - Design Solutions: solutions
+  - Design Primitives: primitives
   - Reference Implementations: implementation
   - "*"
