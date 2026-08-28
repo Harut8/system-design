@@ -16,6 +16,7 @@ A comprehensive reference covering data distribution strategies, replication top
 8. [Failure Handling](#8-failure-handling)
 9. [Consistency Models](#9-consistency-models)
 10. [Comparison Table](#10-comparison-table)
+11. [Design Playbook: Invariant to Mechanism](#11-design-playbook-invariant-to-mechanism)
 
 ---
 
@@ -157,6 +158,141 @@ Is data loss / inconsistency acceptable?
 | Social media like counter | AP | Off-by-one like count is invisible to users |
 | Distributed lock service | CP | Incorrect lock = data corruption |
 | DNS | AP | Stale record for TTL is by design |
+
+### 1.5 Before CAP: Invariants, Not Labels
+
+CAP and PACELC classify *systems*. Production designs need guarantees per *operation*.
+Before choosing either, separate five properties that the word "consistency" routinely collapses.
+
+```
+The Five Properties People Call "Consistency"
+══════════════════════════════════════════════
+
+┌──────────────┬───────────────────────────────┬──────────────────────────────────┐
+│ Property     │ Question it answers           │ Canonical failure                │
+├──────────────┼───────────────────────────────┼──────────────────────────────────┤
+│ Replication  │ How many copies exist, and    │ Disk dies, data is gone          │
+│              │ how do updates propagate?     │                                  │
+├──────────────┼───────────────────────────────┼──────────────────────────────────┤
+│ Consistency  │ What may a reader observe?    │ User's own edit disappears on    │
+│              │                               │ refresh                          │
+├──────────────┼───────────────────────────────┼──────────────────────────────────┤
+│ Durability   │ Does an ACKed write survive   │ Async commit + primary crash =   │
+│              │ a crash?                      │ acknowledged write lost          │
+├──────────────┼───────────────────────────────┼──────────────────────────────────┤
+│ Availability │ Does a non-failed node answer │ Minority partition refuses reads │
+│              │ at all?                       │ it could have served safely      │
+├──────────────┼───────────────────────────────┼──────────────────────────────────┤
+│ Correctness  │ Can the observed state violate│ Balance goes negative;           │
+│              │ a business invariant?         │ two customers get the last unit  │
+└──────────────┴───────────────────────────────┴──────────────────────────────────┘
+
+  They are independent. All four combinations exist in production:
+
+    Consistent but not durable    Raft group with fsync disabled. Every reader
+                                  agrees; a correlated power loss drops
+                                  committed entries.
+
+    Durable but not consistent    Async PostgreSQL replica. The write is on the
+                                  primary's disk, just not visible everywhere.
+
+    Available but not durable     Node ACKs into a memory buffer, then crashes.
+                                  The client got a response; the data never existed.
+
+    Consistent but not correct    Every replica agrees the balance is -$500,
+                                  because no one enforced the invariant.
+```
+
+That last row is the point: **consistency is a means, the invariant is the end.** A like
+count of 999,999 instead of 1,000,000 is a consistency defect that is not a correctness
+defect. A negative balance is a correctness defect even when every replica agrees on it
+perfectly. Strong consistency does not give you correctness for free -- it only makes it
+*possible* to enforce.
+
+**The design ladder** -- run it per operation, never per database:
+
+```
+  1. Business invariant     "sold <= available", "sum(ledger) == balance",
+                            "one order per idempotency key"
+  2. Guarantee required     Linearizable CAS? Read-your-writes? Just convergence?
+  3. Consistency model      -> §9
+  4. Replication strategy   Single-leader / multi-leader / leaderless / consensus (§2, §3)
+  5. Sync point             Which ACK does the client actually wait for?
+  6. Partition behaviour    Reject / degrade / accept-and-reconcile
+  7. Conflict resolution    LWW / vector clocks / CRDT / app merge / conflicts impossible
+  8. Latency budget         Does step 5 fit in it? If not, return to step 1
+                            and renegotiate the invariant with the business.
+```
+
+Step 8 looping back to step 1 is not a failure of the process. "Airlines deliberately
+overbook" and "Amazon accepts the order and cancels later" are both cases where the
+business changed the invariant because the coordination cost was not worth paying.
+
+**Two questions that replace "is it CP or AP?"**
+
+```
+  Q1. Which invariant does this operation protect, and can stale data violate it?
+
+      Stale is merely inconvenient  -> weak guarantee is fine
+      Stale can break the invariant -> you need coordination
+
+  Q2. If two replicas independently accept this operation during a partition,
+      is the merge total and deterministic?
+
+      add_to_set(user, post)      -> YES. Union works. Safe to be AP.
+      increment(views)            -> YES. Sum of per-replica counters.
+      decrement_with_floor(stock) -> NO.  100 - 80 - 80 = -60. Cannot be AP
+                                          without a reservation protocol.
+      set_username(name)          -> NO.  Uniqueness is a global predicate.
+
+  Q2 is the sharper test. An operation whose merge function is associative,
+  commutative, and idempotent can be made available under partition (§2.2 CRDTs).
+  One that enforces a global predicate -- uniqueness, a floor, a budget -- cannot,
+  unless you first reserve capacity through a coordinated path.
+```
+
+**One application, five different guarantees.** A single checkout flow mixes them:
+
+| Operation | Invariant at risk | Guarantee needed | Mechanism | Behaviour under partition |
+|---|---|---|---|---|
+| Reserve last unit | `sold <= available` | Linearizable CAS on the row | Raft leaseholder / conditional write | Reject the checkout |
+| Create order | One order per idempotency key | Linearizable unique insert | Unique constraint on the key | Reject, client retries |
+| Capture payment | Money is conserved | Linearizable + durable ledger append | Consensus + fsync | Reject, retry later |
+| Update search index | None (derived data) | Eventual | CDC -> indexer | Accept, catch up after |
+| Increment view count | None | Eventual + convergent | Sharded counter / G-Counter | Accept, merge |
+| Cart contents | None (merge is cheap) | Causal + convergent | Multi-leader + OR-Set | Accept, merge |
+
+Same product, same request path, six different answers. A design that picks one
+consistency level for the whole application is either overpaying on the bottom three
+rows or unsafe on the top three.
+
+**Where the complexity goes.** Weak consistency is not "consistency, but cheaper" --
+it is coordination cost traded for permanent application complexity:
+
+```
+  Strong consistency                 Eventual consistency
+  ══════════════════                 ════════════════════
+  Cost paid ONCE, at write time      Cost paid in EVERY consumer, forever
+
+  + extra RTTs to a quorum           + idempotency keys on every operation
+  + availability tied to quorum      + dedup tables / bloom filters
+  + tail latency from the slowest    + out-of-order and late-arrival handling
+    replica in the quorum            + reconciliation jobs and backfills
+  + more failure dependencies        + invariant-checking sweeps
+  + harder cross-region deployment   + user-visible divergence to design around
+                                     + a permanently larger on-call surface
+
+  Budget the reconciliation code BEFORE choosing eventual consistency.
+  Teams routinely count the RTTs they saved and never count the six
+  reconciliation services they now operate.
+```
+
+**On the CP/AP labels.** "MongoDB is CP" and "Cassandra is AP" are shorthand for a
+default configuration, not properties of the software. The same MongoDB cluster is
+PC/EC with `w:majority` + `readConcern:linearizable`, and PA/EL with `w:1` and reads
+from secondaries. Cassandra with `LOCAL_QUORUM` on both paths behaves very differently
+from `CL=ONE`. State the operation's configured level and its partition behaviour --
+the label belongs to the operation, not the logo.
 
 ---
 
@@ -715,6 +851,60 @@ Quorum: W + R > N
   │ Fast-W   │ 3 │ 1 │ 3 │ Fast writes, slow reads, less durable│
   │ Large N  │ 5 │ 3 │ 3 │ Survives 2 node failures             │
   └──────────┴───┴───┴───┴────────────────────────────────────────┘
+```
+
+#### What W + R > N Does NOT Buy You
+
+```
+Quorum Intersection != Linearizability
+═══════════════════════════════════════
+
+  Overlap guarantees the read set intersects the last SUCCESSFUL write set.
+  That is weaker than "reads return the most recent write." Known holes:
+
+  1. PARTIAL WRITES (no rollback)
+     ────────────────────────────
+     Write with W=2, N=3 reaches only N1, then fails and returns an error.
+     Nothing undoes N1. Subsequent reads flicker:
+
+       read hits {N1,N2} -> sees the "failed" value
+       read hits {N2,N3} -> does not
+       read repair later -> the failed write silently WINS
+
+     A failed write is not an absent write.
+
+  2. CONCURRENT WRITES
+     ─────────────────
+     Two clients write different values, both reach quorum. Resolution is
+     LWW (drops one write silently) or siblings (application must merge).
+     Neither produces a real-time order, which is what linearizability requires.
+
+  3. READ-REPAIR RACES
+     ─────────────────
+     A read that repairs replicas mid-flight can let a LATER read observe an
+     OLDER value than an earlier one -- a monotonic-read violation -- unless
+     repairs are serialized against concurrent reads.
+
+  4. SLOPPY QUORUM
+     ─────────────
+     Hinted writes land outside the key's preference list, so a strict read
+     quorum over that list can miss them entirely (see below).
+
+  5. CLOCK SKEW UNDER LWW
+     ────────────────────
+     A node whose clock runs 5s fast stamps its writes into the future.
+     Later, correct writes lose the comparison and are discarded.
+     Every quorum condition was satisfied; the write is still gone.
+
+  To get linearizability on a leaderless store you need an extra protocol:
+
+    Cassandra   Lightweight transactions -- Paxos per partition key
+                (4 round trips, ~10-20x the cost of a QUORUM write)
+    DynamoDB    Conditional writes (ConditionExpression) + ConsistentRead
+    Riak        Strong-consistency buckets (consensus-backed)
+
+  Quorum alone means "usually fresh," not "correct." Use it for freshness,
+  never for enforcing an invariant.
 ```
 
 #### Sloppy Quorum and Hinted Handoff
@@ -2478,12 +2668,22 @@ Consistency Model Spectrum
    ▼
   Causal Consistency
    │
-   ▼
-  Bounded Staleness
-   │
-   ▼
+   ├──────────────┐
+   ▼              ▼
+  Session      Bounded Staleness
+  Guarantees   (recency, no ordering)
+   │              │
+   └──────┬───────┘
+          ▼
   Eventual Consistency
 ```
+
+**The spectrum is not a total order.** Bounded staleness and causal consistency are
+incomparable: bounded staleness bounds *recency* ("at most 5s behind") but permits
+reordering, while causal consistency preserves *ordering* but permits unbounded lag.
+A system can offer one, both, or neither. Treat the diagram as a rough guide to cost,
+not as a lattice -- and when comparing two databases, compare the actual guarantees,
+not their positions on a picture.
 
 ### 9.1 Linearizability
 
@@ -2588,7 +2788,109 @@ Causal Consistency
   Systems: MongoDB (with majority read concern + majority write concern)
 ```
 
-### 9.4 Eventual Consistency
+### 9.4 Session Guarantees (The Practical Middle)
+
+Full causal or linearizable consistency is expensive. Yet nearly every user-visible
+"the database is broken" complaint is fixed by four much cheaper guarantees, each
+scoped to a single client *session* rather than to the whole system. §2.1 showed these
+as replication-lag anomalies; here they are as a model you deliberately choose.
+
+```
+The Four Session Guarantees
+════════════════════════════
+
+  1. READ-YOUR-WRITES (read-after-write)
+     "My own writes are visible to me."
+     Fixes: "I changed my avatar and it still shows the old one."
+
+  2. MONOTONIC READS
+     "I never move backwards in time."
+     Fixes: "The comment was there, I refreshed, now it's gone, refreshed again,
+             it's back."
+
+  3. MONOTONIC WRITES
+     "My writes apply in the order I issued them."
+     Fixes: post created after its own edit is applied -- edit silently lost.
+
+  4. WRITES-FOLLOW-READS (session causality)
+     "If I read X and then write Y, anyone who sees Y also sees X."
+     Fixes: your reply to a post is visible on a replica that lacks the post.
+
+  Together these give a single user a coherent view of the world WITHOUT any
+  global ordering. Two different users may still disagree with each other --
+  which is almost always acceptable, because users compare notes far less
+  often than product managers fear.
+```
+
+**Implementation, and what each approach costs:**
+
+| Guarantee | Implementation | Cost | Breaks when |
+|---|---|---|---|
+| Read-your-writes | Route reads to leader for T seconds after a write | Leader read load; T is a guess | Actual lag exceeds T |
+| Read-your-writes | Client carries a write token (LSN / HLC / `operationTime`); replica waits for it or redirects | One field on the request; occasional wait | Token not propagated across services or devices |
+| Monotonic reads | Pin session to one replica (hash of user ID) | Uneven load | Failover, rebalance, pool churn — silently |
+| Monotonic reads | Carry the highest token seen; reject or wait on older replicas | Small | Many lagging replicas → frequent waits |
+| Monotonic writes | All session writes through one leader, with per-session sequence numbers | Serialization per session | Multi-leader topologies |
+| Writes-follow-reads | Attach the read token to the subsequent write; replicas apply only after the dependency | Dependency tracking | Cross-shard dependencies |
+
+```
+Token-Based Read-Your-Writes (the version that survives failover)
+══════════════════════════════════════════════════════════════════
+
+  Client                 Leader                    Follower
+    │                      │                          │
+    ├── WRITE(x=5) ───────►│                          │
+    │                      │ commit at LSN 4711       │
+    │◄── OK, token=4711 ───┤                          │
+    │                      ├── replicate ────────────►│ (lagging, at 4700)
+    │                      │                          │
+    ├── READ(x), token=4711 ──────────────────────────►│
+    │                                                  │ applied < 4711
+    │                                                  │ → wait, or redirect
+    │◄──────────────────── x=5 ────────────────────────┤
+```
+
+**Sticky routing is a scheduling trick, not a guarantee.** Pinning a user to a replica
+appears to work in staging and degrades silently in production at every failover,
+rebalance, replica restart, connection-pool recycle, and second device. Nothing raises
+an error; the user just sees time travel. Only the token-based version survives topology
+change, because the guarantee then lives in the data, not in the routing table.
+
+**The guarantee ends at the database boundary.** A token that is not propagated through
+the gateway, the service mesh, and the cache layer buys nothing: a stale Redis entry
+in front of a perfectly session-consistent database breaks read-your-writes just as
+effectively. Session consistency is a property of the whole request path, and it is
+usually a cache — not the database — that violates it.
+
+**Real systems:**
+
+```
+  MongoDB       Causally consistent sessions: afterClusterTime / operationTime.
+                Provides all four guarantees within a session. Opt-in per client.
+
+  PostgreSQL    Client reads pg_current_wal_lsn() from the primary after a write,
+                then waits on pg_last_wal_replay_lsn() at the replica (or falls
+                back to the primary). Manual, but effective.
+
+  CockroachDB   Session-scoped read timestamps; follower reads are bounded-stale
+                by the closed timestamp (see §9.6).
+
+  DynamoDB      No session tokens. Per-request ConsistentRead=true is a leader
+                read -- correct, but 2x the RCU cost and no monotonicity across
+                eventually-consistent reads.
+
+  Cassandra     No session guarantees. LOCAL_QUORUM on both paths approximates
+                read-your-writes within one datacenter only -- and inherits every
+                caveat in "What W + R > N Does NOT Buy You" (§2.3).
+```
+
+**When session guarantees are the right answer:** the invariant is not at risk, but the
+*user experience* is. Profile edits, comments, settings, drafts, "my orders" lists.
+When the invariant *is* at risk — stock, balances, uniqueness — session guarantees are
+irrelevant, because the operation must be correct with respect to *other* users' writes,
+not just your own.
+
+### 9.5 Eventual Consistency
 
 ```
 Eventual Consistency (Weakest Useful Guarantee)
@@ -2621,7 +2923,7 @@ Eventual Consistency (Weakest Useful Guarantee)
     - DO NOT use for financial balances
 ```
 
-### 9.5 Bounded Staleness
+### 9.6 Bounded Staleness
 
 ```
 Bounded Staleness
@@ -2652,7 +2954,7 @@ Bounded Staleness
     - Dramatically reduces read latency for geo-distributed reads
 ```
 
-### 9.6 Jepsen Testing
+### 9.7 Jepsen Testing
 
 ```
 Jepsen: Distributed Systems Testing
@@ -2767,10 +3069,288 @@ Decision Guide
 
 ---
 
+## 11. Design Playbook: Invariant to Mechanism
+
+§1.5 gave the ladder. This section walks three operations down it end to end, then gives
+the failure drill and the traps. The pattern to internalize: **decompose the feature into
+operations, and give each operation the weakest guarantee that still protects its
+invariant.**
+
+### 11.1 Case Study: Likes (the one everybody gets half-right)
+
+The common answer is "likes are AP, use eventual consistency." That is half of the design.
+The real move is noticing that "like" is *two operations with different invariants*.
+
+```
+Decomposition
+══════════════
+
+  Operation A: "Did user X like post Y?"
+  ─────────────────────────────────────
+  Invariant:   exactly one like per (user, post); a retry must not double-count
+  Guarantee:   uniqueness on the key -- a global predicate on a SINGLE key
+  Mechanism:   PRIMARY KEY (user_id, post_id), INSERT ... ON CONFLICT DO NOTHING
+  Note:        this is a per-key predicate, so it is cheap. A single-shard
+               conditional write is enough -- no cross-shard consensus.
+
+  Operation B: "How many likes does post Y have?"
+  ──────────────────────────────────────────────
+  Invariant:   none. The count is derived and self-correcting.
+  Guarantee:   eventual + convergent
+  Mechanism:   sharded counters, aggregated asynchronously
+  Note:        undercounting for 2 seconds violates nothing.
+```
+
+Why the decomposition matters: the count is what people focus on, but the *relationship*
+is where the actual bug lives. Retries are the norm, not the exception:
+
+```
+The Retry That Creates a Bug
+═════════════════════════════
+
+  Client ──── POST /like ────► Server
+                                 │
+                                 ├── row written  ✓
+                                 │
+              response ◄─────────┤
+                  ✗ (connection dropped, LB timeout, app backgrounded)
+
+  Client retries. Without a uniqueness constraint: +2 likes from one tap.
+
+  The fix is NOT stronger consistency. The write already succeeded and was
+  already durable. The fix is making the OPERATION idempotent, which the
+  (user_id, post_id) key does for free.
+```
+
+**Counter architecture.** A single row per post is a hot key: every like on a viral post
+contends on one lock, one leaseholder, one Raft group.
+
+```
+  Naive:    UPDATE posts SET likes = likes + 1 WHERE id = 123
+            → one row, one leader, serialized. A celebrity post melts a shard.
+
+  Sharded:  UPDATE like_counts SET n = n + 1
+            WHERE post_id = 123 AND shard = hash(user_id) % 16
+            → 16 independent rows, 16x the write concurrency
+
+  Read:     SELECT SUM(n) FROM like_counts WHERE post_id = 123
+            → cached; recomputed on a schedule or on invalidation
+
+  Cost:     reads got more expensive and slightly stale.
+            That is exactly the trade you wanted for a display counter.
+```
+
+**Cross-region partition.** Because the underlying structure is a *set* of `(user, post)`
+pairs, the merge is a union — associative, commutative, idempotent. This passes Q2 in
+§1.5, so both regions can accept likes during a partition and reconcile afterwards
+(§2.2 CRDTs). A count derived from a converged set converges too.
+
+Full ladder for likes:
+
+| Rung | Choice |
+|---|---|
+| Invariant | One like per (user, post); count is derived |
+| Guarantee | Idempotent unique insert; eventual convergent count |
+| Consistency model | Session guarantees for the actor (your like shows as liked), eventual for everyone else |
+| Replication | Async, leader per shard |
+| Sync point | Local durable commit, then event stream |
+| Partition | Accept in both regions |
+| Conflicts | Union of sets; sum of counters |
+| Latency | Single-digit ms write |
+
+### 11.2 Case Study: Reserving the Last Unit
+
+Same product, opposite answer.
+
+```
+Why Eventual Consistency Oversells
+═══════════════════════════════════
+
+  stock = 1, replicated to two regions
+
+  Region A: user buys → local read says 1 → decrement → "confirmed"
+  Region B: user buys → local read says 1 → decrement → "confirmed"
+
+  merge: 1 - 1 - 1 = -1
+
+  There is no merge function that fixes this. "sold <= available" is a
+  predicate over state that both sides needed to evaluate exclusively.
+  This is Q2 in §1.5 answering NO.
+```
+
+Three legitimate designs, in increasing order of coordination:
+
+```
+  1. RESERVE THROUGH A SINGLE OWNER (the default)
+     ────────────────────────────────────────────
+     Every SKU has one authoritative shard/leaseholder.
+     UPDATE inventory SET reserved = reserved + 1
+       WHERE sku = ? AND reserved < available     -- conditional write
+     Fails cleanly when the condition is false. One round trip to one
+     Raft group. Under partition, the minority side rejects checkouts.
+
+     This is the important insight: you do NOT need a globally strongly
+     consistent DATABASE. You need a linearizable operation on ONE key.
+     That is dramatically cheaper -- and it is what CockroachDB, Spanner,
+     and DynamoDB conditional writes all give you per key.
+
+  2. CAPACITY LEASES (regional pre-allocation)
+     ─────────────────────────────────────────
+     The owner grants region A a lease on 40 units, region B on 60.
+     Each region then sells from its own pool with NO cross-region
+     coordination -- local latency, and partition-tolerant.
+     Expired/unused leases return to the pool.
+
+     Trade-off: A can sell out while B still holds stock. You have
+     traded utilization for latency and availability. Very common
+     in ticketing, ad budgets, and rate limiting.
+
+  3. OVERSELL AND COMPENSATE (change the invariant)
+     ──────────────────────────────────────────────
+     Accept optimistically, reconcile asynchronously, cancel and refund
+     the losers. Correct only if the business accepts the apology cost.
+     Airlines overbook on purpose. Amazon accepts orders it may cancel.
+
+     This is a BUSINESS decision surfaced as an architecture decision.
+     Bring it to the product owner rather than deciding it silently in
+     a design doc.
+```
+
+Note that option 3 is not "weaker engineering" — it is a different invariant
+(`sold <= available + acceptable_overshoot`) with an explicit compensation path,
+which is precisely the Saga pattern from §5.3.
+
+### 11.3 Case Study: Money Movement
+
+```
+Why You Cannot Merge Your Way Out
+══════════════════════════════════
+
+  US replica: balance = 100        EU replica: balance = 100
+  withdraw(80) → 20                withdraw(80) → 20
+
+  Merge strategies, all wrong:
+    LWW           → 20. One withdrawal vanishes; the bank is short $80.
+    min()         → 20. Same.
+    sum of deltas → -60. Invariant violated.
+
+  The mistake is storing a BALANCE. Balances do not merge.
+```
+
+The production shape:
+
+```
+  1. Store the LEDGER, not the balance.
+     Append-only entries: (txn_id, account, delta, timestamp).
+     Appends commute -- a ledger IS mergeable. The balance is a fold
+     over the ledger, i.e. derived data (§1.5).
+
+  2. Enforce the invariant at the point of debit, not at read time.
+     The "balance >= amount" check must be a linearizable conditional
+     operation on the account. That is one key, one leader -- as in 11.2.
+
+  3. Idempotency key on every transfer.
+     (client_id, request_id) unique. Payment APIs retry aggressively;
+     without this, a network timeout charges the customer twice.
+
+  4. Cross-account transfers are cross-shard.
+     Same shard  -> single transaction, done.
+     Cross-shard -> 2PC over consensus-replicated participants (§5.1, §5.4)
+                    or a Saga with an explicit compensating credit (§5.3).
+                    Never two independent commits and a hope.
+
+  5. Reconciliation is not optional.
+     A periodic job asserts sum(ledger) == materialized balance for
+     every account. When strong consistency is real, this finds nothing --
+     which is exactly why you should run it: silence is the signal.
+```
+
+### 11.4 The Failure Drill
+
+Run all five against any replicated design. These questions are worth more than
+any CP/AP label.
+
+| # | Scenario | The question to answer |
+|---|---|---|
+| 1 | A replica is slow (not dead) | Do writes block, time out, or degrade the quorum? Slow is harder than dead — it passes health checks (§8.2 gray failure) |
+| 2 | A replica is dead | Can we still commit? At what redundancy level are we now running? |
+| 3 | Network partition | Which side keeps serving? Can both sides accept writes, and does the merge exist? |
+| 4 | Leader dies right after ACK | Was the write durable? Does the new leader have it? What did the client believe? |
+| 5 | Conflicting concurrent writes | Who wins, deterministically? Is a losing write logged anywhere, or silently discarded? |
+
+Scenario 4 is the one most designs answer wrong: with async replication, the client
+holds an acknowledgement for a write that no longer exists. Decide explicitly whether
+that is acceptable, and if it is not, move the sync point (§1.5, rung 5).
+
+Scenario 5 deserves the same scrutiny: "last write wins" is a decision to lose data
+silently. If losing that write matters, log the loser or use siblings.
+
+### 11.5 Traps
+
+```
+  "CAP says pick two of three."
+      P is not a choice. The statement is: during a partition, a system that
+      keeps operating chooses between linearizability and availability.
+
+  "We use ACID transactions, so the system is consistent."
+      ACID holds at ONE database boundary. DB -> Kafka -> search -> cache
+      is asynchronous end to end. Always ask: at WHICH boundary does the
+      guarantee hold, and what happens one hop past it?
+
+  "We need exactly-once delivery."
+      You cannot have it across a network. You get at-least-once delivery
+      plus idempotent effects, which is operationally equivalent and
+      actually implementable (§11.1).
+
+  "Our database is CP, so we're safe."
+      Then someone sets readPreference=secondary for a dashboard, and six
+      months later that connection string is reused for a checkout path.
+      The guarantee is per operation and it drifts.
+
+  "Eventual consistency is faster."
+      It is faster at write time and more expensive everywhere else,
+      permanently (§1.5, "where the complexity goes").
+
+  "Sticky sessions give us read-your-writes."
+      Until the first failover (§9.4).
+
+  "We'll add strong consistency later."
+      The hardest retrofit in this document. Ordering, versioning, and
+      idempotency keys must exist in the data model from the start;
+      adding them later means rewriting every consumer and backfilling
+      history that no longer has the information you need.
+
+  "Multi-region active-active."
+      Only for operations whose merge is total and deterministic. Applying
+      it uniformly is how inventory gets oversold and balances go negative.
+```
+
+### 11.6 Answering "Would You Make This CP or AP?"
+
+The question is a probe for whether you reason at the operation level. A strong answer
+refuses the framing and then delivers something more specific:
+
+> "It depends on the operation, so let me decompose the feature. The like *relationship*
+> needs a unique, idempotent write on `(user_id, post_id)` — that's a predicate on a
+> single key, so a conditional write on one shard is enough; I don't need a globally
+> consistent database for it. The like *count* is derived, so it can be eventually
+> consistent and served from sharded counters. Both merge cleanly under partition
+> because the underlying structure is a set, so I'd keep accepting writes in both
+> regions and reconcile — call it PA/EL. The operation that changes my answer is
+> inventory reservation: `sold <= available` has no merge function, so that one goes
+> through a single leaseholder with a conditional write and rejects during a partition.
+> Same system, opposite choice, because the invariants differ."
+
+The content that makes it strong: decomposition into operations, naming the invariant,
+the merge-function test, the cheap mechanism instead of the expensive one, and a
+contrasting operation that proves you are not applying one answer everywhere.
+
+---
+
 ## Key Takeaways
 
 ```
-Top 10 Principles for Distributed Storage
+Top 12 Principles for Distributed Storage
 ═══════════════════════════════════════════
 
   1. REPLICATION is for availability and read scalability.
@@ -2779,6 +3359,7 @@ Top 10 Principles for Distributed Storage
 
   2. CAP is a spectrum, not a binary choice.
      Most systems let you tune consistency per-operation.
+     The label belongs to the OPERATION, not to the database logo.
 
   3. Raft won the consensus war for open-source systems.
      Paxos won at Google. Both work. Raft is easier to implement correctly.
@@ -2809,4 +3390,16 @@ Top 10 Principles for Distributed Storage
  10. Start with the simplest architecture that meets your requirements.
      Single-node PostgreSQL handles more than most teams think.
      Distribute only when you have evidence you need to.
+
+ 11. CONSISTENCY IS A MEANS; THE INVARIANT IS THE END.
+     Choose the weakest guarantee that still protects the invariant,
+     per operation. A stale like count is a consistency defect that is
+     not a correctness defect. A negative balance is a correctness
+     defect even when every replica agrees on it. (§1.5)
+
+ 12. Before designing for a partition, ask whether the operation's merge
+     is total and deterministic. add_to_set merges; decrement_with_floor
+     does not. That single test predicts whether the operation can be
+     available under partition -- and it is a cheaper question than
+     "is this database CP or AP?" (§1.5, §11)
 ```
