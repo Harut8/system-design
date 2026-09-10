@@ -37,7 +37,7 @@ repository alongside them.
     engines, transactions and concurrency control, B-trees and LSM-trees,
     write-ahead logging, and vector search internals.
 
-    [:octicons-arrow-right-24: 24 chapters](databases/MENTAL_MODEL.md)
+    [:octicons-arrow-right-24: 25 chapters](databases/MENTAL_MODEL.md)
 
 -   :material-lan:{ .lg .middle } __Distributed Systems__
 
