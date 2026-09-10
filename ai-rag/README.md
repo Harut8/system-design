@@ -64,9 +64,9 @@ keeps every claim honest by construction.
 | [`02-chunking-and-document-processing.md`](02-chunking-and-document-processing.md) | Parsing, chunk strategies, contextual/late chunking, parent-doc | **written** — labs unrun |
 | [`03-indexing-and-vector-stores.md`](03-indexing-and-vector-stores.md) | HNSW parameters in anger, quantization, filtered search, pgvector vs dedicated | **written** — labs unrun |
 | [`04-retrieval-hybrid-and-reranking.md`](04-retrieval-hybrid-and-reranking.md) | BM25 + dense, RRF fusion, cross-encoder rerankers, latency budget | **written** — labs unrun |
-| `05-query-understanding.md` | Rewriting, decomposition, multi-query, HyDE, routing | planned |
-| `06-context-engineering.md` | Window budgeting, compaction, citation, memory, long-context tradeoffs | planned |
-| `07-generation-and-structured-output.md` | Structured outputs, schema validation, retries, determinism | planned |
+| [`05-query-understanding.md`](05-query-understanding.md) | Rewriting, decomposition, multi-query, HyDE, routing | **written** — labs unrun |
+| [`06-context-engineering.md`](06-context-engineering.md) | Window budgeting, compaction, citation, memory, long-context tradeoffs | **written** — labs unrun |
+| [`07-generation-and-structured-output.md`](07-generation-and-structured-output.md) | Structured outputs, schema validation, retries, determinism | **written** — labs unrun |
 | [`08-evaluation-methodology.md`](08-evaluation-methodology.md) | Golden sets, recall@k / MRR / nDCG, faithfulness, LLM-as-judge calibration, significance | **written** — labs unrun |
 | `09-eval-infrastructure-and-ci.md` | Eval as a pipeline: datasets, versioning, regression gates, dashboards | planned |
 | `10-llm-observability-and-tracing.md` | OTEL GenAI semconv, span design, trace↔eval linkage, sampling | planned |
@@ -76,7 +76,7 @@ keeps every claim honest by construction.
 | `14-agent-evaluation.md` | Trajectory eval, task success, tool-call correctness, cost per resolved task | planned |
 | `15-ingestion-pipelines-and-freshness.md` | Parsing at volume, dedup, incremental index updates, backfill, staleness SLOs | planned |
 | `16-multi-tenancy-and-isolation.md` | Per-tenant indexes, noisy neighbours, quota, data isolation | planned |
-| `17-safety-guardrails-and-prompt-injection.md` | Injection defence, output filtering, PII, tool-call authorization | planned |
+| [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md) | Injection defence, output filtering, PII, tool-call authorization | **written** — labs unrun |
 | `18-failure-modes-and-incident-walkthrough.md` | End-to-end: a retrieval regression found, diagnosed, fixed | planned |
 | `19-build-vs-buy.md` | Langfuse / LangSmith / Braintrust / Arize / Helicone landscape and when to build | planned |
 | `appendix-a-glossary.md` | | planned |
