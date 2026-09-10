@@ -265,8 +265,9 @@ If you sat down to build a database from scratch, this is the order. Each phase 
 | **14** | Specialty indexes (GiST/GIN/BRIN/HNSW) | Postgres ships these. Pick one to stretch the index abstraction. | [06](./06-indexing-internals.md), [11](./11-vector-search-internals.md), [11-hnsw](./11-hnsw-vector-search-internals.md) | — |
 | **15** | Replication: ship WAL to N replicas (sync or async) | Single-node fails too often. Replication is "WAL but over a socket". | [12](./12-replication-and-distributed-storage.md) §1–2 | — |
 | **16** | Distributed: failure detection (gossip/phi-accrual), leader election (Raft), sharding, distributed txn (2PC, Percolator, Calvin) | Scale beyond one machine. Almost all difficulty here is about **time and partial failure**. | [12](./12-replication-and-distributed-storage.md), [16](./16-failure-detection-and-leader-election.md), [19](./19-distributed-databases-deep-dive.md), `failure_detection_*.py` | — |
+| **17** | Data lake & lakehouse: Parquet internals, open table formats (Iceberg, Delta Lake, Hudi), catalogs, medallion architecture | ACID transactions on object storage. The modern analytical data stack decouples compute from storage with open formats. | [22](./22-data-lake-lakehouse.md), also [08](./08-olap-databases.md) §11 | — |
 
-**The sentence to remember.** *Phases 0–10 build a database. Phase 11 makes it fast. Phases 12–14 specialize it. Phases 15–16 scale it.* Most production complaints are mis-tuned phase 11 + 13. Most outages are phase 16.
+**The sentence to remember.** *Phases 0–10 build a database. Phase 11 makes it fast. Phases 12–14 specialize it. Phases 15–16 scale it. Phase 17 opens it to the lake.* Most production complaints are mis-tuned phase 11 + 13. Most outages are phase 16.
 
 ---
 
@@ -381,6 +382,11 @@ What's the workload?
 │   Examples: pgvector, Pinecone, Milvus, Weaviate
 │   Phase 7's B+Tree is replaced by a graph or partition index.
 │
+├── Petabyte-scale analytics on cheap object storage (S3/GCS)
+│   → Data lakehouse, open table formats                                ─── doc 22
+│   Examples: Iceberg + Trino, Delta Lake + Spark, Hudi + Flink
+│   Parquet files + metadata layer = ACID on object storage.
+│
 └── Single node not enough (capacity, throughput, geo, HA)
     → distributed: pick one
         ├── single-leader replication (Postgres replicas, MySQL)        ─── doc 12
@@ -470,7 +476,9 @@ If you want to read every doc once, this order minimizes "wait, what is X?" mome
 15. **12** — Replication and distributed storage. Single-node assumptions break.
 16. **16** — Failure detection and leader election. Re-read with `failure_detection_*.py` open.
 17. **19** — Distributed databases deep dive. Modern landscape. Easier after 12 + 16.
-18. **simpledb.py** — Read end-to-end last. By this point every layer should look familiar.
+18. **21** — In-process OLAP. DuckDB and chDB bring analytical power without servers.
+19. **22** — Data lake & lakehouse. Parquet internals, Iceberg, Delta Lake, Hudi — ACID on object storage.
+20. **simpledb.py** — Read end-to-end last. By this point every layer should look familiar.
 
 For "I just want to build it" mode, follow phases 0–10 in §3 instead of reading docs end-to-end.
 

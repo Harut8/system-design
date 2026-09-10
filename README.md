@@ -13,7 +13,7 @@ several have runnable code alongside them.
 | Track | What it covers | Chapters |
 | --- | --- | --- |
 | [`python-mastery/`](python-mastery/README.md) | CPU execution model, caches, virtual memory, allocators, syscalls, then CPython internals: refcounting, eval loop, GC, the GIL, free-threading, asyncio | 30 |
-| [`databases/`](databases/MENTAL_MODEL.md) | Storage engines, encoding formats, access methods, query engines, transactions, B-trees and LSM-trees, WAL, vector search | 24 |
+| [`databases/`](databases/MENTAL_MODEL.md) | Storage engines, encoding formats, access methods, query engines, transactions, B-trees and LSM-trees, WAL, vector search, data lake and lakehouse | 25 |
 | [`distributed-systems/`](distributed-systems/README.md) | Consensus, replication, failure detection, coordination | roadmap |
 | [`kubernetes/`](kubernetes/ROADMAP.md) | Linux primitives, etcd, API server, scheduler and kubelet internals, CNI/Cilium/eBPF, CSI, operators, multi-tenancy, supply-chain security | 46 |
 | [`k8s-learn/`](k8s-learn/README.md) | Hands-on Kubernetes task sheets with manifests | 14 |
