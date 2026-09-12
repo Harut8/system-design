@@ -22,6 +22,18 @@ Building a job scheduler on PostgreSQL sounds deceptively simple — `INSERT` a 
 12. [Production Architecture](#12-production-architecture)
 13. [Monitoring & Operational Runbook](#13-monitoring--operational-runbook)
 14. [Decision Framework](#14-decision-framework)
+15. [Data Model Gaps: What the Naive Schema Misses](#15-data-model-gaps-what-the-naive-schema-misses)
+16. [Claim Protocol: Subtleties](#16-claim-protocol-subtleties)
+17. [Failure & Retry Semantics](#17-failure--retry-semantics)
+18. [Scheduling: Cron, Catch-Up & Time](#18-scheduling-cron-catch-up--time)
+19. [Job Semantics: Ordering, Dependencies & Cancellation](#19-job-semantics-ordering-dependencies--cancellation)
+20. [Producer Side: Transactional Enqueue & Outbox](#20-producer-side-transactional-enqueue--outbox)
+21. [Worker Runtime](#21-worker-runtime)
+22. [Advanced PostgreSQL Operations](#22-advanced-postgresql-operations)
+23. [Observability Gaps](#23-observability-gaps)
+24. [Security & Compliance](#24-security--compliance)
+25. [Scaling: Capacity Planning & Exit Path](#25-scaling-capacity-planning--exit-path)
+26. [Developer Experience & Testing](#26-developer-experience--testing)
 
 ---
 
@@ -1709,23 +1721,1691 @@ WHERE state = 'idle in transaction'
 | Multi-tenancy | Row-level filter | Weighted fair queue | Code complexity vs fairness |
 | Index strategy | Broad index | Partial index on active | Maintenance vs scan speed |
 
-### Production Checklist
+---
+
+## 15. Data Model Gaps: What the Naive Schema Misses
+
+### State Machine: Use an Enum, Not Free-Form Text
+
+The schema in Section 3 uses `TEXT` for status. In production, use a proper enum:
+
+```sql
+CREATE TYPE job_status AS ENUM (
+    'pending',      -- waiting to be claimed
+    'running',      -- claimed by a worker
+    'completed',    -- finished successfully
+    'failed',       -- handler returned an error, will retry
+    'retryable',    -- explicitly marked for retry (snooze/defer)
+    'dead',         -- exhausted all attempts
+    'cancelled'     -- cancelled by user or system
+);
+
+ALTER TABLE jobs_active ALTER COLUMN status TYPE job_status USING status::job_status;
+```
+
+Enum values are stored as 4-byte integers internally — faster comparison than text, and PostgreSQL enforces valid values at the type level.
+
+### Attempts History Table
+
+The main table only stores `attempt` count and `error_message` for the last failure. For debugging, you need the full history:
+
+```sql
+CREATE TABLE job_attempts (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_id      BIGINT      NOT NULL,
+    attempt     SMALLINT    NOT NULL,
+    worker_id   TEXT        NOT NULL,
+    started_at  TIMESTAMPTZ NOT NULL,
+    finished_at TIMESTAMPTZ,
+    status      TEXT        NOT NULL,  -- 'completed', 'failed', 'timeout'
+    error_class TEXT,                  -- e.g. 'TimeoutError', 'HTTPError'
+    error_message TEXT,
+    stack_trace TEXT,
+    duration_ms INTEGER GENERATED ALWAYS AS (
+        EXTRACT(MILLISECONDS FROM (finished_at - started_at))
+    ) STORED,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_attempts_job ON job_attempts (job_id, attempt);
+```
+
+This table is append-only — no bloat from updates. Partition by `created_at` for retention.
+
+### Job Type Registry
+
+Scattered string identifiers (`"send_email"`, `"sync_user"`) across the codebase are a maintenance hazard. Define typed jobs:
+
+```python
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+
+@dataclass(frozen=True)
+class JobType:
+    name: str
+    queue: str
+    max_attempts: int = 3
+    timeout_seconds: int = 300
+    priority: int = 0
+
+class JobHandler(ABC):
+    job_type: JobType
+    
+    @abstractmethod
+    async def execute(self, payload: dict) -> dict:
+        ...
+
+class SendEmailHandler(JobHandler):
+    job_type = JobType(
+        name="send_email",
+        queue="email",
+        max_attempts=5,
+        timeout_seconds=30,
+        priority=10
+    )
+    
+    async def execute(self, payload: dict) -> dict:
+        # Handler validates payload shape, not the enqueue path
+        ...
+
+# Registry maps type name → handler class
+JOB_REGISTRY: dict[str, type[JobHandler]] = {}
+
+def register(handler_cls: type[JobHandler]) -> type[JobHandler]:
+    JOB_REGISTRY[handler_cls.job_type.name] = handler_cls
+    return handler_cls
+```
+
+The registry ensures: (1) every job name maps to exactly one handler, (2) queue/timeout/retry defaults are per-type not per-call, (3) new workers fail fast if a handler is missing.
+
+### Payload Versioning
+
+When job formats change during a rolling deploy, old workers must not crash on new payloads:
+
+```sql
+ALTER TABLE jobs_active ADD COLUMN payload_version SMALLINT NOT NULL DEFAULT 1;
+```
+
+```python
+class SendEmailHandler(JobHandler):
+    async def execute(self, payload: dict, version: int) -> dict:
+        if version == 1:
+            recipient = payload["email"]
+        elif version == 2:
+            recipient = payload["recipient"]["address"]  # new format
+        else:
+            raise UnsupportedVersionError(version)
+```
+
+### Payload Validation at Enqueue Time
+
+Validate payload structure when the job is submitted, not when a worker picks it up. A malformed payload discovered at execution time wastes a claim cycle and an attempt:
+
+```python
+from pydantic import BaseModel
+
+class SendEmailPayload(BaseModel):
+    recipient: str
+    subject: str
+    template_id: str
+
+PAYLOAD_SCHEMAS: dict[str, type[BaseModel]] = {
+    "send_email": SendEmailPayload,
+}
+
+def enqueue_job(job_type: str, payload: dict):
+    schema = PAYLOAD_SCHEMAS.get(job_type)
+    if schema:
+        schema.model_validate(payload)  # raises ValidationError if invalid
+    
+    db.execute("INSERT INTO jobs_active ...")
+```
+
+---
+
+## 16. Claim Protocol: Subtleties
+
+### Short Claim Transaction
+
+The most critical correctness rule: **processing happens strictly outside the transaction that claims the job.**
+
+```python
+# WRONG — holds a transaction open for the entire job duration
+with db.transaction():
+    job = db.execute("SELECT ... FOR UPDATE SKIP LOCKED").fetchone()
+    result = call_external_api(job.payload)  # could take 30 seconds
+    db.execute("UPDATE ... SET status = 'completed'")
+# Transaction held 30 seconds → blocks VACUUM, holds row lock, wastes connection
+
+# RIGHT — claim in one transaction, process outside
+with db.transaction():
+    job = db.execute("""
+        UPDATE jobs_active SET status = 'running', locked_by = %s, ...
+        WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
+        RETURNING *
+    """).fetchone()
+
+# Transaction committed — row is now 'running', lock released
+result = call_external_api(job.payload)
+
+with db.transaction():
+    db.execute("UPDATE ... SET status = 'completed' WHERE fence_token = %s")
+```
+
+A long claim transaction is the single most common cause of VACUUM stalls in PostgreSQL job queues.
+
+### Predicate Shape: Equality vs `= ANY`
+
+```sql
+-- GOOD: equality predicate → index scan in sorted order
+WHERE queue_name = 'email'
+ORDER BY priority DESC, scheduled_at
+LIMIT 1
+
+-- BAD: = ANY → planner may choose BitmapOr, which destroys sort ordering
+WHERE queue_name = ANY(ARRAY['email', 'webhook', 'export'])
+ORDER BY priority DESC, scheduled_at
+LIMIT 1
+-- Result: PostgreSQL cannot use the index to deliver rows in order
+-- → explicit Sort node → reads ALL matching rows → sorts → returns 1
+```
+
+If a worker processes multiple queues, run one claim query per queue, not one query with `= ANY`.
+
+### Batch Claiming: Head-of-Line Blocking
+
+When Worker-3 claims a batch of 20 jobs, the lease covers all 20. If job #1 takes 4 minutes and jobs #2-20 each take 1 second:
 
 ```
-[ ] Hot/Cold table split (jobs_active + jobs_completed)
-[ ] jobs_completed partitioned by day with automated DROP PARTITION
-[ ] LISTEN/NOTIFY + polling hybrid for job dispatch
-[ ] Batch claiming (10-20 jobs per claim query)
-[ ] Fence tokens on every claim for exactly-once safety
-[ ] Heartbeat thread with self-termination on failure
-[ ] Reaper process for expired leases (runs every 30s)
-[ ] Per-tenant concurrency limits
-[ ] Autovacuum tuned per table (scale_factor = 0.01, cost_delay = 2)
-[ ] maintenance_work_mem = 1GB for job table VACUUM
-[ ] idle_in_transaction_session_timeout = 5min
-[ ] Monitoring: dead tuple ratio, XID age, queue depth, claim latency
-[ ] Alerting on VACUUM lag and bloat ratio
-[ ] pg_repack available for emergency compaction
+t=0:     Claim 20 jobs, lease_expires = t+300s
+t=0-240: Processing job #1 (slow HTTP call)
+t=240:   Jobs #2-20 have been sitting claimed but unprocessed for 4 minutes
+         Other workers could have processed them already
+```
+
+**Mitigations:**
+- Use a local worker queue: claim a batch but process items concurrently with a thread pool
+- Set batch size relative to expected processing time: `batch = target_prefetch_seconds / avg_job_duration`
+- Heartbeat per job, not per batch — each job has its own lease timer
+
+### Work Stealing
+
+When hash-based sharding assigns jobs to workers, a slow or crashed worker's partition goes unprocessed. Work stealing lets idle workers reclaim from overloaded partitions:
+
+```python
+class StealingWorker:
+    def claim_batch(self):
+        # First: try own partition
+        jobs = self.claim_from_partition(self.partition_id)
+        if jobs:
+            return jobs
+        
+        # Second: steal from other partitions (only if own is empty)
+        for partition in self.other_partitions():
+            jobs = self.claim_from_partition(partition)
+            if jobs:
+                metrics.counter("jobs.stolen", tags={"from": partition})
+                return jobs
+        
+        return []
+```
+
+### Claim Fairness
+
+Without explicit fairness, a fast worker (low-latency network, fast CPU) claims disproportionately more jobs via `SKIP LOCKED` because it arrives at the index scan first more often:
+
+```
+Worker-1 (fast, 2ms RTT):  claims 80% of jobs
+Worker-2 (slow, 20ms RTT): claims 20% of jobs
+```
+
+**Fix:** Add jitter between claim attempts, or use hash-based assignment (Section 6, Solution 3) which eliminates contention entirely.
+
+---
+
+## 17. Failure & Retry Semantics
+
+### Poison Pill Protection
+
+A poison pill is a job whose payload crashes the worker process (OOM, segfault, infinite loop). The danger: if you increment `attempt` on completion, a poison pill restarts the worker forever without ever counting an attempt.
+
+```
+Loop:
+  Worker claims job-99 (attempt stays at 0) →
+  Worker crashes during execution →
+  Reaper requeues job-99 (attempt still 0) →
+  Another worker claims job-99 →
+  Crash → Requeue → Claim → Crash → forever
+```
+
+**Fix:** Increment `attempt` at claim time, not at completion:
+
+```sql
+UPDATE jobs_active
+SET status = 'running',
+    attempt = attempt + 1,  -- increment HERE, before execution
+    locked_by = 'worker-3',
+    lease_expires = now() + interval '5 minutes'
+WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
+RETURNING *;
+```
+
+Now even if the worker crashes without updating the row, the attempt count is already incremented. After `max_attempts` crashes, the job moves to dead.
+
+### Retryable vs Non-Retryable Errors
+
+Not all failures deserve retry. A 400 Bad Request will fail the same way every time:
+
+```python
+class RetryPolicy:
+    RETRYABLE = {
+        "TimeoutError", "ConnectionError", "HTTPError_5xx",
+        "DatabaseUnavailable", "RateLimitExceeded"
+    }
+    NON_RETRYABLE = {
+        "ValidationError", "HTTPError_4xx", "AuthenticationError",
+        "PayloadTooLarge"
+    }
+
+    @staticmethod
+    def should_retry(error: Exception) -> bool:
+        error_class = type(error).__name__
+        if error_class in RetryPolicy.NON_RETRYABLE:
+            return False
+        if error_class in RetryPolicy.RETRYABLE:
+            return True
+        return True  # unknown errors default to retryable
+```
+
+Non-retryable errors go straight to `dead` status regardless of remaining attempts.
+
+### Exponential Backoff with Full Jitter
+
+The reaper in Section 12 uses `power(2, attempt)` but has no jitter. Without jitter, all retried jobs for the same attempt number become runnable at the same instant, causing a thundering herd:
+
+```sql
+-- With full jitter: uniform random between 0 and exponential ceiling
+scheduled_at = now() + make_interval(
+    secs := random() * power(2, LEAST(attempt, 8))  -- 0 to 256s, random
+)
+```
+
+Full jitter (as opposed to equal jitter or decorrelated jitter) gives the best spread for reducing correlated retries.
+
+### Dead Letter Queue Replay / Redrive
+
+Jobs in `dead` status need tooling to inspect and retry:
+
+```sql
+-- Redrive: move dead jobs back to pending with attempt reset
+UPDATE jobs_active
+SET status = 'pending',
+    attempt = 0,
+    locked_by = NULL,
+    lease_expires = NULL,
+    fence_token = NULL,
+    scheduled_at = now()
+WHERE id = ANY($1)           -- array of job IDs
+  AND status = 'dead'
+RETURNING id;
+
+-- Bulk redrive with filter (e.g., all dead jobs for a specific error)
+INSERT INTO jobs_active (tenant_id, queue_name, priority, payload, scheduled_at, max_attempts)
+SELECT tenant_id, queue_name, priority, payload, now(), max_attempts
+FROM jobs_completed
+WHERE status = 'dead'
+  AND error_message LIKE '%TimeoutError%'
+  AND completed_at > now() - interval '24 hours';
+```
+
+### Circuit Breaker per Handler/Queue
+
+When an external API goes down, every job that calls it will fail and retry, amplifying load on both the queue and the failing service:
+
+```python
+from datetime import datetime, timedelta
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, recovery_timeout=60):
+        self.failure_count = 0
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.last_failure: datetime | None = None
+        self.state = "closed"  # closed, open, half-open
+    
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure = datetime.utcnow()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+    
+    def allow_request(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if datetime.utcnow() - self.last_failure > timedelta(seconds=self.recovery_timeout):
+                self.state = "half-open"
+                return True  # allow one probe
+            return False
+        return True  # half-open: allow
+
+# Per-queue circuit breakers
+breakers: dict[str, CircuitBreaker] = {}
+
+def claim_batch(queue_name: str):
+    breaker = breakers.setdefault(queue_name, CircuitBreaker())
+    if not breaker.allow_request():
+        log.info(f"Circuit open for queue {queue_name}, skipping")
+        return []
+    # ... proceed with claim
+```
+
+When the circuit is open, the worker stops claiming from that queue entirely — no wasted attempts, no amplifying the outage.
+
+### Snooze / Defer
+
+A handler can say "give this back in 10 minutes" without counting as a failure:
+
+```python
+class SnoozeError(Exception):
+    def __init__(self, delay_seconds: int):
+        self.delay_seconds = delay_seconds
+
+class Worker:
+    def execute_job(self, job_id, fence_token, payload):
+        try:
+            result = handler.execute(payload)
+            self.complete_job(job_id, fence_token, result)
+        except SnoozeError as e:
+            # Don't increment attempt — this isn't a failure
+            db.execute("""
+                UPDATE jobs_active
+                SET status = 'pending',
+                    locked_by = NULL,
+                    lease_expires = NULL,
+                    scheduled_at = now() + make_interval(secs := %s)
+                WHERE id = %s AND fence_token = %s
+            """, [e.delay_seconds, job_id, fence_token])
+        except Exception as e:
+            self.fail_job(job_id, fence_token, str(e))
+```
+
+### Error Fingerprinting
+
+A DLQ with 50,000 entries is useless without grouping. Fingerprint errors so operators see patterns:
+
+```python
+import hashlib
+
+def error_fingerprint(error_class: str, error_message: str, stack_trace: str) -> str:
+    # Normalize: strip line numbers and memory addresses from stack
+    normalized = re.sub(r'line \d+', 'line N', stack_trace)
+    normalized = re.sub(r'0x[0-9a-f]+', '0xADDR', normalized)
+    return hashlib.md5(f"{error_class}:{normalized}".encode()).hexdigest()[:12]
+```
+
+```sql
+ALTER TABLE job_attempts ADD COLUMN error_fingerprint TEXT;
+CREATE INDEX idx_attempts_fingerprint ON job_attempts (error_fingerprint, created_at DESC);
+
+-- Group DLQ by error pattern
+SELECT error_fingerprint, error_class, COUNT(*) AS occurrences,
+       MIN(created_at) AS first_seen, MAX(created_at) AS last_seen,
+       (array_agg(error_message ORDER BY created_at DESC))[1] AS latest_message
+FROM job_attempts
+WHERE status = 'failed'
+  AND created_at > now() - interval '24 hours'
+GROUP BY error_fingerprint, error_class
+ORDER BY occurrences DESC;
+```
+
+---
+
+## 18. Scheduling: Cron, Catch-Up & Time
+
+### Cron Jobs: Deduplication Across Workers
+
+Multiple workers must not each spawn the same cron job at the same time slot. Use a unique constraint on `(job_type, scheduled_slot)`:
+
+```sql
+CREATE TABLE cron_schedules (
+    id              SERIAL PRIMARY KEY,
+    job_type        TEXT        NOT NULL,
+    cron_expression TEXT        NOT NULL,
+    tenant_id       INTEGER     NOT NULL,
+    payload         JSONB       NOT NULL DEFAULT '{}',
+    enabled         BOOLEAN     NOT NULL DEFAULT true,
+    last_run_at     TIMESTAMPTZ,
+    next_run_at     TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- A single scheduler process (leader-elected) runs every minute:
+WITH due_crons AS (
+    SELECT id, job_type, tenant_id, payload, next_run_at
+    FROM cron_schedules
+    WHERE enabled = true AND next_run_at <= now()
+    FOR UPDATE SKIP LOCKED
+)
+INSERT INTO jobs_active (queue_name, tenant_id, payload, scheduled_at, idempotency_key)
+SELECT job_type, tenant_id, payload, next_run_at,
+       md5(job_type || tenant_id || next_run_at::text)::uuid  -- dedup key per time slot
+FROM due_crons
+ON CONFLICT (idempotency_key) WHERE status IN ('pending', 'running')
+DO NOTHING;
+
+-- Update next_run_at based on cron expression
+UPDATE cron_schedules
+SET last_run_at = next_run_at,
+    next_run_at = cron_next(cron_expression, next_run_at)  -- requires pg_cron or app-level
+WHERE id IN (SELECT id FROM due_crons);
+```
+
+### Catch-Up Policy: What Happens After Downtime?
+
+If the scheduler was down for 3 hours and a cron job runs every 15 minutes, do you run 12 catch-up instances or just 1?
+
+```python
+class CatchUpPolicy:
+    SKIP = "skip"         # only run the latest missed slot
+    CATCH_UP = "catch_up" # run every missed slot sequentially
+    COLLAPSE = "collapse" # run once with metadata about missed slots
+
+def schedule_catchup(cron: CronSchedule, policy: str):
+    missed_slots = compute_missed_slots(cron.last_run_at, now(), cron.expression)
+    
+    if policy == CatchUpPolicy.SKIP:
+        enqueue(cron, scheduled_at=now())  # just run once
+    elif policy == CatchUpPolicy.CATCH_UP:
+        for slot in missed_slots:
+            enqueue(cron, scheduled_at=slot)  # one job per missed slot
+    elif policy == CatchUpPolicy.COLLAPSE:
+        enqueue(cron, scheduled_at=now(), payload={
+            **cron.payload,
+            "missed_slots": len(missed_slots),
+            "first_missed": missed_slots[0],
+            "last_missed": missed_slots[-1]
+        })
+```
+
+### Priority Starvation
+
+Numeric priority (`0-100`) causes starvation: high-priority jobs always jump the queue, so a steady stream of priority-90 jobs means priority-10 jobs never run.
+
+**Prefer weighted queues over numeric priority.** Instead of one queue sorted by priority, use separate queues with weighted claim ratios:
+
+```python
+QUEUE_WEIGHTS = {
+    "critical": 5,    # 50% of claims
+    "default":  3,    # 30% of claims
+    "bulk":     2,    # 20% of claims
+}
+
+def weighted_claim(worker):
+    # Weighted random selection
+    queues = list(QUEUE_WEIGHTS.keys())
+    weights = list(QUEUE_WEIGHTS.values())
+    selected_queue = random.choices(queues, weights=weights, k=1)[0]
+    return claim_from_queue(selected_queue)
+```
+
+If you must use numeric priority, add **priority aging** to prevent starvation:
+
+```sql
+-- Effective priority increases with age
+SELECT *, priority + EXTRACT(EPOCH FROM (now() - created_at)) / 60 AS effective_priority
+FROM jobs_active
+WHERE status = 'pending'
+ORDER BY effective_priority DESC
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+```
+
+A low-priority job (priority=10) created 100 minutes ago has effective_priority = 110, surpassing a high-priority job (priority=100) created just now.
+
+### SKIP LOCKED Breaks FIFO
+
+`FOR UPDATE SKIP LOCKED` gives no ordering guarantee across concurrent workers:
+
+```
+Queue (ordered): [A, B, C, D, E]
+Worker-1 locks A → Worker-2 skips A, locks B → Worker-1 finishes A fast
+Worker-1 locks C → Worker-2 still processing B
+Result processing order: A, C, B (NOT A, B, C)
+```
+
+For strict ordering (e.g., events for the same user must be processed in order), use **job groups**:
+
+```sql
+ALTER TABLE jobs_active ADD COLUMN group_key TEXT;
+CREATE INDEX idx_jobs_group ON jobs_active (group_key, created_at) WHERE status = 'pending';
+
+-- Only claim from groups with no running job
+SELECT j.* FROM jobs_active j
+WHERE j.status = 'pending'
+  AND NOT EXISTS (
+      SELECT 1 FROM jobs_active j2
+      WHERE j2.group_key = j.group_key AND j2.status = 'running'
+  )
+ORDER BY j.created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED;
+```
+
+### Job Expiration / TTL
+
+Some jobs are pointless after a deadline:
+
+```sql
+ALTER TABLE jobs_active ADD COLUMN expires_at TIMESTAMPTZ;
+
+-- Reaper also expires stale pending jobs
+UPDATE jobs_active
+SET status = 'cancelled'
+WHERE status = 'pending'
+  AND expires_at IS NOT NULL
+  AND expires_at < now()
+RETURNING id;
+```
+
+### Timezone / DST Handling for Cron
+
+Store cron schedules in the **tenant's timezone**, but convert to UTC for `next_run_at`:
+
+```sql
+ALTER TABLE cron_schedules ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC';
+
+-- When computing next_run_at:
+-- 1. Parse cron expression in tenant's timezone
+-- 2. Convert result to UTC for storage
+-- This handles DST transitions correctly
+-- (a "daily at 2am" schedule that falls in DST gap is skipped or doubled, policy-dependent)
+```
+
+### Server Time Everywhere
+
+Never trust the worker's clock for scheduling decisions:
+
+```sql
+-- ALWAYS use server time
+WHERE scheduled_at <= now()                    -- Postgres server's clock
+SET lease_expires = now() + interval '5 min'   -- Postgres server's clock
+
+-- NEVER
+WHERE scheduled_at <= '2025-01-15T10:00:00Z'   -- worker's clock, might be skewed
+SET lease_expires = $1                          -- worker-computed timestamp
+```
+
+---
+
+## 19. Job Semantics: Ordering, Dependencies & Cancellation
+
+### Job Dependencies / Workflows (DAGs)
+
+When jobs have dependencies (A must complete before B starts):
+
+```sql
+CREATE TABLE job_dependencies (
+    job_id     BIGINT NOT NULL REFERENCES jobs_active(id),
+    depends_on BIGINT NOT NULL,  -- references jobs_active or jobs_completed
+    PRIMARY KEY (job_id, depends_on)
+);
+
+-- Job becomes claimable only when all dependencies are completed
+-- Modify the claim query:
+SELECT j.* FROM jobs_active j
+WHERE j.status = 'pending'
+  AND NOT EXISTS (
+      SELECT 1 FROM job_dependencies d
+      LEFT JOIN jobs_completed c ON c.id = d.depends_on AND c.status = 'completed'
+      WHERE d.job_id = j.id AND c.id IS NULL
+  )
+ORDER BY j.priority DESC, j.scheduled_at
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+```
+
+For fan-out/fan-in (batch completion callbacks):
+
+```sql
+CREATE TABLE job_batches (
+    batch_id    UUID PRIMARY KEY,
+    total_jobs  INTEGER NOT NULL,
+    completed   INTEGER NOT NULL DEFAULT 0,
+    callback_payload JSONB  -- job to enqueue when all finish
+);
+
+-- On each job completion, atomically increment:
+UPDATE job_batches
+SET completed = completed + 1
+WHERE batch_id = $1
+RETURNING completed, total_jobs;
+-- If completed == total_jobs → enqueue the callback job
+```
+
+**When you need DAGs, strongly consider Temporal.** PostgreSQL-native DAGs are fragile — cycle detection, partial failure recovery, and visualization are all hard problems that Temporal solves out of the box.
+
+### Cancellation
+
+```sql
+-- Cancel pending job: simple status update
+UPDATE jobs_active
+SET status = 'cancelled'
+WHERE id = $1 AND status = 'pending'
+RETURNING id;
+
+-- Cancel running job: set a flag that the worker checks
+ALTER TABLE jobs_active ADD COLUMN cancel_requested BOOLEAN NOT NULL DEFAULT false;
+
+UPDATE jobs_active
+SET cancel_requested = true
+WHERE id = $1 AND status = 'running'
+RETURNING id;
+```
+
+The worker must cooperatively check `cancel_requested` during long operations:
+
+```python
+class CancellableWorker:
+    def execute_job(self, job_id, fence_token, payload):
+        for chunk in process_in_chunks(payload):
+            if self.is_cancelled(job_id, fence_token):
+                self.complete_job(job_id, fence_token, status='cancelled')
+                return
+            process_chunk(chunk)
+```
+
+### Debounce / Throttle / Singleton
+
+**Singleton:** Only one instance of a job type can be pending/running at a time:
+
+```sql
+-- Enforced via partial unique index
+CREATE UNIQUE INDEX idx_singleton ON jobs_active (queue_name, tenant_id)
+WHERE status IN ('pending', 'running')
+  AND singleton = true;
+```
+
+**Debounce:** Replace a pending job with a newer version (e.g., sync_user after rapid edits):
+
+```sql
+-- Use the idempotency_key as the job key
+-- ON CONFLICT replace the payload and reset scheduled_at
+INSERT INTO jobs_active (queue_name, tenant_id, payload, idempotency_key, scheduled_at)
+VALUES ('sync_user', 42, '{"user_id": 99}', 'sync-user-99', now() + interval '5 seconds')
+ON CONFLICT (idempotency_key) WHERE status IN ('pending', 'running')
+DO UPDATE SET payload = EXCLUDED.payload,
+              scheduled_at = EXCLUDED.scheduled_at
+WHERE jobs_active.status = 'pending';  -- don't replace running jobs
+```
+
+### Bulk Enqueue
+
+N individual `INSERT` statements for N jobs is N round-trips. Use multi-row insert or `COPY`:
+
+```sql
+-- Multi-row INSERT (up to ~1000 rows per statement)
+INSERT INTO jobs_active (tenant_id, queue_name, payload, scheduled_at)
+VALUES
+    (42, 'email', '{"to":"a@b.com"}', now()),
+    (42, 'email', '{"to":"c@d.com"}', now()),
+    -- ... up to 1000 rows
+;
+
+-- COPY for very large batches (100K+ jobs)
+COPY jobs_active (tenant_id, queue_name, payload, scheduled_at)
+FROM STDIN WITH (FORMAT csv);
+```
+
+---
+
+## 20. Producer Side: Transactional Enqueue & Outbox
+
+### Transactional Enqueue
+
+**This is the single biggest reason to use PostgreSQL as a job queue.** When the job and the business data live in the same database, you get atomicity for free:
+
+```python
+async def place_order(order: Order):
+    async with db.transaction():
+        # Business logic and job enqueue in the SAME transaction
+        await db.execute("INSERT INTO orders (...) VALUES (...)")
+        await db.execute("""
+            INSERT INTO jobs_active (queue_name, tenant_id, payload)
+            VALUES ('send_confirmation', %s, %s)
+        """, [order.tenant_id, json.dumps({"order_id": order.id})])
+    
+    # If the transaction commits → both the order AND the job exist
+    # If it rolls back → neither exists
+    # No "order created but email never sent" bug
+```
+
+With Redis/SQS/Kafka, you can't do this — you either write the job first (risk: order fails, orphaned job) or the order first (risk: job enqueue fails, user never gets an email). The workaround is the outbox pattern.
+
+### Outbox Pattern
+
+When some events must go to an external system (Kafka, SQS) while others stay in-database:
+
+```sql
+CREATE TABLE outbox (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_type  TEXT        NOT NULL,
+    payload     JSONB       NOT NULL,
+    destination TEXT        NOT NULL,  -- 'kafka', 'sqs', 'webhook'
+    published   BOOLEAN     NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Business transaction writes to outbox atomically
+BEGIN;
+INSERT INTO orders (...) VALUES (...);
+INSERT INTO outbox (event_type, payload, destination)
+VALUES ('order_placed', '{"order_id": 123}', 'kafka');
+COMMIT;
+
+-- Separate publisher process reads and publishes
+UPDATE outbox SET published = true
+WHERE id IN (
+    SELECT id FROM outbox
+    WHERE published = false
+    ORDER BY id
+    LIMIT 100
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+-- Publish each to Kafka/SQS, then commit the UPDATE
+```
+
+### Producer Backpressure
+
+When the system is saturated, reject enqueue to prevent unbounded growth:
+
+```python
+async def enqueue_with_backpressure(job):
+    pending_count = await db.fetchval(
+        "SELECT COUNT(*) FROM jobs_active WHERE queue_name = $1 AND status = 'pending'",
+        job.queue_name
+    )
+    
+    if pending_count > MAX_QUEUE_DEPTH:  # e.g., 100,000
+        raise QueueFullError(f"Queue {job.queue_name} has {pending_count} pending jobs")
+    
+    await db.execute("INSERT INTO jobs_active ...")
+```
+
+---
+
+## 21. Worker Runtime
+
+### Bounded Concurrency
+
+A worker should never consume unlimited database connections:
+
+```python
+import asyncio
+
+class BoundedWorker:
+    def __init__(self, concurrency=10, dsn: str = ""):
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.pool = asyncpg.create_pool(dsn, min_size=concurrency + 2, max_size=concurrency + 2)
+        # +2: one for heartbeat, one for LISTEN
+
+    async def run_loop(self):
+        while True:
+            async with self.semaphore:
+                job = await self.claim_one()
+                if job:
+                    asyncio.create_task(self.process(job))
+```
+
+### Pool Sizing vs `max_connections`
+
+```
+PostgreSQL default max_connections = 100
+
+Workers:            10 instances
+Concurrency/worker: 20 jobs
+Connections/worker: 20 (work) + 1 (heartbeat) + 1 (LISTEN) = 22
+Total connections:  10 × 22 = 220 > 100 → CONNECTION REFUSED
+
+Add: enqueue services, query services, admin, monitoring
+Total: 220 + 30 = 250 connections needed
+```
+
+**Solutions:**
+1. `max_connections = 300` (increases shared memory usage)
+2. PgBouncer in transaction mode for work connections (session mode for LISTEN)
+3. Reduce per-worker concurrency
+
+### Graceful Shutdown / Drain
+
+On SIGTERM, the worker must:
+1. Stop claiming new jobs
+2. Wait for in-flight jobs to complete (with a deadline)
+3. Return uncompleted jobs to `pending`
+
+```python
+import signal
+
+class GracefulWorker:
+    def __init__(self):
+        self.draining = False
+        self.in_flight: set[int] = set()
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+    
+    def _handle_sigterm(self, signum, frame):
+        log.info("SIGTERM received, draining...")
+        self.draining = True
+    
+    async def run_loop(self):
+        while not self.draining:
+            jobs = await self.claim_batch()
+            for job in jobs:
+                self.in_flight.add(job.id)
+                asyncio.create_task(self._process_and_track(job))
+        
+        # Drain: wait for in-flight jobs with timeout
+        deadline = time.monotonic() + 30  # 30s drain timeout
+        while self.in_flight and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+        
+        # Return any still-running jobs to pending
+        if self.in_flight:
+            log.warn(f"Returning {len(self.in_flight)} jobs to pending")
+            await db.execute("""
+                UPDATE jobs_active
+                SET status = 'pending', locked_by = NULL, lease_expires = NULL
+                WHERE id = ANY($1) AND locked_by = $2
+            """, [list(self.in_flight), self.worker_id])
+```
+
+### Handler Isolation
+
+One crashing handler must not take down the entire worker process:
+
+```python
+async def safe_execute(self, job):
+    try:
+        handler = JOB_REGISTRY[job.queue_name]
+        async with asyncio.timeout(handler.job_type.timeout_seconds):
+            result = await handler.execute(job.payload)
+        return result
+    except asyncio.TimeoutError:
+        raise JobTimeoutError(f"Job {job.id} exceeded {handler.job_type.timeout_seconds}s")
+    except MemoryError:
+        log.critical("OOM in handler, recycling worker")
+        os._exit(1)  # let the supervisor restart us
+    except Exception as e:
+        # Handler crashed — job fails, worker continues
+        raise
+```
+
+### Middleware Chain
+
+Cross-cutting concerns (logging, tracing, metrics) as composable middleware:
+
+```python
+class LoggingMiddleware:
+    async def __call__(self, job, next_handler):
+        log.info("job.start", job_id=job.id, queue=job.queue_name, attempt=job.attempt)
+        start = time.monotonic()
+        try:
+            result = await next_handler(job)
+            log.info("job.complete", job_id=job.id, duration_ms=(time.monotonic()-start)*1000)
+            return result
+        except Exception as e:
+            log.error("job.failed", job_id=job.id, error=str(e))
+            raise
+
+class TracingMiddleware:
+    async def __call__(self, job, next_handler):
+        trace_ctx = job.payload.get("_trace_context")
+        with tracer.start_span("job.execute", parent=trace_ctx):
+            return await next_handler(job)
+
+class MetricsMiddleware:
+    async def __call__(self, job, next_handler):
+        with metrics.timer("job.duration", tags={"queue": job.queue_name}):
+            return await next_handler(job)
+
+# Compose: Logging → Tracing → Metrics → Handler
+pipeline = compose(LoggingMiddleware(), TracingMiddleware(), MetricsMiddleware())
+```
+
+### Adaptive Polling
+
+Don't use a fixed poll interval. Use a greedy loop when work exists, back off when empty:
+
+```python
+class AdaptivePoller:
+    def __init__(self):
+        self.min_interval = 0.01   # 10ms when busy
+        self.max_interval = 5.0    # 5s when idle
+        self.current = self.min_interval
+    
+    async def run_loop(self):
+        while True:
+            jobs = await self.claim_batch()
+            if jobs:
+                self.current = self.min_interval  # reset to aggressive
+                await self.process(jobs)
+            else:
+                await asyncio.sleep(self.current)
+                self.current = min(self.current * 2, self.max_interval)  # exponential backoff
+```
+
+---
+
+## 22. Advanced PostgreSQL Operations
+
+### TOAST Awareness
+
+PostgreSQL stores large column values (> ~2KB) out-of-line in a TOAST table. For job payloads, this means:
+
+```sql
+-- Check if payloads are being TOASTed
+SELECT pg_column_size(payload) AS size,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY pg_column_size(payload)) AS p95_size
+FROM jobs_active;
+```
+
+If p95 payload size > 2KB, every claim query that reads the payload column does an extra TOAST table lookup. The mitigation:
+
+```
+Option 1: Don't SELECT payload in the claim query; fetch it in a second query
+Option 2: Store large payloads in object storage (S3), carry only a reference
+Option 3: Split the table (hot/cold already helps — jobs_ready has no payload)
+```
+
+### WAL Impact
+
+The job queue can dominate the cluster's WAL production:
+
+```
+Per job lifecycle: INSERT + 2-3 UPDATEs + DELETE = 5 WAL records
+At 5,000 jobs/sec: 25,000 WAL records/sec
+Average WAL record size: ~200 bytes
+WAL throughput: 5 MB/sec just from the job queue
+
+Add indexes: each index update adds another WAL record
+5 indexes × 5 operations × 200 bytes = 5,000 bytes/job = 25 MB/sec
+```
+
+This affects replication lag (streaming replication must replay all this WAL) and backup storage.
+
+**Mitigations:**
+- `UNLOGGED` for the ready queue table (no WAL at all — acceptable for derived data)
+- Minimize number of indexes on the hot table
+- `wal_level = replica` not `logical` (unless you need CDC)
+- Dedicated tablespace on fast storage for WAL
+
+### Replication Slots Block VACUUM
+
+Streaming replication with `hot_standby_feedback = on` or unused replication slots pin the xmin horizon just like long-running transactions:
+
+```sql
+-- Check if replication slots are blocking VACUUM
+SELECT slot_name, slot_type, active,
+       age(xmin) AS xmin_age,
+       age(catalog_xmin) AS catalog_xmin_age
+FROM pg_replication_slots;
+
+-- An inactive slot with growing xmin_age is a VACUUM blocker
+-- Drop it if no longer needed:
+SELECT pg_drop_replication_slot('unused_slot');
+```
+
+### Separate Database for the Queue
+
+At scale, the job queue's write volume, VACUUM pressure, and connection consumption can interfere with the application's OLTP workload:
+
+```
+Shared instance:
+  Application writes: 2,000 TPS (orders, users, products)
+  Queue writes:       25,000 TPS (job lifecycle)
+  VACUUM pressure:    Dominated by queue
+  max_connections:     Split between app and workers
+  Autovacuum workers:  Shared between app tables and queue tables
+
+Separate instance:
+  App DB:   2,000 TPS, autovacuum tuned for OLTP, connections for app
+  Queue DB: 25,000 TPS, autovacuum tuned for queue, connections for workers
+  Trade-off: Lose transactional enqueue (need outbox pattern)
+```
+
+**Decision:** Keep them together as long as you can (transactional enqueue is too valuable). Split when WAL throughput or VACUUM contention becomes the bottleneck. The outbox pattern bridges the gap.
+
+### Know the Ceiling
+
+PostgreSQL queues run on the **primary only**. Read replicas don't help for the claim path (`FOR UPDATE SKIP LOCKED` requires write access). This means:
+
+```
+Max throughput = single PostgreSQL primary's write capacity
+Typical ceiling: 10,000-50,000 claims/sec (hardware-dependent)
+```
+
+Beyond this, you need either:
+- Horizontal sharding (multiple PostgreSQL primaries, each owning a subset of queues)
+- A purpose-built queue (Redis, SQS, Kafka)
+
+### REINDEX CONCURRENTLY
+
+B-tree indexes on job tables fragment over time even with VACUUM. Schedule periodic rebuilds:
+
+```sql
+-- Non-blocking index rebuild (PostgreSQL 12+)
+REINDEX INDEX CONCURRENTLY idx_jobs_fetchable;
+
+-- Or use pg_repack for the whole table
+-- $ pg_repack --table jobs_active --only-indexes dbname
+```
+
+River ships a reindexer as a built-in maintenance service that runs on a schedule.
+
+### Online Migrations
+
+Rolling deployments mean old and new workers run simultaneously. Schema changes must be backwards-compatible:
+
+```
+Expand/Contract pattern:
+1. EXPAND: Add new column (nullable, with default)
+   ALTER TABLE jobs_active ADD COLUMN new_field TEXT DEFAULT 'v1';
+   
+2. MIGRATE: Backfill existing rows
+   UPDATE jobs_active SET new_field = compute(old_field) WHERE new_field IS NULL;
+   
+3. Deploy new code that writes both old and new columns
+   
+4. CONTRACT: Drop old column once all workers use the new one
+   ALTER TABLE jobs_active DROP COLUMN old_field;
+```
+
+Never rename a column or change its type in a single deploy — old workers will crash.
+
+---
+
+## 23. Observability Gaps
+
+### `oldest_pending_age` Is the Primary Metric
+
+Queue depth is misleading. 10,000 pending jobs could be fine (workers will clear them in seconds) or catastrophic (workers are down). **`oldest_pending_age` tells you the truth:**
+
+```sql
+SELECT queue_name,
+       now() - MIN(scheduled_at) FILTER (WHERE status = 'pending' AND scheduled_at <= now())
+           AS oldest_pending_age,
+       COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+       COUNT(*) FILTER (WHERE status = 'running') AS running_count
+FROM jobs_active
+GROUP BY queue_name;
+```
+
+Alert on `oldest_pending_age > 5 minutes` — not on depth.
+
+### Autoscaling
+
+Scale workers based on `oldest_pending_age`, not CPU or queue depth:
+
+```
+oldest_pending_age > 2 min → scale up workers
+oldest_pending_age < 30s for 5 min → scale down workers
+```
+
+### Handler Duration Histogram
+
+Track per-handler execution time to detect degradation:
+
+```python
+# Emit as a histogram metric
+metrics.histogram("job.handler.duration_ms",
+                  value=duration_ms,
+                  tags={"handler": job.queue_name, "status": "success"})
+```
+
+Alert on p99 handler duration increasing — a slow external API will cascade into queue buildup.
+
+### Lease Expiry Rate
+
+A proxy for worker crashes. If lease expiry rate spikes, workers are dying:
+
+```sql
+-- Track reaper activity as a time-series metric
+SELECT COUNT(*) AS expired_leases
+FROM jobs_active
+WHERE status = 'running'
+  AND lease_expires < now();
+```
+
+### Distributed Tracing
+
+Carry trace context through the job payload so you can trace a request from HTTP → enqueue → worker:
+
+```python
+# At enqueue time
+trace_id = get_current_trace_id()
+payload["_trace_context"] = {"trace_id": trace_id, "span_id": get_current_span_id()}
+
+# At execution time
+trace_ctx = payload.pop("_trace_context", None)
+with tracer.start_span("job.execute", parent=trace_ctx, attributes={"job_id": job.id}):
+    handler.execute(payload)
+```
+
+### Admin UI / Pause-Resume
+
+An operational necessity — not a nice-to-have:
+
+```sql
+-- Pause a queue: workers skip it during claim
+CREATE TABLE queue_config (
+    queue_name TEXT PRIMARY KEY,
+    paused     BOOLEAN NOT NULL DEFAULT false,
+    paused_at  TIMESTAMPTZ,
+    paused_by  TEXT
+);
+
+-- Workers check before claiming:
+SELECT paused FROM queue_config WHERE queue_name = $1;
+-- If paused, skip this queue entirely
+```
+
+Oban Web is the reference implementation for what a good admin UI looks like: job inspection, retry, cancel, queue pause, real-time metrics.
+
+---
+
+## 24. Security & Compliance
+
+### Payloads Land in WAL and Backups
+
+Every `INSERT` and `UPDATE` to `jobs_active` writes the full row (including payload) to the WAL. The WAL is streamed to replicas and archived to backup storage. If payloads contain PII:
+
+```
+Data flow: INSERT payload → WAL → streaming replication → replica
+                                → WAL archive → S3 backup (retained 30 days)
+                                → pg_basebackup → backup server
+```
+
+**PII in payloads means PII in backups, replicas, and WAL archives.** This has GDPR implications.
+
+### Encrypt Sensitive Payload Fields
+
+```python
+from cryptography.fernet import Fernet
+
+# Application-layer encryption for sensitive fields
+def encrypt_payload(payload: dict, sensitive_keys: set[str]) -> dict:
+    encrypted = payload.copy()
+    for key in sensitive_keys & payload.keys():
+        encrypted[key] = fernet.encrypt(json.dumps(payload[key]).encode()).decode()
+        encrypted[f"_{key}_encrypted"] = True
+    return encrypted
+
+# At enqueue:
+enqueue(job_type="send_email", payload=encrypt_payload(
+    {"recipient": "user@example.com", "body": "Your order..."},
+    sensitive_keys={"recipient", "body"}
+))
+```
+
+### Secrets Out of Payloads
+
+Never store API keys, tokens, or credentials in job payloads:
+
+```python
+# WRONG
+enqueue(payload={"api_key": "sk-live-abc123", "action": "charge"})
+
+# RIGHT — store a reference, resolve at execution time
+enqueue(payload={"credential_ref": "stripe_api_key", "action": "charge"})
+
+# Handler fetches the secret from a vault at runtime
+class ChargeHandler(JobHandler):
+    async def execute(self, payload):
+        api_key = await vault.get_secret(payload["credential_ref"])
+        stripe.api_key = api_key
+        ...
+```
+
+### Least Privilege Database Roles
+
+```sql
+-- Enqueue service: can only INSERT into jobs_active
+CREATE ROLE job_producer;
+GRANT INSERT ON jobs_active TO job_producer;
+GRANT USAGE ON SEQUENCE jobs_active_id_seq TO job_producer;
+
+-- Worker: can UPDATE/DELETE jobs_active, INSERT into jobs_completed
+CREATE ROLE job_worker;
+GRANT SELECT, UPDATE, DELETE ON jobs_active TO job_worker;
+GRANT INSERT ON jobs_completed TO job_worker;
+GRANT USAGE ON SEQUENCE fence_token_seq TO job_worker;
+
+-- Admin: full access (for DLQ replay, cancellation, queue management)
+CREATE ROLE job_admin;
+GRANT ALL ON jobs_active, jobs_completed, cron_schedules, queue_config TO job_admin;
+
+-- Read-only: for dashboards and monitoring
+CREATE ROLE job_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO job_readonly;
+```
+
+### Row-Level Security for Multi-Tenancy
+
+```sql
+ALTER TABLE jobs_active ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON jobs_active
+    USING (tenant_id = current_setting('app.tenant_id')::integer);
+
+-- Set tenant context on each connection
+SET app.tenant_id = '42';
+-- Now all queries automatically filter by tenant_id = 42
+```
+
+### GDPR Right to Erasure
+
+When a user requests deletion, you must purge their data from job payloads — but keep the audit record:
+
+```sql
+-- Scrub PII from completed jobs, keep the metadata
+UPDATE jobs_completed
+SET payload = '{"scrubbed": true}'::jsonb,
+    result = NULL,
+    error_message = NULL
+WHERE tenant_id = $1
+  AND payload->>'user_id' = $2;
+
+-- Also scrub from attempts history
+UPDATE job_attempts
+SET error_message = '[SCRUBBED]',
+    stack_trace = NULL
+WHERE job_id IN (
+    SELECT id FROM jobs_completed
+    WHERE tenant_id = $1 AND payload->>'user_id' = $2
+);
+```
+
+### RBAC on Admin Operations
+
+Not every engineer should be able to replay DLQ jobs or cancel running jobs:
+
+```python
+ADMIN_PERMISSIONS = {
+    "job.cancel":     ["admin", "oncall"],
+    "job.retry":      ["admin", "oncall"],
+    "job.redrive":    ["admin"],
+    "queue.pause":    ["admin", "oncall"],
+    "queue.purge":    ["admin"],
+}
+
+def require_permission(action: str, user: User):
+    allowed_roles = ADMIN_PERMISSIONS.get(action, [])
+    if not any(role in user.roles for role in allowed_roles):
+        raise PermissionDenied(f"Action {action} requires one of {allowed_roles}")
+```
+
+### Audit Log
+
+```sql
+CREATE TABLE admin_audit_log (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    actor       TEXT        NOT NULL,
+    action      TEXT        NOT NULL,
+    target_type TEXT        NOT NULL,  -- 'job', 'queue', 'cron'
+    target_id   TEXT        NOT NULL,
+    details     JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Example: admin replays a dead job
+INSERT INTO admin_audit_log (actor, action, target_type, target_id, details)
+VALUES ('admin@company.com', 'redrive', 'job', '12345',
+        '{"from_status": "dead", "reason": "external API recovered"}');
+```
+
+---
+
+## 25. Scaling: Capacity Planning & Exit Path
+
+### Capacity Planning Formula
+
+```
+Per job: INSERT(1) + UPDATE to running(1) + heartbeats(N) + UPDATE/DELETE to complete(1) + INSERT to completed(1)
+       = 4 + N writes per job
+
+At 5,000 jobs/sec with avg 2 heartbeats per job:
+  Write TPS = 5,000 × 6 = 30,000 TPS
+
+WAL per write ≈ 200 bytes (tuple + index updates)
+WAL throughput = 30,000 × 200 = 6 MB/sec
+
+With 5 indexes, each write generates ~5 additional WAL entries:
+Actual WAL ≈ 30 MB/sec
+
+Replication lag = WAL throughput / replication bandwidth
+```
+
+### Global Concurrency Limits
+
+Per-tenant limits are not enough. Some resources have cluster-wide limits:
+
+```sql
+-- "No more than 20 concurrent report-generation jobs across all workers"
+-- Use a dedicated limiter table
+
+CREATE TABLE global_concurrency (
+    resource_key TEXT PRIMARY KEY,
+    max_slots    INTEGER NOT NULL,
+    used_slots   INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT INTO global_concurrency VALUES ('report_generation', 20, 0);
+
+-- At claim time (inside the claim transaction):
+UPDATE global_concurrency
+SET used_slots = used_slots + 1
+WHERE resource_key = 'report_generation'
+  AND used_slots < max_slots
+RETURNING used_slots;
+-- If 0 rows returned → limit reached, skip this job type
+
+-- At completion time:
+UPDATE global_concurrency
+SET used_slots = GREATEST(used_slots - 1, 0)
+WHERE resource_key = 'report_generation';
+```
+
+### Queue-to-Pool Mapping
+
+Different queues should run on different worker deployments:
+
+```
+Deployment 1 (email-workers):
+  - Queues: [email, notification]
+  - Concurrency: 50
+  - Scaling: based on email queue oldest_pending_age
+
+Deployment 2 (report-workers):
+  - Queues: [report, export]
+  - Concurrency: 5 (reports are CPU-heavy)
+  - Scaling: based on report queue oldest_pending_age
+
+Deployment 3 (webhook-workers):
+  - Queues: [webhook]
+  - Concurrency: 100 (I/O bound, high fan-out)
+  - Scaling: based on webhook queue oldest_pending_age
+```
+
+This prevents a CPU-heavy report from blocking email delivery.
+
+### Rate Limiting Against External Resources
+
+Check rate limits **before** claiming, not after:
+
+```python
+class RateLimitedWorker:
+    def __init__(self):
+        self.rate_limiters = {
+            "stripe_api": TokenBucket(rate=100, capacity=100),   # 100 req/sec
+            "sendgrid_api": TokenBucket(rate=500, capacity=500), # 500 req/sec
+        }
+    
+    async def claim_batch(self, queue_name: str):
+        resource = QUEUE_TO_RESOURCE.get(queue_name)
+        if resource and not self.rate_limiters[resource].try_acquire():
+            return []  # don't claim — we can't execute anyway
+        
+        return await super().claim_batch(queue_name)
+```
+
+### Exit Path: When PostgreSQL Isn't Enough
+
+Signs it's time to move:
+
+```
+1. Claim latency p99 > 200ms despite all optimizations
+2. WAL throughput > 100 MB/sec (approaching disk limits)
+3. autovacuum can't keep up (dead_tup ratio chronically > 30%)
+4. max_connections exhausted even with PgBouncer
+5. Replication lag chronically > 5 seconds due to WAL volume
+```
+
+Migration strategy:
+
+```
+Phase 1: Add Redis/SQS as a "fast lane" for high-volume, low-importance jobs
+         PostgreSQL keeps critical jobs (transactional enqueue)
+         
+Phase 2: Move all claim operations to Redis (BRPOPLPUSH)
+         PostgreSQL becomes the state store (status, history, retry)
+         
+Phase 3: Full migration to SQS/Kafka
+         PostgreSQL stores only job metadata and audit history
+```
+
+**Key rule:** Never delete the PostgreSQL state store. Even at full scale, you need a relational store for job history queries, tenant analytics, and admin operations.
+
+---
+
+## 26. Developer Experience & Testing
+
+### Testing Primitives
+
+```python
+class InlineExecutor:
+    """Run jobs synchronously in tests — no background workers needed."""
+    
+    async def enqueue_and_execute(self, job_type: str, payload: dict) -> dict:
+        handler = JOB_REGISTRY[job_type]
+        return await handler.execute(payload)
+
+class FakeClock:
+    """Control time in tests for scheduled jobs."""
+    
+    def __init__(self, start: datetime):
+        self._now = start
+    
+    def advance(self, seconds: int):
+        self._now += timedelta(seconds=seconds)
+    
+    def now(self) -> datetime:
+        return self._now
+
+# Test assertions
+class JobAssertions:
+    @staticmethod
+    async def assert_enqueued(queue_name: str, count: int = 1, payload_match: dict = None):
+        jobs = await db.fetch(
+            "SELECT * FROM jobs_active WHERE queue_name = $1 AND status = 'pending'",
+            queue_name
+        )
+        assert len(jobs) == count
+        if payload_match:
+            for key, value in payload_match.items():
+                assert jobs[0]["payload"][key] == value
+```
+
+### Fault Injection
+
+The concept map's reference to `SIGKILL` the worker, drop the DB connection, hang the external API — these are the right chaos tests:
+
+```python
+# Test: worker crash mid-execution
+@pytest.mark.chaos
+async def test_worker_crash_requeue():
+    job_id = await enqueue("slow_job", {"sleep": 60})
+    worker = spawn_worker()
+    
+    await wait_until(lambda: get_job_status(job_id) == "running")
+    worker.kill(signal.SIGKILL)  # hard kill, no cleanup
+    
+    # Reaper should requeue within lease_duration
+    await wait_until(
+        lambda: get_job_status(job_id) == "pending",
+        timeout=LEASE_DURATION + REAPER_INTERVAL + 10
+    )
+
+# Test: DB connection drop during heartbeat
+@pytest.mark.chaos
+async def test_heartbeat_failure_self_terminates():
+    job_id = await enqueue("long_job", {})
+    worker = spawn_worker()
+    
+    await wait_until(lambda: get_job_status(job_id) == "running")
+    drop_pg_connections(worker.pid)  # iptables or pg_terminate_backend
+    
+    # Worker should self-terminate after 3 failed heartbeats
+    await wait_until(lambda: not worker.is_alive(), timeout=HEARTBEAT_INTERVAL * 4)
+```
+
+### Load/Benchmark Harness
+
+```sql
+-- EXPLAIN the claim path under load
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT id FROM jobs_active
+WHERE status = 'pending' AND scheduled_at <= now()
+ORDER BY priority DESC, scheduled_at
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+
+-- Key things to check:
+-- 1. Is it using the partial index? (Index Scan using idx_jobs_fetchable)
+-- 2. How many heap fetches vs rows returned? (Buffers: shared hit, shared read)
+-- 3. Execution time (should be < 10ms for healthy table)
+```
+
+### Incident Runbook
+
+| Symptom | Likely Cause | Action |
+|---------|-------------|--------|
+| Queue depth growing, workers idle | Workers can't connect to DB | Check `max_connections`, PgBouncer |
+| Claim latency > 500ms | Index bloat / dead tuples | Check `n_dead_tup`, run `REINDEX CONCURRENTLY` |
+| DLQ growing rapidly | External API down | Check circuit breaker, pause affected queue |
+| VACUUM running for hours | Long-running transaction blocking | `pg_stat_activity`, kill idle-in-transaction |
+| Table size 10× expected | VACUUM not keeping up | Check autovacuum settings, `pg_repack` |
+| XID age approaching 1B | Anti-wraparound VACUUM can't finish | Emergency VACUUM, increase `autovacuum_freeze_max_age` |
+| Replication lag > 30s | Queue WAL overwhelming replica | Reduce indexes, consider `UNLOGGED` for ready queue |
+| Jobs processed out of order | `SKIP LOCKED` inherent behavior | Use job groups for ordering, or accept it |
+
+---
+
+## Production Checklist (Complete)
+
+### MVP — Can't Launch Without
+
+```
+[ ] FOR UPDATE SKIP LOCKED claim protocol
+[ ] Short claim transaction (processing outside the transaction)
+[ ] Lease with fence token on every claim
+[ ] Reaper process for expired leases
+[ ] max_attempts with exponential backoff + full jitter
+[ ] Retryable vs non-retryable error classification
+[ ] Dead letter state (dead) with visibility
+[ ] Poison pill protection (increment attempt at claim time)
+[ ] Partial index on the claim path
+[ ] Payload validation at enqueue time
+[ ] Job type registry (typed, not string identifiers)
+[ ] Transactional enqueue (the reason you picked PostgreSQL)
+[ ] Per-table autovacuum tuning (scale_factor=0, cost_delay=0)
+[ ] Bloat monitoring (n_dead_tup, index sizes)
+[ ] xmin horizon monitoring (idle_in_transaction_session_timeout)
+[ ] statement_timeout on all connections
+[ ] Bounded worker concurrency
+[ ] Graceful shutdown / drain on SIGTERM
+[ ] Pool sizing vs max_connections math
+[ ] Polling interval ≤ 5 seconds
+[ ] oldest_pending_age metric per queue (THE primary metric)
+[ ] Queue depth by state/queue/tenant
+[ ] Throughput + success/failure/DLQ rate metrics
+[ ] Structured logging (job_id, attempt, worker_id)
+[ ] Alerts and SLOs (on age, DLQ growth, autovacuum lag)
+[ ] Server time everywhere (now(), never worker clock)
+[ ] Least-privilege DB roles (producer, worker, admin)
+[ ] Secrets out of payloads (store references, not credentials)
+[ ] PII awareness (payloads land in WAL and backups)
+[ ] RBAC on admin operations (cancel, retry, purge)
+[ ] Online migrations (expand/contract)
+[ ] Containerized worker deployments
+[ ] CI: lint, tests, migrations, security scan
+[ ] Testing primitives (inline mode, fake clock, assertions)
+[ ] One-command local startup
+```
+
+### Growth — Needed as You Scale
+
+```
+[ ] Hot/cold table split (jobs_active + jobs_completed)
+[ ] Attempts history table (per-attempt worker_id, error, stack trace)
+[ ] Payload versioning (old workers handle new formats)
+[ ] LISTEN/NOTIFY + polling hybrid (latency optimization)
+[ ] NOTIFY debounce (one per batch, not per job)
+[ ] Thundering herd mitigation (jitter before claim)
+[ ] PgBouncer compatibility (session mode for LISTEN)
+[ ] Batch claiming (10-20 jobs per claim)
+[ ] Heartbeat (lease extension for long jobs)
+[ ] Cooperative cancellation (AbortSignal / context into handler)
+[ ] Cron / recurring jobs with dedup (unique key per time slot)
+[ ] Catch-up policy for missed cron runs
+[ ] Weighted queues over numeric priority
+[ ] Job expiration / TTL
+[ ] Timezone / DST handling for cron
+[ ] Uniqueness / deduplication (idempotency_key with partial unique index)
+[ ] Debounce / singleton patterns
+[ ] Cancellation (pending + running)
+[ ] Bulk enqueue (multi-row INSERT or COPY)
+[ ] DLQ replay / redrive tooling
+[ ] Circuit breaker per handler/queue
+[ ] Error fingerprinting
+[ ] Snooze / defer
+[ ] Outbox pattern (if events go to Kafka/SQS)
+[ ] Enqueue-time rate limiting and quotas
+[ ] DROP PARTITION retention (not DELETE)
 [ ] Partition creation automated 7 days ahead
-[ ] Read replicas for reporting/analytics queries
+[ ] Index maintenance (REINDEX CONCURRENTLY on schedule)
+[ ] TOAST awareness (p95 of pg_column_size(payload))
+[ ] fillfactor tuning
+[ ] Lock monitoring (pg_locks)
+[ ] Dedicated heartbeat and LISTEN connections
+[ ] Handler isolation (one crash doesn't kill the worker)
+[ ] Middleware chain (logging, tracing, metrics)
+[ ] Adaptive polling (greedy when busy, backoff when idle)
+[ ] Sleep until next run_at
+[ ] Claim latency p50/p99 metric
+[ ] Handler duration histogram
+[ ] Lease expiry rate metric
+[ ] Distributed tracing (trace context in payload)
+[ ] Admin UI / CLI (inspect, retry, cancel, pause)
+[ ] Pause / resume queue (incident kill switch)
+[ ] Per-tenant concurrency cap
+[ ] Weighted fair scheduling
+[ ] Noisy neighbor isolation (large tenants get own queues)
+[ ] Row-Level Security for multi-tenancy
+[ ] Audit log of admin actions
+[ ] GDPR retention + right to erasure (payload scrubbing)
+[ ] Fault injection / chaos testing
+[ ] Load/benchmark harness with EXPLAIN ANALYZE
+[ ] Incident runbook
+```
+
+### Scale — Maturity Only
+
+```
+[ ] Bucket sharding + work stealing
+[ ] Progress-based heartbeat (only extend on real progress)
+[ ] Worker registry / presence table
+[ ] Priority aging (prevent starvation)
+[ ] Job dependencies / DAGs (evaluate Temporal at this point)
+[ ] Ordering guarantees / job groups
+[ ] Retry budget / load shedding
+[ ] Producer backpressure (reject enqueue when saturated)
+[ ] WAL / full-page write awareness
+[ ] Separate database/instance for the queue
+[ ] Know the ceiling (primary-only, replicas don't help claims)
+[ ] Global concurrency limits (cluster-wide resource caps)
+[ ] Queue → pool mapping (separate deployments per queue type)
+[ ] Autoscaling on oldest_pending_age
+[ ] Capacity planning (jobs/s × writes per job = WAL load)
+[ ] End-to-end backpressure
+[ ] Exit path planning (when to move to Redis/SQS/Kafka)
 ```
