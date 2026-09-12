@@ -8,42 +8,43 @@ This solution is best studied alongside the curriculum chapters that explain the
 
 | Section in this doc | Curriculum chapter | What it covers |
 |--------------------|--------------------|----------------|
-| §6 Chunking Engine | [`ai-rag/02-chunking-and-document-processing.md`](../ai-rag/02-chunking-and-document-processing.md) | All chunking strategies in depth: fixed-size, semantic, recursive, document-structure-aware, parent-child, overlap tuning |
-| §7 Embedding Service | [`ai-rag/01-embeddings-and-representation.md`](../ai-rag/01-embeddings-and-representation.md) | Embedding models, vector spaces, similarity metrics, dimensionality trade-offs, matryoshka embeddings |
-| §8 Vector Store | [`ai-rag/03-indexing-and-vector-stores.md`](../ai-rag/03-indexing-and-vector-stores.md) | HNSW vs IVF, quantization (SQ/PQ), sharding, filtered search, benchmarking methodology |
-| §9–10 Retrieval + Reranking | [`ai-rag/04-retrieval-hybrid-and-reranking.md`](../ai-rag/04-retrieval-hybrid-and-reranking.md) | Dense + sparse hybrid search, BM25/SPLADE, cross-encoder reranking, RRF, MMR |
-| §13 Evaluation | [`ai-rag/08-evaluation-methodology.md`](../ai-rag/08-evaluation-methodology.md) | Recall@k, MRR, NDCG, faithfulness, LLM-as-judge, golden dataset design |
-| §5 Ingestion Pipeline | [`ai-rag/appendix-d-doc-processing-benchmarks.md`](../ai-rag/appendix-d-doc-processing-benchmarks.md) | Parser benchmarks (Tika, Unstructured, Docling), extraction quality by format |
-| §3 Architecture | [`ai-rag/00-mental-models.md`](../ai-rag/00-mental-models.md) | The represent→retrieve→generate mental model that shapes the entire platform |
-| §15 Deployment | [`ai-rag/appendix-e-deployment-and-compute.md`](../ai-rag/appendix-e-deployment-and-compute.md) | GPU provisioning for embedding models, inference optimization, cost modeling |
+| §7 Chunking Engine | [`ai-rag/02-chunking-and-document-processing.md`](../ai-rag/02-chunking-and-document-processing.md) | All chunking strategies in depth: fixed-size, semantic, recursive, document-structure-aware, parent-child, overlap tuning |
+| §8 Embedding Service | [`ai-rag/01-embeddings-and-representation.md`](../ai-rag/01-embeddings-and-representation.md) | Embedding models, vector spaces, similarity metrics, dimensionality trade-offs, matryoshka embeddings |
+| §9 Vector Store | [`ai-rag/03-indexing-and-vector-stores.md`](../ai-rag/03-indexing-and-vector-stores.md) | HNSW vs IVF, quantization (SQ/PQ), sharding, filtered search, benchmarking methodology |
+| §10–11 Retrieval + Reranking | [`ai-rag/04-retrieval-hybrid-and-reranking.md`](../ai-rag/04-retrieval-hybrid-and-reranking.md) | Dense + sparse hybrid search, BM25/SPLADE, cross-encoder reranking, RRF, MMR |
+| §14 Evaluation | [`ai-rag/08-evaluation-methodology.md`](../ai-rag/08-evaluation-methodology.md) | Recall@k, MRR, NDCG, faithfulness, LLM-as-judge, golden dataset design |
+| §6 Ingestion Pipeline | [`ai-rag/appendix-d-doc-processing-benchmarks.md`](../ai-rag/appendix-d-doc-processing-benchmarks.md) | Parser benchmarks (Tika, Unstructured, Docling), extraction quality by format |
+| §4 Architecture | [`ai-rag/00-mental-models.md`](../ai-rag/00-mental-models.md) | The represent→retrieve→generate mental model that shapes the entire platform |
+| §16 Deployment | [`ai-rag/appendix-e-deployment-and-compute.md`](../ai-rag/appendix-e-deployment-and-compute.md) | GPU provisioning for embedding models, inference optimization, cost modeling |
 
 ---
 
 ## Table of Contents
 
 1. [Requirements Clarification](#1-requirements-clarification)
-2. [Capacity Estimates](#2-capacity-estimates)
-3. [High-Level Architecture](#3-high-level-architecture)
-4. [Data Source Connectors](#4-data-source-connectors)
-5. [Ingestion Pipeline](#5-ingestion-pipeline)
-6. [Chunking Engine](#6-chunking-engine)
-7. [Embedding Service](#7-embedding-service)
-8. [Vector Store](#8-vector-store)
-9. [Retrieval Service](#9-retrieval-service)
-10. [Reranking](#10-reranking)
-11. [Permission-Aware Retrieval](#11-permission-aware-retrieval)
-12. [Freshness Management](#12-freshness-management)
-13. [Evaluation](#13-evaluation)
-14. [Data Models](#14-data-models)
-15. [Sequence Flows](#15-sequence-flows)
-16. [API Design](#16-api-design)
-17. [Observability and SLOs](#17-observability-and-slos)
-18. [Scaling](#18-scaling)
-19. [Failure Modes](#19-failure-modes)
-20. [Cost Model](#20-cost-model)
-21. [Trade-offs](#21-trade-offs)
-22. [Evolution Path](#22-evolution-path)
-23. [Exercises](#23-exercises)
+2. [Architecture by Scale](#2-architecture-by-scale)
+3. [Capacity Estimates](#3-capacity-estimates)
+4. [High-Level Architecture](#4-high-level-architecture)
+5. [Data Source Connectors](#5-data-source-connectors)
+6. [Ingestion Pipeline](#6-ingestion-pipeline)
+7. [Chunking Engine](#7-chunking-engine)
+8. [Embedding Service](#8-embedding-service)
+9. [Vector Store](#9-vector-store)
+10. [Retrieval Service](#10-retrieval-service)
+11. [Reranking](#11-reranking)
+12. [Permission-Aware Retrieval](#12-permission-aware-retrieval)
+13. [Freshness Management](#13-freshness-management)
+14. [Evaluation](#14-evaluation)
+15. [Data Models](#15-data-models)
+16. [Sequence Flows](#16-sequence-flows)
+17. [API Design](#17-api-design)
+18. [Observability and SLOs](#18-observability-and-slos)
+19. [Scaling](#19-scaling)
+20. [Failure Modes](#20-failure-modes)
+21. [Cost Model](#21-cost-model)
+22. [Trade-offs](#22-trade-offs)
+23. [Evolution Path](#23-evolution-path)
+24. [Exercises](#24-exercises)
 
 ---
 
@@ -56,20 +57,20 @@ This solution is best studied alongside the curriculum chapters that explain the
 | Scope | Does the platform own the LLM generation step? | No. The platform's contract ends at a ranked, permission-filtered, cited set of chunks. Generation/orchestration is the application team's concern, but the platform still owns *evaluating* faithfulness of downstream answers because that signal feeds retrieval quality decisions. |
 | Tenancy | Who owns a knowledge base? | One team per knowledge base (namespace), but a knowledge base can span many sources and serve many downstream applications/service identities. |
 | Permissions | Whose permissions apply at query time? | The permissions of the **calling end user**, passed as a resolved identity + group set by the caller (application backend), never the service account used to ingest. |
-| Freshness | Is "freshness" the same target for every source? | No — per-source-class SLA (Slack: minutes; wiki: hours; nightly DB export: 24h) declared in §12. |
-| Consistency | Is the vector index linearizable with the source? | No — it is deliberately **eventually consistent for content**, but has a hard, bounded consistency requirement for **permission revocation** (§11). |
+| Freshness | Is "freshness" the same target for every source? | No — per-source-class SLA (Slack: minutes; wiki: hours; nightly DB export: 24h) declared in §13. |
+| Consistency | Is the vector index linearizable with the source? | No — it is deliberately **eventually consistent for content**, but has a hard, bounded consistency requirement for **permission revocation** (§12). |
 | Scale | Largest single knowledge base? | 2B chunks, ~2 TB of float16 vectors at 768d before quantization. |
-| Embedding | One embedding model platform-wide? | No — multiple models coexist; each knowledge base pins one "primary" model version at a time, with a migration protocol (§7.4) for changing it. |
+| Embedding | One embedding model platform-wide? | No — multiple models coexist; each knowledge base pins one "primary" model version at a time, with a migration protocol (§8.4) for changing it. |
 | Chunking | Is chunking strategy global or configurable? | Configurable per source within a knowledge base — a Confluence source and a Slack source in the same KB legitimately want different strategies. |
 | Evaluation | Who writes golden datasets? | The owning team, platform tooling assists by mining query logs + click/thumbs feedback into candidate judgments for human review. |
 | Ops | Team size operating this platform? | ~15-20 engineers across connector, retrieval/index, and ML/eval sub-teams — this shapes how much must be config-driven vs. hand-built per source. |
 
 ### Key Assumptions
 
-1. **Read-heavy, write-heavy-in-bursts.** Query traffic is roughly steady; ingestion traffic is bursty (new KB backfills, bulk re-embeds) and must not starve query serving — these are architecturally separated (§3, §18).
+1. **Read-heavy, write-heavy-in-bursts.** Query traffic is roughly steady; ingestion traffic is bursty (new KB backfills, bulk re-embeds) and must not starve query serving — these are architecturally separated (§4, §19).
 2. **Permissions are the hardest constraint, not the biggest one.** Scale is "big but standard" vector-search scale; the differentiator versus a generic vector DB is that a permission mistake is a security incident, not a quality regression.
 3. **Source systems are authoritative.** The platform never originates content or permission truth; it is always a derived, rebuildable index. This makes "delete the knowledge base and re-backfill" always a valid (if slow) recovery path.
-4. **Most knowledge bases are small; a few are huge.** Power-law distribution — 90% of KBs are under 1M chunks, but the top 1% (5 KBs) hold 40%+ of total chunks. The architecture must not force every KB to pay large-KB overhead (§8.5, §18).
+4. **Most knowledge bases are small; a few are huge.** Power-law distribution — 90% of KBs are under 1M chunks, but the top 1% (5 KBs) hold 40%+ of total chunks. The architecture must not force every KB to pay large-KB overhead (§9.5, §19).
 5. **Embedding models improve over time and must be swappable** without a flag day for every downstream application.
 6. **Not every source offers clean incremental primitives.** Some connectors are stuck polling and diffing; the freshness SLA for those sources is honestly worse, not force-fit to match webhook-backed sources.
 
@@ -82,7 +83,606 @@ This solution is best studied alongside the curriculum chapters that explain the
 
 ---
 
-## 2. Capacity Estimates
+## 2. Architecture by Scale (1K Docs → 500M Docs)
+
+> **Start simple, scale when needed.** The sections below show how a RAG platform evolves as you grow. Don't over-engineer early — each tier builds on the previous one. Sections §4–§22 detail the full enterprise design (Tier 3).
+
+### Architecture Comparison Matrix
+
+| Scale | Docs | Chunks | Query QPS | Architecture | Team | Monthly Cost |
+|-------|------|--------|-----------|--------------|------|--------------|
+| **Tier 1: MVP** | 1K–50K | 20K–1M | 1–50 | Monolith + PostgreSQL/pgvector | 1–2 | $100–500 |
+| **Tier 2: Growth** | 50K–5M | 1M–100M | 50–2K | Services + Dedicated Vector DB + Queue | 3–8 | $2K–15K |
+| **Tier 3: Enterprise** | 5M–500M | 100M–10B+ | 2K–20K+ | Full distributed (§4 onward) | 15–50 | $50K–500K+ |
+
+---
+
+### 2.1 Tier 1: MVP (1K–50K Documents)
+
+**Scale Profile:**
+```
+Total documents:     10,000
+Chunks:              200,000 (avg 20 chunks/doc)
+Chunk size:          ~300 tokens, ~1.2 KB
+Embedding dim:       384 (small model, cheap)
+Vector storage:      200K × 384 × 4B = 307 MB (float32, no quantization needed)
+Queries/sec:         ~1–5 QPS (peak ~20)
+Sources:             1–3 (a Confluence space, a Drive folder, maybe S3)
+```
+
+**Architecture: Monolith + PostgreSQL with pgvector**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         CLIENTS                                  │
+│              (Internal app, Slack bot, CLI tool)                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Single Server                                │
+│              (EC2 / Railway / Cloud Run)                         │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │              RAG Application (FastAPI / Django)              ││
+│  │                                                              ││
+│  │  ┌───────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐  ││
+│  │  │Ingest API │  │Retrieve   │  │Admin API │  │Background││
+│  │  │           │  │API        │  │          │  │Sync Cron ││
+│  │  └───────────┘  └───────────┘  └──────────┘  └──────────┘  ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │               PostgreSQL + pgvector                          ││
+│  │     (documents, chunks, embeddings, metadata — all in one)   ││
+│  └─────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Database Schema:**
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE knowledge_bases (
+    id              SERIAL PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    embedding_model VARCHAR(100) NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+    chunk_size      INTEGER NOT NULL DEFAULT 400,
+    chunk_overlap   INTEGER NOT NULL DEFAULT 60,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE documents (
+    id              SERIAL PRIMARY KEY,
+    kb_id           INTEGER REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    source_type     VARCHAR(50) NOT NULL,          -- 'confluence', 'drive', 's3'
+    source_ref      TEXT NOT NULL,                  -- source-native ID
+    title           TEXT,
+    content_hash    VARCHAR(64) NOT NULL,           -- SHA-256, skip re-processing unchanged docs
+    raw_text        TEXT NOT NULL,
+    metadata        JSONB DEFAULT '{}',
+    last_synced_at  TIMESTAMPTZ DEFAULT NOW(),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (kb_id, source_type, source_ref)
+);
+
+CREATE TABLE chunks (
+    id              SERIAL PRIMARY KEY,
+    document_id     INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index     SMALLINT NOT NULL,
+    text            TEXT NOT NULL,
+    token_count     SMALLINT NOT NULL,
+    section_path    TEXT,                           -- 'Intro > Setup > Step 3'
+    embedding       vector(384) NOT NULL,           -- pgvector column
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- The critical index: HNSW for fast ANN search
+CREATE INDEX idx_chunks_embedding ON chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+
+-- Filter support
+CREATE INDEX idx_chunks_document ON chunks(document_id);
+CREATE INDEX idx_documents_kb ON documents(kb_id, last_synced_at DESC);
+CREATE INDEX idx_documents_hash ON documents(kb_id, content_hash);
+```
+
+**Ingestion (in-process, no queue):**
+
+```python
+from sentence_transformers import SentenceTransformer
+import hashlib
+
+model = SentenceTransformer("all-MiniLM-L6-v2")  # 384-dim, fast, free
+
+SEPARATORS = ["\n\n", "\n", ". ", " "]
+
+def recursive_split(text: str, max_tokens: int = 400, overlap: int = 60) -> list[str]:
+    """Simple recursive splitter — the workhorse default."""
+    tokens = text.split()
+    if len(tokens) <= max_tokens:
+        return [text]
+    for sep in SEPARATORS:
+        if sep in text:
+            parts = text.split(sep)
+            return _merge_parts(parts, sep, max_tokens, overlap)
+    # hard split on words
+    chunks = []
+    for i in range(0, len(tokens), max_tokens - overlap):
+        chunks.append(" ".join(tokens[i:i + max_tokens]))
+    return chunks
+
+async def ingest_document(db, kb_id: int, source_type: str, source_ref: str,
+                          title: str, raw_text: str, metadata: dict):
+    content_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+
+    # Skip if unchanged
+    existing = await db.fetchrow(
+        "SELECT id FROM documents WHERE kb_id=$1 AND content_hash=$2 AND source_ref=$3",
+        kb_id, content_hash, source_ref,
+    )
+    if existing:
+        return existing["id"]
+
+    # Upsert document
+    doc_id = await db.fetchval("""
+        INSERT INTO documents (kb_id, source_type, source_ref, title, content_hash, raw_text, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (kb_id, source_type, source_ref)
+        DO UPDATE SET title=$4, content_hash=$5, raw_text=$6, metadata=$7, last_synced_at=NOW()
+        RETURNING id
+    """, kb_id, source_type, source_ref, title, content_hash, raw_text, metadata)
+
+    # Delete old chunks, re-chunk, embed, insert
+    await db.execute("DELETE FROM chunks WHERE document_id=$1", doc_id)
+    chunks = recursive_split(raw_text)
+    embeddings = model.encode(chunks, batch_size=64)
+
+    for i, (text, emb) in enumerate(zip(chunks, embeddings)):
+        await db.execute("""
+            INSERT INTO chunks (document_id, chunk_index, text, token_count, embedding)
+            VALUES ($1, $2, $3, $4, $5)
+        """, doc_id, i, text, len(text.split()), emb.tolist())
+
+    return doc_id
+```
+
+**Retrieval (dense search, single query):**
+
+```python
+async def retrieve(db, kb_id: int, query: str, top_k: int = 10,
+                   similarity_threshold: float = 0.5) -> list[dict]:
+    query_embedding = model.encode(query).tolist()
+
+    results = await db.fetch("""
+        SELECT c.id, c.text, c.section_path, c.token_count,
+               d.title, d.source_type, d.source_ref, d.metadata,
+               1 - (c.embedding <=> $1::vector) AS score
+        FROM chunks c
+        JOIN documents d ON c.document_id = d.id
+        WHERE d.kb_id = $2
+          AND 1 - (c.embedding <=> $1::vector) > $3
+        ORDER BY c.embedding <=> $1::vector
+        LIMIT $4
+    """, query_embedding, kb_id, similarity_threshold, top_k)
+
+    return [dict(r) for r in results]
+```
+
+**Background Sync (cron-based, simple polling):**
+
+```python
+# Run every 15 minutes via cron or APScheduler
+async def sync_confluence_source(db, kb_id: int, space_key: str, since: datetime):
+    """Poll Confluence for changes since last sync."""
+    pages = confluence_client.get_pages(
+        space=space_key,
+        modified_after=since,
+        limit=100,
+    )
+    for page in pages:
+        raw_text = html_to_text(page["body"])
+        await ingest_document(
+            db, kb_id,
+            source_type="confluence",
+            source_ref=page["id"],
+            title=page["title"],
+            raw_text=raw_text,
+            metadata={"author": page["author"], "url": page["url"]},
+        )
+```
+
+**Infrastructure:**
+
+```
+Single-Server Setup (~$100–300/month):
+
+┌──────────────────────────────────────────────────────────┐
+│  1x Server (2-4 vCPU, 8GB RAM, 50GB SSD)       ~$50-100 │
+│    - FastAPI application                                 │
+│    - Embedding model (CPU inference, ~50 chunks/sec)     │
+│    - Background sync cron                                │
+├──────────────────────────────────────────────────────────┤
+│  1x PostgreSQL + pgvector (4GB RAM, 50GB SSD)   ~$50-100 │
+│    - Documents, chunks, embeddings — all in one          │
+│    - HNSW index fits in RAM at this scale                │
+├──────────────────────────────────────────────────────────┤
+│  Backups, monitoring, DNS                       ~$20-50  │
+└──────────────────────────────────────────────────────────┘
+
+Total: ~$100-300/month
+```
+
+**What You Get:**
+- End-to-end RAG pipeline: ingest → chunk → embed → search
+- Content-hash dedup (unchanged docs skip re-processing)
+- Sub-50ms retrieval (pgvector HNSW on <1M vectors is fast)
+- Simple to operate: one server, one database, one process
+
+**What You're Deliberately Skipping:**
+- Permissions (KB-level access only — you can see the whole KB or nothing)
+- Hybrid search (dense only — no BM25/lexical)
+- Reranking (raw vector similarity is good enough at this scale)
+- Freshness SLAs (cron-based sync, 15-min cadence, best-effort)
+- Evaluation tooling (ad-hoc quality checks)
+- Multi-tenancy isolation (everything in one Postgres)
+
+**When to Move to Tier 2:**
+
+| Signal | Threshold | Why |
+|--------|-----------|-----|
+| Chunk count | > 1M | pgvector HNSW build time and memory pressure increase |
+| Query latency P99 | > 200ms | ANN index too large for single-node RAM |
+| Documents | > 50K | Sync cron takes too long, need incremental/webhook |
+| Sources | > 3 or need Slack/DB | Polling doesn't scale; need event-driven connectors |
+| Users need permissions | Any | KB-level access is too coarse — need document-level ACLs |
+| Quality complaints | Recurring | Need hybrid search, reranking, eval tooling |
+
+---
+
+### 2.2 Tier 2: Growth (50K–5M Documents)
+
+**Scale Profile:**
+```
+Total documents:     500,000
+Chunks:              10,000,000 (10M)
+Embedding dim:       768 (stronger model, still self-hosted)
+Vector storage:      10M × 768 × 2B (float16) = 15.4 GB
+Queries/sec:         ~50–500 QPS (peak ~1,000)
+Sources:             5–15 (Confluence, Drive, Slack, S3, databases)
+Team:                3–8 engineers
+```
+
+**Architecture: Services + Dedicated Vector DB + Task Queue**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         CLIENTS                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     API Gateway / LB                             │
+│                    (nginx / ALB)                                 │
+└─────────────────────────────────────────────────────────────────┘
+          │                         │                    │
+          ▼                         ▼                    ▼
+  ┌──────────────┐         ┌──────────────┐     ┌──────────────┐
+  │ Retrieval    │         │ Ingestion    │     │ Admin        │
+  │ Service      │         │ Service      │     │ Service      │
+  │ (stateless,  │         │ (stateless,  │     │ (KB CRUD,    │
+  │  2-4 replicas)│        │  2-4 workers) │    │  source cfg) │
+  └──────┬───────┘         └──────┬───────┘     └──────────────┘
+         │                        │
+    ┌────┴────────┐          ┌────┴────────┐
+    │             │          │             │
+    ▼             ▼          ▼             ▼
+┌────────┐  ┌────────┐  ┌────────┐  ┌────────────┐
+│Vector  │  │Redis   │  │Task    │  │PostgreSQL  │
+│DB      │  │Cache   │  │Queue   │  │(metadata,  │
+│(Qdrant │  │        │  │(Celery/│  │ documents, │
+│ or     │  │        │  │ Bull)  │  │ configs)   │
+│Weaviate)│ │        │  │        │  │            │
+└────────┘  └────────┘  └────────┘  └────────────┘
+                                          │
+                                    ┌─────┴──────┐
+                                    │ Embedding  │
+                                    │ Service    │
+                                    │ (GPU or    │
+                                    │  hosted API)│
+                                    └────────────┘
+```
+
+**Key Changes from Tier 1:**
+
+1. **Dedicated vector database** (Qdrant, Weaviate, or Milvus) replaces pgvector — purpose-built for ANN at 10M+ vectors, with filtered search, quantization, and sharding built in
+2. **Task queue** (Celery/Redis or Bull) for async ingestion — decouples ingest from query serving so a big backfill doesn't block searches
+3. **Separate embedding service** — GPU inference (or hosted API) for faster throughput; batch processing for backfills
+4. **Redis cache** for hot query results and embedding cache
+5. **Multiple app replicas** behind a load balancer
+6. **Hybrid search** — dense + BM25 (most vector DBs support this natively now)
+
+**Retrieval with Hybrid Search + RRF:**
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+qdrant = QdrantClient(host="qdrant", port=6333)
+
+async def retrieve(kb_id: str, query: str, user_id: str,
+                   top_k: int = 10, alpha: float = 0.6) -> list[dict]:
+    # Check cache
+    cache_key = f"q:{kb_id}:{hash(query)}:{user_id}:{top_k}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    query_embedding = await embedding_service.embed(query)
+
+    # Hybrid search: dense + sparse (BM25) with RRF fusion
+    # Most vector DBs (Qdrant, Weaviate) support this natively
+    results = qdrant.query_points(
+        collection_name=f"kb_{kb_id}",
+        query=query_embedding,
+        using="dense",
+        query_filter=Filter(
+            must=[
+                # Document-level permission filter (basic group check)
+                FieldCondition(key="allowed_groups", match=MatchValue(value=user_group)),
+            ]
+        ),
+        limit=top_k,
+        with_payload=True,
+        # Enable hybrid search if the collection has a sparse index
+        # Qdrant uses named vectors; Weaviate has bm25 built-in
+    )
+
+    # Enrich with document metadata from Postgres
+    chunk_ids = [r.id for r in results]
+    docs = await postgres.fetch_documents_for_chunks(chunk_ids)
+
+    response = [{
+        "chunk_id": r.id,
+        "text": r.payload["text"],
+        "score": r.score,
+        "document": docs[r.payload["document_id"]],
+        "section_path": r.payload.get("section_path"),
+        "last_synced_at": r.payload.get("last_synced_at"),
+    } for r in results]
+
+    # Cache for 60 seconds
+    await redis.setex(cache_key, 60, json.dumps(response, default=str))
+    return response
+```
+
+**Ingestion Pipeline (queue-based):**
+
+```python
+# Celery task — runs on worker pool, not the API server
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def ingest_document_task(self, kb_id: str, source_type: str,
+                         source_ref: str, raw_content: str, metadata: dict):
+    try:
+        content_hash = hashlib.sha256(raw_content.encode()).hexdigest()
+
+        # Skip if unchanged
+        if document_store.hash_exists(kb_id, source_ref, content_hash):
+            return {"status": "skipped", "reason": "unchanged"}
+
+        # Parse based on format
+        text = parse_document(raw_content, metadata.get("format", "text"))
+
+        # Chunk with strategy based on content type
+        strategy = get_chunking_strategy(metadata.get("content_type", "prose"))
+        chunks = strategy.chunk(text)
+
+        # Batch embed
+        embeddings = embedding_service.embed_batch(
+            [c.text for c in chunks],
+            model="bge-base-en-v1.5",
+        )
+
+        # Write to document store (Postgres)
+        doc_id = document_store.upsert(kb_id, source_type, source_ref,
+                                        text, content_hash, metadata)
+
+        # Write to vector store (Qdrant)
+        vector_store.upsert_chunks(
+            collection=f"kb_{kb_id}",
+            chunks=chunks,
+            embeddings=embeddings,
+            doc_id=doc_id,
+            metadata=metadata,
+        )
+
+        return {"status": "ingested", "doc_id": doc_id, "chunks": len(chunks)}
+
+    except Exception as e:
+        # Retry transient errors; DLQ persistent ones
+        if is_transient(e):
+            raise self.retry(exc=e)
+        dead_letter_queue.send(kb_id, source_ref, str(e))
+        return {"status": "failed", "error": str(e)}
+```
+
+**Multiple Chunking Strategies:**
+
+```python
+class ChunkingStrategy:
+    """Base — Tier 2 adds structure-aware and parent-child on top of Tier 1's recursive split."""
+
+def get_chunking_strategy(content_type: str) -> ChunkingStrategy:
+    return {
+        "prose": RecursiveSplitter(max_tokens=400, overlap=60),
+        "markdown": StructureAwareSplitter(),           # respects headings
+        "code": CodeSplitter(parser="tree-sitter"),     # respects function boundaries
+        "slack_thread": ParentChildSplitter(             # message=child, thread=parent
+            child_size=200, parent_size=1000
+        ),
+        "table": TabularSplitter(rows_per_chunk=20),
+    }.get(content_type, RecursiveSplitter())
+```
+
+**Basic Document-Level Permissions:**
+
+```python
+# At ingestion: store allowed groups/users per document
+def sync_permissions(doc_id: str, source_type: str, source_ref: str):
+    """Fetch ACLs from source, store as filterable metadata."""
+    if source_type == "confluence":
+        perms = confluence_client.get_page_permissions(source_ref)
+        allowed = [p["principal_id"] for p in perms if p["level"] == "read"]
+    elif source_type == "drive":
+        perms = drive_client.get_file_permissions(source_ref)
+        allowed = [p["emailAddress"] for p in perms]
+    else:
+        allowed = ["*"]  # public within the KB
+
+    # Store on the vector DB payload for filtered search
+    vector_store.update_payload(
+        collection=f"kb_{doc.kb_id}",
+        doc_id=doc_id,
+        payload={"allowed_groups": allowed},
+    )
+
+# At query time: filter by user's groups (resolved from IdP)
+def resolve_user_groups(user_id: str) -> list[str]:
+    groups = idp_client.get_user_groups(user_id)
+    return [user_id] + groups  # direct + group access
+```
+
+**Freshness: Webhook + Polling Hybrid:**
+
+```python
+# Webhook receiver — real-time for sources that support it
+@app.post("/webhooks/confluence")
+async def confluence_webhook(event: ConfluenceEvent):
+    if event.type in ("page:created", "page:updated"):
+        ingest_document_task.delay(
+            kb_id=resolve_kb(event.space_key),
+            source_type="confluence",
+            source_ref=event.page_id,
+            raw_content=event.content,
+            metadata={"format": "html", "content_type": "wiki"},
+        )
+    elif event.type == "page:removed":
+        vector_store.delete_by_doc(resolve_kb(event.space_key), event.page_id)
+
+# Polling fallback — for sources without webhooks, and as reconciliation
+@celery_app.task
+def scheduled_sync():
+    """Runs on a per-source cadence: Slack 1min, wiki 15min, S3 1hr, web daily."""
+    for source in get_active_sources():
+        changes = source.connector.fetch_changes(since=source.last_synced_at)
+        for doc in changes:
+            ingest_document_task.delay(source.kb_id, source.type, doc.ref,
+                                       doc.content, doc.metadata)
+        source.update_checkpoint()
+```
+
+**Evaluation (basic golden dataset):**
+
+```python
+# Simple eval runner — measures retrieval quality against labeled examples
+def evaluate_retrieval(kb_id: str, golden_set: list[dict], top_k: int = 10) -> dict:
+    recalls, mrrs = [], []
+    for example in golden_set:
+        results = retrieve(kb_id, example["query"], user_id="eval-bot", top_k=top_k)
+        retrieved_ids = {r["chunk_id"] for r in results}
+        relevant_ids = set(example["relevant_chunk_ids"])
+
+        recall = len(retrieved_ids & relevant_ids) / len(relevant_ids) if relevant_ids else 1.0
+        recalls.append(recall)
+
+        # MRR: rank of first relevant result
+        for i, r in enumerate(results):
+            if r["chunk_id"] in relevant_ids:
+                mrrs.append(1.0 / (i + 1))
+                break
+        else:
+            mrrs.append(0.0)
+
+    return {
+        "recall_at_k": sum(recalls) / len(recalls),
+        "mrr": sum(mrrs) / len(mrrs),
+        "examples_evaluated": len(golden_set),
+    }
+```
+
+**Infrastructure:**
+
+```
+Multi-Service Setup (~$2,000–8,000/month):
+
+┌──────────────────────────────────────────────────────────┐
+│  2-4x App Servers (2 vCPU, 4GB each)             ~$200   │
+│    - Retrieval Service, Ingestion Service                │
+├──────────────────────────────────────────────────────────┤
+│  1x Vector DB (Qdrant/Weaviate, 8-16GB RAM)      ~$200   │
+│    - Or managed: Qdrant Cloud, Weaviate Cloud            │
+├──────────────────────────────────────────────────────────┤
+│  1x PostgreSQL (4 vCPU, 8GB, 200GB SSD)          ~$200   │
+│    - Document store, configs, metadata                   │
+├──────────────────────────────────────────────────────────┤
+│  1x Redis (2 vCPU, 4GB)                          ~$100   │
+│    - Query cache, embedding cache, task queue             │
+├──────────────────────────────────────────────────────────┤
+│  Embedding: self-hosted 1x GPU (A10G)            ~$500   │
+│    - Or hosted API: ~$100-500 depending on volume        │
+├──────────────────────────────────────────────────────────┤
+│  LB, monitoring, backups, DNS                    ~$200   │
+└──────────────────────────────────────────────────────────┘
+
+Total: ~$1,500-2,000/month (self-hosted embedding)
+       ~$2,000-8,000/month (hosted API at higher volumes)
+```
+
+**What Tier 2 Adds Over Tier 1:**
+- Dedicated vector DB with filtered search and hybrid (dense + BM25)
+- Async ingestion pipeline (queue-based, retries, DLQ)
+- Multiple chunking strategies per content type
+- Basic document-level permissions (group-based filtering)
+- Webhook-driven freshness for supported sources
+- Simple evaluation framework (recall@k, MRR against golden sets)
+- Redis caching for hot queries
+
+**What You're Still Skipping (deferred to Tier 3):**
+- Cross-encoder reranking (RRF is enough for now)
+- Pre-filter permission enforcement at ANN traversal (post-filter is fine at this selectivity)
+- Multi-model embedding support and live migration
+- Sharding beyond single-node vector DB capacity
+- Full freshness SLAs with staleness tracking and tombstone propagation
+- LLM-as-judge evaluation, A/B testing
+- Continuous permission auditing and chaos testing
+- Per-KB cost attribution and chargeback
+
+**When to Move to Tier 3:**
+
+| Signal | Threshold | Why |
+|--------|-----------|-----|
+| Chunks | > 100M | Single-node vector DB can't hold the index in RAM |
+| QPS | > 2,000 | Need sharded vector store + read replicas |
+| KBs | > 50 | Noisy-neighbor isolation becomes critical |
+| Permission bugs | Any leak | Need pre-filter enforcement + defense-in-depth (§12) |
+| Sources | > 15 or complex (DB CDC, web crawl) | Need the full connector framework (§5) |
+| Team size | > 8 | Enough headcount to operate the full distributed system |
+| Compliance | GDPR, SOC2, data residency | Need the full permission, audit, and cost model |
+
+---
+
+### 2.3 Tier 3: Enterprise (§4 Onward)
+
+The remainder of this document (§4–§22) details the full enterprise-scale architecture: 500+ knowledge bases, 10B+ chunks, 20K QPS, document-level zero-leakage permissions, multi-model embedding with live migration, sharded vector stores, cross-encoder reranking, full freshness SLAs with tombstone propagation, LLM-as-judge evaluation, continuous security auditing, and per-KB cost attribution.
+
+**Migration path from Tier 2 → Tier 3** is detailed in §23's version-by-version upgrade sequence. The key principle: every component in Tier 2 maps to a component in Tier 3 (Qdrant → the platform's owned Vector Store, Celery → Temporal workflows, basic group filtering → the full Permission Service), and the migration is a live, per-KB upgrade — not a flag-day cutover.
+
+---
+
+## 3. Capacity Estimates
 
 Doing the arithmetic up front constrains every later design choice.
 
@@ -118,7 +718,7 @@ Doing the arithmetic up front constrains every later design choice.
 | Platform peak QPS | 20,000 qps |
 | Largest single KB peak | 2,000 qps |
 | Vector search cost per query (HNSW, ef_search=100, top_k=50, single shard) | ~2-5 ms CPU |
-| With reranking (cross-encoder, top-100 candidates) | +100-400 ms depending on batch size/GPU vs CPU (§10.4) — this is why reranking is opt-in per call |
+| With reranking (cross-encoder, top-100 candidates) | +100-400 ms depending on batch size/GPU vs CPU (§11.4) — this is why reranking is opt-in per call |
 | Fraction of queries expected to use reranking | ~30% (quality-sensitive interactive apps); rest use raw hybrid search |
 
 ### Shard sizing (HNSW)
@@ -128,11 +728,11 @@ A single HNSW index holding 100M vectors at 768d float16 needs roughly:
 
 `64 GB ÷ (1536 B × 1.5) ≈ 27.7M vectors per shard` → round down to **25M vectors/shard** as the sharding target.
 
-10B chunks ÷ 25M/shard = **400 shards** platform-wide at steady state, growing with corpus size. This number recurs in §8.5 (sharding strategy) and §18 (scaling).
+10B chunks ÷ 25M/shard = **400 shards** platform-wide at steady state, growing with corpus size. This number recurs in §9.5 (sharding strategy) and §19 (scaling).
 
 ### Query fan-out bandwidth
 
-For the largest sharded KBs (§8.5), a single query fans out to every shard, each returning an overfetched candidate list (§9.3) — worth sizing so the fan-out itself isn't a hidden bottleneck:
+For the largest sharded KBs (§9.5), a single query fans out to every shard, each returning an overfetched candidate list (§10.3) — worth sizing so the fan-out itself isn't a hidden bottleneck:
 
 ```
 Largest KB: 2B chunks ÷ 25M/shard = 80 shards
@@ -141,20 +741,20 @@ Per-result payload: ~1.2 KB (chunk text + metadata + scores, before rerank
                              truncates it down to the final top_k)
 Per-query fan-out traffic: 80 shards × 30 results × 1.2 KB ≈ 2.9 MB per query
 
-At this KB's peak of 2,000 qps (§2): 2,000 × 2.9 MB ≈ 5.8 GB/sec of
+At this KB's peak of 2,000 qps (§3): 2,000 × 2.9 MB ≈ 5.8 GB/sec of
 internal fan-out traffic — comfortably within a modern data-center
 network fabric's budget, but large enough that the Retrieval Service
 instances handling this KB's traffic are deliberately placed
-network-adjacent to that KB's shard fleet (§18's "colocate with vector
+network-adjacent to that KB's shard fleet (§19's "colocate with vector
 store shards to minimize network hops"), rather than assuming cross-AZ
 bandwidth is free at this volume.
 ```
 
-The 3x overfetch factor is the direct multiplier on this number — it's the same knob that improves cross-shard result quality (§9.3) and inflates fan-out bandwidth, one more concrete instance of §21's recurring theme that a quality lever and a cost/capacity lever are often the same knob viewed from two directions.
+The 3x overfetch factor is the direct multiplier on this number — it's the same knob that improves cross-shard result quality (§10.3) and inflates fan-out bandwidth, one more concrete instance of §22's recurring theme that a quality lever and a cost/capacity lever are often the same knob viewed from two directions.
 
 ---
 
-## 3. High-Level Architecture
+## 4. High-Level Architecture
 
 ```
                                    ┌─────────────────────────────┐
@@ -238,8 +838,8 @@ The 3x overfetch factor is the direct multiplier on this number — it's the sam
 
 ### Why this shape
 
-- **Ingestion and query serving are fully decoupled** (separate services, separate infra, only meeting at the Vector Store and Permission Service). A backfill storm cannot starve query latency because it competes for different resource pools; the only shared resource is the vector store's write path, which is rate-limited per KB (§18.4).
-- **The Permission Service sits on both write and read paths.** It is consulted at index build time (to attach ACL references to chunks) and, critically, at query time (to compute the live allow-set) — never trusting a stale index-time permission alone (§11).
+- **Ingestion and query serving are fully decoupled** (separate services, separate infra, only meeting at the Vector Store and Permission Service). A backfill storm cannot starve query latency because it competes for different resource pools; the only shared resource is the vector store's write path, which is rate-limited per KB (§19.4).
+- **The Permission Service sits on both write and read paths.** It is consulted at index build time (to attach ACL references to chunks) and, critically, at query time (to compute the live allow-set) — never trusting a stale index-time permission alone (§12).
 - **Everything downstream of the Document Store is derived and rebuildable.** Chunking strategy change, embedding model migration, and even vector-store schema change are all "replay from Document Store" operations, not special-cased migrations.
 
 ### Architecture alternatives considered
@@ -251,25 +851,25 @@ Two shape decisions are worth arguing explicitly, because the obvious-looking al
 | | Managed vendor | Owned Vector Store (chosen) |
 |---|---|---|
 | Time to first KB | Fast — days | Slower — the platform has to be built first |
-| Multi-tenancy model | Vendor's namespace/index model, often coarser-grained than this design's per-KB isolation + physical-isolation-at-scale (§8.5) | Purpose-built for the platform's specific tenancy and permission-filtering requirements |
-| Permission pre-filtering at ANN traversal time (§8.6, §11.3) | Vendor-dependent — not all ANN services expose a filter-aware traversal hook; some only offer post-filter, which is precisely the pathological case this design avoids | Full control — the pre-filter/bitset mechanism is a first-class design constraint, not something retrofitted onto a general-purpose vector DB's filter API |
-| Cost at 10B-chunk scale | Managed per-vector pricing tends to be materially more expensive than owned infrastructure at this scale (the same "hosted vs. self-hosted" arithmetic as §7's embedding cost comparison, but for storage/query instead of embedding) | Cost model in §20 assumes owned infra specifically because the arithmetic doesn't favor a managed vendor at this scale |
+| Multi-tenancy model | Vendor's namespace/index model, often coarser-grained than this design's per-KB isolation + physical-isolation-at-scale (§9.5) | Purpose-built for the platform's specific tenancy and permission-filtering requirements |
+| Permission pre-filtering at ANN traversal time (§9.6, §12.3) | Vendor-dependent — not all ANN services expose a filter-aware traversal hook; some only offer post-filter, which is precisely the pathological case this design avoids | Full control — the pre-filter/bitset mechanism is a first-class design constraint, not something retrofitted onto a general-purpose vector DB's filter API |
+| Cost at 10B-chunk scale | Managed per-vector pricing tends to be materially more expensive than owned infrastructure at this scale (the same "hosted vs. self-hosted" arithmetic as §8's embedding cost comparison, but for storage/query instead of embedding) | Cost model in §21 assumes owned infra specifically because the arithmetic doesn't favor a managed vendor at this scale |
 | Operational burden | Low — vendor operates it | Real — needs the ~15-20 person team assumed in §1 |
 
-**Decision: owned Vector Store**, specifically *because* the permission pre-filtering requirement (§11) is not a bolt-on feature request but the platform's core differentiator, and because the scale (§2) crosses the point where managed per-vector pricing becomes the dominant cost line. A smaller-scale internal tool serving one team, without the zero-leakage requirement, would reasonably choose a managed vendor instead — this decision is scale- and requirement-contingent, not a universal "always self-host" stance.
+**Decision: owned Vector Store**, specifically *because* the permission pre-filtering requirement (§12) is not a bolt-on feature request but the platform's core differentiator, and because the scale (§3) crosses the point where managed per-vector pricing becomes the dominant cost line. A smaller-scale internal tool serving one team, without the zero-leakage requirement, would reasonably choose a managed vendor instead — this decision is scale- and requirement-contingent, not a universal "always self-host" stance.
 
 **Alternative 2: one shared vector index for the whole platform (single large multi-tenant index with a `kb_id` metadata filter) instead of per-KB sharding.**
 
 This looks appealing at first — one index is operationally simpler than hundreds. It fails for two independent reasons:
 
-1. **Permission filtering composes badly with tenant filtering.** Every query would need *both* a `kb_id` filter and a permission-allow-set filter applied simultaneously as pre-filters, and the selectivity math from §8.6's benchmark table gets worse, not better, when the base filter set (a KB's chunk range) is itself a small fraction of the whole index — the pre-filter bitset would need to be `kb_id_membership AND allow_set`, a more expensive intersection computed fresh per query rather than the current design's cheap "query only touches this KB's shard(s) at all."
-2. **Noisy-neighbor isolation is structurally impossible in a shared index.** HNSW graph traversal for a query against KB A's chunks and a concurrent query against KB B's chunks would contend for the same underlying graph structure's cache locality and traversal resources — the physical/logical isolation guarantee in §8.5's multi-tenancy table simply cannot be built on top of one shared structure, no matter how the metadata filter is optimized.
+1. **Permission filtering composes badly with tenant filtering.** Every query would need *both* a `kb_id` filter and a permission-allow-set filter applied simultaneously as pre-filters, and the selectivity math from §9.6's benchmark table gets worse, not better, when the base filter set (a KB's chunk range) is itself a small fraction of the whole index — the pre-filter bitset would need to be `kb_id_membership AND allow_set`, a more expensive intersection computed fresh per query rather than the current design's cheap "query only touches this KB's shard(s) at all."
+2. **Noisy-neighbor isolation is structurally impossible in a shared index.** HNSW graph traversal for a query against KB A's chunks and a concurrent query against KB B's chunks would contend for the same underlying graph structure's cache locality and traversal resources — the physical/logical isolation guarantee in §9.5's multi-tenancy table simply cannot be built on top of one shared structure, no matter how the metadata filter is optimized.
 
 **Decision: per-KB (or per-KB-shard for the largest KBs) index isolation**, accepting the operational cost of managing hundreds of index structures in exchange for permission-filtering performance and noisy-neighbor isolation that a shared index cannot provide at this platform's tenancy count and scale.
 
 ---
 
-## 4. Data Source Connectors
+## 5. Data Source Connectors
 
 ### Connector framework
 
@@ -314,13 +914,13 @@ Checkpoint {
 }
 ```
 
-Checkpoints are persisted **after** the corresponding batch is durably enqueued into the ingestion pipeline (not after processing completes) — this makes sync resumable and idempotent: a crash between "enqueue" and "checkpoint write" simply re-fetches and re-enqueues a batch the ingestion pipeline will dedupe by content hash (§5.4).
+Checkpoints are persisted **after** the corresponding batch is durably enqueued into the ingestion pipeline (not after processing completes) — this makes sync resumable and idempotent: a crash between "enqueue" and "checkpoint write" simply re-fetches and re-enqueues a batch the ingestion pipeline will dedupe by content hash (§6.4).
 
 ### Credential management
 
 - OAuth tokens and API keys live in a **credential vault** (e.g., Vault/KMS-backed), referenced by the connector config as an opaque `credential_ref`, never stored inline.
 - OAuth refresh handled by a shared token-refresh sidecar per source-type, so individual connector workers never handle refresh races.
-- Per-source-type **service principal** used for ingestion (distinct from any end-user identity) — this is intentional: ingestion needs broad read access to enumerate ACLs, but that access must never be conflated with a *user's* access at query time (§11.1).
+- Per-source-type **service principal** used for ingestion (distinct from any end-user identity) — this is intentional: ingestion needs broad read access to enumerate ACLs, but that access must never be conflated with a *user's* access at query time (§12.1).
 
 **Token refresh, made concrete** — the failure mode this exists to prevent is two connector workers racing to refresh the same expiring OAuth token, one succeeding and the other invalidating it with a redundant refresh call moments later, causing in-flight requests on a third worker to suddenly 401:
 
@@ -362,11 +962,11 @@ Each connector worker pool is rate-limited to the source's documented API budget
                                             └──────────────────────────────▶ DISABLED
 ```
 
-- **Partial batch failure isolation**: one malformed document (corrupt PDF, oversized payload) is routed to a per-source **dead letter queue** with the error, and does not fail the rest of the batch. A DLQ item is retried with backoff up to N times, then surfaced to the owning team's dashboard for manual triage (§5.5).
+- **Partial batch failure isolation**: one malformed document (corrupt PDF, oversized payload) is routed to a per-source **dead letter queue** with the error, and does not fail the rest of the batch. A DLQ item is retried with backoff up to N times, then surfaced to the owning team's dashboard for manual triage (§6.5).
 - **DEGRADED** state: entered automatically when error rate over a rolling window exceeds a threshold (e.g., >10% of fetches failing); still syncs at reduced concurrency, alerts the platform on-call, and — if the errors look like a source-side outage rather than a config issue — backs off exponentially rather than hammering a struggling upstream.
-- A connector that stays in DEGRADED beyond its source's freshness SLA window automatically raises staleness alerts (§12.2), separate from the connector's own health alerts, because "the connector is technically running but too slow" and "the connector is down" have different operator responses.
+- A connector that stays in DEGRADED beyond its source's freshness SLA window automatically raises staleness alerts (§13.2), separate from the connector's own health alerts, because "the connector is technically running but too slow" and "the connector is down" have different operator responses.
 
-**Schema drift handling.** Generic REST API and database connectors (§4's weakest-guarantee sources) are the most exposed to the source silently changing its response/table shape — a field renamed, a type changed from string to object, a column dropped. The connector framework treats this as a distinct failure class from a transient fetch error:
+**Schema drift handling.** Generic REST API and database connectors (§5's weakest-guarantee sources) are the most exposed to the source silently changing its response/table shape — a field renamed, a type changed from string to object, a column dropped. The connector framework treats this as a distinct failure class from a transient fetch error:
 
 ```python
 def parse_with_drift_detection(raw_response: dict, expected_schema: JSONSchema) -> ParsedDoc:
@@ -390,7 +990,7 @@ A **blocking** schema-drift error pauses that specific source (not the whole con
 
 ### Per-connector configuration examples
 
-Concrete `SourceConfig` payloads for four representative connectors, showing how the same declarative shape (§4.1) accommodates very different sources:
+Concrete `SourceConfig` payloads for four representative connectors, showing how the same declarative shape (§5.1) accommodates very different sources:
 
 ```yaml
 # Confluence — space-scoped, webhook + reconciliation
@@ -414,7 +1014,7 @@ scope:
   include_dm: false                    # DMs excluded from enterprise KBs by default
 credentials_ref: vault://connectors/slack/eng-wiki-bot
 parsing_hints:
-  chunking_strategy: parent_child      # message = child, thread = parent (§6.5)
+  chunking_strategy: parent_child      # message = child, thread = parent (§7.5)
 sync_policy:
   mechanism: webhook
   reconciliation_cadence: daily
@@ -448,7 +1048,7 @@ scope:
   domain_allowlist: ["internal-docs.company.com"]
   max_depth: 6
   respect_robots_txt: true
-  crawl_budget_per_day: 50000          # hard cap, prevents a runaway crawl (§17)
+  crawl_budget_per_day: 50000          # hard cap, prevents a runaway crawl (§18)
 credentials_ref: null                   # internal docs site, network-ACL gated instead
 parsing_hints:
   chunking_strategy: structure_aware
@@ -457,7 +1057,7 @@ sync_policy:
   cadence: daily
 ```
 
-Two things worth calling out from these examples: (1) the **database connector's `acl_mapping`** is a second declarative query, not a hardcoded assumption — row-level permissions in enterprise databases are almost always modeled via a join table, and forcing that mapping to be explicit at config time is what lets the platform apply the exact same permission-sync machinery (§11) to a database source as to a Confluence space; (2) the **web crawler's `crawl_budget_per_day`** is a config-level guardrail, not just a runtime safety net — most "runaway crawl" incidents are actually a misconfigured `domain_allowlist` or `max_depth`, and a hard budget turns a potential incident into a "sync stopped early, check the config" dashboard entry instead.
+Two things worth calling out from these examples: (1) the **database connector's `acl_mapping`** is a second declarative query, not a hardcoded assumption — row-level permissions in enterprise databases are almost always modeled via a join table, and forcing that mapping to be explicit at config time is what lets the platform apply the exact same permission-sync machinery (§12) to a database source as to a Confluence space; (2) the **web crawler's `crawl_budget_per_day`** is a config-level guardrail, not just a runtime safety net — most "runaway crawl" incidents are actually a misconfigured `domain_allowlist` or `max_depth`, and a hard budget turns a potential incident into a "sync stopped early, check the config" dashboard entry instead.
 
 ### Connector-specific quirks worth designing around
 
@@ -465,14 +1065,14 @@ Two things worth calling out from these examples: (1) the **database connector's
 |---|---|---|
 | Confluence | Page permissions can be **space-level defaults overridden per-page**, and the override can be *more* or *less* restrictive | ACL sync always resolves the effective (not just declared) permission via the API's own permission-check endpoint, never inferred client-side |
 | Google Drive | A file can be shared via **link** ("anyone with the link") which has no enumerable principal list | Modeled as a distinct `principal_type: link_share` grant; whether link-shared content is ingestible at all is a KB-level policy toggle (default: excluded, since "anyone with the link" is not a verifiable identity the platform can re-check at query time) |
-| Slack | **Channel membership changes constantly**, and a message's visibility follows *current* channel membership, not membership at post time | Slack messages are treated as permission-dynamic — the ACL is "current channel members," re-resolved at query time via the same group-expansion path as any other group (§11.3), not snapshotted at ingest time |
+| Slack | **Channel membership changes constantly**, and a message's visibility follows *current* channel membership, not membership at post time | Slack messages are treated as permission-dynamic — the ACL is "current channel members," re-resolved at query time via the same group-expansion path as any other group (§12.3), not snapshotted at ingest time |
 | SharePoint | Delta query tokens **expire** after a source-side retention window (commonly 30 days); an expired token forces a full re-sync | Checkpoint staleness is monitored explicitly; a connector idle long enough to risk token expiry (e.g., paused for 3+ weeks) proactively triggers a full re-sync rather than waiting to discover the token is dead |
 | Databases | No universal "what changed" primitive — some tables have no `updated_at`, some have soft-deletes with no delete timestamp | Documented per-table capability tiers (full CDC / watermark column / append-only / full-scan-only) with the freshness SLA explicitly downgraded for the weakest tier, communicated to the owning team at connector setup time rather than discovered later |
-| Web crawl | Content-hash diffing produces false "changed" positives on pages with embedded timestamps/ads/A-B test markup | Boilerplate-aware hashing (strip common noise patterns before hashing) reduces but doesn't eliminate this; crawl-diff false-positive rate is tracked as its own metric because it directly inflates re-embedding cost (§20) |
+| Web crawl | Content-hash diffing produces false "changed" positives on pages with embedded timestamps/ads/A-B test markup | Boilerplate-aware hashing (strip common noise patterns before hashing) reduces but doesn't eliminate this; crawl-diff false-positive rate is tracked as its own metric because it directly inflates re-embedding cost (§21) |
 
 ---
 
-## 5. Ingestion Pipeline
+## 6. Ingestion Pipeline
 
 ### Pipeline orchestration
 
@@ -495,7 +1095,7 @@ RawDocument (from connector)
                                                           └─────────┬──────────┘
                                                                     │ emits event
                                                                     ▼
-                                                          Chunking Engine (§6)
+                                                          Chunking Engine (§7)
 ```
 
 Each step is a Temporal **activity** with its own retry policy; the workflow (one per document, or one per small batch for very high-volume sources like Slack) is the unit of idempotency — replaying a workflow for the same `(source_id, doc_id, content_hash)` is a no-op if that hash was already fully processed.
@@ -529,7 +1129,7 @@ class IngestDocumentWorkflow:
         return IngestResult(status="ingested", document_id=doc.id)
 ```
 
-The `retry_policy` is scoped **per activity**, not per workflow — a transient failure in `parse_document` (e.g., a momentary OCR-service timeout) retries just that step, while a hard failure after exhausting retries fails the workflow and routes to the DLQ (§5.5) with the specific activity and error preserved, rather than restarting the whole document from scratch or losing which step actually failed.
+The `retry_policy` is scoped **per activity**, not per workflow — a transient failure in `parse_document` (e.g., a momentary OCR-service timeout) retries just that step, while a hard failure after exhausting retries fails the workflow and routes to the DLQ (§6.5) with the specific activity and error preserved, rather than restarting the whole document from scratch or losing which step actually failed.
 
 ### Document parsing
 
@@ -539,15 +1139,15 @@ The `retry_policy` is scoped **per activity**, not per workflow — a transient 
 | DOCX / PPTX | python-docx / python-pptx via Tika | Extract embedded images' alt text/captions as supplementary text, not the images themselves in v1 |
 | HTML | Readability-style boilerplate stripping + structural parse (headings, lists, tables) | Critical for web crawler and Confluence-exported-as-HTML sources |
 | Markdown | Native AST parse (preserves heading hierarchy directly — best case for structure-aware chunking) | |
-| Code | Tree-sitter, per-language grammars (40+ languages) | Chunk boundaries respect function/class boundaries (§6.4) |
-| CSV/TSV | Row-to-document or row-to-chunk mapping, schema-aware | Large CSVs are *not* embedded row-by-row as prose; see §6 for tabular strategy |
+| Code | Tree-sitter, per-language grammars (40+ languages) | Chunk boundaries respect function/class boundaries (§7.4) |
+| CSV/TSV | Row-to-document or row-to-chunk mapping, schema-aware | Large CSVs are *not* embedded row-by-row as prose; see §7 for tabular strategy |
 | JSON/API payloads | Declarative field mapping (JSONPath) configured per REST connector | Non-text fields become metadata, not chunk text |
 
 Parsing runs in a resource-isolated worker pool (separate from chunking/embedding) because PDF/OCR parsing is CPU-heavy and unpredictable in duration — isolating it prevents one giant PDF from head-of-line-blocking lightweight Markdown parsing.
 
 ### Metadata extraction
 
-Extracted into a normalized `DocumentMetadata` envelope (§14) regardless of source:
+Extracted into a normalized `DocumentMetadata` envelope (§15) regardless of source:
 
 ```json
 {
@@ -575,7 +1175,7 @@ Run per document (fastText lid.176 or similar, sub-millisecond) and, for documen
 Two-tier:
 
 1. **Exact duplicate**: SHA-256 of normalized (whitespace-collapsed, boilerplate-stripped) content. O(1) lookup against a content-hash index scoped to the knowledge base. Exact dupes are recorded as an alias to the canonical document (first-seen or highest-authority-source wins, configurable) rather than re-ingested.
-2. **Near-duplicate**: SimHash (64-bit) computed per document, indexed in a locality-sensitive structure (banded LSH) for approximate lookup with Hamming-distance threshold (e.g., ≤3 bits ≈ >95% similar). Near-dupes across sources (a PDF policy doc that's *also* pasted into a Confluence page) are flagged, both are kept (their permissions may legitimately differ!), but retrieval-time diversity reranking (§10.3, MMR) suppresses returning both in the same result set.
+2. **Near-duplicate**: SimHash (64-bit) computed per document, indexed in a locality-sensitive structure (banded LSH) for approximate lookup with Hamming-distance threshold (e.g., ≤3 bits ≈ >95% similar). Near-dupes across sources (a PDF policy doc that's *also* pasted into a Confluence page) are flagged, both are kept (their permissions may legitimately differ!), but retrieval-time diversity reranking (§11.3, MMR) suppresses returning both in the same result set.
 
 Canonical-copy policy is configurable per knowledge base (e.g., "prefer Confluence over Drive" for a wiki-first org), defaulting to most-recently-modified.
 
@@ -598,11 +1198,11 @@ Retried with exponential backoff (up to 5 attempts over 24h, to ride out transie
 
 ---
 
-## 6. Chunking Engine
+## 7. Chunking Engine
 
 ### Strategy selection heuristics
 
-The chunking engine doesn't pick one universal strategy; the ingestion pipeline attaches a `content_type` + `format` to every document (§5), and a per-KB (overridable per-source) **strategy policy** maps that to a chunker:
+The chunking engine doesn't pick one universal strategy; the ingestion pipeline attaches a `content_type` + `format` to every document (§6), and a per-KB (overridable per-source) **strategy policy** maps that to a chunker:
 
 | Content signal | Default strategy | Why |
 |---|---|---|
@@ -632,7 +1232,7 @@ def recursive_split(text: str, max_tokens: int, overlap_tokens: int) -> list[str
     return _hard_split(text, max_tokens, overlap_tokens)
 ```
 
-Overlap is applied by carrying the trailing `overlap_tokens` of chunk *N* into the start of chunk *N+1* — this is the single biggest lever against "the answer spans a chunk boundary and neither half retrieves well" (§21.1).
+Overlap is applied by carrying the trailing `overlap_tokens` of chunk *N* into the start of chunk *N+1* — this is the single biggest lever against "the answer spans a chunk boundary and neither half retrieves well" (§22.1).
 
 ### Semantic chunking
 
@@ -653,7 +1253,7 @@ def semantic_chunk(sentences: list[str], embed_fn, threshold_percentile=95, max_
     return chunks
 ```
 
-This costs an extra embedding pass at chunk-boundary-detection time (using a small, cheap model — not the primary retrieval embedding model), so it's reserved for content classes where boundary quality materially affects downstream answer quality and ingest volume is low enough to absorb the cost (§21.1 trade-off).
+This costs an extra embedding pass at chunk-boundary-detection time (using a small, cheap model — not the primary retrieval embedding model), so it's reserved for content classes where boundary quality materially affects downstream answer quality and ingest volume is low enough to absorb the cost (§22.1 trade-off).
 
 ### Document-structure-aware chunking
 
@@ -701,7 +1301,7 @@ def chunk_tabular(rows: list[dict], headers: list[str], rows_per_chunk: int = 20
     return chunks
 ```
 
-`rows_per_chunk` is tuned down (as low as 1, i.e., one row = one chunk) for tables where each row is independently query-relevant (e.g., a support-ticket export — a query about one ticket shouldn't have to compete for embedding "attention" with 19 unrelated rows), and tuned up for tables where rows are only meaningful in aggregate context (e.g., a small reference/lookup table). This mirrors the database connector's `chunking_strategy: fixed_unit` default from §4.6 — for structured sources the platform generally prefers letting the source's own row/record boundary define the chunk boundary rather than imposing a token-count-driven split that would ignore it.
+`rows_per_chunk` is tuned down (as low as 1, i.e., one row = one chunk) for tables where each row is independently query-relevant (e.g., a support-ticket export — a query about one ticket shouldn't have to compete for embedding "attention" with 19 unrelated rows), and tuned up for tables where rows are only meaningful in aggregate context (e.g., a small reference/lookup table). This mirrors the database connector's `chunking_strategy: fixed_unit` default from §5.6 — for structured sources the platform generally prefers letting the source's own row/record boundary define the chunk boundary rather than imposing a token-count-driven split that would ignore it.
 
 ### Sliding window overlap tuning
 
@@ -734,7 +1334,7 @@ Every chunk carries enough lineage to reconstruct citation and support parent-ch
 
 ---
 
-## 7. Embedding Service
+## 8. Embedding Service
 
 ### Model selection
 
@@ -743,13 +1343,13 @@ Every chunk carries enough lineage to reconstruct citation and support parent-ch
 | OpenAI `text-embedding-3-large` | 3072 (truncatable via Matryoshka to 256-1536) | Hosted API, strong general quality, per-token cost | Default for new KBs wanting best-effort quality without self-hosting |
 | Cohere `embed-v3` | 1024 | Hosted, strong multilingual + input-type-aware (query vs. document) | KBs with heavy non-English content |
 | Open-source `bge-large-en` / `gte-large` | 1024 | Self-hosted, no per-call cost, full data control | Cost-sensitive or data-residency-constrained KBs |
-| Open-source `bge-small-en` | 384 | Self-hosted, fast, lower quality | High-volume, latency-sensitive, or budget-constrained KBs; also used as the *cheap boundary-detection* model in semantic chunking (§6.2) |
+| Open-source `bge-small-en` | 384 | Self-hosted, fast, lower quality | High-volume, latency-sensitive, or budget-constrained KBs; also used as the *cheap boundary-detection* model in semantic chunking (§7.2) |
 
-Selection is a per-knowledge-base config (`embedding_model_id`), not a platform-wide constant — this is what makes §7.4 (model migration) a first-class supported operation rather than a rare emergency.
+Selection is a per-knowledge-base config (`embedding_model_id`), not a platform-wide constant — this is what makes §8.4 (model migration) a first-class supported operation rather than a rare emergency.
 
 ### Cost comparison, worked
 
-Using the initial-backfill scenario from §2 (10M documents, ~200M chunks, ~250 tokens/chunk average) to make the hosted-vs-self-hosted trade-off concrete rather than qualitative:
+Using the initial-backfill scenario from §3 (10M documents, ~200M chunks, ~250 tokens/chunk average) to make the hosted-vs-self-hosted trade-off concrete rather than qualitative:
 
 ```
 Total tokens to embed: 200M chunks × 250 tokens ≈ 50B tokens
@@ -759,10 +1359,10 @@ model tier):
   50,000M tokens × $0.02/1M  ≈ $1,000   (cheapest tier)
   50,000M tokens × $0.13/1M  ≈ $6,500   (highest-quality tier)
   → one-time backfill cost: roughly $1,000-$6,500, no infra to run,
-    fully elastic, but recurring on every re-embed (§7.4 migrations
+    fully elastic, but recurring on every re-embed (§8.4 migrations
     are NOT free even though they reuse the same pipeline as ingestion)
 
-Self-hosted (bge-large-en class model, ~1,500 chunks/sec/GPU from §2):
+Self-hosted (bge-large-en class model, ~1,500 chunks/sec/GPU from §3):
   200M chunks ÷ 1,500 chunks/sec ≈ 133,333 sec ≈ 37 GPU-hours
   At ~$1.50/GPU-hour (A10G on-demand): 37 × $1.50 ≈ $56 in raw compute
   → dramatically cheaper per backfill, but requires standing GPU
@@ -793,7 +1393,7 @@ async def embed_batch(chunks: list[Chunk], model: EmbeddingModel) -> list[Embedd
 Two lanes:
 
 - **Bulk lane** (backfills, re-embeds): maximizes throughput, large batches, tolerates minutes of queueing latency, autoscales GPU pool by queue depth.
-- **Incremental lane** (single-document edits from live sources like Slack): small batches, prioritized scheduling, optimizes for the freshness SLA (§12) over raw throughput — a Slack message edit shouldn't wait behind a 10M-document backfill.
+- **Incremental lane** (single-document edits from live sources like Slack): small batches, prioritized scheduling, optimizes for the freshness SLA (§13) over raw throughput — a Slack message edit shouldn't wait behind a 10M-document backfill.
 
 Both lanes share the GPU pool but incremental-lane requests are placed on a higher-priority queue so they preempt bulk-lane batch formation (a standard priority-queue admission policy, not physically separate GPUs, to avoid under-utilizing hardware during quiet bulk periods).
 
@@ -801,10 +1401,10 @@ Both lanes share the GPU pool but incremental-lane requests are placed on a high
 
 - **Dynamic batching** (via Text Embeddings Inference / vLLM-style serving): incoming requests are coalesced into GPU batches up to a max wait (e.g., 10ms) or max batch size, trading a small latency tax for large throughput gains.
 - **Length-bucketed batching**: chunks are sorted/bucketed by token length before batching to minimize padding waste — a batch mixing a 20-token and a 500-token chunk wastes 96% of the padded compute on the short one.
-- **Quantized inference** (fp16/bf16, or int8 for the smaller models) roughly doubles throughput per GPU with negligible embedding-quality loss for retrieval purposes (unlike quantizing the *stored* vectors, which trades recall directly — see §8.2).
-- Roughly **1,500 chunks/sec per A10G** for `bge-base`-class models at 768d with dynamic batching — the number used in §2's capacity math.
+- **Quantized inference** (fp16/bf16, or int8 for the smaller models) roughly doubles throughput per GPU with negligible embedding-quality loss for retrieval purposes (unlike quantizing the *stored* vectors, which trades recall directly — see §9.2).
+- Roughly **1,500 chunks/sec per A10G** for `bge-base`-class models at 768d with dynamic batching — the number used in §3's capacity math.
 
-Representative serving configuration (Text-Embeddings-Inference-style server), showing how the bulk/incremental lane priority split (§7.2) maps onto actual serving knobs rather than staying purely conceptual:
+Representative serving configuration (Text-Embeddings-Inference-style server), showing how the bulk/incremental lane priority split (§8.2) maps onto actual serving knobs rather than staying purely conceptual:
 
 ```yaml
 model_id: bge-large-en-v2
@@ -820,10 +1420,10 @@ queue_priority:
   bulk: 1                         # have pending work, without starving bulk entirely
 admission_control:
   bulk_lane_max_gpu_share: 0.7    # bulk work can never claim more than 70% of the
-                                   # pool even under a large backfill (§18.3)
+                                   # pool even under a large backfill (§19.3)
 ```
 
-The two `max_wait_ms` values are the concrete mechanism behind the abstract "priority lane" description in §7.2 — a single physical GPU pool serves both lanes, and the only difference between them is how long the scheduler is willing to wait to accumulate a fuller (more efficient) batch before dispatching, which is exactly the latency/throughput trade each lane is optimizing for.
+The two `max_wait_ms` values are the concrete mechanism behind the abstract "priority lane" description in §8.2 — a single physical GPU pool serves both lanes, and the only difference between them is how long the scheduler is willing to wait to accumulate a fuller (more efficient) batch before dispatching, which is exactly the latency/throughput trade each lane is optimizing for.
 
 ### Model versioning and migration
 
@@ -837,8 +1437,8 @@ t1: Migration triggered. Backfill job re-embeds all existing chunks with v2,
     written to a PARALLEL v2 vector index. New/updated chunks embedded with
     BOTH v1 and v2 during the migration window (dual-write).
 t2: Backfill completes (progress tracked, resumable — same chunk stream as
-    §5's pipeline, replayed from Document Store, not from source connectors).
-t3: Shadow evaluation: run the KB's golden dataset (§13) against the v2
+    §6's pipeline, replayed from Document Store, not from source connectors).
+t3: Shadow evaluation: run the KB's golden dataset (§14) against the v2
     index, compare recall@k/NDCG against v1 baseline. Must meet or beat
     threshold before cutover.
 t4: Cutover: KB config flips primary=v2 atomically (a config write, not a
@@ -862,7 +1462,7 @@ Because a migration is "replay documents through chunking+embedding again," it r
 
 ---
 
-## 8. Vector Store
+## 9. Vector Store
 
 ### Index types
 
@@ -872,7 +1472,7 @@ Because a migration is "replay documents through chunking+embedding again," it r
 | **HNSW** | High (graph build) | O(log n), fast | 95-99% (tunable via `ef_search`) | ~1.5-2x vectors (graph edges) | Default for most KBs — best latency/recall trade-off at moderate memory cost |
 | **IVF-PQ** | Moderate (train centroids + quantize) | Fast, scans few clusters | 85-95% (tunable via `nprobe`, PQ bits) | Much lower — PQ compresses vectors 8-32x | Very large KBs (100M+) where HNSW's memory footprint is prohibitive |
 
-Per-KB index type is chosen by size and recall requirements at KB creation, with the platform defaulting HNSW → IVF-PQ automatically once a KB crosses a configurable chunk-count threshold (e.g., 200M), migrating in the background (same replay-from-Document-Store mechanism as §7.4).
+Per-KB index type is chosen by size and recall requirements at KB creation, with the platform defaulting HNSW → IVF-PQ automatically once a KB crosses a configurable chunk-count threshold (e.g., 200M), migrating in the background (same replay-from-Document-Store mechanism as §8.4).
 
 ### HNSW parameter tuning
 
@@ -882,13 +1482,13 @@ Three parameters dominate the HNSW latency/recall/memory trade-off, and the plat
 |---|---|---|---|
 | `M` (max edges per node) | Higher `M` → better recall, more memory, slower build | 16 (small/medium KBs), 32 (large KBs prioritizing recall) | Rarely changed post-creation — it's baked into the graph structure, so changing it means a full rebuild, not a config flip |
 | `ef_construction` (candidate list size at build time) | Higher → better graph quality, slower ingest | 200 | Bumped only for KBs where ingest is infrequent/batchy (nightly backfill) and can absorb slower builds for better steady-state recall |
-| `ef_search` (candidate list size at query time) | Higher → better recall, higher latency | 100 (auto-scaled down under load shedding, §17) | The one HNSW knob exposed **per query**, not just per KB — an application can trade recall for latency on individual calls (e.g., a lower-stakes autocomplete-style query can request `ef_search=40`) |
+| `ef_search` (candidate list size at query time) | Higher → better recall, higher latency | 100 (auto-scaled down under load shedding, §18) | The one HNSW knob exposed **per query**, not just per KB — an application can trade recall for latency on individual calls (e.g., a lower-stakes autocomplete-style query can request `ef_search=40`) |
 
-The `ef_search` numbers from §8's benchmark table (50 → 3ms/92% recall, 200 → 9ms/98% recall) are what this default is calibrated against: 100 sits close to the knee of the latency/recall curve for the platform's stated P50 ≤ 80ms target, leaving headroom for the permission pre-filter and hybrid-fusion overhead layered on top.
+The `ef_search` numbers from §9's benchmark table (50 → 3ms/92% recall, 200 → 9ms/98% recall) are what this default is calibrated against: 100 sits close to the knee of the latency/recall curve for the platform's stated P50 ≤ 80ms target, leaving headroom for the permission pre-filter and hybrid-fusion overhead layered on top.
 
 ### IVF-PQ sizing example
 
-Worked arithmetic for the largest single KB (2B chunks, §2), the case that forces IVF-PQ rather than HNSW:
+Worked arithmetic for the largest single KB (2B chunks, §3), the case that forces IVF-PQ rather than HNSW:
 
 ```
 Vectors:              2,000,000,000
@@ -904,10 +1504,10 @@ Avg vectors/cluster:  2B / 65,536 ≈ 30,500
 Query with nprobe=32:  scans 32 of 65,536 clusters ≈ 32 × 30,500 ≈ 976,000 candidate
                         codes — a ~2000x reduction vs. a full 2B-vector scan,
                         then PQ-distance-scored, then top ~500 rescored full-
-                        precision (the recall-recovery step from §8.2)
+                        precision (the recall-recovery step from §9.2)
 ```
 
-This is the concrete justification behind the "100M+ chunks → IVF-PQ" threshold in the index-type table above: HNSW's ~1.5-2x graph overhead on 5.7 TB of raw vectors would mean 8.5-11.4 TB of RAM-resident graph for one KB alone — outside what the platform is willing to dedicate to a single tenant regardless of replication strategy, whereas IVF-PQ's 179 GB compressed footprint is a shape the sharding strategy (§8.5) can spread comfortably across a dedicated node pool.
+This is the concrete justification behind the "100M+ chunks → IVF-PQ" threshold in the index-type table above: HNSW's ~1.5-2x graph overhead on 5.7 TB of raw vectors would mean 8.5-11.4 TB of RAM-resident graph for one KB alone — outside what the platform is willing to dedicate to a single tenant regardless of replication strategy, whereas IVF-PQ's 179 GB compressed footprint is a shape the sharding strategy (§9.5) can spread comfortably across a dedicated node pool.
 
 ### Quantization
 
@@ -920,10 +1520,10 @@ Isolation between knowledge bases is layered, not a single mechanism, because th
 
 | Layer | Mechanism | Protects against |
 |---|---|---|
-| **Logical** | Every index entry is namespaced by `kb_id`; a query without an explicit, authorized `kb_id` matches nothing — there is no cross-tenant default scope | Accidental cross-KB data mixing in code, not malicious access (that's §11's job) |
+| **Logical** | Every index entry is namespaced by `kb_id`; a query without an explicit, authorized `kb_id` matches nothing — there is no cross-tenant default scope | Accidental cross-KB data mixing in code, not malicious access (that's §12's job) |
 | **Resource quotas** | Per-KB caps on ingest throughput (chunks/sec), query QPS, and storage — enforced at admission, not just monitored after the fact | One KB's traffic spike or backfill consuming shared-pool capacity that other KBs depend on |
 | **Logical shard isolation** (small/medium KBs) | Each KB's shard(s) are a distinct index structure, even when co-located on shared hardware — no shared graph, no shared postings list | A slow query against KB A cannot slow down a concurrent query against KB B on the same node, since they touch disjoint memory structures and are scheduled independently |
-| **Physical isolation** (large KBs, >500M chunks) | Dedicated node pools (§8.5) — not just a separate index, a separate machine fleet | The remaining risk after logical isolation: a KB large/hot enough to saturate a shared node's CPU/network/disk I/O even while touching "its own" index structure |
+| **Physical isolation** (large KBs, >500M chunks) | Dedicated node pools (§9.5) — not just a separate index, a separate machine fleet | The remaining risk after logical isolation: a KB large/hot enough to saturate a shared node's CPU/network/disk I/O even while touching "its own" index structure |
 
 The threshold for physical isolation (500M chunks, matching the sharding table below) is deliberately conservative — most noisy-neighbor incidents in practice come from the top handful of largest/hottest KBs, so isolating those completely removes the vast majority of cross-tenant risk without paying dedicated-hardware cost for the long tail of small KBs that logical isolation already handles well.
 
@@ -931,8 +1531,8 @@ The threshold for physical isolation (500M chunks, matching the sharding table b
 
 Two shard axes, chosen per KB by scale:
 
-1. **By knowledge base** (default): every KB up to the single-shard capacity (§2: ~25M vectors) gets one shard. This is the common case (90% of KBs) — no fan-out needed, simplest operationally, and gives clean noisy-neighbor isolation for free (§18.4).
-2. **By KB + hash-partition** (large KBs): a KB exceeding single-shard capacity is split across N shards by a hash of `chunk_id` (uniform distribution, no hot shard from e.g. alphabetical document-id skew). Queries fan out to all N shards and merge (§9.3).
+1. **By knowledge base** (default): every KB up to the single-shard capacity (§3: ~25M vectors) gets one shard. This is the common case (90% of KBs) — no fan-out needed, simplest operationally, and gives clean noisy-neighbor isolation for free (§19.4).
+2. **By KB + hash-partition** (large KBs): a KB exceeding single-shard capacity is split across N shards by a hash of `chunk_id` (uniform distribution, no hot shard from e.g. alphabetical document-id skew). Queries fan out to all N shards and merge (§10.3).
 
 ```
 KB size < 25M chunks  → 1 shard   (the common case, ~90% of KBs)
@@ -944,7 +1544,7 @@ KB size > 500M        → same, but shards distributed across dedicated
 
 ### Replication
 
-Each shard replicated **3x** across availability zones (mirrors the durability reasoning of a classic distributed store — survive node loss and AZ loss with zero query downtime). Replicas serve reads round-robin/least-loaded; writes (new/updated embeddings) go through a primary per shard and asynchronously propagate to replicas, with a bounded replication lag SLO (§12.4 ties this to the freshness contract — replication lag is one component of end-to-end ingest-to-retrievable latency).
+Each shard replicated **3x** across availability zones (mirrors the durability reasoning of a classic distributed store — survive node loss and AZ loss with zero query downtime). Replicas serve reads round-robin/least-loaded; writes (new/updated embeddings) go through a primary per shard and asynchronously propagate to replicas, with a bounded replication lag SLO (§13.4 ties this to the freshness contract — replication lag is one component of end-to-end ingest-to-retrievable latency).
 
 ### Hybrid search architecture
 
@@ -971,11 +1571,11 @@ def hybrid_search(query: str, kb_id: str, top_k: int, alpha: float = 0.5):
 
 `alpha` (dense vs. sparse weight) is tunable per query or per KB default — KBs heavy on structured/technical content (runbooks full of error codes) often default lower `alpha` (more lexical weight) than KBs of narrative prose (postmortem summaries).
 
-**SPLADE** (learned sparse retrieval) is offered as an upgrade over plain BM25 for KBs that show a measurable eval lift (§13) from it — it captures term-expansion (matching "car" against a document saying "automobile") that BM25 cannot, at the cost of a small model-inference step at both index and query time, so it's opt-in rather than default.
+**SPLADE** (learned sparse retrieval) is offered as an upgrade over plain BM25 for KBs that show a measurable eval lift (§14) from it — it captures term-expansion (matching "car" against a document saying "automobile") that BM25 cannot, at the cost of a small model-inference step at both index and query time, so it's opt-in rather than default.
 
 ### Filtered search: pre-filter vs. post-filter
 
-This is the single highest-stakes performance decision in the vector store, because **permission filtering is a filtered search** (§11) and it runs on every query.
+This is the single highest-stakes performance decision in the vector store, because **permission filtering is a filtered search** (§12) and it runs on every query.
 
 | Approach | Mechanism | Pro | Con |
 |---|---|---|---|
@@ -997,34 +1597,34 @@ This is the single highest-stakes performance decision in the vector store, beca
 
 The last row is included deliberately: it is the empirical justification for the pre-filter decision above, not a hypothetical.
 
-**IVF-PQ, for comparison** (indicative, single shard, 2B vectors from the §8.2 sizing example, `nlist=65536`):
+**IVF-PQ, for comparison** (indicative, single shard, 2B vectors from the §9.2 sizing example, `nlist=65536`):
 
 | Configuration | P50 latency | P99 latency | Recall@10 |
 |---|---|---|---|
 | `nprobe=8` (fast, low recall) | 4 ms | 15 ms | 78% |
 | `nprobe=32` (platform default for this scale) | 11 ms | 35 ms | 89% |
-| `nprobe=32` + full-precision rescore of top-500 (§8.2's recovery step) | 18 ms | 55 ms | 96% |
+| `nprobe=32` + full-precision rescore of top-500 (§9.2's recovery step) | 18 ms | 55 ms | 96% |
 | `nprobe=128` (high recall, high cost) | 40 ms | 120 ms | 94% (rescore still wins — fewer clusters + rescore beats more clusters without it) |
 
 The third row is the platform's actual default for IVF-PQ-tier KBs: it costs roughly 60% more latency than the raw `nprobe=32` scan, but the recall jump (89% → 96%) is large enough that the rescore step is treated as mandatory rather than optional for this index type, unlike HNSW's `ef_search`, which is tunable per-query precisely because its default `ef_search=100` already sits close enough to the quality/latency knee that most callers don't need to think about it.
 
 ### Backup and restore
 
-Even with 3x replication (§8.4), the vector store needs a backup strategy distinct from replication — replication protects against hardware loss, not against a bad deploy that corrupts an index, an operator error that deletes the wrong KB, or a bug that silently writes malformed vectors that only a point-in-time restore can undo.
+Even with 3x replication (§9.4), the vector store needs a backup strategy distinct from replication — replication protects against hardware loss, not against a bad deploy that corrupts an index, an operator error that deletes the wrong KB, or a bug that silently writes malformed vectors that only a point-in-time restore can undo.
 
 | Mechanism | What it protects against | Restore time |
 |---|---|---|
-| Continuous replication (§8.4) | Node/AZ hardware loss | Seconds (automatic failover, no restore needed) |
+| Continuous replication (§9.4) | Node/AZ hardware loss | Seconds (automatic failover, no restore needed) |
 | Nightly index snapshot (per shard, to object storage) | Index corruption, bad deploy, accidental shard-level deletion | Minutes to low hours depending on shard size — a snapshot restore is a direct copy, faster than the Document-Store-replay rebuild path |
-| Document Store replay (§18.2) | Total loss of a shard's vector data (all replicas + all snapshots gone) — the ultimate fallback | Hours — re-runs chunking + embedding, the slowest but always-available option since the vector store is a derived index by design |
+| Document Store replay (§19.2) | Total loss of a shard's vector data (all replicas + all snapshots gone) — the ultimate fallback | Hours — re-runs chunking + embedding, the slowest but always-available option since the vector store is a derived index by design |
 
 The three-tier structure is deliberate: snapshots exist specifically to make the **common** corruption/operator-error case fast (minutes, not hours) without relying on the much slower full-replay path, while the replay path remains the guaranteed-correct fallback for the rare case where snapshots themselves are unavailable or untrusted (e.g., a corruption bug that had already been silently writing bad snapshots for a while — the replay path re-derives from Document Store content directly, so it can't inherit a vector-store-layer bug the way restoring a snapshot of the same buggy index would).
 
-A KB's snapshot retention (default 7 days of nightly snapshots) is a knob the owning team can extend for compliance-sensitive KBs, surfaced through the same schema/config API as other KB-level settings (§16).
+A KB's snapshot retention (default 7 days of nightly snapshots) is a knob the owning team can extend for compliance-sensitive KBs, surfaced through the same schema/config API as other KB-level settings (§17).
 
 ---
 
-## 9. Retrieval Service
+## 10. Retrieval Service
 
 ### Query processing pipeline
 
@@ -1039,10 +1639,10 @@ Query("how do we roll back a failed payments deploy?", user=alice, kb="eng-wiki"
    │
    ▼
 2. Permission resolution (parallel with step 3's setup)
-   - Resolve alice → allow-set bitset for KB "eng-wiki" (Permission Service, §11)
+   - Resolve alice → allow-set bitset for KB "eng-wiki" (Permission Service, §12)
    │
    ▼
-3. Hybrid search execution (dense + sparse, pre-filtered by allow-set, §8.6)
+3. Hybrid search execution (dense + sparse, pre-filtered by allow-set, §9.6)
    - Fan out to all shards of "eng-wiki" if sharded, else single shard
    │
    ▼
@@ -1055,7 +1655,7 @@ Query("how do we roll back a failed payments deploy?", user=alice, kb="eng-wiki"
    applied here on the smaller merged candidate set)
    │
    ▼
-6. Reranking (optional, §10)
+6. Reranking (optional, §11)
    │
    ▼
 7. Response assembly (chunk text, citation, scores, freshness metadata)
@@ -1068,7 +1668,7 @@ Query("how do we roll back a failed payments deploy?", user=alice, kb="eng-wiki"
 
 ### Result merging across shards
 
-For sharded KBs (§8.5), each shard returns its local top-`k*overfetch`, scored on its own local scale. Because HNSW similarity scores aren't perfectly comparable across independently-built shard indices at the tail, the service **overfetches per shard** (e.g., top-3k from each of N shards) and re-ranks the merged 3k·N candidates by score, trusting relative order more within a shard than absolute score comparability across shards — this is a standard scatter-gather caveat and is why reranking (§10) matters more, not less, for sharded KBs.
+For sharded KBs (§9.5), each shard returns its local top-`k*overfetch`, scored on its own local scale. Because HNSW similarity scores aren't perfectly comparable across independently-built shard indices at the tail, the service **overfetches per shard** (e.g., top-3k from each of N shards) and re-ranks the merged 3k·N candidates by score, trusting relative order more within a shard than absolute score comparability across shards — this is a standard scatter-gather caveat and is why reranking (§11) matters more, not less, for sharded KBs.
 
 Score normalization, made concrete (min-max per shard before merge, the cheapest option that avoids one shard's naturally-tighter score distribution dominating the merge purely due to scale):
 
@@ -1087,11 +1687,11 @@ def merge_shard_results(shard_results: list[list[ScoredChunk]], top_k: int) -> l
     return sorted(normalized, key=lambda r: -r.normalized_score)[:top_k]
 ```
 
-This is a deliberately cheap normalization, not a statistically rigorous one — it's good enough to make cross-shard ordering *reasonable* for the overfetched candidate pool feeding into reranking, but it is explicitly **not** trusted as the final relevance signal on its own, which is exactly why sharded KBs benefit more from reranking (§10) than single-shard ones: the cross-encoder pass re-scores every surviving candidate against the actual query text, sidestepping the cross-shard score-comparability problem entirely rather than trying to solve it more precisely at the merge step.
+This is a deliberately cheap normalization, not a statistically rigorous one — it's good enough to make cross-shard ordering *reasonable* for the overfetched candidate pool feeding into reranking, but it is explicitly **not** trusted as the final relevance signal on its own, which is exactly why sharded KBs benefit more from reranking (§11) than single-shard ones: the cross-encoder pass re-scores every surviving candidate against the actual query text, sidestepping the cross-shard score-comparability problem entirely rather than trying to solve it more precisely at the merge step.
 
 ### Metadata filtering
 
-Filters are typed and declared per KB via the schema registry (§16), e.g., `source: enum`, `created_after: timestamp`, `labels: array<string>`. High-selectivity, high-cardinality filters (like permission allow-sets) are pushed to pre-filter (§8.6); low-selectivity filters (like `language = "en"` on an English-majority KB) are cheaper as post-filters on the smaller candidate set and are handled there by default, with per-KB override if a filter proves pathological in practice (observed via the query-analytics pipeline, §16 KB management).
+Filters are typed and declared per KB via the schema registry (§17), e.g., `source: enum`, `created_after: timestamp`, `labels: array<string>`. High-selectivity, high-cardinality filters (like permission allow-sets) are pushed to pre-filter (§9.6); low-selectivity filters (like `language = "en"` on an English-majority KB) are cheaper as post-filters on the smaller candidate set and are handled there by default, with per-KB override if a filter proves pathological in practice (observed via the query-analytics pipeline, §17 KB management).
 
 ### Pagination
 
@@ -1111,7 +1711,7 @@ def query_cache_key(kb_id: str, query: str, filters: dict, top_k: int, allow_set
         json.dumps(filters, sort_keys=True).encode()
     ).hexdigest()[:16]
     # allow_set_version is bumped by the Permission Service on any grant
-    # change affecting this (principal, kb) pair — see §11.4 — so a stale
+    # change affecting this (principal, kb) pair — see §12.4 — so a stale
     # cache entry is naturally unreachable, never explicitly hunted down
     return f"{kb_id}:{normalized_query}:{filter_fingerprint}:{top_k}:v{allow_set_version}"
 
@@ -1133,11 +1733,11 @@ def decode_cursor(cursor: str) -> CursorPayload:
     return payload
 ```
 
-The signed-cursor detail matters more than it looks: an **unsigned** cursor (plain base64 of `{offset, query}`) would let a client hand-craft an arbitrary offset into a query it never actually issued through the permission-filtered path — a signed cursor closes that gap by making the cursor only ever derivable from a request that already passed permission filtering, consistent with §11.6's zero-leakage claims applying to *every* code path that returns chunk data, not just the first page.
+The signed-cursor detail matters more than it looks: an **unsigned** cursor (plain base64 of `{offset, query}`) would let a client hand-craft an arbitrary offset into a query it never actually issued through the permission-filtered path — a signed cursor closes that gap by making the cursor only ever derivable from a request that already passed permission filtering, consistent with §12.6's zero-leakage claims applying to *every* code path that returns chunk data, not just the first page.
 
 ---
 
-## 10. Reranking
+## 11. Reranking
 
 ### Cross-encoder reranking
 
@@ -1154,7 +1754,7 @@ Typical models: `ms-marco-MiniLM-L-6-v2` (self-hosted, fast, good baseline), `bg
 
 ### Reciprocal rank fusion (RRF) for hybrid search
 
-Used to merge the dense and sparse ranked lists (§8.6) before or instead of a cross-encoder pass — cheap (no model inference), rank-based (robust to the two lists having incomparable raw scores):
+Used to merge the dense and sparse ranked lists (§9.6) before or instead of a cross-encoder pass — cheap (no model inference), rank-based (robust to the two lists having incomparable raw scores):
 
 ```python
 def reciprocal_rank_fusion(*ranked_lists: list[ChunkId], k: int = 60) -> list[ChunkId]:
@@ -1169,7 +1769,7 @@ The constant `k=60` is the standard RRF damping factor (de-weights the tail with
 
 ### MMR for diversity
 
-Given a relevance-ranked candidate list, **Maximal Marginal Relevance** re-orders to balance relevance against redundancy, so five near-duplicate chunks from the same document (or the near-duplicate documents flagged in §5.4) don't crowd out genuinely different information:
+Given a relevance-ranked candidate list, **Maximal Marginal Relevance** re-orders to balance relevance against redundancy, so five near-duplicate chunks from the same document (or the near-duplicate documents flagged in §6.4) don't crowd out genuinely different information:
 
 ```python
 def mmr(query_vec, candidates: list[ScoredChunk], lambda_param=0.7, top_k=10):
@@ -1187,7 +1787,7 @@ def mmr(query_vec, candidates: list[ScoredChunk], lambda_param=0.7, top_k=10):
 
 `lambda_param` near 1 behaves like pure relevance ranking; near 0 maximizes diversity at the cost of relevance. Default 0.7, exposed as a per-call tuning parameter for applications (e.g., a "give me a broad survey" use case wants lower lambda than a "find the one right answer" use case).
 
-**Complexity note**: the naive MMR loop above is `O(top_k × |candidates|)` pairwise-similarity comparisons — for the platform's typical MMR input (candidates ≤ 100, top_k ≤ 20) that's at most 2,000 cosine comparisons, comfortably under a millisecond even unoptimized, which is why §10.4's latency table shows MMR adding only 1-3ms. It would **not** stay cheap if applied to the full pre-rerank candidate pool at large-KB scale (thousands of candidates) — the platform enforces MMR only ever runs after the candidate set has already been narrowed by hybrid search + optional cross-encoder rerank, never as a first-pass filter over an unbounded result set.
+**Complexity note**: the naive MMR loop above is `O(top_k × |candidates|)` pairwise-similarity comparisons — for the platform's typical MMR input (candidates ≤ 100, top_k ≤ 20) that's at most 2,000 cosine comparisons, comfortably under a millisecond even unoptimized, which is why §11.4's latency table shows MMR adding only 1-3ms. It would **not** stay cheap if applied to the full pre-rerank candidate pool at large-KB scale (thousands of candidates) — the platform enforces MMR only ever runs after the candidate set has already been narrowed by hybrid search + optional cross-encoder rerank, never as a first-pass filter over an unbounded result set.
 
 ### Reranking latency budget and when to skip it
 
@@ -1200,20 +1800,20 @@ def mmr(query_vec, candidates: list[ScoredChunk], lambda_param=0.7, top_k=10):
 
 Given the platform's P99 ≤ 300ms target for unreranked queries and ≤ 700ms for reranked (§ task NFRs), cross-encoder reranking is **opt-in per call** (`rerank: true` in the retrieval request), with the Retrieval Service documentation steering callers explicitly:
 
-- **Skip reranking**: autocomplete-adjacent/typeahead use cases, high-QPS internal tools where raw hybrid search recall is already sufficient, or any caller whose own eval (§13) shows no measurable quality lift from reranking on their query distribution.
+- **Skip reranking**: autocomplete-adjacent/typeahead use cases, high-QPS internal tools where raw hybrid search recall is already sufficient, or any caller whose own eval (§14) shows no measurable quality lift from reranking on their query distribution.
 - **Use reranking**: user-facing Q&A/copilot applications where answer quality materially matters and the extra 100-400ms is acceptable within the overall LLM-generation latency budget (which is usually seconds anyway, making reranking's cost proportionally small).
 
 RRF and MMR, being cheap, are on by default for hybrid-search and multi-result use cases respectively; only the cross-encoder step is latency-gated.
 
 ---
 
-## 11. Permission-Aware Retrieval
+## 12. Permission-Aware Retrieval
 
 This is the section where a mistake is a security incident, not a quality regression — treated accordingly.
 
 ### ACL sync from sources
 
-Each connector's `fetch_acl` (§4.1) normalizes source-native permissions into a common model:
+Each connector's `fetch_acl` (§5.1) normalizes source-native permissions into a common model:
 
 ```json
 {
@@ -1229,7 +1829,7 @@ Each connector's `fetch_acl` (§4.1) normalizes source-native permissions into a
 }
 ```
 
-Group principals (`eng-all@company.com`) are stored **as groups**, not expanded to member lists at sync time — expansion happens at query time against the identity provider (§11.3), because a group's membership changes far more often than document ACLs do, and pre-expanding would mean re-syncing every document's ACL on every team-membership change (a combinatorial freshness problem the platform avoids entirely by deferring expansion).
+Group principals (`eng-all@company.com`) are stored **as groups**, not expanded to member lists at sync time — expansion happens at query time against the identity provider (§12.3), because a group's membership changes far more often than document ACLs do, and pre-expanding would mean re-syncing every document's ACL on every team-membership change (a combinatorial freshness problem the platform avoids entirely by deferring expansion).
 
 ### Permission index
 
@@ -1247,7 +1847,7 @@ Group Expansion Cache
 
 ### Query-time permission filtering strategy: pre-filter vs. post-filter
 
-Already decided in principle in §8.6 (bitset pre-filter into ANN traversal); here is the full reasoning and the fallback layering, because permissions get **two independent enforcement points**, not one — defense in depth against any single bug:
+Already decided in principle in §9.6 (bitset pre-filter into ANN traversal); here is the full reasoning and the fallback layering, because permissions get **two independent enforcement points**, not one — defense in depth against any single bug:
 
 ```
 Query(user=alice, kb="eng-wiki")
@@ -1260,7 +1860,7 @@ Query(user=alice, kb="eng-wiki")
    │
    ▼
 2. PRIMARY enforcement: pass allow_set as a pre-filter into the ANN/BM25
-   search itself (§8.6) — the search literally cannot surface a chunk
+   search itself (§9.6) — the search literally cannot surface a chunk
    outside the allow-set. This is also what makes filtered search fast
    under highly selective permission filters.
    │
@@ -1318,21 +1918,21 @@ The last paragraph is the concrete illustration of "fails closed" from a design 
 
 ### Permission cache and revocation latency
 
-The allow-set bitset (§11.2) is cached per `(principal_id, kb_id)` for **at most 60 seconds** — short enough that a revoked grant or removed group membership is reflected in retrieval within the platform's stated bound, long enough to keep the common case (repeated queries by the same user) cheap. Cache entries are also **actively invalidated** (not just left to expire) on:
+The allow-set bitset (§12.2) is cached per `(principal_id, kb_id)` for **at most 60 seconds** — short enough that a revoked grant or removed group membership is reflected in retrieval within the platform's stated bound, long enough to keep the common case (repeated queries by the same user) cheap. Cache entries are also **actively invalidated** (not just left to expire) on:
 
 - A group-membership-change webhook from the IdP, where available.
 - A source-side permission-change event from the connector (someone unshares a Drive doc), which propagates as an ACL-sync event feeding a tombstone-and-cache-bust for every principal who lost access to that specific document — this is a targeted invalidation (only affected principal×doc pairs), not a full cache flush.
 
-Combined with the pipeline's ≤5-minute tombstone SLA (§12.3) and this ≤60s cache bound, the platform's stated permission-revocation guarantee is: **a revoked grant stops being retrievable within 5 minutes, and a cached allow-set is never more than 60 seconds stale even before that pipeline catches it** — two independent, additive bounds, not one number picked to sound good.
+Combined with the pipeline's ≤5-minute tombstone SLA (§13.3) and this ≤60s cache bound, the platform's stated permission-revocation guarantee is: **a revoked grant stops being retrievable within 5 minutes, and a cached allow-set is never more than 60 seconds stale even before that pipeline catches it** — two independent, additive bounds, not one number picked to sound good.
 
 ### Federated multi-KB search
 
-Most retrieval calls target one KB, but some legitimate use cases (an org-wide "search everything I have access to" tool) need to query several. Rather than build a shared multi-tenant index that would undermine §3's isolation argument, federation is implemented as **fan-out at the Retrieval Service layer, with each KB's permission-filtering pipeline run to completion independently**:
+Most retrieval calls target one KB, but some legitimate use cases (an org-wide "search everything I have access to" tool) need to query several. Rather than build a shared multi-tenant index that would undermine §4's isolation argument, federation is implemented as **fan-out at the Retrieval Service layer, with each KB's permission-filtering pipeline run to completion independently**:
 
 ```python
 def federated_retrieve(principal: Principal, kb_ids: list[str], query: str, top_k: int):
-    # Each KB call runs the FULL single-KB pipeline (§9's 7 steps, including
-    # both permission-filter layers, §11.3) independently and completely —
+    # Each KB call runs the FULL single-KB pipeline (§10's 7 steps, including
+    # both permission-filter layers, §12.3) independently and completely —
     # there is no shared intermediate result set between KBs at any point
     per_kb_results = parallel_map(
         lambda kb_id: retrieve(principal, kb_id, query, top_k=top_k),  # full pipeline
@@ -1352,15 +1952,15 @@ The property this construction guarantees: **a result from KB B can only appear 
 
 | Claim | Mechanism |
 |---|---|
-| A user cannot retrieve chunk text from a document they can't access at the source | Pre-filter (§11.3 step 2) + secondary in-service check (step 3) |
+| A user cannot retrieve chunk text from a document they can't access at the source | Pre-filter (§12.3 step 2) + secondary in-service check (step 3) |
 | A user cannot infer a document's *existence* from result counts/scores of a query they're not authorized for | Retrieval API never returns "N results were filtered out"; result counts reflect only the allow-set-filtered set from the start (pre-filtering, not post-filtering-and-reporting-totals) |
-| A user cannot infer restricted content via a *reranking* score leak (e.g., a cross-encoder call accidentally scoring a chunk outside the allow-set) | Reranking operates strictly on the post-permission-filtered candidate set (§9 pipeline step ordering: permission filter happens in step 2-3, before step 6 reranking) — a restricted chunk never reaches the reranker at all |
-| A permission-sync lag results in under-sharing, never over-sharing | Fail-closed default (§11.4) — a chunk with *no* successfully synced ACL is treated as **zero-grantee** (visible to nobody but KB admins) until a sync succeeds, not treated as public |
+| A user cannot infer restricted content via a *reranking* score leak (e.g., a cross-encoder call accidentally scoring a chunk outside the allow-set) | Reranking operates strictly on the post-permission-filtered candidate set (§10 pipeline step ordering: permission filter happens in step 2-3, before step 6 reranking) — a restricted chunk never reaches the reranker at all |
+| A permission-sync lag results in under-sharing, never over-sharing | Fail-closed default (§12.4) — a chunk with *no* successfully synced ACL is treated as **zero-grantee** (visible to nobody but KB admins) until a sync succeeds, not treated as public |
 | Cross-knowledge-base queries can't be used to bypass a single KB's ACLs | No implicit "search all KBs" mode (task NFR); federated multi-KB search requires the caller to be independently authorized against each KB's own ACL layer, with the same pre-filter applied per KB before merge |
 
 ---
 
-## 12. Freshness Management
+## 13. Freshness Management
 
 ### Incremental sync scheduling
 
@@ -1381,8 +1981,8 @@ Driven by the Freshness Manager, which owns a per-source **sync policy** (cadenc
 
 Two independent signals, because a connector can be "running" but not actually keeping up:
 
-1. **Sync health**: is the connector successfully completing sync cycles (§4.4 lifecycle state)? Tracked per source, alerts on DEGRADED/PAUSED beyond a grace period.
-2. **Data staleness**: `now() - last_successful_sync_covering_this_document`, tracked **per document**, not just per source — a source can be "healthy" in aggregate while a specific document silently failed every retry and sits in the DLQ (§5.5) for days. The platform surfaces both a source-level staleness percentile (P50/P99 age of "last confirmed fresh" across all documents in the source) and a count of documents exceeding the SLA threshold.
+1. **Sync health**: is the connector successfully completing sync cycles (§5.4 lifecycle state)? Tracked per source, alerts on DEGRADED/PAUSED beyond a grace period.
+2. **Data staleness**: `now() - last_successful_sync_covering_this_document`, tracked **per document**, not just per source — a source can be "healthy" in aggregate while a specific document silently failed every retry and sits in the DLQ (§6.5) for days. The platform surfaces both a source-level staleness percentile (P50/P99 age of "last confirmed fresh" across all documents in the source) and a count of documents exceeding the SLA threshold.
 
 For webhook-backed sources specifically, staleness detection also catches the classic silent failure mode — a webhook subscription that quietly expired or got unregistered at the source, after which the connector looks "idle" (no errors, because nothing is arriving) rather than "failing." This is caught by comparing observed event rate against the source's historical baseline rate and alerting on an anomalous drop, plus the reconciliation poll (below) which would eventually catch the drift anyway but on a much longer cycle.
 
@@ -1401,7 +2001,7 @@ violation itself):
   - 9,847 of 10,000 docs (98.5%) synced within SLA — the webhook path
     is healthy for the vast majority
   - 153 docs (1.5%) are the P99 tail — cross-referencing against the
-    DLQ (§5.5) shows 140 of these hit a transient Slack API 429 during
+    DLQ (§6.5) shows 140 of these hit a transient Slack API 429 during
     a burst and are retrying with backoff (self-healing, not urgent)
   - 13 docs show no DLQ entry at all — these are the actionable signal:
     likely a webhook delivery gap the reconciliation poll hasn't yet
@@ -1439,7 +2039,7 @@ Tombstone Propagator writes a tombstone marker to:
   1. Vector Store metadata (chunk_id → tombstoned=true) — checked as an
      implicit filter on EVERY query, same code path as permission
      pre-filtering, so a tombstoned chunk is excluded with the same
-     "can't accidentally forget to check it" guarantee (§11.3's pattern
+     "can't accidentally forget to check it" guarantee (§12.3's pattern
      reused, not a separate ad hoc check)
   2. Permission Index (zero-grantee, belt-and-suspenders with #1)
       │
@@ -1449,7 +2049,7 @@ metadata from all shards/replicas within a bounded window (target: 24h),
 independent of the tombstone's immediate query-time effect above.
 ```
 
-The tombstone marker is what gives the ≤5-minute permission-revocation bound (§11.4) its teeth — it's a fast, cheap, universally-checked flag, decoupled from the slower, heavier physical-deletion cleanup job.
+The tombstone marker is what gives the ≤5-minute permission-revocation bound (§12.4) its teeth — it's a fast, cheap, universally-checked flag, decoupled from the slower, heavier physical-deletion cleanup job.
 
 ### Source-of-truth reconciliation
 
@@ -1466,14 +2066,14 @@ Reconciliation runs are logged with a diff summary (`N documents re-ingested, M 
 ```
 Confluence source, 500,000 pages, daily full reconciliation:
   Full listing API calls: 500,000 pages ÷ 100 pages/call ≈ 5,000 calls
-  Against a 1,000 req/hour budget (§4.5): 5,000 ÷ 1,000 ≈ 5 hours just
+  Against a 1,000 req/hour budget (§5.5): 5,000 ÷ 1,000 ≈ 5 hours just
   to LIST — before diffing or re-fetching anything that changed.
 
   This is the concrete reason reconciliation cadence is source-size-
   aware, not a flat "daily for everyone" policy: a 500k-page space
   running daily reconciliation would consume 5 of Confluence's 24
   hourly rate-limit windows just enumerating, competing directly with
-  the webhook-driven incremental path's own budget (§4.5's shared
+  the webhook-driven incremental path's own budget (§5.5's shared
   token bucket) and risking the exact freshness SLA reconciliation
   exists to protect.
 
@@ -1491,12 +2091,12 @@ Confluence source, 500,000 pages, daily full reconciliation:
 |---|---|---|
 | Content freshness | Eventually consistent | Per source-class SLA table above |
 | Permission grants (new access) | Eventually consistent | Same as content freshness — no urgency asymmetry, granting access late is a usability issue not a security one |
-| Permission revocations | Bounded eventual consistency, **fail-closed** | ≤5 min via tombstone/ACL-sync pipeline, ≤60s via permission cache bound (§11.4) — whichever catches it first |
+| Permission revocations | Bounded eventual consistency, **fail-closed** | ≤5 min via tombstone/ACL-sync pipeline, ≤60s via permission cache bound (§12.4) — whichever catches it first |
 | Deletions (tombstone → physically gone) | Eventually consistent, tombstone effect is immediate-ish | Tombstone flag: same bound as revocation above; physical purge: ≤24h, no query-visible effect |
 
 ---
 
-## 13. Evaluation
+## 14. Evaluation
 
 ### Retrieval metrics
 
@@ -1594,7 +2194,7 @@ Scheduled (regression detection):
 
 ### LLM-as-judge for quality
 
-Faithfulness/relevance/hallucination metrics (§13.2) are expensive to hand-label at scale, so a calibrated LLM judge is used, with two safeguards against judge unreliability:
+Faithfulness/relevance/hallucination metrics (§14.2) are expensive to hand-label at scale, so a calibrated LLM judge is used, with two safeguards against judge unreliability:
 
 1. **Calibration**: the judge's scores are periodically validated against a smaller human-labeled sample (e.g., 100 examples/month); if judge-human agreement drops below a threshold (e.g., Cohen's kappa < 0.6), the judge prompt/model is flagged for review before its scores are trusted for gating decisions.
 2. **Structured rubrics, not free-form scoring**: the judge is prompted with an explicit decomposition (list claims → check each against provided context → aggregate), not asked for a bare 1-10 "quality" number — this is both more reproducible and more debuggable when a score looks wrong.
@@ -1630,11 +2230,11 @@ For KBs with enough query volume to support it, the Retrieval Service supports *
 
 - Consistent bucketing per user (a user doesn't flip between variants mid-session).
 - Online metrics: click-through on returned citations, thumbs feedback, downstream answer-accepted signals where the calling application reports them back.
-- Combined with the offline golden-dataset eval (§13.4) as a pre-flight gate — A/B testing validates real-world behavior the golden dataset might not anticipate (genuine query distribution shift), it doesn't replace offline eval as the first gate.
+- Combined with the offline golden-dataset eval (§14.4) as a pre-flight gate — A/B testing validates real-world behavior the golden dataset might not anticipate (genuine query distribution shift), it doesn't replace offline eval as the first gate.
 
 ---
 
-## 14. Data Models
+## 15. Data Models
 
 ```
 KnowledgeBase
@@ -1668,7 +2268,7 @@ Chunk
 Embedding
   chunk_id, model_id, vector, dimension
   created_at
-  # one Chunk can have multiple Embedding rows during model migration (§7.4)
+  # one Chunk can have multiple Embedding rows during model migration (§8.4)
 
 PermissionGrant
   doc_id, principal_type (user|group), principal_id, level (read|write)
@@ -1697,18 +2297,18 @@ KnowledgeBase (1) ──── (N) DataSource
       │                        │ produces
       │                        ▼
       │                  Chunk (N) ──parent_chunk_id──▶ Chunk (self-referential,
-      │                        │                          parent-child, §6.5)
+      │                        │                          parent-child, §7.5)
       │                        │ has
       │                        ▼
       │                  Embedding (N per Chunk — one per active model_id
-      │                        │       during a migration window, §7.4)
+      │                        │       during a migration window, §8.4)
       │                        │
       │                  PermissionGrant (N per Document, via source_acl_ref)
       │
       └──── (N) EvalDataset ──── (N) EvalResult
 ```
 
-The two self-referential edges — `Document.canonical_document_id` (deduplication, §5.4) and `Chunk.parent_chunk_id` (parent-child chunking, §6.5) — are both nullable foreign keys back into their own table, which is why both dedup resolution and parent-expansion at query time are cheap single-hop lookups rather than requiring a separate join table.
+The two self-referential edges — `Document.canonical_document_id` (deduplication, §6.4) and `Chunk.parent_chunk_id` (parent-child chunking, §7.5) — are both nullable foreign keys back into their own table, which is why both dedup resolution and parent-expansion at query time are cheap single-hop lookups rather than requiring a separate join table.
 
 ### Representative payloads
 
@@ -1775,9 +2375,9 @@ The two self-referential edges — `Document.canonical_document_id` (deduplicati
 
 ---
 
-## 15. Sequence Flows
+## 16. Sequence Flows
 
-### 15.1 End-to-end ingestion: a Confluence page edit becomes retrievable
+### 16.1 End-to-end ingestion: a Confluence page edit becomes retrievable
 
 ```
 User edits a Confluence page
@@ -1791,7 +2391,7 @@ validates signature, enqueues RawDocument fetch job              │
       │                                                          │
       ▼                                                          │
 Connector fetches full page content + ACL via Confluence API,    │
-respecting the source's rate-limit token bucket (§4.5)           │
+respecting the source's rate-limit token bucket (§5.5)           │
       │                                                          │
       ▼                                                          │
 RawDocument{source_doc_ref, content, acl, fetched_at} enqueued   │
@@ -1828,7 +2428,7 @@ Ingestion workflow (Temporal) starts, keyed on                   │
       Vector Store write: new/updated vectors indexed on the       │
       shard(s) owning this KB; old chunk_ids belonging to the      │
       previous doc version but absent from the new version are     │
-      tombstoned (§12.4)                                            │
+      tombstoned (§13.4)                                            │
               │                                                    │
               ▼                                                    │
       Permission Sync (parallel, triggered by the same RawDocument │
@@ -1841,13 +2441,13 @@ Ingestion workflow (Temporal) starts, keyed on                   │
       Elapsed time budget: this path targets P50 ≤ 1 min,          │
       P99 ≤ 15 min end-to-end (§ task NFRs) ◀─────────────────────┘
                                               hourly reconciliation
-                                              poll (§12.5) is the
+                                              poll (§13.5) is the
                                               backstop if the webhook
                                               path above is silently
                                               dropped
 ```
 
-### 15.2 End-to-end query: a permission-filtered, reranked retrieval call
+### 16.2 End-to-end query: a permission-filtered, reranked retrieval call
 
 ```
 Application backend calls Retrieval API on behalf of "alice"
@@ -1862,7 +2462,7 @@ Permission Service:                Query Understanding:
   - check allow-set cache            - (optional) multi-query
     for (alice, eng-wiki)              expansion or HyDE
   - cache miss → resolve             - embed query text
-    alice's groups via IdP,            (cache-checked, §9.5)
+    alice's groups via IdP,            (cache-checked, §10.5)
     build allow-set bitset,
     cache w/ 60s TTL
       │                               │
@@ -1879,10 +2479,10 @@ Permission Service:                Query Understanding:
                        │
                        ▼
         Residual metadata filters applied (date range,
-        content_type — non-permission filters, §9.4)
+        content_type — non-permission filters, §10.4)
                        │
                        ▼
-        Secondary permission check (§11.3 step 3, defense in
+        Secondary permission check (§12.3 step 3, defense in
         depth — bitset membership test on every surviving
         candidate; anomaly-log + drop if any fail, should never
         fire)
@@ -1896,19 +2496,19 @@ Permission Service:                Query Understanding:
           ▼
         expand_to_parent=true? ──yes──▶ fetch ParentChunk text
           │                              for each surviving child
-          no                             chunk (§6.5)
+          no                             chunk (§7.5)
           │
           ▼
         MMR diversity pass (if requested), freshness metadata
-        attached per result (§12.3)
+        attached per result (§13.3)
                        │
                        ▼
         Response assembled: chunk text, scores, citation,
         freshness_score, next_cursor
                        │
                        ▼
-        query_id logged for feedback loop (§13.4) and query-log
-        mining (§13.3 golden dataset seeding)
+        query_id logged for feedback loop (§14.4) and query-log
+        mining (§14.3 golden dataset seeding)
 
 Latency budget (P99): permission resolution ≤15ms (cached) or
 ~40ms (cold) │ hybrid search ≤300ms │ rerank +150-250ms if used
@@ -1916,7 +2516,7 @@ Latency budget (P99): permission resolution ≤15ms (cached) or
 
 ---
 
-## 16. API Design
+## 17. API Design
 
 ### Knowledge base management: schema, analytics, and lifecycle
 
@@ -1935,9 +2535,9 @@ PATCH /v1/knowledge-bases/{kb_id}/schema
 }
 ```
 
-Field values are populated via connector `parsing_hints` (§4's config examples — e.g., the database connector's SELECT can map a `status` column directly to a custom field) or via a post-ingestion enrichment hook for sources that don't carry the field natively. Schema changes are additive-only through this API (removing a field that's in active use as a retrieval filter is a breaking change gated behind an explicit deprecation window, not an in-place delete) — this mirrors how a shared platform must treat schema evolution more conservatively than a single application would.
+Field values are populated via connector `parsing_hints` (§5's config examples — e.g., the database connector's SELECT can map a `status` column directly to a custom field) or via a post-ingestion enrichment hook for sources that don't carry the field natively. Schema changes are additive-only through this API (removing a field that's in active use as a retrieval filter is a breaking change gated behind an explicit deprecation window, not an in-place delete) — this mirrors how a shared platform must treat schema evolution more conservatively than a single application would.
 
-**Usage analytics.** Beyond the health dashboard (§17), the analytics endpoint answers questions the owning team actually asks week to week:
+**Usage analytics.** Beyond the health dashboard (§18), the analytics endpoint answers questions the owning team actually asks week to week:
 
 ```json
 GET /v1/knowledge-bases/{kb_id}/analytics?window=7d
@@ -1963,7 +2563,7 @@ GET /v1/knowledge-bases/{kb_id}/analytics?window=7d
 }
 ```
 
-`zero_result_queries` and `top_queries` are the two fields owning teams look at most in practice — zero-result queries are the single best signal for "what content is missing," directly actionable as a connector-scope or chunking-strategy fix, and are also the primary feed into golden-dataset mining (§13.3).
+`zero_result_queries` and `top_queries` are the two fields owning teams look at most in practice — zero-result queries are the single best signal for "what content is missing," directly actionable as a connector-scope or chunking-strategy fix, and are also the primary feed into golden-dataset mining (§14.3).
 
 **Deletion cascade.** Deleting a knowledge base is not a single operation — it fans out across every derived store, and the ordering matters for correctness (permissions must be the *first* thing to go, not the last, so a deletion-in-progress KB never has a window where content is un-tombstoned but permissions have already been dropped):
 
@@ -2083,7 +2683,7 @@ POST /v1/knowledge-bases/{kb_id}/feedback
 
 ---
 
-## 17. Observability and SLOs
+## 18. Observability and SLOs
 
 ### The handful of metrics that actually tell you the platform is healthy
 
@@ -2091,23 +2691,23 @@ POST /v1/knowledge-bases/{kb_id}/feedback
 |---|---|---|
 | Retrieval API P50/P99 latency, per KB | Direct user-facing SLO (§ task NFRs) | P99 > 300ms unreranked, or > 700ms reranked, sustained 5 min |
 | Retrieval API error rate, per KB | Availability SLO | > 0.1% over 5 min |
-| Permission-check secondary-mismatch count (§11.3 step 3) | Should be **zero** in steady state; any nonzero value is a P0 | Any occurrence > 0 |
-| Staleness: P50/P99 document age, per source | Freshness SLA compliance (§12) | Exceeds source-class SLA bound for > 30 min |
+| Permission-check secondary-mismatch count (§12.3 step 3) | Should be **zero** in steady state; any nonzero value is a P0 | Any occurrence > 0 |
+| Staleness: P50/P99 document age, per source | Freshness SLA compliance (§13) | Exceeds source-class SLA bound for > 30 min |
 | Connector error rate / DEGRADED time, per source | Ingestion health | DEGRADED > 1h continuous |
 | DLQ depth, per KB | Silent data loss risk | Growing DLQ depth over 24h, or depth > 0.1% of KB's document count |
 | Embedding queue depth (bulk + incremental lanes separately) | Ingestion backpressure | Incremental lane depth > 10k for > 10 min (should drain fast) |
-| Eval metric trend (recall@k, NDCG), per KB with a golden dataset | Slow quality regression detection (§13.4) | > 2% relative drop week-over-week |
+| Eval metric trend (recall@k, NDCG), per KB with a golden dataset | Slow quality regression detection (§14.4) | > 2% relative drop week-over-week |
 | Vector store shard replica divergence (chunk count / checksum mismatch) | Data integrity | Any divergence detected on scheduled consistency check |
 | Cache hit rate: permission allow-set cache, query-result cache, embedding cache | Cost + latency efficiency, not correctness | Informational; sustained drop worth investigating but not itself an incident |
-| Reranking Service GPU utilization / queue depth | Capacity planning signal for §18's "reranking adoption" scaling risk | Utilization > 85% sustained, or queue wait > 100ms P99 |
+| Reranking Service GPU utilization / queue depth | Capacity planning signal for §19's "reranking adoption" scaling risk | Utilization > 85% sustained, or queue wait > 100ms P99 |
 
 ### Proving guarantees hold in production, not just in design
 
-The permission-leakage guarantee (§11.6) is the platform's highest-stakes claim, so it gets its own **continuous verification job**, not just point-in-time testing:
+The permission-leakage guarantee (§12.6) is the platform's highest-stakes claim, so it gets its own **continuous verification job**, not just point-in-time testing:
 
 ```
 Continuous permission audit (runs every 15 min, samples live traffic):
-  1. Sample N recent query_ids (from query logs, §15.2) across KBs.
+  1. Sample N recent query_ids (from query logs, §16.2) across KBs.
   2. For each, independently re-resolve the querying principal's
      allow-set from the Permission Service (a *second*, offline
      computation path, not reusing the cached value the live query
@@ -2118,7 +2718,7 @@ Continuous permission audit (runs every 15 min, samples live traffic):
   4. Any mismatch is a P0 page — not a metric, an incident.
 ```
 
-This is the production analogue of "prove linearizability holds" in a consistency-critical store: a design argument (§11) is necessary but not sufficient — an always-on adversarial-style check against the platform's own live traffic is what makes the zero-leakage claim something ops can actually stand behind, not just something the design doc asserts.
+This is the production analogue of "prove linearizability holds" in a consistency-critical store: a design argument (§12) is necessary but not sufficient — an always-on adversarial-style check against the platform's own live traffic is what makes the zero-leakage claim something ops can actually stand behind, not just something the design doc asserts.
 
 Freshness SLA compliance is similarly audited: a scheduled job compares a random sample of documents' `last_synced_at` in the platform against a direct source-side fetch of that document's true last-modified time, flagging any sample exceeding the source class's stated bound — catching cases where the staleness *tracker itself* might be wrong (e.g., miscomputing an age) rather than only catching cases where the underlying sync is slow.
 
@@ -2130,7 +2730,7 @@ Freshness SLA compliance is similarly audited: a scheduled job compares a random
 
 ### Sample incident: permission-audit mismatch page
 
-Walking through what the on-call response actually looks like when §17.2's continuous permission audit fires, to make "P0 page" concrete rather than aspirational:
+Walking through what the on-call response actually looks like when §18.2's continuous permission audit fires, to make "P0 page" concrete rather than aspirational:
 
 ```
 ALERT: permission-audit-mismatch
@@ -2153,14 +2753,14 @@ On-call response (first 15 minutes):
      live query's allow-set resolution and the independent re-check) vs.
      a structural bug (e.g., a bitset index-offset error in the pre-
      filter implementation itself).
-  3. If sync race: this is a KNOWN acceptable window (§12.6's bounded
+  3. If sync race: this is a KNOWN acceptable window (§13.6's bounded
      eventual consistency) as long as it's within the 60s cache /
      5min tombstone bounds — confirm the timestamps, downgrade from P0
      to a logged-and-tracked event, no code change needed.
   4. If structural bug: this is a genuine P0 — the query path itself is
      capable of leaking. Immediate mitigation: disable pre-filter fast
      path platform-wide, fall back to a slower but independently-
-     re-verified filtering path (§11.3 step 3's secondary check,
+     re-verified filtering path (§12.3 step 3's secondary check,
      promoted to primary) until the bitset bug is found and fixed.
 ```
 
@@ -2168,21 +2768,21 @@ The branch between step 3 and step 4 is the entire point of running the audit co
 
 ### Chaos testing the permission guarantee
 
-The continuous audit (§17.2) catches leakage in live, organic traffic, but it only samples traffic that's actually happening — it won't necessarily exercise the specific edge cases (deep group nesting, mid-flight revocation, sharded-KB fan-out) where a bug is most likely to hide. A scheduled **synthetic chaos suite** complements it by deliberately manufacturing those edge cases:
+The continuous audit (§18.2) catches leakage in live, organic traffic, but it only samples traffic that's actually happening — it won't necessarily exercise the specific edge cases (deep group nesting, mid-flight revocation, sharded-KB fan-out) where a bug is most likely to hide. A scheduled **synthetic chaos suite** complements it by deliberately manufacturing those edge cases:
 
 | Scenario | What it injects | What must hold |
 |---|---|---|
 | Revoke-mid-query | A synthetic principal's grant is revoked at the source at the exact moment a query against a large KB is executing (query start before revocation, response after) | The response reflects either fully-pre-revocation or fully-post-revocation state — never a partial mix of chunks from two different permission snapshots within one response |
-| Nested-group depth exhaustion | A synthetic group hierarchy nested exactly at the 10-level bound (§11.3) plus one level beyond it | Depth-11 grants are correctly excluded (logged as a depth-exceeded event, §11.3), not silently included via a truncation bug |
-| IdP timeout injection | Group-expansion calls are made to fail/time out for a synthetic principal on a schedule | Fail-closed behavior (§11.3's worked example) holds exactly, verified by re-running the same query with the IdP healthy and diffing — the healthy result must be a **superset** of the degraded result, never a mismatched set |
-| Cross-shard leak probe | A synthetic KB is sharded across N shards with a permission grant deliberately placed so only one shard holds the authorizing document | Verifies the pre-filter bitset is correctly applied per-shard during fan-out (§9.3), not just at a merge step that would be too late to prevent an unauthorized shard-local candidate from ever being computed |
-| Federated fan-out probe | A synthetic principal authorized for KB A but not KB B, querying both via §11.5's federation path | KB B's fan-out call returns empty, contributes nothing to the merged result, and produces no partial/leaked score signal from KB B in the final response |
+| Nested-group depth exhaustion | A synthetic group hierarchy nested exactly at the 10-level bound (§12.3) plus one level beyond it | Depth-11 grants are correctly excluded (logged as a depth-exceeded event, §12.3), not silently included via a truncation bug |
+| IdP timeout injection | Group-expansion calls are made to fail/time out for a synthetic principal on a schedule | Fail-closed behavior (§12.3's worked example) holds exactly, verified by re-running the same query with the IdP healthy and diffing — the healthy result must be a **superset** of the degraded result, never a mismatched set |
+| Cross-shard leak probe | A synthetic KB is sharded across N shards with a permission grant deliberately placed so only one shard holds the authorizing document | Verifies the pre-filter bitset is correctly applied per-shard during fan-out (§10.3), not just at a merge step that would be too late to prevent an unauthorized shard-local candidate from ever being computed |
+| Federated fan-out probe | A synthetic principal authorized for KB A but not KB B, querying both via §12.5's federation path | KB B's fan-out call returns empty, contributes nothing to the merged result, and produces no partial/leaked score signal from KB B in the final response |
 
 Each scenario runs nightly against a dedicated synthetic KB (never against real tenant data) and any failure is a release-blocking signal for the next deploy, not just a dashboard entry — this is the platform's answer to "how do you know the zero-leakage guarantee still holds after every code change," since the continuous production audit alone only proves it held for the traffic that happened to occur, not for the traffic patterns a bug fix might have missed.
 
 ---
 
-## 18. Scaling
+## 19. Scaling
 
 ### Horizontal scaling per component
 
@@ -2191,24 +2791,24 @@ Each scenario runs nightly against a dedicated synthetic KB (never against real 
 | Connector Service | Source API rate limits (external, not platform-controlled) | More parallel workers within the source's rate budget; cannot out-scale a slow source — freshness SLA is honestly capped by it |
 | Ingestion Pipeline | Parsing CPU (large PDFs/OCR) | Horizontal worker pool, autoscaled on queue depth, isolated pool for OCR specifically |
 | Chunking Engine | Semantic chunking's embedding-boundary pass | Horizontal, GPU-assisted for semantic strategy only; cheap strategies scale on plain CPU |
-| Embedding Service | GPU throughput | Horizontal GPU pool, autoscaled on queue depth, bulk/incremental lane priority (§7.2) |
-| Vector Store | Shard memory/CPU at large single-KB scale | Sharding (§8.5) + read replicas; large KBs get dedicated node pools |
+| Embedding Service | GPU throughput | Horizontal GPU pool, autoscaled on queue depth, bulk/incremental lane priority (§8.2) |
+| Vector Store | Shard memory/CPU at large single-KB scale | Sharding (§9.5) + read replicas; large KBs get dedicated node pools |
 | Retrieval Service | Fan-out latency to many shards on huge KBs | Stateless, scale replicas; colocate with vector store shards to minimize network hops |
 | Reranking Service | GPU throughput at high `rerank:true` adoption | Horizontal GPU pool, same dynamic-batching approach as embedding |
-| Permission Service | Group-expansion calls to IdP | Aggressive caching (§11.4) is the primary lever, not raw horizontal scaling — the IdP itself is the real bottleneck |
+| Permission Service | Group-expansion calls to IdP | Aggressive caching (§12.4) is the primary lever, not raw horizontal scaling — the IdP itself is the real bottleneck |
 
 ### Vector store scaling walkthrough
 
-As a KB grows past the single-shard threshold (~25M vectors, §2):
+As a KB grows past the single-shard threshold (~25M vectors, §3):
 
 1. Platform auto-detects the threshold crossing during a scheduled capacity check.
 2. A resharding job is scheduled (off-peak), computing the new shard count `N = ceil(size / 25M)`.
-3. New shards are populated by **replaying from the Document Store** (same mechanism as embedding migration, §7.4) rather than physically splitting the existing single shard — simpler, and doubles as a validation that the KB is fully reconstructable from source-of-truth.
+3. New shards are populated by **replaying from the Document Store** (same mechanism as embedding migration, §8.4) rather than physically splitting the existing single shard — simpler, and doubles as a validation that the KB is fully reconstructable from source-of-truth.
 4. Retrieval Service's shard map is updated atomically once the new shards pass a consistency check (chunk counts reconcile against the Document Store); old single shard decommissioned after a rollback window.
 
 ### Embedding throughput optimization
 
-Beyond §7.3's dynamic/length-bucketed batching: for very large backfills (a new 200M-chunk KB), the Embedding Service supports a **priority-lowered bulk mode** that intentionally trades latency for GPU utilization — larger batches, longer max-wait-to-batch, and explicit admission control that caps bulk-mode's share of the GPU pool (e.g., 70% max) so it can never fully starve the incremental lane even during a massive concurrent backfill.
+Beyond §8.3's dynamic/length-bucketed batching: for very large backfills (a new 200M-chunk KB), the Embedding Service supports a **priority-lowered bulk mode** that intentionally trades latency for GPU utilization — larger batches, longer max-wait-to-batch, and explicit admission control that caps bulk-mode's share of the GPU pool (e.g., 70% max) so it can never fully starve the incremental lane even during a massive concurrent backfill.
 
 ### Query fan-out
 
@@ -2216,7 +2816,7 @@ For multi-shard KBs, fan-out is parallel (not sequential) with a **per-shard tim
 
 ### Where the platform hits limits first as it grows 10x
 
-1. **The Permission Service's dependency on the IdP** — group expansion at 10x query volume needs either a much bigger IdP-side budget or a much longer effective cache TTL (which directly trades against the revocation-latency guarantee, §11.4) — likely the first real architectural tension to resurface.
+1. **The Permission Service's dependency on the IdP** — group expansion at 10x query volume needs either a much bigger IdP-side budget or a much longer effective cache TTL (which directly trades against the revocation-latency guarantee, §12.4) — likely the first real architectural tension to resurface.
 2. **Reranking GPU capacity** if `rerank:true` adoption grows faster than raw query volume (a very plausible trend as more teams build quality-sensitive apps) — mitigated by the priority-lane and admission-control patterns already in place, but capacity planning needs to track adoption rate as its own metric, not just QPS.
 3. **Source API rate limits** on the handful of highest-volume connectors (Slack, Confluence) as more KBs pull from the same shared org-wide source instance — mitigated by negotiating higher enterprise-tier API budgets and/or a shared, deduplicated cross-KB sync for documents multiple KBs would otherwise redundantly pull from the same source.
 
@@ -2226,18 +2826,18 @@ Reactive autoscaling (queue-depth-triggered GPU scale-out, threshold-triggered r
 
 ---
 
-## 19. Failure Modes
+## 20. Failure Modes
 
 | Failure | Detection | Immediate effect | Recovery |
 |---|---|---|---|
-| Connector fails mid-sync | Elevated error rate → DEGRADED state (§4.4) | Partial batch isolated via per-doc DLQ; sync continues for unaffected documents | Automatic retry w/ backoff; reconciliation (§12.5) catches anything missed; alert if DEGRADED exceeds SLA window |
-| Embedding model degrades (quality regression, e.g., a provider silently updates a hosted model) | Nightly eval run (§13.4) trend detects metric drop | New embeddings continue to be produced (no hard stop) but flagged | Pin to a known-good model version explicitly (hosted APIs are usually versioned for exactly this reason); trigger migration (§7.4) to a validated replacement if needed |
+| Connector fails mid-sync | Elevated error rate → DEGRADED state (§5.4) | Partial batch isolated via per-doc DLQ; sync continues for unaffected documents | Automatic retry w/ backoff; reconciliation (§13.5) catches anything missed; alert if DEGRADED exceeds SLA window |
+| Embedding model degrades (quality regression, e.g., a provider silently updates a hosted model) | Nightly eval run (§14.4) trend detects metric drop | New embeddings continue to be produced (no hard stop) but flagged | Pin to a known-good model version explicitly (hosted APIs are usually versioned for exactly this reason); trigger migration (§8.4) to a validated replacement if needed |
 | Embedding provider outage (hosted API down) | Elevated error rate on Embedding Service calls | Incremental-lane embedding backs up in queue; bulk lane pauses | Circuit breaker trips, queue buffers (bounded, with alerting past a depth threshold); optional automatic failover to a secondary self-hosted model for the incremental lane only, with a note that mixed-model chunks get re-embedded with the primary once it recovers |
-| Vector store shard corruption / loss | Replica consistency check (chunk count / checksum mismatch) fails | Queries route around the bad replica automatically (§8.4 replication) | Rebuild the shard from a healthy replica; if all replicas lost, rebuild from Document Store replay (§18.2) — slower, but always possible since the vector store is a derived index, never source of truth |
-| Permission sync lag | Staleness tracker (§12.2) on the Permission Sync pipeline specifically | Fail-closed (§11.4) — affected documents become unretrievable rather than under-protected | Alert if lag exceeds the 5-min bound; investigate source-side (IdP outage?) vs. platform-side (Permission Sync worker backlog?) |
-| Stale content served past SLA | Staleness tracker (§12.2) per-document metric | Freshness score/filter (§12.3) lets freshness-sensitive callers self-protect even before the platform-level alert fires | Prioritize the lagging source's sync; if source-side outage, communicate degraded freshness on the KB health dashboard |
-| Runaway crawl / backfill in one KB | Per-KB rate limiting and quota enforcement on ingestion pipeline throughput | Contained to that KB's ingestion lane; query serving unaffected (decoupled planes, §3) | Automatic quota-based throttling; platform on-call notified if a KB's ingestion volume anomaly exceeds a threshold (possible runaway crawl or misconfiguration) |
-| Query storm on one KB | Per-KB QPS quota + noisy-neighbor isolation (§18, dedicated node pools for large KBs) | Bounded to that KB's shard pool; other KBs' latency unaffected | Rate-limit/429 the offending caller past quota; scale that KB's replica count if the load is legitimate and sustained |
+| Vector store shard corruption / loss | Replica consistency check (chunk count / checksum mismatch) fails | Queries route around the bad replica automatically (§9.4 replication) | Rebuild the shard from a healthy replica; if all replicas lost, rebuild from Document Store replay (§19.2) — slower, but always possible since the vector store is a derived index, never source of truth |
+| Permission sync lag | Staleness tracker (§13.2) on the Permission Sync pipeline specifically | Fail-closed (§12.4) — affected documents become unretrievable rather than under-protected | Alert if lag exceeds the 5-min bound; investigate source-side (IdP outage?) vs. platform-side (Permission Sync worker backlog?) |
+| Stale content served past SLA | Staleness tracker (§13.2) per-document metric | Freshness score/filter (§13.3) lets freshness-sensitive callers self-protect even before the platform-level alert fires | Prioritize the lagging source's sync; if source-side outage, communicate degraded freshness on the KB health dashboard |
+| Runaway crawl / backfill in one KB | Per-KB rate limiting and quota enforcement on ingestion pipeline throughput | Contained to that KB's ingestion lane; query serving unaffected (decoupled planes, §4) | Automatic quota-based throttling; platform on-call notified if a KB's ingestion volume anomaly exceeds a threshold (possible runaway crawl or misconfiguration) |
+| Query storm on one KB | Per-KB QPS quota + noisy-neighbor isolation (§19, dedicated node pools for large KBs) | Bounded to that KB's shard pool; other KBs' latency unaffected | Rate-limit/429 the offending caller past quota; scale that KB's replica count if the load is legitimate and sustained |
 | Reranker unavailable | Health check / elevated error rate on Reranking Service | Retrieval Service falls back to un-reranked (RRF-only) results rather than failing the whole query | Alert; circuit breaker; queries automatically resume reranking once the service recovers |
 
 ### Two failure walkthroughs, traced end to end
@@ -2248,29 +2848,29 @@ The table above is the reference; two of its rows are worth walking through in f
 
 A node hosting one replica of shard 47 (part of a 500M-chunk KB) suffers a disk failure. Sequence of events:
 
-1. Health checks on that replica start failing within seconds; the shard's other two replicas (different AZs, §8.4) continue serving all traffic for shard 47 — the Retrieval Service's shard map marks the dead replica unhealthy and routes exclusively to the surviving two. **No query-visible impact** at this point; this is exactly what 3x replication is for.
+1. Health checks on that replica start failing within seconds; the shard's other two replicas (different AZs, §9.4) continue serving all traffic for shard 47 — the Retrieval Service's shard map marks the dead replica unhealthy and routes exclusively to the surviving two. **No query-visible impact** at this point; this is exactly what 3x replication is for.
 2. The platform's control plane detects the persistent replica failure (not a transient blip — health checks fail for longer than the flap-tolerance window, e.g., 2 minutes) and triggers a **rebuild**: a new node is provisioned, and the shard is repopulated from one of the two healthy replicas via a bulk copy (fast — this is the common case, most shard losses are single-replica).
 3. Rebuild completes, new replica passes a consistency check (chunk count and a sampled checksum against a healthy replica), and rejoins the routing pool. Total time-to-full-redundancy: minutes to low tens of minutes depending on shard size, during which the KB ran at 2/3 replication — degraded durability margin, but zero degraded availability.
 4. **The genuinely bad case**: a correlated failure takes out 2 of 3 replicas simultaneously (e.g., an AZ-wide event coinciding with the first failure). Now shard 47 is down to one replica — queries against it still succeed (one replica is enough to serve, just not to tolerate another failure), but the platform is one more failure away from actual data loss for that shard's chunk range. This state pages on-call immediately (not just logs a warning) and triggers an **emergency third-replica rebuild** at elevated priority, competing for rebuild bandwidth ahead of routine maintenance.
-5. **The catastrophic case**: all three replicas are lost (extremely unlikely given AZ-spread, but the design must still answer it). Recovery falls through the backup tiers in order (§8.7): first, restore from the most recent nightly snapshot (minutes to low hours) if snapshots for that shard are intact and trusted; only if snapshots are also unavailable does the platform fall back to the slowest, always-correct path — rebuilding from the Document Store by replaying chunking + embedding for every document whose chunks lived on that shard (§18.2), hours rather than minutes since it re-runs the embedding step rather than copying vectors. Either way, the KB's owning team sees a partial-recall window for that shard's chunk range during the rebuild, surfaced explicitly on their health dashboard rather than silently degrading.
+5. **The catastrophic case**: all three replicas are lost (extremely unlikely given AZ-spread, but the design must still answer it). Recovery falls through the backup tiers in order (§9.7): first, restore from the most recent nightly snapshot (minutes to low hours) if snapshots for that shard are intact and trusted; only if snapshots are also unavailable does the platform fall back to the slowest, always-correct path — rebuilding from the Document Store by replaying chunking + embedding for every document whose chunks lived on that shard (§19.2), hours rather than minutes since it re-runs the embedding step rather than copying vectors. Either way, the KB's owning team sees a partial-recall window for that shard's chunk range during the rebuild, surfaced explicitly on their health dashboard rather than silently degrading.
 
-The throughline: every layer of this failure has a defined, bounded, non-silent response, and the worst case is bounded by "re-derive from source of truth," which is only possible because §3's architectural choice — vector store as a rebuildable derived index — was made deliberately up front, not discovered as a lucky accident during an incident.
+The throughline: every layer of this failure has a defined, bounded, non-silent response, and the worst case is bounded by "re-derive from source of truth," which is only possible because §4's architectural choice — vector store as a rebuildable derived index — was made deliberately up front, not discovered as a lucky accident during an incident.
 
 **Walkthrough 2 — a knowledge base attempts a 50M-document backfill without warning.**
 
 A team enables a new Confluence-wide connector scoped far more broadly than intended (a config mistake — `spaces: ["*"]` instead of a specific space list), effectively triggering a 50M-document full backfill against a KB provisioned for ~1M documents.
 
-1. The Connector Service begins enumerating and fetching documents at the source's rate-limit ceiling (§4.5) — this alone bounds the ingestion rate regardless of platform capacity, so the "attack" is naturally rate-limited by Confluence's own API budget.
-2. Documents flow into the Ingestion Pipeline and Chunking Engine; per-KB ingestion throughput quotas (§18) cap how fast this KB's chunks can be embedded and written to the vector store, so the backlog **queues** rather than consuming unbounded shared capacity — other KBs' ingestion is unaffected, per the noisy-neighbor isolation guarantee.
-3. The KB's chunk count crosses its provisioned single-shard capacity threshold (§2/§8.5) mid-backfill. The platform's capacity monitor detects this and **automatically schedules a resharding job** rather than letting one shard silently balloon past its memory budget — this is the same mechanism as planned growth (§18.2), just triggered earlier and faster than expected.
+1. The Connector Service begins enumerating and fetching documents at the source's rate-limit ceiling (§5.5) — this alone bounds the ingestion rate regardless of platform capacity, so the "attack" is naturally rate-limited by Confluence's own API budget.
+2. Documents flow into the Ingestion Pipeline and Chunking Engine; per-KB ingestion throughput quotas (§19) cap how fast this KB's chunks can be embedded and written to the vector store, so the backlog **queues** rather than consuming unbounded shared capacity — other KBs' ingestion is unaffected, per the noisy-neighbor isolation guarantee.
+3. The KB's chunk count crosses its provisioned single-shard capacity threshold (§3/§9.5) mid-backfill. The platform's capacity monitor detects this and **automatically schedules a resharding job** rather than letting one shard silently balloon past its memory budget — this is the same mechanism as planned growth (§19.2), just triggered earlier and faster than expected.
 4. The KB's ingestion volume anomaly (order-of-magnitude above its historical baseline) trips an alert to platform on-call *and* to the owning team, well before the backfill completes — this is the detection path from the failure-mode table's "runaway crawl" row, generalized: any KB whose ingestion rate deviates sharply from its own history is flagged, not just crawler-specific runaways.
-5. The owning team is notified, confirms the config mistake, and scopes the connector down; already-ingested out-of-scope documents are removed via the standard document-deletion path (§15's tombstone flow), which also correctly retracts their chunks from the resharded index and their grants from the permission index — cleanup uses the same mechanism as a routine deletion, not a special-cased incident-response script.
+5. The owning team is notified, confirms the config mistake, and scopes the connector down; already-ingested out-of-scope documents are removed via the standard document-deletion path (§16's tombstone flow), which also correctly retracts their chunks from the resharded index and their grants from the permission index — cleanup uses the same mechanism as a routine deletion, not a special-cased incident-response script.
 
 The throughline here: nothing in this scenario required a human to intervene *before* damage was contained — quotas, rate limits, and anomaly detection did the containment; the human intervention (scoping down the connector) is about correctness of *intent*, not about stopping a system that would otherwise have kept degrading.
 
 ---
 
-## 20. Cost Model
+## 21. Cost Model
 
 ### Cost components
 
@@ -2278,25 +2878,25 @@ The throughline here: nothing in this scenario required a human to intervene *be
 |---|---|---|
 | Embedding (hosted API) | tokens embedded × per-token price | Dominant cost for KBs on hosted models at high chunk-turnover sources |
 | Embedding (self-hosted) | GPU-hours | Dominant cost at very large steady-state scale; cheaper per-chunk at volume, higher fixed cost |
-| Vector storage | bytes stored × replication factor | Dimensionality + quantization choice (§7.4, §8.2) is the single biggest lever |
-| Query compute | QPS × (search cost + optional rerank cost) | Reranking is the biggest per-query cost differential — gating it (§10.4) is a direct cost lever, not just a latency one |
+| Vector storage | bytes stored × replication factor | Dimensionality + quantization choice (§8.4, §9.2) is the single biggest lever |
+| Query compute | QPS × (search cost + optional rerank cost) | Reranking is the biggest per-query cost differential — gating it (§11.4) is a direct cost lever, not just a latency one |
 | Reranking (if hosted API) | reranked-query volume × per-call price | Self-hosting a reranker trades a fixed GPU cost for eliminating this variable cost past a break-even query volume |
 
 ### Concrete optimization levers
 
-1. **Dimensionality reduction** (§7.4): dropping from 1536 to 768 dims roughly **halves vector storage** with ~1% recall loss for MRL-capable models — essentially free quality-for-cost trade for most KBs, applied as the platform default rather than an opt-in.
-2. **Quantization** (§8.2): int8 scalar quantization gives another ~4x storage reduction on top, near-zero recall loss — also a default. PQ for the largest KBs trades more recall for much larger (8-32x) compression, applied selectively where the eval framework (§13) confirms the recall loss is acceptable for that KB's use case.
+1. **Dimensionality reduction** (§8.4): dropping from 1536 to 768 dims roughly **halves vector storage** with ~1% recall loss for MRL-capable models — essentially free quality-for-cost trade for most KBs, applied as the platform default rather than an opt-in.
+2. **Quantization** (§9.2): int8 scalar quantization gives another ~4x storage reduction on top, near-zero recall loss — also a default. PQ for the largest KBs trades more recall for much larger (8-32x) compression, applied selectively where the eval framework (§14) confirms the recall loss is acceptable for that KB's use case.
 3. **Storage tiering**: chunks/embeddings for documents with `freshness_score` below a low threshold and no recent query hits (tracked via query-log chunk-hit analytics) are candidates for a colder, cheaper storage tier (higher-latency retrieval acceptable) — this targets the long tail of rarely-touched historical content that dominates storage but not query cost.
-4. **Reranking gating** (§10.4): the single biggest per-query cost lever — steering low-stakes callers away from `rerank: true` via clear API guidance and per-KB eval-backed defaults, rather than reranking universally "just in case."
+4. **Reranking gating** (§11.4): the single biggest per-query cost lever — steering low-stakes callers away from `rerank: true` via clear API guidance and per-KB eval-backed defaults, rather than reranking universally "just in case."
 5. **Self-hosting break-even**: for a KB doing >~5M reranked queries/month, self-hosting a reranker on owned GPU capacity is typically cheaper than a hosted per-call API — the platform tracks per-KB rerank-call volume specifically to identify candidates for this migration.
-6. **Batch-size discipline on embedding** (§7.3): maximizing batch fill (length-bucketing, dynamic batching) is a pure efficiency lever with no quality trade-off — treated as an SRE-owned optimization target, not a product decision.
+6. **Batch-size discipline on embedding** (§8.3): maximizing batch fill (length-bucketing, dynamic batching) is a pure efficiency lever with no quality trade-off — treated as an SRE-owned optimization target, not a product decision.
 
 ### Platform-wide monthly cost estimate
 
-Rough order-of-magnitude, built from the capacity numbers in §2, to sanity-check that the design is economically sane at stated scale (not a finance-grade estimate, but the arithmetic a design review should demand):
+Rough order-of-magnitude, built from the capacity numbers in §3, to sanity-check that the design is economically sane at stated scale (not a finance-grade estimate, but the arithmetic a design review should demand):
 
 ```
-STORAGE (steady state, 10B chunks, quantized, 3x replication — §2, §20)
+STORAGE (steady state, 10B chunks, quantized, 3x replication — §3, §21)
   ~75-90 TB across dense vectors + metadata + raw text
   @ ~$0.023/GB-month (object-store-class pricing for the bulk of it,
     a smaller hot fraction on faster disk) ≈ 80,000 GB × $0.023
@@ -2306,14 +2906,14 @@ STORAGE (steady state, 10B chunks, quantized, 3x replication — §2, §20)
 
 EMBEDDING (steady state ingest, 50M chunks/day, self-hosted default)
   50M chunks/day ÷ 1,500 chunks/sec/GPU ÷ 86,400 sec/day ≈ 0.4 GPU-days
-    of raw throughput — but bursty, provisioned for peak (§2: 8-12 GPUs)
+    of raw throughput — but bursty, provisioned for peak (§3: 8-12 GPUs)
   12 GPUs × 24h × 30d × $1.50/GPU-hour ≈ $12,960/month
   (this is the "always-on capacity for burst headroom" number, not the
    theoretical minimum — most of this pool sits idle off-peak, which is
-   why the bulk/incremental lane priority split, §7.2, matters: it lets
+   why the bulk/incremental lane priority split, §8.2, matters: it lets
    this same fleet serve both without needing to size for their sum)
 
-QUERY COMPUTE (20,000 qps average, ~30% reranked — §2, §10.4)
+QUERY COMPUTE (20,000 qps average, ~30% reranked — §3, §11.4)
   Vector search: mostly CPU, amortized into the vector-store node fleet
     cost (folded into a broader "serving infra" line, not broken out
     per-query at this level of estimate)
@@ -2326,7 +2926,7 @@ QUERY COMPUTE (20,000 qps average, ~30% reranked — §2, §10.4)
 RERANKING (if partially hosted-API instead of self-hosted, illustrative)
   At Cohere-Rerank-class pricing (~$2/1000 searches), 6,000 qps reranked
   × 86,400 sec/day × 30d ≈ 15.5B reranked calls/month — clearly past
-  the self-hosting break-even (§20.5) by orders of magnitude, confirming
+  the self-hosting break-even (§21.5) by orders of magnitude, confirming
   self-hosted reranking is the only economically sane choice at this
   query volume, not merely a nice-to-have optimization
 
@@ -2338,17 +2938,17 @@ TOTAL (rough): storage $3-5k + embedding ~$13k + reranking GPU ~$22k
   optional but load-bearing for the platform team's own budget defense.
 ```
 
-The headline takeaway from this arithmetic: **reranking GPU capacity, not storage, is the largest single line item** at the platform's target query volume — directly validating §10.4's decision to make reranking opt-in and eval-gated rather than default-on, and §18's identification of reranking-adoption growth as the first place the platform is likely to hit a capacity wall as usage scales.
+The headline takeaway from this arithmetic: **reranking GPU capacity, not storage, is the largest single line item** at the platform's target query volume — directly validating §11.4's decision to make reranking opt-in and eval-gated rather than default-on, and §19's identification of reranking-adoption growth as the first place the platform is likely to hit a capacity wall as usage scales.
 
 ### Chargeback
 
-Every cost component is attributable per KB (embedding calls tagged by `kb_id`, storage metered by KB's shard allocation, query compute metered by `kb_id` in request logs) and rolled up into the KB analytics dashboard (§16) — making cost visible to the owning team is itself the biggest lever, since most of the cost growth in practice comes from defaults (unbounded chunk size, reranking-on-everything, no dimensionality reduction) that teams change readily once they see the bill attributed to them.
+Every cost component is attributable per KB (embedding calls tagged by `kb_id`, storage metered by KB's shard allocation, query compute metered by `kb_id` in request logs) and rolled up into the KB analytics dashboard (§17) — making cost visible to the owning team is itself the biggest lever, since most of the cost growth in practice comes from defaults (unbounded chunk size, reranking-on-everything, no dimensionality reduction) that teams change readily once they see the bill attributed to them.
 
 ---
 
-## 21. Trade-offs
+## 22. Trade-offs
 
-### 21.1 Chunking granularity
+### 22.1 Chunking granularity
 
 | Smaller chunks | Larger chunks |
 |---|---|
@@ -2356,49 +2956,51 @@ Every cost component is attributable per KB (embedding calls tagged by `kb_id`, 
 | More chunks → more storage, more embedding cost, more index memory | Fewer chunks → cheaper, but coarser matching |
 | Risk: a fact and its context land in different chunks | Risk: a chunk is "about" many things, diluting its embedding, hurting precision |
 
-**Resolution**: parent-child chunking (§6.5) is the platform's answer to not actually having to choose — retrieve small (precision), generate with large (context) — at the cost of roughly doubling stored chunk records (children + parents) and added indexing complexity. For KBs unwilling to absorb that complexity, a single mid-sized (400-token) chunk with overlap is the pragmatic middle default.
+**Resolution**: parent-child chunking (§7.5) is the platform's answer to not actually having to choose — retrieve small (precision), generate with large (context) — at the cost of roughly doubling stored chunk records (children + parents) and added indexing complexity. For KBs unwilling to absorb that complexity, a single mid-sized (400-token) chunk with overlap is the pragmatic middle default.
 
-### 21.2 Embedding dimensionality vs. quality
+### 22.2 Embedding dimensionality vs. quality
 
-Already quantified in §7.4's table — the trade-off is close to monotonic (more dims, more quality, more cost) but with **steeply diminishing returns** past ~768 dims for most retrieval workloads, which is why 768 is the platform default rather than the theoretical-max 1536+ some hosted models offer. KBs with genuinely quality-critical, low-volume use cases (e.g., legal/compliance search where a missed document has real consequences) are the ones that should deliberately opt up to full dimensionality; defaulting everyone there would be paying 2x storage for most KBs' unmeasurable benefit.
+Already quantified in §8.4's table — the trade-off is close to monotonic (more dims, more quality, more cost) but with **steeply diminishing returns** past ~768 dims for most retrieval workloads, which is why 768 is the platform default rather than the theoretical-max 1536+ some hosted models offer. KBs with genuinely quality-critical, low-volume use cases (e.g., legal/compliance search where a missed document has real consequences) are the ones that should deliberately opt up to full dimensionality; defaulting everyone there would be paying 2x storage for most KBs' unmeasurable benefit.
 
-### 21.3 Pre-filter vs. post-filter permissions
+### 22.3 Pre-filter vs. post-filter permissions
 
-Fully argued in §8.6/§11.3: pre-filter chosen for permissions specifically because selectivity is often extreme and the failure mode of post-filtering (silent under-return, or expensive refetch storms) is unacceptable for a security-relevant filter. The cost is implementation complexity (filter-aware ANN traversal) and a small fixed per-hop overhead even for permissive users — accepted because the alternative's worst case is worse than its best case is good.
+Fully argued in §9.6/§12.3: pre-filter chosen for permissions specifically because selectivity is often extreme and the failure mode of post-filtering (silent under-return, or expensive refetch storms) is unacceptable for a security-relevant filter. The cost is implementation complexity (filter-aware ANN traversal) and a small fixed per-hop overhead even for permissive users — accepted because the alternative's worst case is worse than its best case is good.
 
-### 21.4 Freshness vs. query latency/cost
+### 22.4 Freshness vs. query latency/cost
 
 - Real-time webhook-driven sync (Slack, Confluence) buys tight freshness SLAs but costs more infrastructure (persistent connections, event processing) than periodic polling.
-- Freshness-weighted ranking (§12.3) or freshness hard-filters cost nothing extra at query time (the score is precomputed at index time, just read at query time) — the real trade-off isn't freshness-at-query-time cost, it's **ingestion pipeline cost/complexity to make freshness tight in the first place** (§4's per-source mechanism table is really a menu of freshness-vs-engineering-effort trade-offs, source by source).
-- Aggressive query-result caching (§9.5) directly trades against freshness — the platform's answer is TTL-per-KB rather than a global constant, so freshness-insensitive high-QPS KBs can cache hard while freshness-critical KBs set TTL near zero.
+- Freshness-weighted ranking (§13.3) or freshness hard-filters cost nothing extra at query time (the score is precomputed at index time, just read at query time) — the real trade-off isn't freshness-at-query-time cost, it's **ingestion pipeline cost/complexity to make freshness tight in the first place** (§5's per-source mechanism table is really a menu of freshness-vs-engineering-effort trade-offs, source by source).
+- Aggressive query-result caching (§10.5) directly trades against freshness — the platform's answer is TTL-per-KB rather than a global constant, so freshness-insensitive high-QPS KBs can cache hard while freshness-critical KBs set TTL near zero.
 
-### 21.5 Single embedding model vs. many
+### 22.5 Single embedding model vs. many
 
-| Single platform-wide model | Multiple concurrent models (chosen, §7.1) |
+| Single platform-wide model | Multiple concurrent models (chosen, §8.1) |
 |---|---|
 | Simpler operations — one model to monitor, one migration path, one capacity plan | Per-KB model choice lets cost-sensitive KBs pick a small self-hosted model while quality-critical KBs pick a large hosted one — no KB pays for capability it doesn't need |
-| No risk of comparing scores across incompatible vector spaces by mistake, because there's only one space | Requires discipline: a query must never compare/merge raw similarity scores computed by two different models (§9.3's per-shard score-normalization caveat generalizes to per-model too) — a real correctness trap if the discipline slips |
-| Cannot take advantage of a better model for one KB without forcing every other KB through the same migration | Model migration (§7.4) is inherently per-KB, so a KB can upgrade independently without coordinating a platform-wide flag day |
-| Embedding infrastructure sizing is a single, simpler forecast | GPU pool must serve several model architectures' inference simultaneously — more operational surface area (§7.3's dynamic batching has to be model-aware, not just batch-aware) |
+| No risk of comparing scores across incompatible vector spaces by mistake, because there's only one space | Requires discipline: a query must never compare/merge raw similarity scores computed by two different models (§10.3's per-shard score-normalization caveat generalizes to per-model too) — a real correctness trap if the discipline slips |
+| Cannot take advantage of a better model for one KB without forcing every other KB through the same migration | Model migration (§8.4) is inherently per-KB, so a KB can upgrade independently without coordinating a platform-wide flag day |
+| Embedding infrastructure sizing is a single, simpler forecast | GPU pool must serve several model architectures' inference simultaneously — more operational surface area (§8.3's dynamic batching has to be model-aware, not just batch-aware) |
 
 **Decision: multiple concurrent models**, because the cost-sensitivity spread across 500+ independently-owned KBs (§1's assumption 4 — a strong power-law in KB size and, in practice, in budget) makes a single platform-wide model either overkill for small KBs or underpowered for the largest, quality-critical ones. The operational cost (serving several model architectures, disciplined per-model score handling) is accepted because the alternative — forcing every team onto one model's cost/quality point — would push some teams to abandon the platform for a bespoke solution, defeating its purpose as shared infrastructure.
 
-### 21.6 Hosted vs. self-hosted inference: rate limits and blast radius
+### 22.6 Hosted vs. self-hosted inference: rate limits and blast radius
 
-Beyond the raw cost comparison (§7.4), hosted and self-hosted embedding/reranking inference differ in a way that matters specifically *because* this is a shared multi-tenant platform:
+Beyond the raw cost comparison (§8.4), hosted and self-hosted embedding/reranking inference differ in a way that matters specifically *because* this is a shared multi-tenant platform:
 
 | | Hosted API | Self-hosted |
 |---|---|---|
-| Rate-limit ownership | Shared across the **entire platform's** usage of that provider — one KB's burst can throttle every other KB's calls to the same provider unless the platform implements its own per-KB sub-allocation on top of the provider's overall limit | Rate limits are whatever the platform's own GPU pool and admission control (§18.3) decide — fully within the platform's control to allocate fairly per KB |
-| Blast radius of an outage | A single hosted provider outage degrades **every KB** using that model simultaneously — a correlated, platform-wide failure (§19's "embedding provider outage" row) | A self-hosted GPU pool failure is contained to whatever fraction of KBs are pinned to models served by the affected pool — smaller, more contained blast radius, at the cost of the platform owning that infrastructure's reliability directly |
+| Rate-limit ownership | Shared across the **entire platform's** usage of that provider — one KB's burst can throttle every other KB's calls to the same provider unless the platform implements its own per-KB sub-allocation on top of the provider's overall limit | Rate limits are whatever the platform's own GPU pool and admission control (§19.3) decide — fully within the platform's control to allocate fairly per KB |
+| Blast radius of an outage | A single hosted provider outage degrades **every KB** using that model simultaneously — a correlated, platform-wide failure (§20's "embedding provider outage" row) | A self-hosted GPU pool failure is contained to whatever fraction of KBs are pinned to models served by the affected pool — smaller, more contained blast radius, at the cost of the platform owning that infrastructure's reliability directly |
 | Data residency / compliance | Document text leaves the platform's network boundary to reach the provider — a real constraint for KBs containing regulated or highly sensitive content, independent of the provider's own security posture | Data never leaves platform-controlled infrastructure — the only viable option for KBs under a data-residency constraint that forbids third-party processing |
-| Time-to-availability for a new model | Immediate — a config change (§7.1's per-KB `embedding_model_id`) | Requires provisioning, serving-stack integration, and validation (§13's eval gate) before it's available as an option at all |
+| Time-to-availability for a new model | Immediate — a config change (§8.1's per-KB `embedding_model_id`) | Requires provisioning, serving-stack integration, and validation (§14's eval gate) before it's available as an option at all |
 
-This is why the platform's per-KB `embedding_model_id` config (§7.1) isn't purely a cost/quality knob — for a subset of KBs (anything touching regulated data), self-hosting is a **hard requirement**, not an optimization, and the platform's connector/schema framework surfaces a `data_residency_constrained` flag at KB creation time that restricts the selectable model list to self-hosted-only options, closing off the hosted-API path entirely rather than relying on every KB owner to remember to avoid it.
+This is why the platform's per-KB `embedding_model_id` config (§8.1) isn't purely a cost/quality knob — for a subset of KBs (anything touching regulated data), self-hosting is a **hard requirement**, not an optimization, and the platform's connector/schema framework surfaces a `data_residency_constrained` flag at KB creation time that restricts the selectable model list to self-hosted-only options, closing off the hosted-API path entirely rather than relying on every KB owner to remember to avoid it.
 
 ---
 
-## 22. Evolution Path
+## 23. Evolution Path
+
+> **How this maps to §2's scale tiers:** v1 corresponds to Tier 1 (MVP) — a single-server PostgreSQL/pgvector setup serving a handful of teams. v2 corresponds to Tier 2 (Growth) — dedicated vector DB, task queues, and hybrid search serving dozens of teams. v3 is the full Tier 3 (Enterprise) architecture detailed in §4–§22. v4 is forward-looking beyond what most organizations need today.
 
 ### v1 — Basic RAG
 
@@ -2412,28 +3014,28 @@ This is why the platform's per-KB `embedding_model_id` config (§7.1) isn't pure
 
 ### v2 — Hybrid search + reranking
 
-- Hybrid dense + BM25 search with RRF (§8.6, §10.2).
-- Cross-encoder reranking, opt-in (§10.1, §10.4).
-- Multiple chunking strategies, configurable per source (§6).
-- Multiple embedding models supported; migration protocol (§7.4) introduced.
-- Retrieval metrics (recall@k, MRR, NDCG) against manually curated golden sets (§13.1, §13.3).
+- Hybrid dense + BM25 search with RRF (§9.6, §11.2).
+- Cross-encoder reranking, opt-in (§11.1, §11.4).
+- Multiple chunking strategies, configurable per source (§7).
+- Multiple embedding models supported; migration protocol (§8.4) introduced.
+- Retrieval metrics (recall@k, MRR, NDCG) against manually curated golden sets (§14.1, §14.3).
 
 ### v3 — Permissions + freshness (this document's full design)
 
-- Document-level ACL sync and query-time permission filtering with the pre-filter/secondary-check pattern (§11).
-- Full incremental sync + tombstone + reconciliation freshness pipeline (§12).
+- Document-level ACL sync and query-time permission filtering with the pre-filter/secondary-check pattern (§12).
+- Full incremental sync + tombstone + reconciliation freshness pipeline (§13).
 - Full connector suite (Slack, SharePoint, databases, generic APIs, web crawl).
-- Sharding, quantization, dimensionality tuning at scale (§8).
-- End-to-end RAG evaluation (faithfulness, hallucination) with LLM-as-judge (§13.2, §13.5).
-- Cost attribution and chargeback (§20).
+- Sharding, quantization, dimensionality tuning at scale (§9).
+- End-to-end RAG evaluation (faithfulness, hallucination) with LLM-as-judge (§14.2, §14.5).
+- Cost attribution and chargeback (§21).
 
 ### v4 — Agentic RAG with tool use
 
 - Retrieval Service exposes a **tool-callable** interface (structured function-calling schema) so an agent can issue multiple, iterative, reasoning-driven retrieval calls within one user turn — re-querying based on what the first retrieval returned, rather than a single fixed retrieval-then-generate pass.
-- **Query planning**: an agent decomposes a complex query into sub-queries routed to different KBs (e.g., "compare our Q3 incident rate to last year's policy on postmortem SLAs" → one sub-query to an incidents KB, one to a policy KB), with the platform providing a federated-search convenience layer that still enforces per-KB permission checks independently for each sub-query (§11.5's federation constraint holds).
-- **Self-correcting retrieval**: the agent evaluates its own retrieved context's sufficiency (using the same faithfulness/context-relevance signals from §13.2, now applied inline rather than only offline) and re-retrieves with reformulated queries or wider filters if the initial context looks insufficient, before generating a final answer.
-- **Tool-augmented sources**: beyond static document retrieval, agentic RAG calls live tools (a database query API, an internal search-the-web tool) mid-reasoning — this pushes the platform's connector framework (§4) toward also exposing certain sources as live-query tools, not only as pre-indexed corpora, for sources where freshness-at-generation-time matters more than freshness-at-index-time ever could.
-- Evaluation extends to **multi-step trajectory quality** (did the agent retrieve efficiently, did it stop retrieving at the right point, not just "was the final answer good") — a materially harder eval problem than v3's single-shot retrieval eval, deliberately deferred until the single-shot foundation (§13) is solid and trusted.
+- **Query planning**: an agent decomposes a complex query into sub-queries routed to different KBs (e.g., "compare our Q3 incident rate to last year's policy on postmortem SLAs" → one sub-query to an incidents KB, one to a policy KB), with the platform providing a federated-search convenience layer that still enforces per-KB permission checks independently for each sub-query (§12.5's federation constraint holds).
+- **Self-correcting retrieval**: the agent evaluates its own retrieved context's sufficiency (using the same faithfulness/context-relevance signals from §14.2, now applied inline rather than only offline) and re-retrieves with reformulated queries or wider filters if the initial context looks insufficient, before generating a final answer.
+- **Tool-augmented sources**: beyond static document retrieval, agentic RAG calls live tools (a database query API, an internal search-the-web tool) mid-reasoning — this pushes the platform's connector framework (§5) toward also exposing certain sources as live-query tools, not only as pre-indexed corpora, for sources where freshness-at-generation-time matters more than freshness-at-index-time ever could.
+- Evaluation extends to **multi-step trajectory quality** (did the agent retrieve efficiently, did it stop retrieving at the right point, not just "was the final answer good") — a materially harder eval problem than v3's single-shot retrieval eval, deliberately deferred until the single-shot foundation (§14) is solid and trusted.
 
 ### Migration mechanics between versions
 
@@ -2458,7 +3060,7 @@ v2 → v3 (adding document-level permissions):
   previously KB-level-access-only now needs document-level ACLs BEFORE
   any query can safely run with the new filtering enabled.
   1. Permission Sync backfills ACLs for every existing document
-     (§4/§11) — this can take significant wall-clock time for a large
+     (§5/§12) — this can take significant wall-clock time for a large
      KB and runs fully in shadow (computed and stored, not yet enforced).
   2. A KB stays on the OLD coarse KB-level-access model for queries
      until its ACL backfill reaches 100% coverage AND passes a
@@ -2466,38 +3068,38 @@ v2 → v3 (adding document-level permissions):
      against the source, confirming no widespread resolution failures).
   3. Cutover to document-level enforcement is a single atomic config
      flip per KB (mirroring the embedding-migration cutover pattern,
-     §7.4) — never a gradual per-document rollout, because a KB
+     §8.4) — never a gradual per-document rollout, because a KB
      straddling two permission models simultaneously is exactly the
      kind of inconsistent intermediate state the zero-leakage guarantee
-     (§11.6) cannot tolerate.
+     (§12.6) cannot tolerate.
 
 v3 → v4 (adding agentic/tool-call retrieval):
   Purely additive at the API layer — the existing single-shot retrieval
-  API (§16) continues to work unchanged; the tool-callable interface is
+  API (§17) continues to work unchanged; the tool-callable interface is
   a new API surface built on top of it, so no existing application
   integration breaks, and teams opt into agentic patterns per
   application rather than being migrated wholesale.
 ```
 
-The v2→v3 sequencing is the one worth internalizing beyond this document: **any migration that changes a security-relevant guarantee must have an explicit, validated, all-or-nothing cutover per tenant** — the same atomic-flip pattern used for embedding-model migration (§7.4) generalizes here precisely because "gradual rollout" and "security guarantee change" are close to a contradiction in terms.
+The v2→v3 sequencing is the one worth internalizing beyond this document: **any migration that changes a security-relevant guarantee must have an explicit, validated, all-or-nothing cutover per tenant** — the same atomic-flip pattern used for embedding-model migration (§8.4) generalizes here precisely because "gradual rollout" and "security guarantee change" are close to a contradiction in terms.
 
 ---
 
-## 23. Exercises
+## 24. Exercises
 
-1. **Selective permission filter under load.** A KB has 50M chunks; a particular principal's allow-set covers only 0.3% of them (a highly restricted contractor account). Walk through what happens with (a) naive post-filtering with 10x overfetch, (b) the pre-filter bitset approach from §8.6/§11.3. Estimate query latency for both and state at what allow-set selectivity post-filtering becomes acceptable.
+1. **Selective permission filter under load.** A KB has 50M chunks; a particular principal's allow-set covers only 0.3% of them (a highly restricted contractor account). Walk through what happens with (a) naive post-filtering with 10x overfetch, (b) the pre-filter bitset approach from §9.6/§12.3. Estimate query latency for both and state at what allow-set selectivity post-filtering becomes acceptable.
 
-2. **Embedding model migration under continuous writes.** Design the exact sequencing (extending §7.4) for migrating a 500M-chunk, actively-written-to KB (documents still being added/edited during the migration) from one embedding model to another with zero query downtime and no window where a query could silently mix scores from two incompatible vector spaces. What happens to a document edited *during* the migration window?
+2. **Embedding model migration under continuous writes.** Design the exact sequencing (extending §8.4) for migrating a 500M-chunk, actively-written-to KB (documents still being added/edited during the migration) from one embedding model to another with zero query downtime and no window where a query could silently mix scores from two incompatible vector spaces. What happens to a document edited *during* the migration window?
 
-3. **Tombstone race.** A document is deleted at the source at the same moment a query is mid-flight against a shard that hasn't yet received the tombstone. Trace exactly where in the pipeline (§8, §9, §12.3) this is caught, and confirm whether the answer changes if the deletion is a permission revocation instead of a full delete.
+3. **Tombstone race.** A document is deleted at the source at the same moment a query is mid-flight against a shard that hasn't yet received the tombstone. Trace exactly where in the pipeline (§9, §10, §13.3) this is caught, and confirm whether the answer changes if the deletion is a permission revocation instead of a full delete.
 
-4. **Chunking strategy regression.** A team changes their KB's chunking strategy from fixed-size to document-structure-aware. Design the eval gate (§13.4) that must pass before this ships to production, including how you'd detect that the new strategy silently drops content types the old one used to chunk successfully (e.g., documents with no heading structure at all).
+4. **Chunking strategy regression.** A team changes their KB's chunking strategy from fixed-size to document-structure-aware. Design the eval gate (§14.4) that must pass before this ships to production, including how you'd detect that the new strategy silently drops content types the old one used to chunk successfully (e.g., documents with no heading structure at all).
 
-5. **Cost blowup diagnosis.** A KB's monthly cost triples with no corresponding growth in document count. Using the cost model (§20) and chargeback data, list the top 3 hypotheses you'd check first and the specific metric/dashboard (from earlier sections) that would confirm or rule out each.
+5. **Cost blowup diagnosis.** A KB's monthly cost triples with no corresponding growth in document count. Using the cost model (§21) and chargeback data, list the top 3 hypotheses you'd check first and the specific metric/dashboard (from earlier sections) that would confirm or rule out each.
 
-6. **Cross-KB federated query design.** Design the API and permission-enforcement flow (extending §11.5 and the v4 evolution note in §22) for a single retrieval call that searches 3 KBs owned by different teams and merges results, without ever letting a result from KB B leak to a principal unauthorized for KB B even transiently in a merged/reranked intermediate result set.
+6. **Cross-KB federated query design.** Design the API and permission-enforcement flow (extending §12.5 and the v4 evolution note in §23) for a single retrieval call that searches 3 KBs owned by different teams and merges results, without ever letting a result from KB B leak to a principal unauthorized for KB B even transiently in a merged/reranked intermediate result set.
 
-7. **Staleness SLA violation triage.** The staleness dashboard (§12.2) shows a source's P99 document age has crept from 15 minutes to 6 hours over two weeks, with no connector errors logged. Enumerate the failure modes from §4, §12 that are consistent with "no errors, but slow," and design the additional signal(s) that would have caught this earlier.
+7. **Staleness SLA violation triage.** The staleness dashboard (§13.2) shows a source's P99 document age has crept from 15 minutes to 6 hours over two weeks, with no connector errors logged. Enumerate the failure modes from §5, §13 that are consistent with "no errors, but slow," and design the additional signal(s) that would have caught this earlier.
 
 8. **Small-scale variant.** A single team wants a 50,000-chunk internal KB with one Confluence source, no reranking budget, and one part-time owner. Which components from this design collapse or become no-ops (mirroring the KV store design's Variant C exercise), and at what chunk-count/QPS threshold does each dropped component need to come back?
 
