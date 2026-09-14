@@ -14,6 +14,7 @@ Prerequisites: familiarity with distributed system failure models from `00-primi
 4. [Bulkhead Pattern](#4-bulkhead-pattern)
 5. [Timeout Patterns](#5-timeout-patterns)
 6. [Combining Patterns — The Full Defense Stack](#6-combining-patterns--the-full-defense-stack)
+   - [6.4 Pattern Comparison — When to Use What](#64-pattern-comparison--when-to-use-what) *(includes Bulkhead vs. Rate Limiter, Little's Law math)*
 7. [Testing Resilience Patterns](#7-testing-resilience-patterns)
 8. [Production Tradeoff Matrix](#8-production-tradeoff-matrix)
 
@@ -77,6 +78,14 @@ Timeouts are necessary but not sufficient. They must be combined with patterns t
 ---
 
 ## 2. Retry Patterns -- The Deceptively Dangerous Pattern
+
+### The Simple Explanation
+
+A retry is exactly what it sounds like: if a request fails, try again. You do this every day — if a webpage doesn't load, you hit refresh. The problem is that computers do this at scale. If one person refreshes a page, that's fine. If 10,000 servers all "refresh" at the same time against a struggling backend, you've just turned a sick patient into a dead one by piling more weight on them.
+
+Think of it like a restaurant. A waiter goes to the kitchen and the order gets lost. Sending it again makes sense — it was a one-off mistake. But if the kitchen is on fire and the waiter keeps re-submitting the same order every 10 seconds, they're not helping. They're blocking the doorway and adding papers to a kitchen that's literally burning. That's what retries do to a failing service at scale.
+
+**The core tension**: retries fix transient glitches but amplify sustained failures. The entire section below is about keeping the first behavior and preventing the second.
 
 Retries are the single most common resilience pattern and, simultaneously, the single most common cause of making outages worse. Every production outage postmortem collection at scale -- Google, Amazon, Meta -- contains incidents where retries turned a partial failure into a total failure.
 
@@ -236,6 +245,66 @@ RETRY BUDGET (Google SRE approach):
 In a multi-tier system, the remaining retry budget and request deadline must be propagated downstream. If Service A has 500ms remaining on its deadline, it is pointless for Service B to retry with 300ms timeouts -- there is not enough time for even one retry to complete and still leave time for A to process the result.
 
 gRPC handles this natively through deadline propagation: the remaining time is passed in the `grpc-timeout` header, and each service in the chain can see how much time remains. HTTP services must implement this manually, typically through a custom header like `X-Request-Deadline` carrying a Unix timestamp.
+
+### The Math You Need to Internalize
+
+```
+WHY RETRY MATH MATTERS — INTUITIVE WALKTHROUGH:
+
+  Imagine you're a teacher grading papers. A student submits an essay,
+  but your printer jams. The student resubmits. Fine — 1 extra copy.
+  That's a retry.
+
+  Now imagine 3 teachers in a chain: Teacher A gives work to Teacher B,
+  who gives it to Teacher C. Each teacher resends 3 times if they don't
+  get a response.
+
+  Teacher C's printer jams (the root failure).
+
+  Teacher B sends to C, no response. B retries 3 times = 3 copies at C.
+  Teacher A sends to B, no response (B was busy retrying).
+  A retries 3 times to B. Each time, B retries 3 times to C.
+
+  Total copies at C's broken printer: 3 × 3 = 9.
+  Add A's own 3 attempts routing through B: 3 × 3 × 1 = 9 per A attempt.
+  A tries 3 times: 3 × 9 = 27 total.
+
+  GENERAL FORMULA:  R^N  (R = retries per layer, N = number of layers)
+
+  This is EXPONENTIAL growth. It's the same math as compound interest,
+  but working against you:
+
+    2 layers, 3 retries:  3^2 =     9x amplification
+    3 layers, 3 retries:  3^3 =    27x amplification
+    5 layers, 3 retries:  3^5 =   243x amplification
+    7 layers, 3 retries:  3^7 = 2,187x amplification
+
+  A service already struggling under 1,000 rps now receives 243,000 rps.
+  That's not recovery — that's a DDoS attack from your own infrastructure.
+
+  THE FIX — RETRY BUDGETS (percentage-based, not count-based):
+
+  Instead of "each request can retry 3 times," the rule is:
+  "total retries across ALL requests cannot exceed 10% of normal traffic."
+
+  At 1,000 rps normal traffic:
+    Budget = 100 retries/second total, shared across all callers.
+
+  At 20% failure rate (200 failures/second):
+    Only 100 get retried. Total load = 1,100 rps (+10%).
+    Compare with per-request 3x retries: 1,000 + 600 = 1,600 rps (+60%).
+
+  The budget prevents retries from becoming the dominant source of load.
+
+  BUDGET MATH:
+    budget_tokens = normal_rps × budget_percentage
+    refill_rate   = successful_requests_per_second (natural backpressure)
+
+  Token bucket implementation: start with budget_tokens.
+  Each retry costs 1 token. No tokens → no retry → fail fast.
+  Successful requests refill tokens, so when the downstream recovers,
+  the budget organically refills.
+```
 
 ### 2.3 Exponential Backoff
 
@@ -426,6 +495,20 @@ HEDGED REQUESTS:
 ---
 
 ## 3. Circuit Breaker Pattern -- Deep Dive
+
+### The Simple Explanation
+
+A circuit breaker is the "stop calling them, they're clearly not answering" pattern.
+
+Imagine you're calling a friend's phone. First call — no answer. Second call — no answer. Third call — no answer. At this point, a reasonable person stops calling and tries again in 30 minutes. An unreasonable person calls 500 more times in the next minute. A circuit breaker makes your service behave like the reasonable person.
+
+The name comes from your home's electrical panel. When a circuit draws too much current (a short circuit), the breaker trips and cuts the power. This prevents the wiring from catching fire. You fix the problem, then flip the breaker back on. Software circuit breakers work the same way: when a dependency is failing too often, the breaker "trips" and stops all requests to it. After a cooldown period, it lets a few test requests through. If they succeed, the breaker closes and normal traffic resumes.
+
+**The key insight**: a circuit breaker is NOT about giving up. It's about giving the failing service breathing room to recover. If a restaurant kitchen is overwhelmed, the best thing the host can do is stop seating new tables for 15 minutes. The kitchen catches up, and then you resume seating. Without that pause, the kitchen never recovers.
+
+**Circuit breaker vs. timeout**: A timeout says "I'll wait 3 seconds for you to answer, then give up on THIS request." A circuit breaker says "You've failed 50 times in a row — I'm not going to ask you ANYTHING for the next 30 seconds." Timeouts are per-request. Circuit breakers are per-dependency, across all requests.
+
+**Circuit breaker vs. retry**: Retries say "that failed, let me try again." Circuit breakers say "that's been failing so much, I'm not even going to try." They work together: retries handle transient blips, and the circuit breaker kicks in when retries prove the problem isn't transient.
 
 ### 3.1 Origin and Purpose
 
@@ -657,6 +740,12 @@ FAILURE MODE: Silent degradation
 
 ### 3.5 What to Do When the Circuit Is Open — Fallback Strategies
 
+A fallback is the "plan B" pattern. When the primary path fails, what do you show the user?
+
+Think of it like a restaurant menu. The chef's special (fresh tuna) isn't available tonight. Your options, from best to worst: (1) serve yesterday's tuna that was refrigerated (cached/stale data — edible but not as fresh), (2) serve the rest of the meal without the tuna (degraded response — incomplete but functional), (3) take the order and promise to deliver the tuna tomorrow (queue for later), (4) serve a generic fish that's always in stock (static defaults), (5) tell the customer "sorry, no tuna tonight" (fail fast — honest error).
+
+The choice depends on the domain. Stale stock prices are dangerous. Stale profile photos are fine. A missing recommendations widget is acceptable. A missing checkout button is not. **Every fallback decision is a domain decision, not a technical one.**
+
 ```
 FALLBACK HIERARCHY (from most to least desirable):
 
@@ -745,6 +834,99 @@ IMPLEMENTATION LANDSCAPE:
 ---
 
 ## 4. Bulkhead Pattern
+
+### The Simple Explanation
+
+A bulkhead is the "don't put all your eggs in one basket" pattern applied to server resources.
+
+Imagine you live in an apartment building with one shared water pipe for all 20 apartments. If apartment 5 has a burst pipe, the water pressure drops for everyone — apartments that have no problem at all suddenly can't take a shower. Now imagine each apartment has its own isolated water supply. Apartment 5's burst pipe is apartment 5's problem. Everyone else is fine.
+
+That's a bulkhead. Instead of all your dependencies sharing one thread pool / connection pool / resource pool, you give each dependency its own isolated pool. When the payments service slows down and hogs all its allocated threads, the user service and the search service keep running perfectly because they have their own threads that payments can't touch.
+
+**Bulkhead vs. Rate Limiter — The Most Commonly Confused Pair**
+
+These two patterns look similar (both "limit stuff") but solve completely different problems:
+
+```
+BULKHEAD vs. RATE LIMITER — SIDE BY SIDE:
+
+  ┌─────────────────────────┬──────────────────────────────────────────┐
+  │  BULKHEAD               │  RATE LIMITER                            │
+  ├─────────────────────────┼──────────────────────────────────────────┤
+  │  WHAT it limits:        │  WHAT it limits:                         │
+  │  Concurrent requests    │  Request RATE (requests per second)      │
+  │  (how many at once)     │  (how many over time)                    │
+  ├─────────────────────────┼──────────────────────────────────────────┤
+  │  WHO it protects:       │  WHO it protects:                        │
+  │  The CALLER (yourself)  │  The CALLEE (the downstream service)     │
+  │  from a slow dependency │  from being overwhelmed by callers       │
+  │  consuming all your     │                                          │
+  │  resources              │                                          │
+  ├─────────────────────────┼──────────────────────────────────────────┤
+  │  WHERE it lives:        │  WHERE it lives:                         │
+  │  Client-side (in the    │  Server-side (or gateway/proxy, the      │
+  │  service making calls)  │  service receiving calls)                │
+  ├─────────────────────────┼──────────────────────────────────────────┤
+  │  WHEN it activates:     │  WHEN it activates:                      │
+  │  When concurrency hits  │  When request rate exceeds the limit,    │
+  │  the cap (pool full),   │  regardless of concurrency               │
+  │  regardless of rate     │                                          │
+  ├─────────────────────────┼──────────────────────────────────────────┤
+  │  Analogy:               │  Analogy:                                │
+  │  A hotel has 80 rooms.  │  A nightclub lets in 10 people per       │
+  │  When they're full,     │  minute. Even if the club is half empty, │
+  │  "no vacancy" — no      │  you wait in line if 10 already entered  │
+  │  matter how fast people │  this minute. Even if you're a VIP.      │
+  │  are checking out.      │                                          │
+  ├─────────────────────────┼──────────────────────────────────────────┤
+  │  Math:                  │  Math:                                   │
+  │  concurrency =          │  rate = requests / time_window           │
+  │  requests_in_flight     │                                          │
+  │  (Little's Law:         │  Token bucket: refill at R tokens/sec,   │
+  │  L = λ × W, where      │  bucket capacity B.                      │
+  │  L = concurrency,       │  Each request costs 1 token.             │
+  │  λ = arrival rate,      │  Sustained rate ≤ R.                     │
+  │  W = avg response time) │  Burst up to B.                          │
+  │                         │                                          │
+  │  If λ=100rps, W=50ms:  │  If R=100/sec, B=150:                    │
+  │  L = 100 × 0.05 = 5    │  Sustains 100 rps.                       │
+  │  concurrent requests    │  Allows burst of 150 at once.            │
+  │  (normal)               │                                          │
+  │                         │                                          │
+  │  If W degrades to 2s:   │  If traffic spikes to 500 rps:           │
+  │  L = 100 × 2 = 200     │  150 burst served, rest rejected at      │
+  │  concurrent requests    │  rate exceeding 100/sec.                 │
+  │  (pool overflow →       │                                          │
+  │  bulkhead protects)     │                                          │
+  └─────────────────────────┴──────────────────────────────────────────┘
+
+  THE PRACTICAL DIFFERENCE IN ONE SENTENCE:
+  ─────────────────────────────────────────────────────────────────────
+  A rate limiter says: "You can only send 100 requests per second."
+  A bulkhead says: "You can only have 10 requests in-flight to me
+  at the same time."
+
+  A service with 1ms response time can handle 10,000 rps through a
+  bulkhead of 10 threads (each thread serves 1000 req/sec).
+
+  The same service with a 2-second response time can only handle
+  5 rps through the same 10-thread bulkhead (each thread is busy
+  for 2 seconds).
+
+  The bulkhead didn't change — the slow dependency filled it up.
+  That's the point: the bulkhead limits the DAMAGE of slowness,
+  not the rate of traffic.
+
+  YOU OFTEN NEED BOTH:
+  ─────────────────────────────────────────────────────────────────────
+  Rate limiter (server-side): protects the downstream from too many
+  requests per second from all callers.
+
+  Bulkhead (client-side): protects the caller from one slow downstream
+  consuming all threads/connections.
+
+  They're complementary, not alternatives.
+```
 
 ### 4.1 Origin and Principle
 
@@ -885,6 +1067,52 @@ SIZING GUIDELINES:
 
 ## 5. Timeout Patterns
 
+### The Simple Explanation
+
+A timeout is the "I'm not waiting forever" pattern. It's the simplest resilience pattern and the only one that is truly non-negotiable — every single network call must have one.
+
+Imagine you order food at a restaurant. If no food arrives after 45 minutes, you leave. That's a timeout. Without it, you sit there indefinitely — maybe the kitchen lost your order, maybe the chef quit, maybe the building is on fire. You don't know and you don't care. You have better things to do than wait forever.
+
+In software, a thread waiting for a response is a thread that can't serve anyone else. Without a timeout, that thread is stuck forever. Multiply by hundreds of requests and your entire service freezes — not because something crashed, but because everything is patiently waiting for a response that will never come.
+
+**Timeout vs. circuit breaker**: A timeout protects a single request ("I won't wait more than 3 seconds for you"). A circuit breaker protects against a pattern of failures ("you've been timing out all day, I'm done calling you"). Timeouts are the input that feeds the circuit breaker — repeated timeouts are what cause the breaker to trip.
+
+**The math of why timeouts matter**:
+
+```
+TIMEOUT MATH — THREAD POOL EXHAUSTION:
+
+  Your server has 200 threads and receives 500 requests/second.
+
+  Normal case (responses in 50ms):
+    Threads in use = 500 rps × 0.05s = 25 threads
+    175 threads idle. Everything is fine.
+
+  Dependency hangs (no timeout set):
+    Threads accumulate: 500 new threads needed per second.
+    After 0.4 seconds: all 200 threads are blocked.
+    Your service is dead. No crash, no error — just frozen.
+
+  Dependency hangs (timeout = 3 seconds):
+    Threads in use = 500 rps × 3s = 1,500 threads needed.
+    You only have 200. Pool exhausts in 200/500 = 0.4 seconds.
+    Still dead — but at least threads get released after 3s
+    instead of never. Combine with a bulkhead to survive.
+
+  Dependency hangs (timeout = 500ms, with bulkhead of 50 threads):
+    Only 50 threads can be consumed by the slow dependency.
+    Other 150 threads serve other work normally.
+    Each stuck thread freed after 500ms.
+    Throughput to slow dependency: 50 / 0.5s = 100 rps (degraded
+    but alive). Everything else: unaffected.
+
+  THE LESSON: timeout × arrival_rate = threads consumed.
+  This is Little's Law: L = λ × W
+    L = concurrent requests (threads in use)
+    λ = arrival rate (requests per second)
+    W = average wait time (which timeout caps)
+```
+
 ### 5.1 The Three Timeouts
 
 Most engineers configure "a timeout" without recognizing that there are three distinct timeouts, each serving a different purpose.
@@ -1011,6 +1239,20 @@ ADAPTIVE TIMEOUT APPROACH:
 ---
 
 ## 6. Combining Patterns -- The Full Defense Stack
+
+### The Simple Explanation
+
+Each resilience pattern solves one specific problem. Using them individually is like wearing only a helmet on a motorcycle — it protects your head, but the rest of you is exposed. The full defense stack combines all patterns into layered protection where each pattern covers the gaps the others leave.
+
+Think of it like airport security. There's a specific order and each layer serves a purpose:
+
+1. **Timeout** (the boarding gate deadline) — "The flight leaves at 3pm. Nothing after this point matters." Sets the absolute outer boundary.
+2. **Bulkhead** (separate security lanes) — "Business class and economy have separate lines so one slow lane doesn't block the other." Isolates resources per dependency.
+3. **Circuit breaker** (the security alert system) — "Terminal B is shut down due to a threat. Don't send anyone there." Stops sending requests to a known-broken dependency.
+4. **Retry** (the re-check) — "Your bag triggered the scanner. Run it through once more." Handles transient one-off failures.
+5. **Fallback** (the backup plan) — "Your flight is cancelled. Here's a hotel voucher." Provides a degraded-but-functional response when everything else fails.
+
+The order is not arbitrary. Retries must happen inside the circuit breaker (so the breaker sees accurate health data). The timeout must wrap everything (so nothing runs past the user's patience). The bulkhead must be outside the circuit breaker (so even checking the breaker doesn't consume unbounded resources).
 
 ### 6.1 The Correct Layering Order
 
@@ -1171,6 +1413,185 @@ FULL DEFENSE STACK — REQUEST FLOW:
            Response header: X-Fallback: true, X-Data-Age: 300s.
 
   t=1551ms Response returned to caller with degraded data.
+```
+
+### 6.4 Pattern Comparison — When to Use What
+
+The patterns are easily confused because they all "protect against failures." This section clarifies exactly what each one does, what it does NOT do, and when to reach for it.
+
+```
+EVERY PATTERN IN ONE SENTENCE:
+
+  Timeout:         "I won't wait forever for you."
+  Retry:           "That failed, let me try once more."
+  Circuit Breaker: "You've been failing too much, I'll stop asking."
+  Bulkhead:        "Your slowness won't consume all my resources."
+  Rate Limiter:    "I'll only accept N requests per second."
+  Fallback:        "You failed, here's a plan B."
+  Hedged Request:  "I'll ask two servers; first answer wins."
+  Deadline:        "The user is waiting 500ms total, pass that clock
+                    down the chain."
+```
+
+```
+WHICH PATTERN SOLVES WHICH PROBLEM?
+
+  ┌──────────────────────────────┬─────┬───────┬─────────┬────────┬──────┬────────┬───────┬────────┐
+  │  Problem                     │ TO  │ Retry │ Circuit │ Bulk-  │ Rate │ Fall-  │ Hedge │ Dead-  │
+  │                              │     │       │ Breaker │ head   │ Limit│ back   │       │ line   │
+  ├──────────────────────────────┼─────┼───────┼─────────┼────────┼──────┼────────┼───────┼────────┤
+  │ Dependency hangs forever     │ ✓   │       │         │        │      │        │       │        │
+  │ Transient one-off failure    │     │ ✓     │         │        │      │        │       │        │
+  │ Dependency down for minutes  │     │       │ ✓       │        │      │        │       │        │
+  │ Slow dep exhausts threads    │     │       │         │ ✓      │      │        │       │        │
+  │ Too many callers overwhelm   │     │       │         │        │ ✓    │        │       │        │
+  │ Need a degraded response     │     │       │         │        │      │ ✓      │       │        │
+  │ Tail latency (p99 spikes)    │     │       │         │        │      │        │ ✓     │        │
+  │ Wasted work past user's wait │     │       │         │        │      │        │       │ ✓      │
+  └──────────────────────────────┴─────┴───────┴─────────┴────────┴──────┴────────┴───────┴────────┘
+
+  TO = Timeout
+
+  NOTICE: each pattern targets exactly one failure mode. No single
+  pattern covers everything. That's why they compose into a stack.
+```
+
+```
+THE MOST COMMONLY CONFUSED PAIRS:
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  CIRCUIT BREAKER vs. RATE LIMITER                                 │
+  ├────────────────────────────────────────────────────────────────────┤
+  │                                                                    │
+  │  Both "block requests." Different reasons, different triggers.    │
+  │                                                                    │
+  │  Circuit breaker triggers on: FAILURE RATE of the downstream.     │
+  │  Rate limiter triggers on: REQUEST RATE of the upstream.          │
+  │                                                                    │
+  │  Circuit breaker: "Backend is sick → stop calling it."            │
+  │  Rate limiter: "Too many callers → reject excess."                │
+  │                                                                    │
+  │  A circuit breaker can be CLOSED (allowing traffic) while the     │
+  │  rate limiter is rejecting requests (too much traffic).            │
+  │  A circuit breaker can be OPEN (blocking traffic) while the       │
+  │  rate limiter would happily allow it (traffic is within limits).   │
+  │                                                                    │
+  │  They solve opposite problems:                                    │
+  │  CB: "the server can't handle ANY load right now"                 │
+  │  RL: "the server can handle SOME load, just not THIS much"       │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  BULKHEAD vs. CIRCUIT BREAKER                                     │
+  ├────────────────────────────────────────────────────────────────────┤
+  │                                                                    │
+  │  Both "prevent a bad dependency from killing you." Different how. │
+  │                                                                    │
+  │  Bulkhead: limits HOW MANY RESOURCES the dependency can consume.  │
+  │  Circuit breaker: limits WHETHER requests go to the dependency.   │
+  │                                                                    │
+  │  Bulkhead with 50 threads: "You can use 50 of my threads.        │
+  │  If all 50 are busy, new requests to you fail fast.               │
+  │  But I'll keep trying — maybe some will succeed."                 │
+  │                                                                    │
+  │  Circuit breaker: "You've failed 50% of the time.                 │
+  │  I'm not sending ANY requests for the next 30 seconds.            │
+  │  Not even one."                                                    │
+  │                                                                    │
+  │  A slow dependency (2s response, not failing) will fill the       │
+  │  bulkhead but NOT trip the circuit breaker. The bulkhead limits   │
+  │  concurrency; the breaker needs actual failures.                   │
+  │                                                                    │
+  │  You want both: the bulkhead contains the blast radius while      │
+  │  the breaker decides whether to bother at all.                    │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  TIMEOUT vs. DEADLINE PROPAGATION                                 │
+  ├────────────────────────────────────────────────────────────────────┤
+  │                                                                    │
+  │  A timeout is LOCAL: "I'll wait 500ms for Service B."             │
+  │  A deadline is GLOBAL: "The user is waiting 500ms total.          │
+  │  Service A used 50ms. Service B, you have 450ms left.             │
+  │  Service C, after B uses 30ms, you have 420ms left."              │
+  │                                                                    │
+  │  Without deadline propagation, each service sets its own          │
+  │  independent timeout. Worst case: 500 + 500 + 500 = 1,500ms.     │
+  │  The user left after 500ms. The remaining 1,000ms of work is      │
+  │  pure waste — the response has nowhere to go.                     │
+  │                                                                    │
+  │  Deadlines prevent wasted work across the entire call chain.      │
+  │  Timeouts prevent wasted work on a single hop.                    │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  RETRY vs. HEDGED REQUEST                                         │
+  ├────────────────────────────────────────────────────────────────────┤
+  │                                                                    │
+  │  Retry: "That failed. Wait, then try the same thing again."       │
+  │  Hedge: "That's taking too long. Try a DIFFERENT server NOW."     │
+  │                                                                    │
+  │  Retry is sequential: fail → wait → try again → wait → try again. │
+  │  Hedge is parallel: send request A, then after p95 latency, send │
+  │  the same request to server B. First response wins, cancel other. │
+  │                                                                    │
+  │  Retry adds latency (the backoff delays).                         │
+  │  Hedge adds cost (you're running 2 requests in parallel).         │
+  │                                                                    │
+  │  Retry helps when the failure is transient (network blip).        │
+  │  Hedge helps when the slowness is per-server (GC pause, hot       │
+  │  shard). If all servers share a bottleneck, hedging doubles the   │
+  │  load on that bottleneck.                                          │
+  └────────────────────────────────────────────────────────────────────┘
+```
+
+```
+LITTLE'S LAW — THE MATH BEHIND IT ALL:
+
+  Almost every resilience pattern's behavior can be predicted using
+  one equation from queueing theory:
+
+    L = λ × W
+
+    L = number of requests in the system (concurrency / threads in use)
+    λ = arrival rate (requests per second)
+    W = average time each request spends in the system (latency)
+
+  THIS ONE EQUATION TELLS YOU:
+
+  1. WHY SLOW IS WORSE THAN DOWN:
+     If a dependency goes DOWN (instant 503): W = 1ms.
+     L = 1000 rps × 0.001s = 1 thread. Negligible.
+
+     If a dependency goes SLOW (hangs for 10s): W = 10s.
+     L = 1000 rps × 10s = 10,000 threads needed. You have 200. Dead.
+
+     Down services release resources instantly. Slow services hold them.
+
+  2. HOW TO SIZE A BULKHEAD:
+     pool_size ≥ λ × W_normal × safety_margin
+     = 100 rps × 0.05s × 2 = 10 threads
+
+     When W degrades to 2s:
+     threads_needed = 100 × 2 = 200 (but bulkhead caps at 10)
+     Excess requests fail fast. That's the protection.
+
+  3. HOW TO SET TIMEOUTS:
+     You want L (concurrency) to stay below your thread pool size.
+     L = λ × W, so W_max = pool_size / λ
+     = 200 threads / 1000 rps = 200ms
+
+     Any timeout above 200ms risks pool exhaustion at 1000 rps.
+     This is why timeout = 2-3x p99 is a rule of thumb, not a law.
+     The real constraint is: timeout × rps < available_threads.
+
+  4. WHY CIRCUIT BREAKERS HELP RECOVERY:
+     When the breaker opens: λ to the dependency drops to 0.
+     L = 0 × W = 0. The dependency has zero load.
+     It can drain its queues, close stuck connections, recover.
+
+     When the breaker allows probes: λ = a few requests.
+     L = a_few × W. Manageable. If W returns to normal, close breaker.
 ```
 
 ---
