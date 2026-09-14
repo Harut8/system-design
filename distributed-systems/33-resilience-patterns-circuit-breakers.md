@@ -1356,6 +1356,172 @@ If any of these answers is "no," the resilience patterns have a bug. The most co
 
 ---
 
+## 9. Interview Preparation — Resilience Patterns
+
+Questions designed to test real-world judgment at the mid-to-staff engineer level. For each question, think through the answer before reading the guidance. The best answers demonstrate tradeoff reasoning, not pattern memorization.
+
+---
+
+### Conceptual and Design Questions
+
+**Q1: Your service calls three downstream dependencies. One of them starts responding in 8 seconds instead of 50ms. You have no resilience patterns in place. Walk me through exactly what happens to your service and how the failure propagates.**
+
+What the interviewer wants: The full cascade story — thread pool exhaustion, requests to healthy dependencies getting blocked, upstream callers timing out, load balancer redistribution, and total outage from a single slow dependency. Mention specific numbers: thread pool size, arrival rate, how quickly threads exhaust. Show you understand that slow is worse than down because slow holds resources while down releases them immediately.
+
+---
+
+**Q2: You're adding retry logic to a payment service that calls a third-party payment processor. What are the five things you need to get right before a single retry is safe to send?**
+
+What the interviewer wants: (1) Idempotency keys — the operation is a charge, retrying without one double-charges the customer. (2) Retry budget — not per-request retry count, but a global budget as a percentage of traffic. (3) Backoff with jitter — exponential backoff alone creates thundering herds. (4) Deadline awareness — no point retrying if the user's request deadline has already passed. (5) Error classification — a 400 should never be retried; a connect timeout is safe to retry even without an idempotency key because the server never received the request. The strong answer also distinguishes connect timeout (safe) from read timeout (unsafe without idempotency key).
+
+---
+
+**Q3: Explain retry amplification. Your architecture has 5 layers of services, each retrying 3 times. How many requests hit the bottom service per user request? How do you prevent this?**
+
+What the interviewer wants: 3^5 = 243 requests per single user request. Prevention: (1) Only retry at the edge — intermediate services should not retry, or should use a shared retry budget propagated via headers. (2) Retry budgets (Google SRE approach) — limit retries to 10% of total traffic, not per-request counts. (3) Deadline propagation — if there's no time left for a retry to be useful, don't send it. The staff-level answer notes that retry budgets must be enforced at each layer independently, and that gRPC propagates deadlines natively while HTTP requires custom headers.
+
+---
+
+**Q4: Your circuit breaker is configured with a 50% failure threshold on a 100-call sliding window. Your dependency has a normal 2% error rate but occasionally spikes to 5% for a few seconds. Should you change the configuration? What are the risks of setting the threshold too low vs. too high?**
+
+What the interviewer wants: The threshold is fine at 50% — a 5% spike is well below it. Risks of too low: the breaker trips during normal variance, turning a 2% degradation into a 100% outage (the breaker itself causes the outage). Risks of too high: the breaker never trips, and you get no protection — the service exhausts threads waiting for a failing dependency. The strong answer mentions the minimum-calls threshold: with a time-based window at low traffic, 1 failure out of 2 calls is 50%, which would trip the breaker on noise. You need a minimum call count (e.g., 100) before evaluating the failure rate.
+
+---
+
+**Q5: You have 50 instances of Service B, all with circuit breakers to Service C. Service C goes down, all 50 breakers open, and C recovers 30 seconds later. What happens next, and what can go wrong?**
+
+What the interviewer wants: All 50 breakers enter HALF-OPEN simultaneously (identical wait durations). Each sends a probe request. C receives 50 simultaneous probes. If C was barely recovering, this probe burst overwhelms it, all probes fail, all breakers reopen. This creates an oscillation cycle that prevents C from ever recovering. Solutions: (1) Jittered wait duration so breakers enter HALF-OPEN at different times. (2) Randomized probe probability so only a fraction of instances probe at each interval. (3) Percentage ramp recovery instead of binary OPEN/CLOSED. The staff answer identifies this as a coordination problem and connects it to the broader theme of avoiding synchronized behavior in distributed systems.
+
+---
+
+**Q6: Why must retries be placed inside the circuit breaker, not outside? What specific failure mode occurs if you get the order wrong?**
+
+What the interviewer wants: If retries wrap the circuit breaker (outside), the first attempt fails and the breaker opens. The retry policy sends 2 more attempts, both hit the open breaker and fail immediately. The breaker now records 3 failures (original + 2 retries against the open breaker), inflating the failure count. The breaker thinks the downstream is 3x worse than reality. Correct order: circuit breaker wraps retry. The breaker sees the outcome of the full retry sequence as one logical call — either eventually-succeeded or finally-failed. This gives the breaker accurate health data.
+
+---
+
+**Q7: Walk me through the correct layering order of timeout, bulkhead, circuit breaker, retry, and fallback. Why this specific order and not another?**
+
+What the interviewer wants: Outermost to innermost: Timeout → Bulkhead → Circuit Breaker → Retry → Actual Call → Fallback. Reasoning: (1) Timeout is outermost because it's the absolute deadline — nothing inside should exceed it. (2) Bulkhead is next because you want to limit concurrency before checking the breaker — if the bulkhead is full, fail fast without even asking the breaker. (3) Circuit breaker checks dependency health before attempting any call or retry. (4) Retry is innermost (closest to the call) because retries should only happen when the breaker allows them, within the bulkhead's concurrency limit, and within the overall deadline. (5) Fallback catches the final failure after all retry attempts are exhausted.
+
+---
+
+### Scenario-Based Questions
+
+**Q8: Your e-commerce product page aggregates data from 4 services: catalog, pricing, reviews, and recommendations. The reviews service goes down. What do you do? What if the pricing service goes down instead?**
+
+What the interviewer wants: Reviews down → serve the product page without reviews (degraded response). This is safe because reviews are not critical to completing a purchase. Pricing down → this is a different story. Serving stale prices is dangerous — a stale price that's too low creates a financial loss; a stale price that's too high creates customer trust issues. The fallback strategy must be domain-aware. Possible approaches: show "price unavailable, add to cart to see price," use last-known price with a freshness indicator and a short TTL cache, or fail the product page entirely if the price is stale beyond a threshold. The staff answer connects this to the fallback hierarchy and explains that not all degraded responses are equal — the domain determines which fallbacks are safe.
+
+---
+
+**Q9: You're running a load test and notice that when you inject a dependency failure, your retry budget is being exhausted in seconds, but the circuit breaker hasn't tripped yet. What's wrong and how do you fix it?**
+
+What the interviewer wants: The circuit breaker's sliding window is likely count-based and too large (e.g., 1000 calls) or the failure threshold is too high. The retry budget depletes at the traffic rate, but the circuit breaker needs N failures in its window before tripping. If the window is large, it takes a long time to accumulate enough failures. Meanwhile, every failed request burns a retry token. Fix: (1) Switch to a time-based sliding window so the breaker evaluates recent behavior regardless of traffic volume. (2) Lower the sliding window size. (3) Ensure the circuit breaker evaluates fast enough to trip before the retry budget is fully consumed. The deeper answer notes that these two patterns need to be tuned together — the breaker should trip fast enough to preserve the retry budget for when the downstream actually recovers.
+
+---
+
+**Q10: Your team proposes adding hedged requests to reduce p99 latency for your search service. The search service calls a single Elasticsearch cluster. Should you do it? Why or why not?**
+
+What the interviewer wants: No. Hedging helps when tail latency comes from per-request variance (GC pauses, queue depth on a specific node) and you can route the hedge to a different backend. If all replicas share the same Elasticsearch cluster, the hedge hits the same bottleneck. Worse, if the cluster is under load, hedging doubles the load, making p99 worse for everyone. Hedging only works when: (1) backends are independent (no shared bottleneck), (2) the operation is idempotent, (3) you can cancel the losing request, and (4) the hedge fires at p95+ (not earlier, or you permanently double load). The right answer for this scenario: investigate why p99 is high on Elasticsearch — it's likely a query optimization or cluster sizing issue, not something hedging can solve.
+
+---
+
+**Q11: You're on-call and get paged. Your service's error rate is near zero, latency is normal, and all dashboards are green. But a colleague mentions that one downstream dependency has been down for 6 hours. What happened?**
+
+What the interviewer wants: The circuit breaker opened and the fallback is serving cached/degraded data. All user-facing metrics look healthy because the breaker suppresses errors and the fallback responds fast. This is the "silent degradation" failure mode. The dependency has been down for 6 hours but nobody noticed because: no error rate alarm (breaker suppresses errors), no latency alarm (fallback is fast), no traffic alarm on the dependency (breaker blocks all traffic). The fix: always alert on circuit breaker state changes, alert when a breaker has been OPEN for more than X minutes, alert on fallback activation rate. The breaker buys time to investigate, not permission to ignore.
+
+---
+
+**Q12: Your service has a 500ms SLA. It calls Service A (p99: 50ms) and Service B (p99: 200ms) sequentially. You set both call timeouts to 500ms. What's wrong with this?**
+
+What the interviewer wants: Without deadline propagation, worst case is 500ms + 500ms = 1000ms, which violates the 500ms SLA. The correct approach: propagate a deadline. Service A gets the full 500ms deadline but should return in ~50ms. After A responds (say 60ms used), Service B gets 440ms remaining. If A is slow and takes 300ms, B only gets 200ms — which might not be enough for B's normal p99, so you may need to fail fast or use a fallback for B. The staff answer also notes that the timeout for each call should be set relative to that call's p99 (2-3x p99), but the overall deadline is the governing constraint. You need both: per-call timeouts AND a propagated deadline.
+
+---
+
+**Q13: You join a team that has circuit breakers on all downstream calls but no chaos testing. They've never seen a breaker trip in production. Should you be concerned?**
+
+What the interviewer wants: Yes, very concerned. Either (1) the thresholds are set so high the breakers will never trip, meaning you have zero protection, (2) the downstream services happen to be reliable enough that the breakers haven't been needed yet — but you have no confidence they'll work correctly when they are needed, or (3) the breakers have a bug and would fail to trip. Untested resilience is worse than no resilience because it creates false confidence. The action items: run chaos experiments to deliberately trip the breakers, verify the fallbacks activate, verify alerts fire, measure recovery lag, and check the configuration against actual baseline error rates.
+
+---
+
+**Q14: Design the resilience strategy for a service that processes financial transactions. The service must call a fraud detection service before approving any transaction. The fraud service has a p99 of 200ms and occasionally has 30-second outages. What patterns do you use and what are your fallback options?**
+
+What the interviewer wants: This is a trick question about fallbacks. The standard fallback hierarchy (cache, degrade, default) is dangerous here. You cannot skip fraud detection — approving a transaction without fraud checking exposes the business to fraud losses. You cannot use cached fraud decisions — they don't apply to new transactions. Your options are limited: (1) Queue the transaction and process it when fraud service recovers (latency hit but correct), (2) Fail the transaction with a clear error to the user ("please try again in a moment"), (3) Apply a simplified local fraud rule (amount threshold, velocity check) as a degraded-but-not-absent check. The staff answer recognizes that some dependencies are mandatory and cannot be gracefully degraded. Circuit breakers still help (fail fast instead of waiting 30 seconds), but the fallback must match the domain's safety requirements.
+
+---
+
+**Q15: You're reviewing a PR that adds retries with exponential backoff but no jitter to a high-throughput service (10,000 rps). The author says jitter is an unnecessary optimization. Convince them otherwise with a concrete scenario.**
+
+What the interviewer wants: At 10,000 rps, even a 100ms outage causes 1,000 requests to fail simultaneously. Without jitter, all 1,000 retry at exactly t=100ms (first backoff). All 1,000 fail again. All retry at exactly t=200ms. The downstream sees perfectly synchronized spikes of 1,000 requests every backoff interval, on top of the 10,000 rps of new traffic. With full jitter, those 1,000 retries spread uniformly across the [0, 100ms] window, adding roughly 10 extra requests per millisecond — which the downstream can absorb. The difference between "1,000 simultaneous retries" and "10 extra rps spread across 100ms" is the difference between deepening the outage and transparently recovering from it. This isn't an optimization — at high throughput, it's a correctness requirement.
+
+---
+
+### Architecture and Tradeoff Questions
+
+**Q16: When would you implement resilience patterns in application code (Resilience4j, Polly) vs. in a service mesh (Envoy/Istio)? What are the tradeoffs?**
+
+What the interviewer wants: Service mesh advantages: no code changes, consistent policy across all services, language-agnostic, centrally managed configuration, operational team can tune without developer involvement. Service mesh disadvantages: limited to L7 patterns (retry, timeout, circuit breaking via outlier detection), cannot implement application-aware fallbacks (cache, degraded response), adds network hop latency through the sidecar, harder to debug (failure happens in the sidecar, not in the application). Application library advantages: full control, can implement domain-specific fallbacks, can integrate with application state (caches, queues), more granular per-operation configuration. Application library disadvantages: requires code changes, inconsistent implementation across teams/languages, each team must understand and tune correctly. The staff answer: use the service mesh for baseline protection (timeouts, retries, outlier detection) across all services, and add application-level patterns (circuit breakers with fallbacks, domain-aware retry logic) where the domain requires it. Defense in depth, not either/or.
+
+---
+
+**Q17: Your company is adopting microservices. The architect proposes adding circuit breakers, bulkheads, retries, timeouts, fallbacks, hedged requests, and deadline propagation to every service from day one. What do you say?**
+
+What the interviewer wants: Push back. This is over-engineering. Start with the patterns that prevent the most common and most dangerous failure modes: (1) Timeouts on every outgoing call — non-negotiable from day one. (2) Retries with backoff, jitter, and budget on idempotent calls. (3) Circuit breakers on critical dependencies with proper alerting. Add bulkheads when you have services with multiple dependencies and have observed or can model the shared-resource-exhaustion problem. Add hedged requests only when you have measured tail latency issues with independent backends. Add deadline propagation when you have request chains deeper than 2 hops. The principle: add patterns when you have evidence (traffic data, failure data, or architectural analysis) that the failure mode they address is a real risk. Resilience patterns have costs — complexity, operational overhead, configuration surface area — and every one is a system that can itself fail.
+
+---
+
+**Q18: You have a service with 200 dependencies (large fanout aggregation service). Thread-pool-per-dependency bulkheads are impractical. What do you do?**
+
+What the interviewer wants: 200 thread pools is too many — the memory overhead (stack per thread) and context-switch overhead would be significant. Options: (1) Semaphore-based bulkheads — a counting semaphore per dependency limits concurrency without dedicated threads. Low overhead, scales to hundreds of dependencies. Downside: cannot force-timeout stuck calls since the caller's thread is blocked. (2) Connection pool isolation — limit max connections per dependency in the HTTP client. Built into most HTTP libraries. (3) Async/non-blocking I/O — if the service uses an event loop model (Node.js, Netty, Go goroutines), thread exhaustion is not the failure mode. Instead, limit in-flight requests per dependency with a semaphore. (4) Group dependencies into tiers by criticality — critical dependencies (5-10) get thread-pool bulkheads; non-critical dependencies (190) get semaphore bulkheads or connection pool limits. The staff answer recognizes that the isolation mechanism should match the execution model and the dependency count.
+
+---
+
+**Q19: A junior engineer asks: "If circuit breakers stop sending requests to a failing service, how does the service ever recover? Aren't we making it worse by cutting off traffic?" How do you explain why circuit breakers help recovery, not hurt it?**
+
+What the interviewer wants: When a service is failing due to overload, sending more requests makes it worse. The service needs breathing room to recover — drain its queues, close hung connections, finish processing stuck requests, possibly restart. The circuit breaker gives it that breathing room by cutting off the traffic that's piling up. The HALF-OPEN state then sends a small number of probe requests to test if the service has recovered. If probes succeed, traffic gradually resumes. Without the circuit breaker, the failing service receives the same (or amplified, due to retries) traffic, never gets a chance to recover, and the failure either persists indefinitely or cascades to callers. The analogy: a circuit breaker in your house trips to prevent the wiring from catching fire. It doesn't "make it worse" by cutting power — it prevents the damaging condition from continuing. You fix the problem, then flip the breaker back.
+
+---
+
+**Q20: You're designing a resilience strategy for a globally distributed service. Requests from US users hit the US region, EU users hit the EU region. Each region has its own set of dependencies. Should circuit breakers be per-region, per-instance, global, or something else?**
+
+What the interviewer wants: Per-instance circuit breakers (the default) are the starting point. Each instance tracks its own failure rates based on the traffic it sends. This naturally handles per-region behavior because US instances only call US dependencies and EU instances only call EU dependencies. A global circuit breaker (shared state across instances/regions) is usually wrong because: (1) a failure in one region shouldn't trip the breaker for another region, (2) the shared state store becomes a single point of failure, (3) network latency to the state store adds to every request. Per-region is implicit when you have per-instance breakers and region-local dependencies. The one case for centralized state: when you need to coordinate recovery (avoid the synchronized half-open thundering herd across many instances). Even then, jittered wait durations usually solve this without centralized coordination. The staff answer: start per-instance, and only add coordination when you have evidence of the specific failure mode (synchronized recovery) that coordination solves.
+
+---
+
+### Quick-Fire Judgment Calls
+
+These are rapid-fire questions where the interviewer wants a clear recommendation with a one-sentence justification:
+
+**Q21:** Your dependency's p99 is 150ms. What do you set the read timeout to?
+→ 300-450ms (2-3x p99). Monitor and adjust. Too short causes false timeouts on healthy services; too long defeats the purpose.
+
+**Q22:** Retry count: 3 retries per request, or 10% retry budget?
+→ 10% retry budget. Per-request count doesn't account for global impact. At scale, per-request retries with amplification across layers can multiply load by orders of magnitude.
+
+**Q23:** Circuit breaker trips. Do you page someone?
+→ Warning immediately, page if OPEN for more than N minutes (tune N based on the dependency's typical recovery time). A breaker that stays open means the fallback is covering a real failure nobody is investigating.
+
+**Q24:** Full jitter or equal jitter?
+→ Full jitter as the default. Equal jitter only when your system cannot tolerate near-zero sleep values (e.g., a retry that fires at 0ms delay effectively becomes an immediate retry, which you might want to avoid for rate-limited APIs).
+
+**Q25:** Your team wants to add retries to a `DELETE /resource/{id}` endpoint. Is this safe?
+→ Yes, if the endpoint is idempotent (returns 200 or 204 whether the resource existed or was already deleted). Most REST APIs implement DELETE as idempotent. Verify the implementation — a DELETE that has side effects (cascading deletes, event emission) on every call is not truly idempotent.
+
+**Q26:** You're choosing between Resilience4j in your Java service and Envoy sidecar outlier detection. You need fallbacks that return cached data from a local Redis. Which do you pick?
+→ Resilience4j. Envoy can do timeouts, retries, and outlier-based ejection, but it cannot execute application-level fallback logic. The fallback needs to call Redis and construct a domain-specific response — that's application code, not infrastructure policy.
+
+**Q27:** A dependency has been returning 503 for 2 minutes. Your circuit breaker is OPEN. A user's request needs data from that dependency and there is no fallback. What do you return?
+→ Fail fast with a clear, machine-readable error (e.g., 503 with a specific error code and a Retry-After header). Do not hang, do not return empty data pretending it's valid, do not retry into a known-broken dependency. Honest, fast errors are better than slow lies.
+
+**Q28:** You notice your circuit breaker is oscillating between OPEN and CLOSED every 30 seconds. What's happening?
+→ The dependency is partially recovering during the OPEN window (no traffic gives it breathing room), passes the half-open probes, breaker closes, traffic resumes, dependency fails again under load, breaker reopens. This is the "barely surviving" pattern. The fix: the dependency needs to be scaled up, its root cause fixed, or traffic to it needs to be load-shed at a higher level. The circuit breaker is correctly reflecting the dependency's inability to handle the current load.
+
+---
+
+*Use these questions for self-assessment: if you can answer each with specific numbers, concrete failure scenarios, and clear tradeoff reasoning — not just pattern names — you're operating at the level where you can design and debug resilience strategies in production systems.*
+
+---
+
 ## References
 
 - Nygard, Michael T. *Release It! Design and Deploy Production-Ready Software*. Pragmatic Bookshelf, 2007 (2nd edition 2018). Origin of the circuit breaker pattern.
