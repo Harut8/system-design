@@ -20,6 +20,7 @@ Prerequisites: familiarity with reliability patterns from `33-resilience-pattern
 10. [Graceful Degradation Under Load](#10-graceful-degradation-under-load)
 11. [Recovery from Overload and Metastability](#11-recovery-from-overload-and-metastability)
 12. [Production Design Tradeoff Matrix](#12-production-design-tradeoff-matrix)
+13. [Interview Preparation — Adaptive Load Control & Backpressure](#13-interview-preparation--adaptive-load-control--backpressure)
 
 ---
 
@@ -1814,6 +1815,212 @@ DEFENSE-IN-DEPTH LAYERING (recommended for production):
 The key principle is defense in depth: each layer catches what the previous layer missed. Rate limiting at the edge prevents bulk abuse. Admission control prevents the service from accepting work it cannot complete. Concurrency limits protect individual service-to-service paths. Load shedding protects the server itself. Queue management prevents resource waste. Fairness prevents noisy neighbors. Degradation preserves core functionality. Backpressure propagates signals upstream so the entire system adapts, rather than one component absorbing all the pain.
 
 The most dangerous configuration is having only one layer of defense. If your only protection is a rate limit at the API gateway, then a single internal service generating excessive retries will bypass it entirely and cascade through the backend. If your only protection is a circuit breaker, then slow responses (not failures) will slip through because the circuit breaker only counts errors, not latency. Staff-level engineering means understanding that each mechanism has blind spots, and layering them so the gaps do not align.
+
+---
+
+## 13. Interview Preparation — Adaptive Load Control & Backpressure
+
+Questions designed to test real-world judgment at the mid-to-staff engineer level. Every question is grounded in a concrete production scenario — FastAPI services, connection pools, Kubernetes pods, real numbers. For each question, think through the answer before reading the guidance. The best answers demonstrate that you can reason about overload quantitatively, not just name the patterns.
+
+---
+
+### Real-World Scenario Questions
+
+**Q1: You have a FastAPI service with 1 Uvicorn worker (single process, async). It handles 1000 RPS with 5ms average latency under normal load. A marketing campaign doubles traffic to 2000 RPS. Walk me through exactly what happens inside the process and what the clients experience.**
+
+What the interviewer wants: A single Uvicorn worker runs one Python event loop on one thread. At 1000 RPS with 5ms per request, the event loop can handle it because 1000 * 0.005 = 5 seconds of CPU work per second — but async means CPU is yielded during I/O waits, so effective utilization depends on how much is I/O-bound vs. CPU-bound. At 2000 RPS: if the handler is purely async I/O (database queries, HTTP calls), the event loop accepts all connections but doubles the number of concurrent coroutines. Memory grows. Each coroutine holds state (request object, response buffer). If downstream dependencies (DB, cache) can handle the extra load, latency stays reasonable. If they can't, await calls take longer, more coroutines pile up in the event loop, memory grows, and eventually the process either runs out of memory or the OS kills it (OOM). If ANY part of the handler is synchronous/CPU-bound (JSON serialization of large payloads, image processing, CPU-heavy validation), the event loop blocks. While one request occupies the CPU, all other coroutines are frozen. Latency spikes. The strong answer quantifies: with 1 worker, 1 CPU core, and handlers that are 2ms CPU + 3ms I/O wait, the CPU capacity is 1000ms / 2ms = 500 RPS of CPU work. At 2000 RPS, the CPU is 4x overloaded. Requests queue in the event loop. Latency goes from 5ms to hundreds of milliseconds within seconds.
+
+---
+
+**Q2: Same FastAPI service. You scale to 4 Uvicorn workers behind a single pod. Your database connection pool is set to `pool_size=5, max_overflow=10` per worker (using SQLAlchemy async). Under load, engineers report intermittent `TimeoutError: QueuePool limit reached`. Explain what is happening and how to fix it.**
+
+What the interviewer wants: 4 workers × (5 + 10) = 60 maximum database connections from this single pod. If the database can handle 60 connections and the queries are fast, this works. The error means all 15 connections per worker are occupied and new requests are waiting for a connection. The pool's `pool_timeout` (default 30s in SQLAlchemy) expires before a connection becomes available. Root causes: (1) Queries are too slow — a slow query holds a connection for 500ms instead of 5ms, so 15 connections can only handle 30 RPS instead of 3000 RPS. (2) Connection leaks — a code path that acquires a connection but does not release it (missing `async with` or failed to close on exception). (3) N+1 query patterns — a single request acquires multiple connections or holds one connection for many sequential queries. (4) The pool is simply too small for the traffic. Fixes: (1) Set `pool_pre_ping=True` to detect stale connections. (2) Set `pool_recycle=3600` to prevent connections from going stale. (3) Add `pool_timeout=5` (not 30) so requests fail fast instead of queuing for 30 seconds behind exhausted connections. (4) Most importantly — diagnose WHY connections are held so long. A connection pool is not a queue; if you need to queue, add explicit admission control. The staff answer also notes: total connections across all pods must not exceed the database's `max_connections`. If you have 10 pods × 60 connections = 600, and PostgreSQL is set to `max_connections=100`, you've already exceeded the limit — connection creation itself will fail, and the pool_size settings are irrelevant.
+
+---
+
+**Q3: Your FastAPI service calls a third-party payment API with a 30-second timeout. Under load, the payment API slows to 25-second responses. Your service has 4 workers with 100 max concurrent connections each. What happens and how do you prevent it?**
+
+What the interviewer wants: Little's Law: at 100 RPS with 25s response time, you need L = 100 × 25 = 2500 concurrent connections to the payment API. You only have 400 (4 × 100). After 4 seconds, all 400 connection slots are occupied. New requests queue waiting for a free connection. But the queue also grows at 100 RPS. Within 10 seconds you have thousands of waiting requests, each consuming memory (coroutine state, request objects). The 30-second timeout means each request waits up to 30 seconds before giving up, holding resources the entire time. Meanwhile, incoming user requests to YOUR service pile up because the event loop is saturated with coroutines waiting on the payment API. Your service becomes unresponsive to ALL endpoints, not just the payment endpoint. Prevention: (1) Set the payment API timeout to 5s, not 30s — if it hasn't responded in 5s, it won't respond usefully. (2) Use a semaphore to limit concurrent payment calls (e.g., 50). Reject additional payment requests immediately with 503. (3) Circuit breaker: if the payment API's p99 exceeds 5s for 30 seconds, stop calling it entirely. (4) Bulkhead: isolate payment-related endpoints so they cannot exhaust resources shared with other endpoints. The key insight: a slow dependency is more dangerous than a dead one, because slow holds resources while dead releases them immediately.
+
+---
+
+**Q4: You deploy a FastAPI service on Kubernetes with `resources.limits.memory: 512Mi` and `resources.limits.cpu: 500m`. The service handles JSON APIs with average response sizes of 2KB. Under a load test at 5000 RPS, pods keep getting OOMKilled. Explain why and how to fix it.**
+
+What the interviewer wants: At 5000 RPS with 10ms average latency, Little's Law says L = 5000 × 0.01 = 50 concurrent requests. Each request consumes memory for: the request object (~1-5KB), the parsed JSON body, any ORM objects loaded from the database, the response serialization buffer, and the asyncio coroutine state (~2-8KB). Under normal conditions, 50 × 10KB = 500KB of concurrent request memory — trivial. But under overload: if latency increases to 500ms, L = 5000 × 0.5 = 2500 concurrent requests. Memory: 2500 × 10KB = 25MB just for request state. If requests involve database queries that load ORM objects averaging 50KB each: 2500 × 50KB = 125MB. If the response serialization buffers large payloads or if there are in-memory caches: you can easily hit 512MB. The OOMKill happens because: (1) No admission control — the service accepts all 5000 RPS regardless of capacity. (2) No concurrency limit — asyncio happily spawns 2500 coroutines. (3) No queue bound — requests pile up in the event loop without limit. Fix: (1) Add a concurrency limiter middleware (`asyncio.Semaphore(200)`) that rejects requests with 503 when 200 are already in flight. (2) Set bounded queue depth on the ASGI server (Uvicorn's `--limit-concurrency`). (3) Increase memory limits based on actual load testing data. (4) Add request size limits. The staff answer: the memory limit should be sized to the maximum concurrent requests you're willing to handle × per-request memory footprint, with 30% headroom. Don't set memory limits without knowing your concurrency limit.
+
+---
+
+**Q5: You have a FastAPI service behind an NGINX reverse proxy. NGINX is configured with `proxy_read_timeout 60s` and a `limit_req_zone` rate limiter at 1000 RPS with burst=200. Your FastAPI service can handle 800 RPS sustainably. Traffic is normally 500 RPS. A traffic spike hits 1500 RPS. Describe second-by-second what happens.**
+
+What the interviewer wants: Second 1: 1500 RPS arrives at NGINX. Rate limiter allows 1000 RPS (configured limit) + 200 burst = 1200 through. 300 requests rejected with 503. Second 2: 1200 RPS reaches FastAPI. FastAPI can only process 800 RPS. 400 requests per second begin queuing in the ASGI server. Second 3: Queue grows by 400/s. After 5 seconds, 2000 requests are queued. Each queued request is waiting for processing. NGINX's 60s timeout means NGINX will wait 60 seconds for a response. Second 10: 4000 requests queued. Latency for new requests is now 4000/800 = 5 seconds of queue wait. Clients see 5-second response times. Second 30: 12,000 requests queued. Queue wait time: 15 seconds. Memory consumption is climbing. Clients at the front of the queue have already timed out (typical client timeout: 10-30s), but FastAPI is still processing their requests — wasted work. Second 60: NGINX starts timing out the oldest requests (60s proxy_read_timeout). But the queue is still 20,000+ deep. This is queue collapse. The problems: (1) NGINX rate limiter is set to 1000 RPS but FastAPI can only handle 800 — the rate limit should match actual backend capacity, not a round number. (2) 60s proxy_read_timeout is far too long — set it to 5-10s. (3) No queue bound on FastAPI — add `--limit-concurrency` to Uvicorn. (4) No deadline-based shedding — requests sitting in queue for >2s should be dropped. Fix the rate limiter to 800 RPS, set proxy_read_timeout to 10s, add `--limit-concurrency 100` to Uvicorn, and add middleware that drops requests older than 3 seconds.
+
+---
+
+**Q6: Your team runs a multi-tenant SaaS API on FastAPI. Three customers: Enterprise (Tenant A, 60% of revenue), Startup (Tenant B, 30%), Free tier (Tenant C, 10%). Total capacity: 1000 RPS. Tenant C discovers your API and starts scraping at 3000 RPS. Your monitoring shows p99 latency for Tenant A jumped from 50ms to 2 seconds. The CEO is calling. What happened, and what do you implement this week vs. this quarter?**
+
+What the interviewer wants: What happened: Tenant C's 3000 RPS overwhelmed the shared service. Without per-tenant isolation, all tenants compete for the same worker threads, database connections, and CPU. Tenant C consumes most of the capacity. Tenant A's requests queue behind Tenant C's requests. p99 goes from 50ms to 2s because the queue depth is dominated by Tenant C's volume.
+
+This week (emergency): (1) Rate limit Tenant C to 50 RPS at the API gateway (NGINX/Kong) using their API key. (2) Rate limit free tier globally to 100 RPS. (3) Add per-tenant rate limits: Tenant A = 600 RPS, Tenant B = 300 RPS, Free tier = 100 RPS. This can be done with NGINX `limit_req_zone` keyed on API key or a Redis-based rate limiter.
+
+This quarter (proper fix): (1) Per-tenant concurrency limits in application middleware — not just RPS limits, but concurrent in-flight request limits per tenant. (2) Weighted fair queuing — Tenant A gets 60% of capacity, Tenant B gets 30%, Free tier gets 10%. (3) Separate database connection pools per tenant tier (or at least reserved connections for Tenant A). (4) Request costing — an expensive aggregation query from Tenant C should count as 10 "units" against their rate limit, not 1. (5) Tenant-aware load shedding — under overload, shed Free tier first, then Startup, never Enterprise. (6) Monitoring and alerting per tenant — p99 by tenant, not just aggregate.
+
+The staff answer also notes: the business impact determines the engineering priority. Tenant A is 60% of revenue. A 2-second p99 for Tenant A is a revenue emergency. The short-term fix must be deployed within hours, not days. Per-tenant rate limiting at the gateway is the fastest path.
+
+---
+
+**Q7: You run a FastAPI service with a PostgreSQL database (RDS, db.r5.xlarge, max_connections=200). The service has 5 pods, each with `pool_size=20, max_overflow=20` (total: 5 × 40 = 200 connections, exactly matching max_connections). During a deploy (rolling update), a 6th pod starts before the 5th pod terminates. What happens?**
+
+What the interviewer wants: During rolling deployment, there's a brief period with 6 pods running simultaneously. The 6th pod tries to create 20 connections (pool_size). But the database already has 200 connections from the existing 5 pods. Every `CREATE CONNECTION` from the 6th pod fails with `FATAL: too many connections`. The 6th pod's health check (which likely hits the database) fails. Kubernetes marks it as unhealthy and restarts it. The restart creates the same problem. You get a restart loop during every deploy.
+
+But it's worse than that: the 5th pod (being terminated) receives SIGTERM and starts draining. It stops accepting new requests but its existing connections stay open until in-flight requests complete (graceful shutdown). If any request is slow, those connections are held for seconds. Meanwhile, the 6th pod is failing. If the 5th pod's graceful shutdown timeout (terminationGracePeriodSeconds) is long, the overlap window grows.
+
+Fix: (1) Set `max_overflow=0` and `pool_size=15` per pod. 5 × 15 = 75, leaving headroom for rolling deploys (6 × 15 = 90, still under 200). (2) Or set PostgreSQL `max_connections=300` with headroom for deploys + monitoring connections + migration connections. (3) Use PgBouncer as a connection pooler between pods and PostgreSQL. PgBouncer multiplexes hundreds of application connections over a smaller number of actual database connections. (4) Configure Kubernetes `maxSurge=0, maxUnavailable=1` so the old pod terminates before the new pod starts (but this means brief downtime during deploys). The staff answer: never size your connection pool to exactly match the database's max_connections. Always leave 20-30% headroom for rolling deploys, monitoring tools (pg_stat_activity, DataDog agent), manual DBA connections, and migration scripts.
+
+---
+
+**Q8: Your FastAPI service processes webhook events from Stripe. Events arrive at ~50/s normally but spike to 5000/s during batch operations (e.g., subscription renewals at month end). Each webhook handler calls 3 internal services and takes 200ms. You're using Celery with Redis as the broker and 10 workers. At 5000 events/s, the Redis broker runs out of memory after 20 minutes. Explain the math and the fix.**
+
+What the interviewer wants: Processing capacity: 10 Celery workers × (1000ms / 200ms) = 50 tasks/second. Arrival rate during spike: 5000/s. Backlog growth: 5000 - 50 = 4950 tasks/second accumulating in Redis. Each task message is ~2KB (JSON payload with event data). After 20 minutes (1200 seconds): 4950 × 1200 = 5,940,000 tasks queued. At 2KB each: 5.94M × 2KB ≈ 11.2GB. If Redis is provisioned with 8GB, it runs out of memory and starts evicting keys or crashes (depending on maxmemory-policy). When Redis crashes, all queued tasks are lost (Redis is not a durable queue by default, even with RDB/AOF, recovery is messy under OOM).
+
+Fix: (1) Backpressure at the webhook endpoint — return 429 to Stripe when queue depth exceeds threshold. Stripe will retry with exponential backoff (their retry policy is well-documented). This is the correct answer because Stripe expects and handles 429s. (2) Scale Celery workers horizontally during spikes (KEDA autoscaler based on Redis queue length). (3) Set a max queue length — reject new tasks when the queue exceeds N items. (4) Use a durable queue (SQS, RabbitMQ with persistence) instead of Redis if at-least-once delivery matters. (5) Batch processing — instead of processing each webhook individually, batch them: dequeue 100 events, process them in a single database transaction. This can increase throughput 10-50x.
+
+The staff answer: the fundamental problem is a 100x mismatch between arrival rate and processing rate. No amount of Redis tuning fixes a throughput mismatch. You either increase processing capacity (more workers, faster handlers, batching) or decrease arrival rate (backpressure, rate limiting at ingestion).
+
+---
+
+**Q9: You have a FastAPI service with an in-memory cache (Python dict) holding 100,000 product records (~500MB). The cache TTL is 5 minutes. Every 5 minutes, all 100,000 keys expire simultaneously. When the cache is empty, each cache miss triggers a database query. Describe the failure and the fix.**
+
+What the interviewer wants: This is a thundering herd / cache stampede. At the 5-minute mark, all 100,000 keys expire simultaneously. The next requests for each key are cache misses. If the service handles 1000 RPS and each request needs 1-5 product records, that's 1000-5000 database queries per second instead of the normal ~10/s (misses on newly added products). The database connection pool saturates immediately. Query latency spikes. More requests pile up. The service becomes unresponsive for 30-60 seconds while the cache refills. This happens every 5 minutes like clockwork.
+
+Fixes: (1) Staggered TTL — set TTL = 5min + random(0, 60s). Keys expire gradually over 60 seconds instead of all at once. (2) Background refresh — a background task refreshes the cache before TTL expires (`stale-while-revalidate`). The cache is never empty; users always get data (possibly stale by seconds). (3) Singleflight / request coalescing — if 100 requests arrive for the same cache key simultaneously, only 1 triggers the database query. The other 99 wait for that one query to complete and share the result. In Python: use `asyncio.Lock` per key, or a library like `cachetools` with locking. (4) Warm-up on startup — pre-populate the cache from database before accepting traffic. (5) Never use synchronous cache expiry for large caches. Either use staggered TTL or background refresh.
+
+The staff answer: cache stampedes are a form of correlated failure — all misses arrive at the same instant. Any caching strategy that allows correlated expiry is a latent time bomb. The fix is decorrelation (staggered TTL) plus deduplication (singleflight).
+
+---
+
+**Q10: Your team's FastAPI service uses `httpx.AsyncClient` with default settings to call 5 internal microservices. Under load testing at 2000 RPS, you discover that request latency to downstream services jumps from 10ms to 500ms even though the downstream services are healthy and fast. `netstat` shows 50,000 connections in TIME_WAIT. Explain what's happening.**
+
+What the interviewer wants: The default `httpx.AsyncClient` (without connection pooling or with a new client per request) creates a new TCP connection for each request. At 2000 RPS to 5 services = 10,000 connections/second being created and destroyed. Each closed connection enters TIME_WAIT for 60 seconds (Linux default). After 5 seconds: 50,000 sockets in TIME_WAIT. Each socket consumes a file descriptor and a port from the ephemeral port range (typically 32768-60999 = ~28,000 ports). At 50,000 TIME_WAIT sockets, you've exhausted the ephemeral port range. New connection attempts fail or get delayed waiting for ports to recycle. The 500ms latency is the kernel waiting for a port to become available.
+
+Fix: (1) Use a single `httpx.AsyncClient` instance with connection pooling (the default pool size is 100 connections). Create it once at startup and reuse it across requests. This reuses TCP connections via HTTP keep-alive. (2) Set `limits=httpx.Limits(max_connections=200, max_keepalive_connections=100)` to size the pool appropriately. (3) If you must create many connections, tune the kernel: `net.ipv4.tcp_tw_reuse=1` allows reuse of TIME_WAIT sockets. (4) Use Unix domain sockets for same-host communication (eliminates TCP overhead entirely). The staff answer: this is a resource exhaustion problem disguised as a latency problem. The fix is not "tune timeouts" — it's "stop creating 10,000 connections per second." Connection pooling is not an optimization; for async HTTP clients at scale, it's a correctness requirement.
+
+---
+
+### Conceptual and Design Questions
+
+**Q11: A junior engineer proposes adding a `asyncio.Queue(maxsize=10000)` as a work buffer in front of the database layer in your FastAPI service. They argue: "If the database is slow, we'll buffer requests in memory and process them when the database recovers." What's wrong with this approach?**
+
+What the interviewer wants: Several problems: (1) A queue does not increase processing capacity. If the database can process 100 queries/s and you're receiving 500/s, the queue grows by 400 items/second. After 25 seconds the 10,000-item queue is full. You've delayed the problem by 25 seconds, not solved it. (2) Requests in the queue are still consuming HTTP connections. The client (browser, mobile app) is waiting for a response. After 5 seconds, the client times out and retries. Now you have the original request sitting uselessly in the queue AND a retry request arriving. (3) If the queue is in-memory and the process crashes or restarts, all 10,000 queued requests are lost. (4) The queue hides the overload signal. Without the queue, the service returns 503 immediately, the client retries on another instance, or the load balancer notices and stops sending traffic. With the queue, the service looks "healthy" (accepting requests, no errors) while actually falling further behind. (5) Memory: 10,000 requests × 10KB each = 100MB consumed just for buffering. The correct approach: reject requests you cannot serve immediately. Return 503 with Retry-After. Let the client decide whether to retry. A bounded queue of 50-100 items for absorbing microsecond bursts is fine; a queue of 10,000 is a memory-consuming lie about your capacity.
+
+---
+
+**Q12: Your FastAPI service processes requests that take between 5ms (cache hit) and 5 seconds (cold database query with aggregation). Average latency is 50ms. You've set `--limit-concurrency 200` on Uvicorn. Is this a good setting? What happens when 200 concurrent requests are all the slow 5-second type?**
+
+What the interviewer wants: When all 200 slots are occupied by 5-second requests, the service is at 100% capacity but processing only 200/5 = 40 RPS — far below its normal throughput. New requests (including fast 5ms cache-hit requests) are rejected with 503 because the concurrency limit is reached. The problem: a uniform concurrency limit treats all requests equally. A 5ms cache-hit request and a 5-second aggregation query both consume one concurrency slot, but the aggregation holds it 1000x longer.
+
+Better approaches: (1) Separate endpoints into fast and slow paths with independent concurrency limits. Fast path: `max_concurrency=180` for cache-hit endpoints. Slow path: `max_concurrency=20` for aggregation endpoints. (2) Cost-based admission: weight the concurrency cost by estimated processing time. A 5-second query costs 100 "units" against the limit while a 5ms query costs 1. (3) Deadline-based shedding: if a request's estimated processing time exceeds the remaining deadline, reject immediately. (4) Separate worker pools (bulkhead pattern): run slow queries in a separate pool of workers with its own connection pool and concurrency limit, so slow requests cannot starve fast ones.
+
+The staff answer: `--limit-concurrency` is a blunt instrument. It prevents memory exhaustion but does not protect goodput for heterogeneous workloads. Production services need per-endpoint or per-cost-class concurrency control, not a single global number.
+
+---
+
+**Q13: You're designing a rate limiter for your public API. The PM wants "1000 requests per minute per API key." You implement a fixed-window counter in Redis. In production, a customer complains they're getting 429 errors even though they sent only 800 requests in the last minute. How is this possible?**
+
+What the interviewer wants: The fixed-window boundary problem. Suppose the window boundary is at :00 seconds. The customer sent 600 requests between 12:00:30 and 12:00:59 (within window 12:00), then 800 requests between 12:01:00 and 12:01:30 (within window 12:01). From the customer's perspective, they sent 800 requests in the last 60 seconds (from 12:00:30 to 12:01:30). From the rate limiter's perspective, window 12:00 had 600 (passed), and window 12:01 starts at 800. But the REAL rate in the sliding 60-second window from 12:00:30 to 12:01:30 is 600 + 800 = 1400 — they're actually over the limit. The opposite can also happen: 999 requests at 12:00:59 and 999 at 12:01:00 = 1998 requests in 2 seconds, both windows say "under 1000."
+
+Fix: use a sliding window counter (weighted overlap between current and previous window) or a sliding window log. The sliding window counter approximation is good enough for most APIs and uses O(1) storage. The staff answer: fixed-window rate limiting has a known 2x burst vulnerability at window boundaries. Any production rate limiter should use sliding windows unless the simplicity tradeoff is explicitly accepted.
+
+---
+
+**Q14: Your team operates a FastAPI service that fans out to 20 microservices to assemble a product page. Each downstream call has a 200ms timeout. The total SLA for the product page is 500ms. A staff engineer joins and says "your timeout math doesn't add up." What are they seeing?**
+
+What the interviewer wants: If the 20 calls are sequential: worst case = 20 × 200ms = 4000ms. Even if most are fast, one slow dependency makes the total exceed 500ms. If the 20 calls are parallel (using `asyncio.gather`): worst case = max(200ms) = 200ms. But the p99 hit rate for 20 parallel calls matters — probability that at least one hits its 200ms timeout is 1 - (1 - p_timeout)^20. If each service has a 1% timeout rate, the chance of at least one timeout is 1 - 0.99^20 = 18.2%. So 18% of product page requests will take ~200ms just from one slow dependency.
+
+The real problem: 500ms SLA minus 200ms downstream timeout leaves only 300ms for: receiving the request, parsing it, making 20 HTTP connections (TCP + TLS handshake if not pooled = 5-20ms each), processing 20 responses, serializing the result, and sending it back. If connections are not pooled, 20 × 10ms handshake = 200ms, leaving 100ms for everything else. With connection pooling and parallel calls: 500ms - 200ms timeout - 20ms overhead = 280ms margin. But you need the margin for the EXPECTED case, not the timeout case. Set downstream timeouts to 300ms (1.5x their p99), use structured concurrency to cancel all outstanding calls if the 500ms deadline is reached, and serve partial results (skip non-critical services like recommendations/reviews) if the critical services respond in time.
+
+---
+
+**Q15: You notice that your FastAPI service's memory usage grows linearly during a load test but never decreases, even after load drops to zero. The service eventually OOMKills after 6 hours of sustained load. There are no obvious memory leaks in your code. What are the most likely causes?**
+
+What the interviewer wants: Common non-obvious memory growth patterns in Python/FastAPI: (1) SQLAlchemy session/identity map — if sessions are not properly closed, the identity map accumulates every loaded ORM object. With a scoped session tied to request lifecycle, a missing `await session.close()` in error paths leaks objects. (2) `httpx.AsyncClient` response bodies — if responses are not consumed (`await response.aread()`), the connection stays open and the buffer is held. (3) asyncio task references — if tasks are created with `asyncio.create_task()` but not awaited, their result objects accumulate. (4) Python's memory allocator (pymalloc) — Python returns memory to its own free lists but does not always return it to the OS. `gc.collect()` frees Python objects but pymalloc's arena allocator may retain the memory. Under sustained load, the high-water mark of allocated arenas only grows. (5) Logging handlers with in-memory buffers. (6) Global caches without eviction (a `dict` used as a cache without TTL or LRU bounds). (7) Circular references that the garbage collector processes but cannot free until a full collection cycle.
+
+Diagnosis: use `tracemalloc` to snapshot memory allocations before and after load. Compare snapshots to find which allocation sites are growing. For pymalloc fragmentation, check `sys._debugmallocstats()`. For ORM leaks, check `len(session.identity_map)` over time.
+
+The staff answer: in a long-running Python process, "no memory leak" does not mean "constant memory." Memory fragmentation and pymalloc's arena allocation policy mean that memory usage can grow monotonically even without leaks. Set memory limits with headroom, use worker recycling (`--limit-max-requests` in Uvicorn/Gunicorn), and monitor RSS over time.
+
+---
+
+### Architecture and Tradeoff Questions
+
+**Q16: You're designing the overload protection strategy for a new FastAPI service that will serve 10,000 RPS. Walk through your design from the edge to the database, specifying exact mechanisms at each layer.**
+
+What the interviewer wants: A complete defense-in-depth design with specific numbers:
+
+Edge (NGINX / cloud LB): Rate limit at 12,000 RPS global (20% headroom). Per-IP limit at 100 RPS to prevent single-source floods. Connection limit at 5000 concurrent. Request body size limit at 1MB.
+
+API Gateway / middleware: Per-API-key rate limit (tiered: free=10 RPS, business=100 RPS, enterprise=1000 RPS). Request validation and early rejection. Deadline header injection (X-Request-Deadline = now + 5s).
+
+Application (FastAPI middleware): Concurrency limiter: `asyncio.Semaphore(500)` — reject with 503 when 500 requests are in-flight. Deadline-aware: middleware checks remaining deadline budget, rejects if <100ms remaining. Priority headers: extract tenant tier, pass to downstream calls. Request metrics: emit latency histogram per endpoint.
+
+Database layer: Connection pool per pod: `pool_size=20, max_overflow=10`. Query timeout: `statement_timeout=3s` in PostgreSQL. Slow query detection: log queries >500ms. Read replica routing for read-heavy endpoints.
+
+Queue layer (if applicable): Bounded queue: `maxsize=1000`. Dead-letter queue for failed items. Consumer concurrency limit.
+
+The staff answer: the specific numbers matter less than the reasoning. Every number should be justified: "500 concurrent requests because each consumes ~1MB of memory, and our pod has 1GB available for request processing." "20 pool connections because our queries average 5ms, so 20 connections can handle 4000 QPS of database work." Numbers without reasoning are just configuration; numbers with reasoning are engineering.
+
+---
+
+**Q17: Your FastAPI service has been running fine at 2000 RPS for months. One morning, latency gradually increases from 10ms to 500ms over 30 minutes with no traffic change, no deploys, and no alerts from dependencies. By the time someone notices, the service is barely functional. What happened, and what observability would have caught it earlier?**
+
+What the interviewer wants: This is a slow-onset degradation — the hardest kind to detect. Common causes: (1) Database table bloat — a table crossed a threshold where query planner switches from index scan to sequential scan. (2) Connection pool leak — a slow leak of 1 connection per hour. After 20 hours, the pool is half-exhausted. At 30 hours, connection wait times dominate latency. (3) Memory pressure — RSS growing due to fragmentation until the OS starts swapping. Swap I/O is 100-1000x slower than RAM. (4) Log volume — a verbose log statement generates 10GB of logs, filling the disk. Once disk is full, every fsync blocks. (5) Certificate expiry or TLS session cache exhaustion — TLS handshakes start failing, causing connection retries. (6) DNS resolution degradation — if DNS TTL expires and the DNS server is slow, every new connection adds 500ms for DNS lookup.
+
+Observability that catches this: (1) p99 latency alerts (not just error rate — this scenario has zero errors). (2) Connection pool utilization alerts (>70% → warning, >90% → page). (3) Memory RSS trending alert (if RSS increases >10% over 1 hour, alert). (4) Database query latency per query type. (5) Disk I/O latency and disk space. (6) Event loop lag for async services (if the event loop is delayed >10ms, something is blocking it). The staff answer: error rate is a lagging indicator. Latency and resource utilization are leading indicators. Alert on gradient changes (rate of change), not just absolute thresholds.
+
+---
+
+**Q18: An engineer proposes: "Let's just auto-scale our FastAPI pods based on CPU. If CPU > 70%, add a pod. If CPU < 30%, remove one. That handles overload." What are the three most important things they're missing?**
+
+What the interviewer wants: (1) Scaling delay — auto-scaling takes 1-5 minutes (detect metric, decide, provision pod, pull image, start process, health check passes, load balancer adds pod). During that window, the service is already overloaded. You need admission control for the window BEFORE new pods arrive. Auto-scaling is a capacity planning mechanism, not an overload defense. (2) Non-CPU bottlenecks — CPU at 50% doesn't mean the service is healthy. The database connection pool might be saturated. Memory might be at 95%. The downstream dependency might be slow. Scaling more pods that all share the same database just multiplies the number of connections hitting an already-stressed database, making it WORSE. (3) Thundering herd on scale-down — when load drops and pods are removed, their in-flight connections are terminated. If the load balancer doesn't drain gracefully, those requests fail. Clients retry. The retries hit the remaining (fewer) pods. The retry load triggers scale-up again. You get an oscillation loop.
+
+Additional: (4) Cost — auto-scaling up is easy; auto-scaling DOWN is where the budget blows up. If the service scales to 20 pods during a 5-minute spike and takes 30 minutes to scale back down (stabilization window), you're paying for 20 pods for 35 minutes total. (5) Stateful resources don't scale horizontally — database connections, cache warm-up, in-memory session state. The staff answer: auto-scaling solves capacity planning. It does not solve overload defense, resource bottlenecks, or thundering herds. You need both auto-scaling AND admission control / load shedding / rate limiting.
+
+---
+
+### Quick-Fire Judgment Calls
+
+**Q19:** Your FastAPI service connects to Redis for caching. Redis goes down. Do you return errors to all users or serve responses without cache?
+→ Serve without cache (bypass Redis). Cache is an optimization, not a data source. Set the Redis call inside a try/except with a 50ms timeout. Log the miss. If Redis-less load overwhelms the database, activate graceful degradation (stale responses from a local in-memory fallback).
+
+**Q20:** Your Uvicorn worker count: should it be `2 * CPU_CORES + 1` (the Gunicorn rule) for a FastAPI async service?
+→ No. That formula is for sync workers (Gunicorn with sync workers, Flask). For async (Uvicorn), use 1 worker per CPU core as a starting point. Async workers handle concurrency via the event loop, not via multiple processes. More workers = more memory overhead and more database connections. Benchmark your specific workload.
+
+**Q21:** Your service handles 1000 RPS. You add a rate limiter at 1000 RPS. Under exactly 1000 RPS of legitimate traffic, users start seeing 429 errors. Why?
+→ Measurement granularity. If the rate limiter uses 1-second fixed windows, traffic isn't perfectly uniform. Requests arrive in bursts within each second. A 50ms burst of 80 requests exceeds the per-window rate. Fix: add burst headroom (rate=1000, burst=1200) or use a sliding window.
+
+**Q22:** You need to choose between `Retry-After: 5` (fixed) and `Retry-After: <random 1-10>` (jittered) on your 429 responses. Which one?
+→ Jittered. Fixed Retry-After causes all rejected clients to retry at exactly T+5s, creating a synchronized spike. Jittered spreads retries over 1-10 seconds. At 1000 rejected clients, fixed creates a 1000-request spike at T+5. Jittered creates ~100 RPS spread over 10 seconds.
+
+**Q23:** Your async FastAPI handler does `await asyncio.sleep(0.001)` at the start to "yield control to the event loop." A colleague says this is cargo cult programming. Are they right?
+→ Yes. `asyncio.sleep(0)` (or 0.001) yields to the event loop scheduler but adds 1ms of latency to EVERY request. At 1000 RPS, that's 1 second of cumulative delay per second of wall time. If the handler already has `await` calls (database, HTTP), those naturally yield. An explicit yield is only useful if the handler is CPU-bound for >10ms without any I/O and you need to prevent event loop starvation — and in that case, the handler should be offloaded to a thread pool with `loop.run_in_executor()`.
+
+**Q24:** You're reviewing a PR that adds `asyncio.Semaphore(10)` to limit concurrent database queries. The service handles 1000 RPS and each query takes 5ms. Will this work?
+→ No. 10 concurrent queries × (1000ms / 5ms) = 2000 queries/second capacity. At 1000 RPS with 1 query per request, the math works — but only if every request needs exactly 1 query of exactly 5ms. In practice, some requests need 3-5 queries, and some queries take 50ms. The semaphore will become the bottleneck and cause artificial queueing. Size it to the database connection pool size (e.g., 20-50), not an arbitrary number. The semaphore should protect the database from overload, not throttle the application unnecessarily.
+
+**Q25:** Your FastAPI service runs on Kubernetes. The liveness probe hits `/health` every 10 seconds with a 3-second timeout. Under heavy load, the event loop is saturated and `/health` takes 5 seconds. What happens?
+→ Kubernetes marks the pod as unhealthy and RESTARTS it. The restart kills all in-flight requests. When the pod restarts, it gets a cold cache, takes 30 seconds to warm up, and during warmup absorbs less load. Kubernetes restarts the pod again. You've turned a latency problem into a crash loop. Fix: (1) Separate the health endpoint from the main event loop (use a separate thread or a dedicated lightweight server on another port). (2) Increase the liveness probe timeout to 10s. (3) Use a readiness probe (not liveness) to stop traffic — readiness failures stop traffic but don't restart the pod. Liveness probes should only restart when the process is truly stuck (deadlocked), not when it's merely overloaded.
+
+**Q26:** Your service writes access logs synchronously to disk for every request. Under 5000 RPS, each log write takes 0.1ms. Is this a problem?
+→ Yes, eventually. 5000 × 0.1ms = 500ms of I/O per second — seems fine. But disk I/O has high variance. When the OS flushes dirty pages (every 5-30 seconds), `write()` latency spikes to 5-50ms. A 50ms disk stall blocks the event loop, freezing all 5000 concurrent requests. Fix: use async logging (write to an in-memory buffer, flush periodically in a background task) or write logs via a sidecar (send to stdout, let the container runtime handle buffering and shipping). Never let a synchronous disk write sit in the hot path of an async event loop.
+
+**Q27:** Your team wants to add a circuit breaker to the database connection. You push back. Why?
+→ A database is not a typical "dependency" for circuit breaker purposes. If the breaker opens, your service cannot serve ANY request that needs data — which is likely all of them. There's no meaningful fallback for "cannot reach the database." A circuit breaker makes sense for optional or replaceable dependencies (a recommendation service, a third-party API) where you have a fallback path. For the database, use connection pool timeouts (fail fast if no connection available in 3s), query timeouts (kill queries over 5s), and read replica failover. The circuit breaker pattern assumes "stop calling this dependency" is a valid state. For your primary datastore, it usually isn't.
+
+**Q28:** Your async FastAPI service calls an external API using `httpx`. Under load, you see `httpx.PoolTimeout: timed out waiting for a connection from the pool`. The external API responds in 20ms. What's happening?
+→ The `httpx.AsyncClient` has a default connection pool limit of 100 connections per host. At 200 RPS with 20ms per request: 200 × 0.02 = 4 concurrent connections needed — should be fine. But if YOU aren't reusing the client (creating a new `AsyncClient` per request), each instance has its own pool. If you ARE reusing it, check: (1) Are responses being fully consumed? Unconsumed responses hold connections open. (2) Is there a slow endpoint on the same host consuming all pool connections? (3) Are connections being leaked in error paths? Fix: `async with httpx.AsyncClient(limits=httpx.Limits(max_connections=200))` as a singleton, ensure `async with client.stream()` is used if streaming, add `timeout=httpx.Timeout(5.0, pool=2.0)` to fail fast on pool exhaustion rather than waiting.
+
+---
+
+*Use these questions for self-assessment: if you can trace the exact resource exhaustion path (threads, connections, memory, file descriptors, ports) through a specific failure scenario with real numbers, you understand overload defense at the level needed to design and debug production systems. Pattern names are necessary but insufficient — the difference between mid-level and staff-level is the ability to quantify what happens and predict when it breaks.*
 
 ---
 
