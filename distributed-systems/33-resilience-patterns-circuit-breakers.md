@@ -17,6 +17,15 @@ Prerequisites: familiarity with distributed system failure models from `00-primi
    - [6.4 Pattern Comparison — When to Use What](#64-pattern-comparison--when-to-use-what) *(includes Bulkhead vs. Rate Limiter, Little's Law math)*
 7. [Testing Resilience Patterns](#7-testing-resilience-patterns)
 8. [Production Tradeoff Matrix](#8-production-tradeoff-matrix)
+9. [Real-World Resilience — Production Case Studies](#9-real-world-resilience--production-case-studies)
+   - [9.1 Payment Processing (Stripe/Adyen)](#91-payment-processing-service-stripeadyen-integration)
+   - [9.2 Background Job Processing (Queue Workers)](#92-background-job-processing-queue-workers)
+   - [9.3 LLM API Calls (OpenAI/Anthropic)](#93-llm-api-calls-openai--anthropic-integration)
+   - [9.4 E-Commerce Product Page (Aggregation)](#94-e-commerce-product-page-aggregation-service)
+   - [9.5 Microservice-to-Database](#95-microservice-to-database-internal-dependency)
+   - [9.6 Third-Party Webhook Delivery](#96-third-party-webhook-delivery-outbound)
+   - [9.7 How to Derive Numbers for YOUR System](#97-how-to-derive-numbers-for-your-system)
+10. [Interview Preparation](#10-interview-preparation--resilience-patterns)
 
 ---
 
@@ -1777,7 +1786,1000 @@ If any of these answers is "no," the resilience patterns have a bug. The most co
 
 ---
 
-## 9. Interview Preparation — Resilience Patterns
+## 9. Real-World Resilience — Production Case Studies
+
+Theory tells you what a circuit breaker is. This section shows you how to configure one for a payment processor versus a recommendation engine, why the numbers differ, and how to derive them from your own system's data instead of copying defaults from a blog post.
+
+Every number below comes from a calculation, not a guess. The general approach: measure your system's actual behavior (latency percentiles, error rates, traffic patterns), apply Little's Law and basic probability, and derive the configuration from those measurements.
+
+---
+
+### 9.1 Payment Processing Service (Stripe/Adyen Integration)
+
+A checkout service that charges customers via an external payment gateway. This is the hardest case because the operation is non-idempotent, financially consequential, and latency-sensitive (users are waiting at checkout).
+
+```
+SYSTEM PROFILE:
+  Traffic:           200 charges/second peak (Black Friday: 800/sec)
+  Gateway p50:       120ms
+  Gateway p95:       350ms
+  Gateway p99:       800ms
+  Gateway error rate: 0.3% baseline (429s during rate limit spikes)
+  Gateway SLA:       99.95% monthly
+  Your SLA to users: checkout completes within 3 seconds
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 1: TIMEOUT CALCULATION
+
+  WHY NOT JUST "SET IT TO 5 SECONDS":
+    Your SLA is 3 seconds total. The checkout flow is:
+      validate cart (20ms) → reserve inventory (50ms) → charge (??ms)
+      → create order (30ms) → send confirmation (async, not counted)
+
+    Budget for charging: 3000 - 20 - 50 - 30 = 2900ms max.
+    But you want headroom for variance: 2900 × 0.7 = ~2000ms.
+
+  Connect timeout: 2 seconds.
+    Gateway is external (cross-internet). DNS + TCP + TLS handshake
+    to Stripe's edge can take 200-500ms normally. 2s covers cold
+    connections and mild network congestion. If the gateway isn't
+    reachable in 2 seconds, it's likely down — fail fast.
+
+  Read timeout: 2 seconds.
+    Gateway p99 = 800ms. Setting timeout at 2.5× p99 = 2000ms.
+    This means ~0.1% of requests timeout under NORMAL conditions
+    (only those beyond p99.9). That's acceptable: ~0.2 timeouts/sec
+    at 200 rps. Those get retried.
+
+    WHY NOT 1 SECOND (closer to p99):
+    At 1s timeout, ~1% of healthy requests timeout = 2 rps of false
+    timeouts. At 3 retries each, that's 6 unnecessary retries/sec on
+    a system that's working perfectly. You're punishing the gateway
+    for normal variance.
+
+    WHY NOT 5 SECONDS:
+    If the gateway hangs, each thread is blocked for 5s.
+    At 200 rps: Little's Law says L = 200 × 5 = 1,000 threads needed.
+    If you have 100 threads in the bulkhead → pool exhausts in 0.5s.
+    Even with the bulkhead, 5s timeout means each thread is wasted
+    for 5 seconds. At 2s timeout, threads recycle 2.5× faster.
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 2: RETRY CONFIGURATION
+
+  Idempotency key: MANDATORY. Generated client-side (UUID v4).
+    Sent as Idempotency-Key header. Stored server-side for 48 hours.
+    WITHOUT THIS, a retry on a read timeout = potential double charge.
+    This is the first thing you implement, before any retry logic.
+
+  Which errors to retry:
+    ✓ Connect timeout     — gateway never saw the request. Safe.
+    ✓ HTTP 429            — rate limited. Respect Retry-After header.
+    ✓ HTTP 502, 503, 504  — gateway infra issue. Transient.
+    ✗ HTTP 400            — your payload is wrong. Fix code, not retry.
+    ✗ HTTP 402            — card declined. Retrying won't unblock the card.
+    ✗ HTTP 404            — endpoint doesn't exist. Never recovers.
+    ✗ Read timeout        — ONLY retry with idempotency key.
+                            Without the key, you don't know if the charge
+                            went through. Retrying = potential double charge.
+
+  Max retries: 2 (total 3 attempts).
+    WHY 2 AND NOT 5:
+    Each retry takes time. With exponential backoff:
+      Attempt 1: immediate (0ms wait)
+      Attempt 2: ~200ms wait (100ms base × 2^1 × jitter)
+      Attempt 3: ~500ms wait (100ms base × 2^2 × jitter)
+    Total worst case: 2000ms (attempt 1) + 200ms + 2000ms (attempt 2)
+    + 500ms + 2000ms (attempt 3) = 6,700ms.
+    But your total deadline is 2,900ms. After attempt 1 takes 2000ms,
+    you have 900ms remaining. That's enough for ONE retry (200ms wait +
+    max 700ms of the call). A third retry wouldn't fit.
+
+    PRACTICAL RULE: max_retries = floor(remaining_deadline / (timeout +
+    max_backoff)) after the first attempt.
+
+  Retry budget: 10% of traffic = 20 retries/sec at 200 rps.
+    At 0.3% baseline error rate: 0.6 failures/sec. Budget is ample.
+    At a 30% spike: 60 failures/sec. Only 20 get retried. Load on
+    gateway: 200 + 20 = 220 rps (+10%). Survivable.
+    Without budget: 60 × 2 retries = 120 extra rps. Load: 320 rps
+    (+60%). Might push gateway into deeper failure.
+
+  Backoff: base=100ms, exponential with full jitter.
+    delay = random(0, min(100 × 2^attempt, 2000))
+    Full jitter chosen because Stripe's rate limiter recovers quickly
+    (sub-second). You want retries spread across time, not bunched.
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 3: CIRCUIT BREAKER CONFIGURATION
+
+  Sliding window: TIME-BASED, 10 seconds, 1-second buckets.
+    WHY TIME-BASED, NOT COUNT-BASED:
+    At 200 rps, a count window of 100 calls = 0.5 seconds of traffic.
+    Too reactive — a 100ms network blip trips the breaker. A 10-second
+    window means transient blips are diluted by the surrounding healthy
+    traffic, but sustained failures (gateway down for 5+ seconds)
+    trip the breaker before too much damage is done.
+
+  Failure threshold: 40%.
+    WHY 40%:
+    Baseline error rate is 0.3%. Setting threshold at 40% means:
+    - Normal 0.3%: nowhere near tripping. Safe margin: 133× baseline.
+    - Gateway rate-limiting (5-10% errors): still below threshold.
+      Rate limiting is self-correcting; tripping the breaker would
+      block ALL charges, which is worse than the 10% that are failing.
+    - Gateway partially down (40%+ errors): breaker trips. At this
+      point, more than 1 in 3 charges is failing. Users are seeing
+      errors. Continuing to send traffic isn't helping.
+
+    WHY NOT 10% ("catch failures early"):
+    Stripe occasionally rate-limits during traffic spikes. A 10%
+    threshold would trip during normal Black Friday traffic when the
+    rate limiter kicks in for 30 seconds. You'd block ALL charges
+    during your highest-revenue hour.
+
+  Minimum calls in window: 50.
+    At 200 rps, 50 calls accumulate in 0.25 seconds. This prevents
+    tripping on 2 failures out of 3 calls during the first 15ms
+    after a deploy when traffic is ramping up.
+
+  Wait duration (OPEN → HALF-OPEN): 15 seconds, with ±5s jitter.
+    WHY 15 SECONDS:
+    Stripe's typical outage recovery is 10-60 seconds. 15 seconds
+    gives the gateway time to recover without making users wait
+    too long. Jitter prevents 20 instances from all probing at t=15.
+
+  HALF-OPEN probes: 5 requests.
+    Require 4/5 success to close. One success is weak evidence.
+    Five requests with 80% success threshold gives confidence the
+    gateway is actually healthy, not just sporadically responding.
+
+  FALLBACK when OPEN:
+    NOT cached data. NOT a default response. For payments, the only
+    safe fallback is:
+      1. Return a clear error: "Payment could not be processed.
+         Please try again in a moment."
+      2. Preserve the cart and idempotency key so the retry uses
+         the same key (preventing double charge on eventual success).
+      3. Optionally queue the charge for async processing with
+         explicit user consent ("We'll charge you when the system
+         recovers and email your confirmation").
+
+    NEVER silently succeed without actually charging. NEVER return
+    cached payment results. Financial operations have no safe
+    "degraded" mode — they either succeed or they don't.
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 4: BULKHEAD CONFIGURATION
+
+  Isolation type: Semaphore (not thread pool).
+    WHY: The payment service is async (Netty/Spring WebFlux/Node.js).
+    Thread pools don't apply. Semaphore limits concurrent in-flight
+    requests to the gateway.
+
+  Semaphore size: 40 permits.
+    CALCULATION (Little's Law):
+      Normal: L = λ × W = 200 rps × 0.12s (p50) = 24 concurrent.
+      Add safety margin: 24 × 1.7 = ~40 permits.
+
+    WHAT HAPPENS WHEN GATEWAY SLOWS TO 2 SECONDS:
+      L = 200 × 2.0 = 400 concurrent needed. Semaphore caps at 40.
+      Only 40 requests in-flight at once. The other 160 rps fail fast
+      with "service unavailable." That's 80% of charges failing, but
+      the OTHER endpoints (cart, inventory, search) are unaffected.
+      Without the bulkhead, all 200 rps pile up on the gateway,
+      consuming ALL server resources, and cart/search/everything dies.
+
+    AT BLACK FRIDAY (800 rps):
+      Normal concurrency: 800 × 0.12 = 96. Semaphore of 40 is too
+      small! Scale to: 800 × 0.12 × 1.7 = ~160 permits.
+      → This is why bulkhead size should be configurable per
+        environment, not hardcoded. Use an env var or config service.
+```
+
+---
+
+### 9.2 Background Job Processing (Queue Workers)
+
+A worker service that consumes jobs from a queue (SQS, RabbitMQ, Kafka) and calls external APIs to process them. Examples: sending emails via SendGrid, generating PDFs via a rendering service, processing webhook deliveries.
+
+```
+SYSTEM PROFILE:
+  Queue depth:       5,000 jobs average, 50,000 during spikes
+  Worker instances:  10 workers, each processing 20 concurrent jobs
+  Total throughput:  200 jobs/second
+  External API p99:  500ms (email), 2s (PDF), 300ms (webhook)
+  Job SLA:           process within 5 minutes of enqueue
+
+─────────────────────────────────────────────────────────────────────
+
+WHY QUEUES CHANGE THE RESILIENCE CALCULUS:
+
+  Synchronous (HTTP API):
+    User is waiting → latency matters → timeout must be tight.
+    If you fail, the user sees an error immediately.
+
+  Asynchronous (queue worker):
+    Nobody is waiting in real-time → latency is less critical.
+    If you fail, the job goes back on the queue and retries later.
+    The QUEUE ITSELF is a natural retry mechanism with built-in backoff.
+
+  This changes your resilience configuration significantly:
+
+  1. TIMEOUTS CAN BE LONGER (user isn't waiting):
+     Email API timeout: 10 seconds (vs. 2s for a synchronous call).
+     PDF generation timeout: 30 seconds (PDFs are legitimately slow).
+     Webhook delivery timeout: 5 seconds.
+
+     CALCULATION: your constraint is the job SLA (5 min), not user
+     patience. With 3 retry attempts and 30s timeout each:
+     worst case per job = 30 + 30 + 30 + backoff = ~2 minutes.
+     Well within the 5-minute SLA.
+
+  2. RETRY STRATEGY IS DIFFERENT:
+     Synchronous: retry immediately with exponential backoff (user
+     is waiting, every millisecond counts).
+
+     Queue worker: let the job fail, return it to the queue, and let
+     the queue's visibility timeout handle the retry delay.
+
+     SQS visibility timeout = backoff:
+       Attempt 1: immediate processing
+       Attempt 2: visibility timeout 30 seconds (job re-appears)
+       Attempt 3: visibility timeout 2 minutes
+       Attempt 4: visibility timeout 10 minutes
+       After max attempts: move to Dead Letter Queue (DLQ)
+
+     WHY THIS IS BETTER THAN IN-PROCESS RETRIES:
+     - If the worker crashes mid-retry, the job isn't lost (still
+       on the queue). In-process retries die with the process.
+     - The queue distributes retries across all workers. A slow
+       worker doesn't hold the job hostage.
+     - Backoff is per-job, managed by the queue, not per-worker.
+
+  3. CIRCUIT BREAKER MATTERS EVEN MORE:
+     Without a breaker, 200 jobs/sec hitting a dead email API means
+     200 timeouts/sec × 10s timeout = 2,000 concurrent stuck workers.
+     The queue backs up to 50,000, then 100,000, then the queue itself
+     hits limits (SQS: 120,000 in-flight, RabbitMQ: memory alarm).
+
+     With a breaker (trips at 50% failure rate):
+       Email API goes down → within 5 seconds, breaker opens.
+       Jobs that need email are immediately returned to the queue
+       with a short visibility timeout (30s). No timeout waiting.
+       Workers are free to process non-email jobs.
+       Every 30 seconds, a probe checks if email API is back.
+
+  4. BULKHEAD IS PER-JOB-TYPE, NOT PER-DEPENDENCY:
+     If your worker processes emails, PDFs, and webhooks:
+       Email pool:   8 concurrent (fast, high volume)
+       PDF pool:     4 concurrent (slow, lower volume)
+       Webhook pool: 8 concurrent (fast, high volume)
+
+     CALCULATION:
+       Email:   100 jobs/sec × 0.5s (p99) = 50 concurrent at p99.
+                But each worker handles 20 total → cap at 8 per type.
+       PDF:     20 jobs/sec × 2s (p99) = 40 concurrent at p99.
+                Cap at 4 per worker. PDFs are slow — don't let them
+                starve email and webhook processing.
+       Webhook: 80 jobs/sec × 0.3s (p99) = 24 concurrent at p99.
+                Cap at 8 per worker.
+
+     WHY THIS MATTERS:
+       If the PDF service hangs, only 4 threads are blocked.
+       Email and webhook processing continues at full speed.
+       Without per-type bulkheads: 20 slow PDF jobs block all 20
+       worker threads → no emails, no webhooks, everything stops.
+
+─────────────────────────────────────────────────────────────────────
+
+DEAD LETTER QUEUE (DLQ) — THE ULTIMATE FALLBACK:
+
+  After max retry attempts, the job moves to a DLQ.
+  A DLQ is NOT a trash can. It is an alerting and investigation tool.
+
+  REQUIRED SETUP:
+  1. Alert when DLQ depth > 0 (warning) and > 100 (page).
+  2. DLQ consumer that logs the job payload, failure reason, and
+     attempt count for investigation.
+  3. A replay mechanism: after fixing the root cause, replay DLQ
+     jobs back to the main queue with one command.
+  4. DLQ retention: 14 days. After that, jobs are gone.
+
+  DLQ MATH:
+    Normal DLQ rate: <0.01% of jobs (1 in 10,000).
+    If DLQ rate exceeds 1%: something is systematically broken.
+    If DLQ rate exceeds 10%: the external API has been down for
+    longer than your retry policy covers. Investigate immediately.
+```
+
+---
+
+### 9.3 LLM API Calls (OpenAI / Anthropic Integration)
+
+A service that calls an LLM API for features like summarization, content moderation, or chat. LLM APIs have unique resilience challenges: high latency variance, token-based rate limits, streaming responses, and cost per call.
+
+```
+SYSTEM PROFILE:
+  Traffic:           50 rps (content moderation on user posts)
+  API p50:           800ms (depends on prompt length and model)
+  API p95:           3 seconds
+  API p99:           8 seconds (long prompts, complex reasoning)
+  API rate limit:    1,000 requests/minute (org-level, shared)
+  API cost:          $0.003 per request average
+  Error rate:        0.5% (mostly 429 rate limits, occasional 500s)
+
+─────────────────────────────────────────────────────────────────────
+
+WHY LLM APIS ARE DIFFERENT FROM TYPICAL REST APIS:
+
+  1. LATENCY IS BIMODAL:
+     Short prompts (content moderation): 200-500ms.
+     Long prompts (summarization): 2-10 seconds.
+     A single timeout doesn't work. You need per-operation timeouts.
+
+  2. RATE LIMITS ARE ORG-LEVEL, NOT PER-INSTANCE:
+     If you have 10 instances each doing 50 rps, total = 500 rps.
+     Rate limit is 1,000 rpm (≈17 rps). You're already 30× over
+     the per-minute limit. Rate limiting is not an edge case — it's
+     your normal operating condition.
+
+  3. RETRIES ARE EXPENSIVE:
+     A typical REST API retry costs microseconds of compute.
+     An LLM API retry costs $0.003 (input tokens re-processed).
+     At 50 rps with a 5% retry rate: 2.5 retries/sec × $0.003
+     = $0.0075/sec = $648/day in wasted spend.
+     Retries need cost awareness, not just availability awareness.
+
+  4. STREAMING CHANGES TIMEOUT SEMANTICS:
+     Non-streaming: wait for complete response. Timeout = total.
+     Streaming: first token arrives in 200ms, then tokens stream
+     for 5 seconds. A 3-second timeout kills a valid streaming
+     response at 60% completion. You need:
+       - Time to first token timeout: 5 seconds
+       - Inter-token timeout: 2 seconds (if no token for 2s, abort)
+       - Total response timeout: 30 seconds (absolute cap)
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 1: TIMEOUT — PER OPERATION TYPE
+
+  Content moderation (short prompt, fast response):
+    Connect timeout: 3 seconds
+    Time to first token: 5 seconds
+    Total timeout: 10 seconds
+    Reasoning: p99 is ~3s. 10s = 3× p99, catches all normal responses
+    and only times out on genuine hangs.
+
+  Summarization (long prompt, slow response):
+    Connect timeout: 3 seconds
+    Time to first token: 15 seconds
+    Total timeout: 60 seconds
+    Reasoning: long prompts take 5-15s to start generating.
+    60s total covers a 4,000-token response at ~50 tokens/second.
+
+  THE MISTAKE EVERYONE MAKES:
+    Setting timeout = 10s for all LLM calls. Summarization times out
+    on every long document. The team raises the timeout to 60s. Now
+    content moderation (which should fail fast in 10s) blocks threads
+    for 60s when the API hangs. Per-operation timeouts are mandatory.
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 2: RETRY — COST-AWARE
+
+  Which errors to retry:
+    ✓ HTTP 429 (rate limited): ALWAYS. Respect Retry-After header.
+       OpenAI returns Retry-After in seconds. Wait that long.
+       If no Retry-After: exponential backoff starting at 1 second.
+    ✓ HTTP 500 (internal error): yes, but max 1 retry.
+       LLM APIs have genuine transient 500s (GPU allocation fails).
+    ✓ HTTP 503 (overloaded): yes, with longer backoff (5s base).
+    ✗ HTTP 400 (bad request): your prompt is malformed. Fix it.
+    ✗ HTTP 401 (unauthorized): API key invalid. No retry helps.
+    ✗ Timeout on streaming response at 80%+ completion:
+       DO NOT retry. You already have most of the response.
+       Use what you have or return partial results.
+       Retrying re-processes ALL input tokens = double the cost
+       for the last 20% of output.
+
+  Max retries: 1 for 500s, 2 for 429s.
+    WHY DIFFERENT:
+    429 means "slow down, try later" — it WILL work if you wait.
+    500 means "something broke" — a second try might work, a third
+    probably won't and costs $0.009 total.
+
+  Backoff for 429s: start at Retry-After value (or 1s), exponential.
+    delay = max(retry_after_header, base × 2^attempt)
+    Base = 1 second (not 100ms — LLM rate limits recover in seconds,
+    not milliseconds, and you're sharing the limit with other teams).
+
+  COST GUARDRAIL:
+    Track retry spend as a percentage of total LLM spend.
+    Alert if retry_cost / total_cost > 5%.
+    This catches: a bug that causes infinite retries of the same
+    failing prompt, a model version that returns 500 on specific
+    inputs (retrying the same input forever), and retry storms
+    from multiple instances hitting rate limits simultaneously.
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 3: CIRCUIT BREAKER — WITH RATE LIMIT AWARENESS
+
+  THE CRITICAL DISTINCTION:
+    HTTP 429 (rate limit) is NOT a failure of the dependency.
+    It is the dependency telling you to slow down. It is working
+    correctly. DO NOT count 429s toward the circuit breaker failure
+    rate. If you do, rate limiting trips your breaker, which blocks
+    ALL requests, including the ones that would have succeeded if
+    you'd just waited 1 second.
+
+  Failure threshold: 30% (counting only 500s and timeouts, NOT 429s).
+  Sliding window: 60 seconds (LLM APIs have longer recovery cycles).
+  Minimum calls: 20.
+
+    WHY 30%:
+    LLM APIs have higher baseline error rates than typical REST APIs
+    (GPU allocation failures, model loading delays). 30% means:
+    - Baseline 0.5% errors: 60× safety margin.
+    - Brief spike of 10% errors (model deployment): no trip.
+    - Sustained 30%+ errors: API is genuinely down. Trip.
+
+    WHY 60-SECOND WINDOW:
+    LLM API outages tend to last minutes, not seconds (GPU cluster
+    issues, model deployment rollbacks). A 10-second window would
+    cause the breaker to oscillate: trip, wait 30s, probe succeeds
+    (the API recovered briefly), close, trip again 5 seconds later.
+    A 60-second window smooths this out.
+
+  HALF-OPEN: 3 probes over 30 seconds (1 probe every 10s).
+    LLM APIs are expensive — don't probe aggressively.
+    Probes should use a CHEAP request (short prompt, fast model)
+    not a production workload. A content moderation check on a
+    10-word test input costs $0.0001 vs. $0.003 for a real request.
+
+  FALLBACK when OPEN:
+    Content moderation: queue posts for later moderation. Show to
+    users with a "pending review" flag. No auto-approve — that
+    defeats the purpose of moderation.
+
+    Summarization: return a truncated version (first 3 paragraphs)
+    with "Full summary temporarily unavailable."
+
+    Chat: return "I'm temporarily unavailable. Please try again
+    in a moment." NEVER fabricate a response without the LLM.
+
+─────────────────────────────────────────────────────────────────────
+
+STEP 4: RATE LIMITING — CLIENT-SIDE (YOU ARE THE CALLER)
+
+  THE UNIQUE PROBLEM: shared org-level rate limits.
+  If your limit is 1,000 rpm and you have 10 instances:
+    Each instance gets 1,000 / 10 = 100 rpm = ~1.7 rps.
+    But your traffic is 50 rps. That's 30× over the per-instance share.
+
+  SOLUTION: client-side rate limiter using a token bucket.
+
+    Token bucket (per instance):
+      Rate: 100 tokens/minute (your fair share)
+      Burst: 20 tokens (handle short spikes without hitting the limit)
+
+    When bucket is empty: queue the request and wait for a token,
+    up to a max queue wait of 5 seconds. If still no token after 5s,
+    fail the request (the system is trying to use the LLM faster
+    than the rate limit allows — this is a capacity problem, not
+    a resilience problem).
+
+  WHY NOT JUST RELY ON THE API'S 429 RESPONSE:
+    Every 429 wastes a network round trip (100-300ms) and counts
+    against your error metrics. Client-side rate limiting prevents
+    the request from ever leaving your service. It's faster (no
+    network hop), cheaper (no API call), and doesn't pollute your
+    error rate metrics.
+
+  COORDINATION ACROSS INSTANCES (advanced):
+    For precise rate limiting across 10 instances, use a Redis-backed
+    token bucket (shared state). Each instance checks Redis before
+    calling the API.
+
+    Redis overhead: 1-2ms per check. Acceptable for LLM calls
+    that take 800ms+ anyway.
+
+    If Redis is down: fall back to per-instance rate limiting
+    at (org_limit / instance_count). Less precise but functional.
+```
+
+---
+
+### 9.4 E-Commerce Product Page (Aggregation Service)
+
+A product page that aggregates data from 6 microservices in a single user-facing request. This is the canonical case for bulkheads and degraded responses.
+
+```
+SYSTEM PROFILE:
+  User SLA:          page loads in 800ms
+  Traffic:           2,000 rps peak
+
+  Dependencies and their profiles:
+  ┌────────────────────┬────────┬────────┬────────┬──────────────────┐
+  │  Service           │  p50   │  p99   │  Rate  │  Critical?       │
+  ├────────────────────┼────────┼────────┼────────┼──────────────────┤
+  │  Catalog           │  15ms  │  80ms  │  0.01% │  YES — no page   │
+  │  Pricing           │  20ms  │  100ms │  0.05% │  YES — no buy    │
+  │  Inventory         │  10ms  │  50ms  │  0.02% │  PARTIAL — show  │
+  │                    │        │        │        │  "check in store" │
+  │  Reviews           │  50ms  │  200ms │  0.1%  │  NO — omit       │
+  │  Recommendations   │  80ms  │  300ms │  0.3%  │  NO — omit       │
+  │  User profile      │  10ms  │  40ms  │  0.01% │  PARTIAL — show  │
+  │  (personalization) │        │        │        │  generic page     │
+  └────────────────────┴────────┴────────┴────────┴──────────────────┘
+
+─────────────────────────────────────────────────────────────────────
+
+TIMEOUT BUDGET (800ms total SLA):
+
+  The aggregation service calls dependencies in TWO PHASES:
+
+  Phase 1 — Critical (sequential, must succeed):
+    Catalog → Pricing → Inventory
+    Sequential worst case: 80 + 100 + 50 = 230ms (all at p99).
+    Budget: 400ms for all three, with 200ms per-call timeout.
+
+  Phase 2 — Non-critical (parallel, best-effort):
+    Reviews + Recommendations + User Profile (all in parallel)
+    Budget: 800 - 400 (phase 1) - 50 (own processing) = 350ms.
+    Per-call timeout: 350ms. Slowest parallel call determines phase
+    duration. Reviews p99 = 200ms, Recs p99 = 300ms, both fit.
+
+  WHY NOT CALL EVERYTHING IN PARALLEL:
+    You could — and many systems do. But pricing often depends on
+    catalog data (product ID → price lookup). And inventory depends
+    on pricing tier (wholesale vs. retail SKU). These dependencies
+    force sequential calls in Phase 1.
+
+    The key insight: parallelize what you can, sequence what you must,
+    and set a timeout for each phase that fits within the total budget.
+
+─────────────────────────────────────────────────────────────────────
+
+BULKHEAD SIZING (per dependency):
+
+  Total thread pool for the aggregation service: 400 threads.
+  At 2,000 rps with 50ms average processing: L = 2000 × 0.05 = 100
+  threads normally active. 400 gives 4× headroom.
+
+  PER-DEPENDENCY SEMAPHORES:
+
+  Catalog:         50 permits
+    L = 2000 × 0.015 (p50) = 30. Safety: 30 × 1.7 = 50.
+
+  Pricing:         60 permits
+    L = 2000 × 0.020 = 40. Safety: 40 × 1.5 = 60.
+
+  Inventory:       40 permits
+    L = 2000 × 0.010 = 20. Safety: 20 × 2.0 = 40.
+
+  Reviews:         30 permits
+    L = 2000 × 0.050 = 100. BUT reviews are non-critical.
+    Cap at 30 intentionally. If reviews are slow, let them fail.
+    Don't allocate 100 permits to a non-critical dependency.
+
+  Recommendations:  25 permits
+    Same logic. Non-critical → small bulkhead.
+
+  User Profile:    30 permits
+    L = 2000 × 0.010 = 20. Safety: 20 × 1.5 = 30.
+
+  TOTAL PERMITS: 50 + 60 + 40 + 30 + 25 + 30 = 235.
+    Less than the 400 thread pool. This is correct. Bulkheads limit
+    concurrency PER dependency. Even if all bulkheads are full
+    simultaneously, total is 235 — the thread pool survives.
+
+    THE MATH GUARANTEES SURVIVAL:
+    Sum of all bulkhead limits < total thread pool size.
+    This is the fundamental constraint. Violate it and bulkheads
+    provide no real isolation.
+
+─────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER CONFIGURATION (per dependency):
+
+  Critical dependencies (Catalog, Pricing):
+    Failure threshold:     60%
+    Sliding window:        10 seconds
+    Minimum calls:         100
+    Wait duration:         10 seconds ± 3s jitter
+
+    WHY 60% (high threshold):
+    Tripping the breaker on Catalog or Pricing means the ENTIRE
+    product page fails (no fallback for these). A false trip is
+    catastrophic. Only trip when the service is genuinely unusable.
+
+  Non-critical dependencies (Reviews, Recommendations):
+    Failure threshold:     25%
+    Sliding window:        10 seconds
+    Minimum calls:         50
+    Wait duration:         30 seconds ± 10s jitter
+
+    WHY 25% (low threshold):
+    Tripping the breaker on Reviews just removes the reviews widget.
+    The page still works. Trip aggressively — failing fast on a non-
+    critical dependency is better than spending 350ms timing out on
+    every request and slowing the page for everyone.
+
+  NOTICE THE ASYMMETRY:
+    Critical dependencies: high threshold (avoid false trips).
+    Non-critical dependencies: low threshold (trip fast, save latency).
+    This is the opposite of what most teams implement by default.
+
+─────────────────────────────────────────────────────────────────────
+
+FALLBACK STRATEGY (domain-specific):
+
+  Catalog down:        ERROR. Cannot render the product page without
+                       product data. Return 503 with "Product
+                       temporarily unavailable."
+
+  Pricing down:        ERROR or STALE with extreme caution.
+                       Option A: show "Price unavailable" with
+                       "Add to cart to see price." Safe but hurts
+                       conversion.
+                       Option B: show cached price with "Price as of
+                       Xm ago" and a 5-minute max staleness.
+                       After 5 minutes stale, switch to Option A.
+                       NEVER serve a stale price older than 5 minutes
+                       — prices change for flash sales, price drops,
+                       and competitive matching.
+
+  Inventory down:      Show "Check availability in store" or "Usually
+                       ships in 1-2 days." Allow add-to-cart — validate
+                       inventory at checkout (where it's checked again
+                       anyway).
+
+  Reviews down:        Hide the reviews section. Show star rating from
+                       cache if available (changes slowly, stale is OK).
+
+  Recommendations down: Hide the "You might also like" section.
+                        Show static "Popular products" from a daily
+                        cache instead.
+
+  User Profile down:   Show generic page (no personalization).
+                        "Hi there" instead of "Hi Harut."
+```
+
+---
+
+### 9.5 Microservice-to-Database (Internal Dependency)
+
+Your service's own database isn't usually thought of as a "dependency that needs a circuit breaker," but it's the most critical one. When the database is slow, your service is slow. When it's down, your service is down.
+
+```
+SYSTEM PROFILE:
+  Database:          PostgreSQL, primary + 2 read replicas
+  Connection pool:   20 connections (HikariCP / pgBouncer)
+  Query p50:         2ms
+  Query p99:         25ms
+  Slow query spike:  queries degrade to 500ms during vacuum or
+                     lock contention
+
+─────────────────────────────────────────────────────────────────────
+
+CONNECTION POOL = BUILT-IN BULKHEAD:
+
+  The connection pool IS a bulkhead. It limits concurrent database
+  calls to pool_size. When all connections are busy, new requests
+  wait in the pool's queue (or fail fast if the queue is full).
+
+  POOL SIZING (HikariCP formula):
+    connections = (core_count × 2) + effective_spindle_count
+    For a 4-core server with SSD: (4 × 2) + 1 = 9 connections.
+    Round up to 10-15 for safety.
+
+    WHY SO FEW (common surprise):
+    PostgreSQL connections are expensive. Each connection is a full
+    OS process (~10MB memory). 100 connections = 1GB memory on the
+    database server. Connection overhead causes more harm than the
+    parallelism helps.
+
+    At 2ms p50 query time: 10 connections serve 10/0.002 = 5,000
+    queries/second. More than enough for most services.
+
+    When queries degrade to 500ms: 10 connections serve 10/0.5 = 20
+    queries/second. Traffic above 20 qps either waits in the pool
+    queue or fails. This is the bulkhead protecting you — without
+    the pool limit, 1,000 connections would open and kill the DB.
+
+  POOL TIMEOUTS:
+    Connection acquisition timeout: 1 second.
+      If no connection is available from the pool in 1 second,
+      fail the request. Don't queue indefinitely — the pool is full
+      because the database is slow, and waiting longer just delays
+      the inevitable timeout.
+
+    Connection max lifetime: 30 minutes.
+      Prevents stale connections (TCP half-open, network changed,
+      DB failover). HikariCP rotates connections transparently.
+
+    Idle timeout: 10 minutes.
+      Release connections that haven't been used. Returns memory
+      to the database.
+
+─────────────────────────────────────────────────────────────────────
+
+CIRCUIT BREAKER ON THE DATABASE — YES OR NO?
+
+  CONTROVERSIAL OPINION: usually NO for your primary database.
+
+  WHY NOT:
+    If your database is down, your service is down. There's no
+    meaningful fallback. A circuit breaker that says "database is
+    down, returning fallback" — returning WHAT? Your service's data
+    IS the database.
+
+  WHEN YES:
+    - Read replicas: if a replica is slow, route reads to another
+      replica or the primary. The circuit breaker per replica enables
+      this routing.
+    - Caching layer: if you have a Redis cache in front of the DB,
+      a circuit breaker can switch reads to cache-only mode when
+      the DB is struggling.
+    - Separate read/write paths: circuit breaker on the write path
+      can queue writes while the DB is briefly unavailable, if you
+      can tolerate eventual consistency.
+
+  WHAT YOU SHOULD USE INSTEAD:
+    Statement timeout:     5 seconds per query.
+      Set at the connection level: SET statement_timeout = '5s'.
+      Prevents any single query from running for 10 minutes and
+      blocking other queries behind it.
+
+    Connection pool timeout: 1 second (as above).
+      Prevents thread pile-up when the pool is exhausted.
+
+    Health check query:    SELECT 1 every 30 seconds.
+      Detects dead connections before a real query hits them.
+      HikariCP does this automatically.
+
+    Slow query alerting:   Alert when p99 > 100ms.
+      Catch degradation before it becomes an outage.
+```
+
+---
+
+### 9.6 Third-Party Webhook Delivery (Outbound)
+
+Your service sends webhooks to customer-configured endpoints. Each customer's endpoint is a different dependency with unknown reliability. This is the hardest resilience problem because you control nothing about the destination.
+
+```
+SYSTEM PROFILE:
+  Customers:         5,000 webhook endpoints
+  Events:            500 events/second total
+  Delivery SLA:      "best effort, at-least-once, within 1 hour"
+  Customer endpoints: latency ranges from 50ms to 30 seconds
+                      availability ranges from 99.9% to 60%
+
+─────────────────────────────────────────────────────────────────────
+
+WHY THIS IS THE HARDEST CASE:
+
+  Every other example has a KNOWN dependency with MEASURABLE behavior.
+  Webhook endpoints are UNKNOWN, UNCONTROLLED, and WILDLY VARIABLE.
+
+  Customer A's endpoint: responds in 100ms, 99.99% uptime.
+  Customer B's endpoint: responds in 15 seconds, goes down for
+    hours at a time, returns HTML error pages instead of proper
+    status codes, has TLS certificates that expire every 3 months.
+
+  You need PER-CUSTOMER resilience, not global configuration.
+
+─────────────────────────────────────────────────────────────────────
+
+RETRY STRATEGY — DECAYING EXPONENTIAL:
+
+  Unlike payment processing (retry in milliseconds) or LLM APIs
+  (retry in seconds), webhooks use LONG backoff because:
+  1. Customer endpoints may be down for hours (deploy, maintenance).
+  2. At-least-once, within 1 hour is the SLA — not "within 5 seconds."
+  3. Aggressive retries to a dead endpoint waste YOUR resources.
+
+  RETRY SCHEDULE:
+    Attempt 1:   immediate
+    Attempt 2:   after 10 seconds
+    Attempt 3:   after 1 minute
+    Attempt 4:   after 5 minutes
+    Attempt 5:   after 15 minutes
+    Attempt 6:   after 30 minutes
+    Attempt 7:   after 1 hour
+    Attempt 8:   after 4 hours
+    After 8 attempts: disable the webhook endpoint, notify customer.
+
+  WHY THESE SPECIFIC INTERVALS:
+    10s and 1m:   catch transient failures (deploy restart, network
+                  blip). Most transient issues resolve in under 1 minute.
+    5m and 15m:   catch short maintenance windows.
+    30m and 1h:   catch extended outages while staying within SLA.
+    4h:           one final attempt before giving up.
+
+  EACH INTERVAL INCLUDES JITTER:
+    actual_delay = scheduled_delay × random(0.8, 1.2)
+    With 5,000 customers, even small synchronization causes bursts.
+
+─────────────────────────────────────────────────────────────────────
+
+PER-CUSTOMER CIRCUIT BREAKER:
+
+  You cannot have ONE circuit breaker for "all webhook deliveries."
+  Customer A's broken endpoint would trip the breaker and block
+  deliveries to Customer B, who is perfectly healthy.
+
+  Configuration (per customer):
+    Failure threshold: 80% (customer endpoints are unreliable;
+                       don't trip on 30% error rates — that's
+                       "normal" for some customers).
+    Sliding window:    10 minutes (longer than typical — customer
+                       endpoints recover slowly).
+    Minimum calls:     5 (some customers get 1 event/day; don't
+                       trip on 1 failure out of 2 calls).
+    Wait duration:     5 minutes (probe every 5 minutes; customer
+                       endpoints aren't worth probing every 15 seconds).
+
+  MEMORY CONSIDERATION:
+    5,000 customers × 1 circuit breaker each = 5,000 circuit breakers.
+    Each breaker stores: state (3 bytes), counters (~100 bytes),
+    timestamps (~24 bytes) = ~127 bytes × 5,000 = 620KB total.
+    Negligible memory. Scale concern is configuration management,
+    not memory.
+
+─────────────────────────────────────────────────────────────────────
+
+BULKHEAD — PER-CUSTOMER CONCURRENCY LIMIT:
+
+  Total delivery workers: 100 concurrent.
+  Per-customer limit:     3 concurrent deliveries.
+
+  WHY 3:
+    Customer B's endpoint takes 15 seconds to respond.
+    Without per-customer limits, B's deliveries consume:
+    events_for_B × 15s = potentially dozens of workers.
+    With a limit of 3: maximum 3 workers blocked by B.
+    The other 97 workers serve the remaining 4,999 customers.
+
+    If B has 50 pending events: 3 are in-flight, 47 are queued.
+    They'll be delivered eventually, at B's slow pace, without
+    affecting anyone else.
+
+─────────────────────────────────────────────────────────────────────
+
+TIMEOUT — GENEROUS BUT BOUNDED:
+
+  Connect timeout: 5 seconds.
+    Customer endpoints might be on slow infrastructure, behind
+    multiple proxies, or in distant regions. 5s is generous.
+
+  Read timeout: 15 seconds.
+    Some endpoints do heavy processing on receive (validate,
+    acknowledge, log). 15s accommodates slow but functional endpoints.
+
+  WHY NOT 30 OR 60 SECONDS:
+    A 30s timeout × 3 concurrent workers per customer = each slow
+    customer can block 3 workers for 30s each. At 100 total workers,
+    if 34 customers are slow simultaneously: 34 × 3 = 102 workers
+    blocked. Pool exhausted. Timeout of 15s halves the exposure:
+    same 34 customers block 3 workers for 15s each — workers recycle
+    2× faster, effective throughput is 2× higher.
+```
+
+---
+
+### 9.7 How to Derive Numbers for YOUR System
+
+Every number in the examples above was calculated, not guessed. Here's the general process:
+
+```
+STEP-BY-STEP: DERIVING YOUR RESILIENCE CONFIGURATION
+
+  1. MEASURE YOUR DEPENDENCIES (before configuring anything):
+
+     For each dependency, collect:
+     ┌───────────────────────────────────────────────────────────────┐
+     │  Metric              │  How to get it                        │
+     ├───────────────────────────────────────────────────────────────┤
+     │  p50 latency         │  Application metrics (Prometheus,     │
+     │  p95 latency         │  Datadog, etc.) — histogram of        │
+     │  p99 latency         │  response times over 7 days           │
+     │  p999 latency        │                                       │
+     ├───────────────────────────────────────────────────────────────┤
+     │  Error rate (%)      │  Count of 5xx / total requests.       │
+     │  Error types         │  Breakdown: timeout vs. 500 vs. 429.  │
+     │                      │  Each type may need different handling.│
+     ├───────────────────────────────────────────────────────────────┤
+     │  Traffic (rps)       │  Requests per second at p50 and peak. │
+     │  Peak traffic        │  Your resilience must work at peak,   │
+     │                      │  not at average.                      │
+     ├───────────────────────────────────────────────────────────────┤
+     │  Dependency recovery │  How long does this dependency take   │
+     │  time                │  to recover from failure? 5 seconds?  │
+     │                      │  5 minutes? This sets your circuit    │
+     │                      │  breaker wait duration.               │
+     └───────────────────────────────────────────────────────────────┘
+
+  2. CALCULATE TIMEOUT (from latency data):
+     timeout = p99 × multiplier
+
+     multiplier choices:
+       2× p99: aggressive. ~0.5% of healthy requests timeout.
+               Use for non-critical, latency-sensitive calls.
+       3× p99: balanced. ~0.1% of healthy requests timeout.
+               Default choice for most dependencies.
+       5× p99: conservative. Almost never false-timeouts.
+               Use for critical ops where a false timeout is expensive.
+
+     SANITY CHECK: timeout × peak_rps < thread_pool_size.
+     If not, either lower the timeout or increase the pool.
+
+  3. CALCULATE BULKHEAD SIZE (from Little's Law):
+     permits = peak_rps × p50_latency × safety_margin
+
+     safety_margin choices:
+       1.5×: tight. May hit the limit during p99 latency spikes.
+       2.0×: balanced. Handles normal variance.
+       3.0×: generous. Use for critical dependencies.
+
+     SANITY CHECK: sum(all_bulkheads) < total_thread_pool.
+
+  4. CALCULATE CIRCUIT BREAKER THRESHOLD:
+     threshold = max(baseline_error_rate × 10, 25%)
+
+     The 10× rule: your threshold should be at least 10× above
+     baseline. This prevents tripping on normal variance while
+     still catching genuine failures.
+
+     Floor of 25%: even with a 0.01% baseline, don't set the
+     threshold below 25%. Too sensitive.
+
+     Ceiling of 80%: above 80%, the dependency is so broken that
+     you're losing most requests anyway. The breaker adds limited
+     value but may still prevent resource exhaustion.
+
+  5. CALCULATE RETRY BUDGET:
+     budget_rps = peak_rps × 0.10
+
+     10% is the Google SRE default. Adjust:
+       5%  for fragile dependencies (barely handling current load).
+       15% for robust dependencies (significant headroom).
+
+  6. CALCULATE BACKOFF BASE:
+     base_delay = dependency_recovery_time / max_retries / 3
+
+     If the dependency typically recovers in 30 seconds and you have
+     3 retries: base = 30 / 3 / 3 = 3.3 seconds.
+     This spaces retries across the recovery window.
+
+     For fast-recovering dependencies (< 1 second): base = 100ms.
+     For slow-recovering dependencies (> 1 minute): use queue-based
+     retry (SQS, Kafka) instead of in-process backoff.
+
+  7. VALIDATE WITH LOAD TESTING:
+     All calculations above are estimates. Validate by:
+     a. Running at peak traffic.
+     b. Injecting the failure mode each pattern targets.
+     c. Measuring: does the pattern behave as calculated?
+     d. Adjusting numbers based on observed behavior.
+
+     THE MOST COMMON ADJUSTMENTS AFTER TESTING:
+     - Bulkhead too small: increased from 1.5× to 2.5× safety.
+     - Circuit breaker too sensitive: raised threshold from 30% to 50%.
+     - Timeout too short: raised from 2× p99 to 3× p99.
+     - Retry backoff too aggressive: base from 100ms to 500ms.
+```
+
+---
+
+## 10. Interview Preparation — Resilience Patterns
 
 Questions designed to test real-world judgment at the mid-to-staff engineer level. For each question, think through the answer before reading the guidance. The best answers demonstrate tradeoff reasoning, not pattern memorization.
 
