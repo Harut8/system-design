@@ -20,7 +20,8 @@ Prerequisites: familiarity with reliability patterns from `33-resilience-pattern
 10. [Graceful Degradation Under Load](#10-graceful-degradation-under-load)
 11. [Recovery from Overload and Metastability](#11-recovery-from-overload-and-metastability)
 12. [Production Design Tradeoff Matrix](#12-production-design-tradeoff-matrix)
-13. [Interview Preparation — Adaptive Load Control & Backpressure](#13-interview-preparation--adaptive-load-control--backpressure)
+13. [Cloud-Native Ownership — App vs. Infra vs. Hybrid](#13-cloud-native-ownership--app-vs-infra-vs-hybrid)
+14. [Interview Preparation — Adaptive Load Control & Backpressure](#14-interview-preparation--adaptive-load-control--backpressure)
 
 ---
 
@@ -1818,7 +1819,1818 @@ The most dangerous configuration is having only one layer of defense. If your on
 
 ---
 
-## 13. Interview Preparation — Adaptive Load Control & Backpressure
+## 13. Cloud-Native Ownership — App vs. Infra vs. Hybrid
+
+The previous sections describe what mechanisms exist. This section answers the question production engineers actually fight about: **who owns each mechanism?** In a cloud-native Kubernetes environment with message queues, the boundary between application team and platform/infra team is precise, not blurry. Getting this wrong means either gaps (nobody owns the mechanism, it is not configured) or conflicts (both teams configure it differently, they interfere).
+
+### 13.1 The Ownership Principle
+
+```
+THE LINE:
+
+  If the decision requires DOMAIN KNOWLEDGE    → app team owns it.
+  If the decision requires INFRASTRUCTURE KNOWLEDGE → infra/platform team owns it.
+  If it requires BOTH → app team sets the POLICY, infra team ENFORCES it.
+
+  EXAMPLES:
+
+  "Which requests are sheddable?"
+    → Requires domain knowledge (is this a checkout or an analytics query?)
+    → APP owns it.
+
+  "How many pods should run?"
+    → Requires infrastructure knowledge (cluster capacity, node sizing)
+    → INFRA owns it.
+
+  "What is the rate limit per tenant?"
+    → Requires domain knowledge (tier, SLA, revenue)
+    → APP team defines the values.
+    → INFRA team enforces them (Istio, NGINX, API gateway config).
+    → HYBRID.
+```
+
+### 13.2 Full Ownership Map — Kubernetes + Message Queues
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     INFRA / PLATFORM TEAM OWNS                       │
+│                                                                      │
+│  KUBERNETES:                                                         │
+│    HPA autoscaling rules (CPU/memory targets, min/max replicas)      │
+│    Resource limits and requests (cpu, memory per container)          │
+│    Pod disruption budgets                                            │
+│    Network policies                                                  │
+│    Ingress controller operations (NGINX, Istio gateway)             │
+│    Node pool sizing and instance types                               │
+│    Namespace quotas                                                  │
+│                                                                      │
+│  SERVICE MESH (Istio / Linkerd):                                     │
+│    mTLS between services                                             │
+│    Mesh-level retry policies (coarse: "retry 503s once")            │
+│    Outlier detection (eject pods with >5% error rate)               │
+│    Traffic shifting (canary, blue-green weight)                      │
+│    Global rate limiting enforcement                                  │
+│                                                                      │
+│  MESSAGE INFRASTRUCTURE:                                             │
+│    Kafka broker cluster operations (broker count, disk, replication) │
+│    RabbitMQ cluster nodes, HA policies, mirroring                    │
+│    Redis cluster / sentinel operations, memory limits               │
+│    Topic/queue/exchange provisioning automation                      │
+│    Retention policies, compaction                                    │
+│    Schema registry infrastructure                                    │
+│    Dead-letter queue infrastructure (DLQ exists, routing configured) │
+│    Monitoring infrastructure (consumer lag dashboards)               │
+│                                                                      │
+│  DATABASE:                                                           │
+│    PgBouncer / ProxySQL (connection pooler between app and DB)       │
+│    max_connections tuning                                            │
+│    Read replica provisioning and failover                            │
+│    Backup, PITR, disaster recovery                                   │
+│    Instance sizing (RDS instance class, disk IOPS)                   │
+│                                                                      │
+│  OBSERVABILITY:                                                      │
+│    Prometheus / Datadog / Grafana infrastructure                     │
+│    Log aggregation pipeline (Loki, ELK, Fluentd)                    │
+│    Distributed tracing backend (Jaeger, Tempo)                       │
+│    Alert routing infrastructure (PagerDuty, OpsGenie integration)   │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                     APP / BACKEND TEAM OWNS                          │
+│                                                                      │
+│  FASTAPI / APPLICATION CODE:                                         │
+│    Concurrency limits (asyncio.Semaphore, --limit-concurrency)      │
+│    Admission control logic (accept/reject based on capacity)        │
+│    Deadline propagation (set and check X-Request-Deadline headers)  │
+│    Priority classification (which requests are CRITICAL vs SHEDDABLE)│
+│    Per-tenant fairness logic (weighted fair queuing in middleware)   │
+│    Graceful degradation (feature flags, response fidelity reduction) │
+│    Backpressure signaling (429 + Retry-After response semantics)    │
+│    Connection pool sizing per pod (SQLAlchemy pool_size)            │
+│    Query timeouts (SET statement_timeout in queries)                │
+│    Application-level circuit breakers with domain-aware fallbacks   │
+│    Request validation and input size limits                          │
+│    Cost estimation per request type                                  │
+│                                                                      │
+│  HEALTH/READINESS ENDPOINT LOGIC:                                    │
+│    What "healthy" means (infra hosts the probe, app defines it)     │
+│    Readiness: "can I serve traffic?" (check DB pool, cache, deps)   │
+│    Liveness: "is my process stuck?" (event loop responsive)         │
+│    Startup: "have I finished initializing?" (cache warmed, etc.)    │
+│                                                                      │
+│  KAFKA CONSUMER CODE:                                                │
+│    Consumer group design and partition assignment strategy            │
+│    Partition key strategy (determines ordering and parallelism)      │
+│    max.poll.records (batch size per poll — controls throughput)      │
+│    Consumer pause() / resume() logic (application-level backpressure)│
+│    Offset commit strategy (at-least-once vs exactly-once semantics) │
+│    Deserialization, processing, and error handling                    │
+│    Dead-letter topic HANDLING logic (what to do with failed msgs)   │
+│    Idempotency in consumer processing                                │
+│                                                                      │
+│  RABBITMQ CONSUMER CODE:                                             │
+│    prefetch_count (QoS) — THE most important backpressure knob      │
+│    ack / nack / reject semantics per message type                   │
+│    Queue declaration, binding, and routing key design                │
+│    TTL per message or per queue (application SLA)                    │
+│    Publisher confirms (producer-side reliability)                     │
+│    Consumer concurrency (how many messages processed in parallel)    │
+│    Dead-letter exchange routing logic                                 │
+│                                                                      │
+│  CELERY / REDIS-BACKED WORKERS:                                      │
+│    Task routing (which queue for which task type)                    │
+│    rate_limit per task class ("100/m" for email, unlimited for pay)  │
+│    acks_late + reject_on_worker_lost (at-least-once delivery)       │
+│    Task result backend choice (Redis, DB, or disabled)               │
+│    Max queue length enforcement (LLEN check before enqueue)          │
+│    Worker concurrency and prefork/eventlet/gevent selection          │
+│    Task retry policy (max_retries, backoff, jitter)                  │
+│    Task priority routing (separate queues for critical vs bulk)     │
+│                                                                      │
+│  OBSERVABILITY CONTENT:                                              │
+│    What metrics to emit (latency histograms, error rates by type)   │
+│    Alert thresholds (p99 > 200ms → warning, > 500ms → page)        │
+│    SLO definitions (99.9% of requests < 300ms)                       │
+│    Dashboard content (per-tenant latency, per-endpoint throughput)  │
+│    Structured log content (trace IDs, tenant IDs, request cost)     │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.3 Why the App MUST Own Admission Control, Priority, and Degradation
+
+Infra can throttle traffic. Only the app knows what the traffic **means**.
+
+```
+WHAT INFRA SEES vs. WHAT THE APP KNOWS:
+
+  ┌──────────────────────────┬────────────────────────────────────────┐
+  │ Infra sees               │ App knows                              │
+  ├──────────────────────────┼────────────────────────────────────────┤
+  │ POST /api/v1/orders      │ $50,000 enterprise order from Tenant A│
+  │ (an HTTP request)        │ needs fraud check + inventory          │
+  │                          │ reservation + payment auth.            │
+  │                          │ Priority: CRITICAL. Cost: 500ms.       │
+  ├──────────────────────────┼────────────────────────────────────────┤
+  │ CPU at 85%               │ 80% of CPU is processing SHEDDABLE    │
+  │ (a resource metric)      │ analytics batch jobs. The CRITICAL     │
+  │                          │ order path uses 5% CPU. Shedding       │
+  │                          │ analytics frees 80% capacity.          │
+  ├──────────────────────────┼────────────────────────────────────────┤
+  │ Kafka consumer lag:      │ 49,950 are notification emails (can    │
+  │ 50,000 messages          │ wait 30 min). 50 are payment events   │
+  │ (a queue depth)          │ that need processing in <5 seconds.    │
+  │                          │ Scaling consumers helps emails but     │
+  │                          │ the payment events need priority       │
+  │                          │ routing to a dedicated consumer group. │
+  ├──────────────────────────┼────────────────────────────────────────┤
+  │ 429 from downstream      │ The 429 is from a recommendation      │
+  │ (an HTTP error)          │ service. The product page can render   │
+  │                          │ without recommendations. Serve a       │
+  │                          │ degraded page. Do NOT fail the request.│
+  ├──────────────────────────┼────────────────────────────────────────┤
+  │ Database connections:    │ 40 connections held by a reporting      │
+  │ 48/50 used               │ query that runs every hour. Killing    │
+  │ (pool exhaustion)        │ the report frees 40 connections.       │
+  │                          │ Infra would scale pods (making it      │
+  │                          │ worse — more pods = more connections). │
+  └──────────────────────────┴────────────────────────────────────────┘
+
+  CONSEQUENCE:
+    Infra-only autoscaling cannot make these decisions.
+    An HPA that scales on CPU would ADD pods when analytics consume
+    85% CPU, creating MORE database connections and making the DB
+    problem WORSE. Only the app knows that shedding analytics
+    (not adding pods) is the correct response.
+```
+
+### 13.4 The Hybrid Mechanisms — Who Sets Policy vs. Who Enforces
+
+These are the mechanisms that cause the most team friction because both teams must participate:
+
+```
+HYBRID OWNERSHIP — POLICY vs. ENFORCEMENT:
+
+  ┌──────────────────────┬─────────────────────┬────────────────────────┐
+  │ Mechanism            │ App team sets        │ Infra team enforces    │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Rate limiting        │ Rate values per      │ NGINX limit_req_zone,  │
+  │                      │ tenant/tier/endpoint │ Istio EnvoyFilter,     │
+  │                      │ (free=10, biz=100,   │ Kong rate-limiting     │
+  │                      │ enterprise=1000 RPS) │ plugin                 │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Connection pool      │ pool_size per pod    │ PgBouncer max_client   │
+  │ sizing               │ based on query       │ _conn, PostgreSQL      │
+  │                      │ profile and latency  │ max_connections.       │
+  │                      │                      │ ALL THREE must agree.  │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Autoscaling          │ Which metric to scale│ HPA configuration,     │
+  │                      │ on (CPU? queue depth?│ KEDA ScaledObject,     │
+  │                      │ custom metric?) and  │ cluster autoscaler     │
+  │                      │ min/max replicas     │ node provisioning      │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Resource limits      │ Memory/CPU needs per │ Kubernetes resource    │
+  │                      │ pod based on load    │ limits/requests in     │
+  │                      │ testing data         │ deployment manifests   │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Health probes        │ Endpoint logic:      │ Probe configuration:   │
+  │                      │ what checks to run,  │ path, port, interval,  │
+  │                      │ what "unhealthy"     │ timeout, threshold     │
+  │                      │ means for this       │ in pod spec            │
+  │                      │ service              │                        │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Kafka partitioning   │ Partition key        │ Initial partition      │
+  │                      │ strategy, requested  │ count, broker resource │
+  │                      │ partition count for  │ allocation,            │
+  │                      │ throughput target     │ rebalancing operations │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Alerting             │ Alert thresholds:    │ Alert routing:         │
+  │                      │ p99 > 200ms = warn,  │ PagerDuty integration, │
+  │                      │ error rate > 1% =    │ escalation policies,   │
+  │                      │ page                 │ on-call schedules      │
+  ├──────────────────────┼─────────────────────┼────────────────────────┤
+  │ Retry policy         │ Which errors to      │ Istio/Envoy retry      │
+  │ (mesh-level)         │ retry, retry budget, │ configuration in       │
+  │                      │ idempotency          │ VirtualService or      │
+  │                      │ requirements         │ DestinationRule        │
+  └──────────────────────┴─────────────────────┴────────────────────────┘
+
+  THE COORDINATION CONTRACT:
+
+  When the app team sizes their connection pool:
+    App:  pool_size=20, max_overflow=10 per pod → 30 max per pod
+    Infra: 10 pods × 30 = 300 connections needed
+
+  PgBouncer must accept ≥ 300.
+  PostgreSQL max_connections must accept PgBouncer's pool.
+  Plus headroom for:
+    - Rolling deploys (11th pod briefly runs)
+    - DBA connections (psql, migrations)
+    - Monitoring (pg_stat_activity, Datadog)
+    - Connection pooler overhead
+
+  If ANY of these three numbers is wrong, the system breaks
+  under load. This is a contract between three teams (app, platform, DBA).
+```
+
+### 13.5 Message Queue Backpressure — The App-Side Knobs That Matter
+
+In Kafka, RabbitMQ, and Redis-backed queues, the infra team provisions the infrastructure. The app team controls how fast messages are consumed and what happens when the consumer falls behind. These knobs are the most important and most frequently misconfigured:
+
+```
+KAFKA — App-Side Backpressure Controls:
+
+  1. max.poll.records (default: 500)
+     How many records consumer.poll() returns per call.
+     Lower = less memory per batch, more frequent commits.
+     Higher = better throughput, risk of rebalance timeout.
+
+     BACKPRESSURE EFFECT:
+       If processing 500 records takes 30s but max.poll.interval.ms is 5min,
+       the consumer is slow but alive. If it takes 6 minutes, the consumer
+       is kicked from the group → rebalance → lag spikes.
+
+  2. Consumer pause() and resume()
+     The app can pause individual partitions when overwhelmed:
+
+       # Pseudo-code for Kafka consumer backpressure
+       while True:
+           records = consumer.poll(timeout=1.0)
+           if database_pool.active_connections > threshold:
+               consumer.pause(assigned_partitions)
+               # Stop fetching until DB pressure drops
+           elif consumer.paused():
+               consumer.resume(paused_partitions)
+           process(records)
+
+     This is APPLICATION-LEVEL backpressure that infra cannot provide.
+     The broker does not know your database is overloaded.
+
+  3. Partition key strategy (determines parallelism ceiling)
+     If all messages have the same key → one partition → one consumer max.
+     No amount of infra scaling helps. This is a design decision
+     the app team makes at message production time.
+
+RABBITMQ — App-Side Backpressure Controls:
+
+  1. prefetch_count (QoS) — THE critical knob
+     How many unacknowledged messages the broker sends to a consumer.
+
+     prefetch_count = 1:
+       Consumer processes one message at a time.
+       Maximum backpressure. Minimum throughput.
+       Broker holds all other messages until ack.
+       SAFE for expensive, failure-prone processing.
+
+     prefetch_count = 50:
+       Consumer buffers 50 messages locally.
+       Good throughput. But if consumer crashes,
+       50 messages are redelivered (nack + requeue).
+       Risk of duplicate processing without idempotency.
+
+     prefetch_count = 0 (unlimited):
+       Broker sends ALL messages as fast as possible.
+       Consumer memory grows without bound.
+       NO backpressure. The consumer will OOM.
+       NEVER use 0 in production.
+
+     SIZING RULE:
+       prefetch_count ≈ consumer_throughput × processing_latency
+       If consumer processes 100 msg/s at 50ms each:
+         prefetch_count = 100 * 0.05 = 5
+       Set it to 2-3x this for burst headroom: 10-15.
+
+  2. ack / nack / reject semantics
+     ack:    message processed successfully. Remove from queue.
+     nack:   processing failed. Requeue (retry) or dead-letter.
+     reject: permanently reject. Route to dead-letter exchange.
+
+     APP DECIDES which errors are retryable (nack + requeue)
+     vs. permanent (reject → DLX). Infra cannot make this decision.
+
+     Example:
+       JSON parse error → reject (retrying won't fix bad data)
+       Database timeout  → nack + requeue (transient, retry may work)
+       Business rule violation → reject + log for human review
+
+REDIS / CELERY — App-Side Backpressure Controls:
+
+  1. Queue length enforcement (Redis has NO built-in limit)
+     Redis lists grow without bound. The APP must check before enqueue:
+
+       queue_length = redis.llen("celery_queue")
+       if queue_length > MAX_QUEUE_LENGTH:
+           raise HTTPException(status_code=429, detail="Queue full")
+       # else enqueue the task
+
+     WITHOUT this check, Redis memory grows until:
+       maxmemory-policy = noeviction → writes fail (producer errors)
+       maxmemory-policy = allkeys-lru → QUEUE DATA IS SILENTLY EVICTED
+
+  2. rate_limit per task class
+     Celery supports per-task rate limits:
+
+       @app.task(rate_limit="100/m")    # max 100 emails per minute
+       def send_notification_email(user_id):
+           ...
+
+       @app.task(rate_limit=None)       # unlimited for critical path
+       def process_payment(order_id):
+           ...
+
+     This is application-level traffic shaping that the infra
+     team cannot configure (they don't know which tasks are
+     rate-sensitive).
+
+  3. Task priority via queue routing
+     Instead of one queue, route by priority:
+
+       CELERY_TASK_ROUTES = {
+           "payments.*":       {"queue": "critical"},
+           "notifications.*":  {"queue": "normal"},
+           "analytics.*":      {"queue": "bulk"},
+       }
+
+     Run dedicated workers per queue with different concurrency:
+       celery -A app worker -Q critical --concurrency=20
+       celery -A app worker -Q normal  --concurrency=10
+       celery -A app worker -Q bulk    --concurrency=2
+
+     This is a BULKHEAD pattern implemented at the queue level.
+     Critical payment processing is isolated from bulk analytics.
+```
+
+### 13.6 The Complete Cloud-Native Request Path — Who Owns What
+
+```
+                     INFRA OWNS                           APP OWNS
+                     ──────────                           ────────
+  Internet
+      │
+      ▼
+  ┌──────────┐
+  │ Cloud LB │  ← DDoS protection, TLS termination,
+  │ (ALB/NLB)│    connection limits, health routing
+  └────┬─────┘
+       │
+       ▼
+  ┌──────────┐
+  │ Ingress  │  ← TLS, routing rules,                  ← rate limit VALUES
+  │ (NGINX / │    request size enforcement                per tenant/tier
+  │  Istio)  │                                            (app defines,
+  └────┬─────┘                                             infra enforces)
+       │
+       ▼
+  ┌──────────┐
+  │ K8s Pod  │  ← resource limits, HPA scaling,        ← readiness endpoint
+  │          │    disruption budgets, scheduling          LOGIC (what checks)
+  │ ┌──────┐ │
+  │ │Uvicorn│ │  ← worker count (ops tunes based       ← --limit-concurrency
+  │ │      │ │    on load testing data from app),         (app sizes to their
+  │ │      │ │    --limit-max-requests (recycling)        workload profile)
+  │ │ ┌────┤ │
+  │ │ │Fast│ │                                          ← admission control
+  │ │ │API │ │                                          ← deadline propagation
+  │ │ │    │ │                                          ← priority routing
+  │ │ │    │ │                                          ← per-tenant fairness
+  │ │ │    │ │                                          ← graceful degradation
+  │ │ │    │ │                                          ← 429 + Retry-After
+  │ │ │    │ │                                          ← circuit breakers
+  │ │ └────┘ │                                            with domain fallbacks
+  │ └──────┘ │
+  └────┬─────┘
+       │
+       ├──────────────────────────┐
+       │                          │
+       ▼                          ▼
+  ┌──────────┐             ┌───────────┐
+  │PgBouncer │  ← pooler   │ Redis     │  ← cluster ops,
+  │          │    ops,      │           │    maxmemory
+  │          │    failover  │           │
+  └────┬─────┘             └─────┬─────┘
+       │                         │
+       ▼                         ▼
+  ┌──────────┐             ┌───────────┐
+  │PostgreSQL│  ← instance │ Kafka     │  ← broker ops,
+  │  (RDS)   │    sizing,  │           │    partitions,
+  │          │    backups   │           │    retention
+  └──────────┘             └───────────┘
+
+  APP OWNS for DB:                    APP OWNS for queues:
+    pool_size per pod                   consumer group design
+    query timeouts                      max.poll.records
+    slow query optimization             prefetch_count (RabbitMQ)
+    index design                        ack/nack/reject logic
+    read vs write routing               pause()/resume()
+                                        queue length enforcement
+                                        task priority routing
+```
+
+### 13.7 Common Ownership Failures
+
+These are the real-world incidents that happen when the boundary is wrong:
+
+```
+FAILURE 1: Infra auto-scales during DB connection saturation
+
+  Symptom:  Database connection errors under load.
+  Infra:    "CPU is high, HPA scaled from 5 to 15 pods."
+  Result:   5 pods × 30 conn = 150 (OK) → 15 pods × 30 conn = 450 (exceeds max_connections=200)
+  Cause:    HPA scaled on CPU without considering database connection budget.
+  Fix:      App team must define max replicas based on DB connection headroom.
+            HPA max replicas = floor(max_connections * 0.7 / pool_size_per_pod)
+            With max_connections=200 and pool_size=30: max replicas = floor(140/30) = 4
+
+FAILURE 2: Mesh-level retries amplify database overload
+
+  Symptom:  Database is slow. Error rate spikes to 90%.
+  Infra:    Istio VirtualService has "retries: attempts: 3" for all services.
+  Result:   Each failed DB-bound request is retried 3x at the mesh level.
+            The app also retries internally. Total: 3 × 3 = 9 attempts per request.
+            Database receives 9x normal load during the slowdown.
+  Cause:    Mesh-level retry is too broad. It doesn't know which errors are retryable.
+  Fix:      Mesh retries should ONLY retry on 503 and connection resets.
+            App-level retries handle business logic (idempotency, backoff).
+            Never retry at both layers for the same failure.
+
+FAILURE 3: Kafka consumer scales but throughput doesn't increase
+
+  Symptom:  Consumer lag is 500,000 messages. KEDA scaled to 20 consumers.
+            Lag is not decreasing.
+  Infra:    "We added more consumers. Why isn't it faster?"
+  Cause:    Topic has 4 partitions. Maximum parallelism is 4 consumers.
+            16 of the 20 consumers are idle (no partitions assigned).
+  Fix:      APP team should have requested partition count matching
+            their throughput target at topic creation time.
+            Partition count = target_throughput / per_consumer_throughput
+            If each consumer handles 1000 msg/s and target is 20,000:
+            partitions = 20,000 / 1,000 = 20
+
+FAILURE 4: Redis maxmemory evicts queue data silently
+
+  Symptom:  Celery tasks are disappearing. No errors in logs.
+  Infra:    Redis maxmemory-policy is allkeys-lru. Memory at 100%.
+  Result:   Redis evicts the oldest list entries (queued tasks) to make
+            room for new ones. Tasks silently vanish.
+  Cause:    App team did not enforce max queue length before enqueue.
+            Infra team set eviction policy without understanding that
+            Redis is being used as a queue (not just a cache).
+  Fix:      App: enforce queue length (LLEN check before LPUSH).
+            Infra: set maxmemory-policy to noeviction for Redis
+            instances used as task queues. Writes fail loudly
+            instead of silently evicting.
+
+FAILURE 5: Health probe kills pods under legitimate load
+
+  Symptom:  During traffic spikes, pods restart repeatedly.
+  Infra:    Liveness probe: GET /health, timeout 3s, period 10s,
+            failure threshold 3.
+  Result:   Under heavy load, /health handler (which queries the DB)
+            takes 4 seconds. Probe fails. After 3 failures (30 seconds),
+            Kubernetes restarts the pod. Cold restart + cache warming
+            takes 30 seconds. Pod absorbs less load. Other pods get
+            more traffic. They also start failing health checks.
+            Cascading pod restarts.
+  Cause:    App team put DB checks in the liveness probe.
+            Liveness should ONLY check "is the process stuck?"
+            Readiness checks "can I serve traffic?"
+  Fix:      Liveness: simple in-process check (return 200, no I/O).
+            Readiness: check DB connection, cache, downstream deps.
+            Failed readiness → stop traffic (don't restart the pod).
+            Failed liveness → restart (process is deadlocked).
+```
+
+### 13.8 The Coordination Checklist
+
+Before any production deployment, these numbers must be coordinated across teams:
+
+```
+COORDINATION CHECKLIST:
+
+  Database Connections:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ App:  pool_size × max_pods = ___  connections needed         │
+  │ Infra: PgBouncer max_client_conn = ___                      │
+  │ DBA:  max_connections = ___                                  │
+  │                                                              │
+  │ RULE: max_connections > PgBouncer pool > (pool_size × pods)  │
+  │       with 30% headroom for deploys + admin + monitoring     │
+  └──────────────────────────────────────────────────────────────┘
+
+  Autoscaling:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ App:  max_replicas limited by DB connections? ___            │
+  │ App:  max_replicas limited by downstream rate limits? ___    │
+  │ Infra: HPA min/max replicas = ___                           │
+  │ Infra: scale-up stabilization window = ___                  │
+  │ Infra: scale-down stabilization window = ___                │
+  │                                                              │
+  │ RULE: max_replicas ≤ min(DB budget, downstream budget,      │
+  │       cluster capacity) / per_pod_resource_usage             │
+  └──────────────────────────────────────────────────────────────┘
+
+  Message Queues:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ App:  expected throughput = ___ msg/s                        │
+  │ App:  per-consumer throughput = ___ msg/s                    │
+  │ Infra: partition count = ___ (must ≥ max consumer count)    │
+  │ Infra: retention = ___ hours                                │
+  │ Infra: broker disk = ___ GB (retention × throughput × msg)  │
+  │                                                              │
+  │ RULE: partitions ≥ target_throughput / per_consumer_rate    │
+  │       with room for 2-3x traffic spikes                     │
+  └──────────────────────────────────────────────────────────────┘
+
+  Rate Limiting:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ App:  actual sustainable throughput = ___ RPS                │
+  │ App:  per-tenant limits = ___                               │
+  │ Infra: ingress rate limit = ___ RPS                         │
+  │                                                              │
+  │ RULE: ingress_limit ≤ actual_throughput                     │
+  │       (never rate-limit above what the service can handle)  │
+  │       sum(per_tenant_limits) may exceed total capacity      │
+  │       (statistical multiplexing — not all tenants peak      │
+  │       simultaneously), but each individual limit must be    │
+  │       ≤ total capacity                                      │
+  └──────────────────────────────────────────────────────────────┘
+
+  Health Probes:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ App:  liveness checks = ___ (process health only, no I/O)   │
+  │ App:  readiness checks = ___ (deps, pool, cache)            │
+  │ Infra: liveness period/timeout/threshold = ___              │
+  │ Infra: readiness period/timeout/threshold = ___             │
+  │                                                              │
+  │ RULE: liveness timeout > worst-case event loop delay        │
+  │       readiness timeout > worst-case DB ping time           │
+  │       Use startup probes for slow-initializing services     │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+### 13.9 The Math and Logic Behind Standard Practices
+
+This section answers the "how exactly?" question for every major app-owned and hybrid mechanism. Not just what to do — the calculations, sizing formulas, and decision logic that determine the correct values in production.
+
+---
+
+#### 13.9.1 Graceful Degradation — Decision Logic and Implementation
+
+Graceful degradation means **reducing response quality to preserve availability**. The app team owns this because only domain knowledge determines what to drop.
+
+```
+THE DEGRADATION LADDER — ordered by impact:
+
+  Level 0: FULL FIDELITY (normal operation)
+    Serve complete response with all features.
+    Cost: 100% of resources per request.
+
+  Level 1: SKIP OPTIONAL ENRICHMENTS
+    Drop: recommendations, related items, personalization.
+    Save: 30-50% latency (removes 1-3 downstream calls).
+    User impact: page works, feels less personalized.
+    Trigger: p99 > 2× baseline OR dependency circuit open.
+
+  Level 2: SERVE STALE DATA
+    Drop: real-time prices, inventory counts, live status.
+    Serve: cached version (stale by 30s-5min).
+    Save: 60-80% DB load (cache hit rate goes to ~100%).
+    User impact: data may be slightly outdated.
+    Trigger: DB connection pool > 80% OR query p99 > 500ms.
+
+  Level 3: REDUCE PAYLOAD SIZE
+    Drop: large lists (100 items → 10), images, preview content.
+    Save: 70% bandwidth, 40% serialization CPU.
+    User impact: list views show fewer items, must paginate.
+    Trigger: memory > 80% OR serialization time > 50ms.
+
+  Level 4: STATIC FALLBACK
+    Drop: all dynamic content.
+    Serve: pre-rendered static page from CDN/local cache.
+    Save: ~100% of backend resources.
+    User impact: page is functional but non-interactive.
+    Trigger: error rate > 20% OR all circuit breakers open.
+
+  Level 5: MAINTENANCE MODE
+    Drop: all user-facing functionality.
+    Serve: "We're working on it" page + status page link.
+    Save: 100% of backend resources.
+    User impact: service is effectively down.
+    Trigger: manual decision OR cascading failure detected.
+```
+
+```
+IMPLEMENTATION IN FASTAPI — The Degradation Middleware Pattern:
+
+  import time
+  from enum import IntEnum
+
+  class DegradationLevel(IntEnum):
+      FULL = 0
+      SKIP_ENRICHMENTS = 1
+      SERVE_STALE = 2
+      REDUCE_PAYLOAD = 3
+      STATIC_FALLBACK = 4
+
+  # The degradation controller — reads system metrics and decides level
+  class DegradationController:
+      def __init__(self):
+          self.current_level = DegradationLevel.FULL
+          self._last_check = 0
+          self._check_interval = 1.0  # re-evaluate every 1 second
+
+      def get_level(self, metrics: SystemMetrics) -> DegradationLevel:
+          now = time.monotonic()
+          if now - self._last_check < self._check_interval:
+              return self.current_level
+          self._last_check = now
+
+          # Evaluate conditions — most severe first
+          if metrics.error_rate > 0.20:
+              self.current_level = DegradationLevel.STATIC_FALLBACK
+          elif metrics.memory_pct > 80 or metrics.serialization_p99 > 0.050:
+              self.current_level = DegradationLevel.REDUCE_PAYLOAD
+          elif metrics.db_pool_pct > 80 or metrics.db_query_p99 > 0.500:
+              self.current_level = DegradationLevel.SERVE_STALE
+          elif metrics.overall_p99 > 2 * metrics.baseline_p99:
+              self.current_level = DegradationLevel.SKIP_ENRICHMENTS
+          else:
+              self.current_level = DegradationLevel.FULL
+
+          return self.current_level
+
+  # In the endpoint handler
+  @app.get("/products/{product_id}")
+  async def get_product(product_id: str, request: Request):
+      level = degradation_controller.get_level(current_metrics)
+
+      product = await get_product_from_db(product_id)  # always needed
+
+      if level <= DegradationLevel.SKIP_ENRICHMENTS:
+          product.recommendations = await get_recommendations(product_id)
+          product.reviews = await get_reviews(product_id)
+
+      if level <= DegradationLevel.SERVE_STALE:
+          product.price = await get_live_price(product_id)
+          product.inventory = await get_inventory(product_id)
+      else:
+          product.price = await get_cached_price(product_id)  # stale OK
+          product.inventory = None  # omit rather than show wrong count
+
+      if level >= DegradationLevel.REDUCE_PAYLOAD:
+          product.related_items = product.related_items[:5]  # trim list
+
+      return product
+
+  KEY INSIGHT:
+    The degradation controller evaluates SYSTEM metrics.
+    The endpoint handler applies DOMAIN-SPECIFIC degradation.
+    The controller says "we're at level 2."
+    The handler knows "level 2 means serve stale prices but
+    NEVER serve stale inventory counts for products with
+    low stock" — that's domain knowledge.
+```
+
+```
+QUANTIFYING THE SAVINGS — How to calculate degradation impact:
+
+  EXAMPLE: Product page with 5 downstream calls:
+
+    Call             Latency   CPU/req   Connections   Required?
+    ──────────────   ───────   ───────   ───────────   ─────────
+    product_db       10ms      2ms       1 DB conn     YES (core data)
+    pricing_svc      30ms      1ms       1 HTTP conn   YES at L0-L1
+    inventory_svc    20ms      1ms       1 HTTP conn   YES at L0-L1
+    recommend_svc    80ms      5ms       1 HTTP conn   NO at L1+
+    review_svc       50ms      3ms       1 HTTP conn   NO at L1+
+
+  At Level 0 (full fidelity):
+    Serial latency:   10 + 30 + 20 + 80 + 50 = 190ms
+    Parallel latency:  max(10, 30, 20, 80, 50) = 80ms
+    CPU per request:   2 + 1 + 1 + 5 + 3 = 12ms
+    Connections used:  1 DB + 4 HTTP = 5
+
+  At Level 1 (skip enrichments — drop recommend + reviews):
+    Parallel latency:  max(10, 30, 20) = 30ms          → 62% faster
+    CPU per request:   2 + 1 + 1 = 4ms                 → 67% less CPU
+    Connections used:  1 DB + 2 HTTP = 3                → 40% fewer conns
+    Capacity increase: 12ms / 4ms = 3× more RPS per core
+
+  At Level 2 (serve stale — cached pricing + no inventory):
+    Parallel latency:  max(10, 0.1) = 10ms              → 87% faster
+    CPU per request:   2 + 0.01 = 2.01ms                → 83% less CPU
+    Connections used:  1 DB + 0 HTTP = 1                 → 80% fewer conns
+    Capacity increase: 12ms / 2ms = 6× more RPS per core
+
+  TAKEAWAY:
+    Level 1 degradation triples your effective capacity.
+    Level 2 degradation gives you 6× capacity.
+    Most services can handle traffic spikes by shedding
+    optional enrichments, without any infrastructure changes.
+    This is why the APP must own degradation — only the app
+    knows which 80ms call is optional and which 10ms call is critical.
+```
+
+---
+
+#### 13.9.2 Backpressure Signaling — The HTTP 429 + Retry-After Contract
+
+The app decides WHEN to signal backpressure and WHAT information to include. The infra layer (NGINX, Istio) can enforce rate limits, but only the app can signal meaningful retry semantics.
+
+```
+THE 429 RESPONSE CONTRACT — What the server communicates:
+
+  HTTP/1.1 429 Too Many Requests
+  Retry-After: 5                          ← "try again in 5 seconds"
+  X-RateLimit-Limit: 1000                 ← "your tier allows 1000 req/min"
+  X-RateLimit-Remaining: 0               ← "you have 0 left in this window"
+  X-RateLimit-Reset: 1694800800           ← "window resets at this Unix time"
+  Content-Type: application/json
+
+  {"error": "rate_limit_exceeded", "retry_after": 5}
+
+  EACH HEADER'S PURPOSE:
+    Retry-After:          Tells client WHEN to retry.
+    X-RateLimit-Limit:    Tells client their budget.
+    X-RateLimit-Remaining: Tells client how close they are.
+    X-RateLimit-Reset:    Tells client when budget refills.
+
+  WITHOUT these headers: the client guesses. Guessing = thundering herd.
+```
+
+```
+CALCULATING Retry-After — The Math:
+
+  GOAL: spread retries so they don't create a synchronized spike.
+
+  SCENARIO: 1000 RPS service, capacity drops to 500 RPS.
+    500 requests/s are rejected with 429.
+
+  FIXED Retry-After: 5
+    All 500 rejected requests retry at T+5.
+    At T+5: 500 retries + 1000 new requests = 1500 RPS.
+    Service is overloaded again. Another 1000 rejected.
+    OSCILLATION: 500→1500→500→1500 RPS pattern.
+
+  JITTERED Retry-After: uniform(2, 10)
+    500 rejected clients spread retries over 8 seconds.
+    Retry rate: 500 / 8 = 62.5 retries/s (mixed into normal traffic).
+    At any given second: ~1000 new + ~63 retries = ~1063 RPS.
+    Service overloaded by 63 RPS, not 500 RPS. Manageable.
+
+  FORMULA for server-side jitter:
+    base_delay = current_queue_depth / processing_rate
+    jittered_delay = base_delay + random.uniform(0, base_delay)
+
+  EXAMPLE:
+    Queue depth: 200 requests.
+    Processing rate: 100 req/s.
+    Drain time (base_delay): 200 / 100 = 2 seconds.
+    Retry-After: uniform(2, 4) seconds.
+
+    This tells clients: "I'll be busy for ~2s, try again in 2-4s."
+    The jitter ensures they don't all arrive at 2.0s.
+
+  ADAPTIVE Retry-After based on load:
+    if current_load < 0.7 * capacity:
+        retry_after = 1  # light load, retry soon
+    elif current_load < 0.9 * capacity:
+        retry_after = random.uniform(2, 5)
+    elif current_load < 1.0 * capacity:
+        retry_after = random.uniform(5, 15)
+    else:  # over capacity
+        retry_after = random.uniform(10, 30)
+
+  This creates BACKPRESSURE PROPORTIONAL TO LOAD:
+    Light overload → retry in 1-5s (fast recovery).
+    Heavy overload → retry in 10-30s (let system drain).
+```
+
+```
+WHEN THE APP SHOULD RETURN 429 vs 503:
+
+  429 Too Many Requests:
+    Meaning: "You're sending too fast. Slow down."
+    Client action: Respect Retry-After, then retry same request.
+    Use when: Per-client or per-tenant rate limit exceeded.
+    The REQUEST is valid. The RATE is too high.
+
+  503 Service Unavailable:
+    Meaning: "I can't handle this right now. Try later."
+    Client action: Retry with exponential backoff.
+    Use when: Server is globally overloaded (not client-specific).
+    The SYSTEM is overloaded. Any client would get this.
+
+  DECISION LOGIC:
+    if request.tenant over their rate limit:
+        return 429 + Retry-After  # client-specific problem
+    elif system.at_capacity():
+        return 503 + Retry-After  # system-wide problem
+    elif request.deadline_expired():
+        return 504 Gateway Timeout  # too late to process
+
+  WHY IT MATTERS:
+    A well-behaved client treats 429 and 503 differently:
+    429 → slow down THIS client's request rate.
+    503 → the whole service is down, switch to fallback/cache.
+    Wrong status code = wrong client behavior = wrong recovery.
+```
+
+---
+
+#### 13.9.3 Graceful Shutdown — The SIGTERM Sequence with Math
+
+Graceful shutdown is the process of stopping a pod without dropping in-flight requests. The app owns the shutdown logic; Kubernetes controls the timeline.
+
+```
+THE KUBERNETES SHUTDOWN TIMELINE:
+
+  T=0s    Kubernetes sends SIGTERM to the pod.
+          Pod is SIMULTANEOUSLY removed from the Service endpoint list.
+          But endpoint propagation is ASYNCHRONOUS — load balancers
+          may not know for 1-5 seconds.
+
+  T=0-5s  DANGER ZONE: new requests may still arrive because
+          kube-proxy / Envoy / NGINX haven't updated their backends yet.
+          The pod MUST still accept and process these requests.
+
+  T=5s+   Endpoint propagation complete. No new traffic arrives.
+          Pod is draining in-flight requests.
+
+  T=Ns    terminationGracePeriodSeconds expires (default: 30s).
+          Kubernetes sends SIGKILL. Process dies immediately.
+          ANY in-flight requests are dropped.
+
+  CRITICAL MATH:
+    terminationGracePeriodSeconds must be >
+      endpoint_propagation_delay + max(in_flight_request_duration)
+
+    With Istio:   propagation ≈ 1-3s
+    With NGINX:   propagation ≈ 1-5s
+    With kube-proxy (iptables): propagation ≈ 1-10s
+
+    If your slowest request takes 30s (e.g., a report generation):
+      terminationGracePeriodSeconds = 10 + 30 + 5 = 45s (minimum)
+
+    FORMULA:
+      grace_period = propagation_delay + max_request_duration + safety_margin
+      grace_period = 5 + max_request_duration + 5
+```
+
+```
+IMPLEMENTATION IN FASTAPI — Proper SIGTERM Handling:
+
+  import signal
+  import asyncio
+  from contextlib import asynccontextmanager
+
+  shutdown_event = asyncio.Event()
+  active_requests = 0  # atomic counter (use threading.Lock or asyncio-safe)
+
+  @asynccontextmanager
+  async def lifespan(app: FastAPI):
+      # Startup
+      loop = asyncio.get_event_loop()
+
+      def handle_sigterm(sig, frame):
+          shutdown_event.set()  # signal that we're draining
+
+      signal.signal(signal.SIGTERM, handle_sigterm)
+      yield
+      # Shutdown — wait for in-flight requests to complete
+      # (Uvicorn handles this, but custom async tasks need manual drain)
+
+  app = FastAPI(lifespan=lifespan)
+
+  @app.middleware("http")
+  async def shutdown_middleware(request: Request, call_next):
+      global active_requests
+
+      if shutdown_event.is_set():
+          # During shutdown: reject NEW requests with 503
+          # so clients retry on other pods.
+          return JSONResponse(
+              status_code=503,
+              headers={"Retry-After": "1", "Connection": "close"},
+              content={"error": "shutting_down"}
+          )
+
+      active_requests += 1
+      try:
+          response = await call_next(request)
+          return response
+      finally:
+          active_requests -= 1
+
+  THE preStop HOOK — Adding delay for endpoint propagation:
+
+    containers:
+    - name: api
+      lifecycle:
+        preStop:
+          exec:
+            command: ["sh", "-c", "sleep 5"]
+      # This 5-second sleep runs BEFORE SIGTERM reaches the app.
+      # It gives kube-proxy / Envoy time to remove this pod
+      # from the endpoint list BEFORE the app starts rejecting.
+
+  COMPLETE TIMELINE WITH preStop:
+
+    T=0s    Kubernetes starts shutdown.
+    T=0s    preStop hook runs: sleep 5. Pod STILL serves traffic.
+    T=0-5s  Endpoint propagation happens in parallel.
+    T=5s    preStop finishes. SIGTERM sent to app.
+    T=5s    App stops accepting NEW requests (503 for stragglers).
+    T=5s+   App drains in-flight requests.
+    T=30s   terminationGracePeriodSeconds expires. SIGKILL.
+
+    GRACE PERIOD MATH:
+      Total shutdown budget = terminationGracePeriodSeconds = 30s
+      preStop sleep: 5s
+      Remaining for app drain: 30 - 5 = 25s
+      If max request duration > 25s, increase the grace period.
+```
+
+```
+CONNECTION DRAINING MATH:
+
+  SCENARIO: Pod handling 500 RPS, average latency 20ms.
+    Concurrent requests at SIGTERM time:
+      L = λ × W = 500 × 0.020 = 10 concurrent requests
+
+    Drain time for 10 in-flight requests at 20ms each:
+      If they all started just before SIGTERM: max(remaining_time) ≈ 20ms
+      99th percentile drain time ≈ 100ms (some requests slower)
+
+    WITH SLOW REQUESTS (5% take 5 seconds):
+      Expected slow requests in flight: 500 × 0.05 × 5 = 125 concurrent
+      Drain time: up to 5 seconds for the slowest one.
+
+    WITH DATABASE TRANSACTIONS:
+      A transaction holding a row lock must complete.
+      If a transaction takes 2s and started at T-1s: needs 1s more.
+      If a transaction takes 30s (batch job): needs up to 30s.
+      This is why batch jobs should check the shutdown signal
+      and commit partial progress:
+
+        for batch in chunks(items, size=100):
+            if shutdown_event.is_set():
+                break  # commit what we have, let next pod continue
+            process(batch)
+            db.commit()
+```
+
+---
+
+#### 13.9.4 Connection Pool Sizing — The Complete Formula
+
+Connection pool sizing is a HYBRID responsibility: the app team sizes the pool based on workload; the infra/DBA team sizes the database and pooler based on aggregate demand.
+
+```
+THE THREE-LAYER CONNECTION BUDGET:
+
+  Layer 1: APPLICATION (SQLAlchemy pool per pod)
+  Layer 2: CONNECTION POOLER (PgBouncer between app and DB)
+  Layer 3: DATABASE (PostgreSQL max_connections)
+
+  Each layer has limits. The system breaks at the TIGHTEST limit.
+
+  ┌─────────────────────────────────────────────────┐
+  │  App Pod 1    App Pod 2    ...    App Pod N      │
+  │  pool=20      pool=20             pool=20       │
+  │  overflow=10  overflow=10         overflow=10   │
+  │     │            │                    │          │
+  │  30 max       30 max             30 max          │
+  │  per pod      per pod            per pod         │
+  └──────┬──────────┬──────────────────┬────────────┘
+         │          │                  │
+         ▼          ▼                  ▼
+  ┌─────────────────────────────────────────────────┐
+  │           PgBouncer (connection pooler)          │
+  │  max_client_conn = 500   (accepts from apps)     │
+  │  default_pool_size = 50  (holds to database)     │
+  │                                                   │
+  │  MULTIPLEXING: 500 app connections share 50 DB   │
+  │  connections. PgBouncer queues when all 50 busy. │
+  └────────────────────┬────────────────────────────┘
+                       │
+                       ▼
+  ┌─────────────────────────────────────────────────┐
+  │           PostgreSQL                              │
+  │  max_connections = 100                            │
+  │    50 for PgBouncer                               │
+  │    10 for monitoring (Datadog, pg_stat)           │
+  │    10 for migrations / DBA                        │
+  │    5 for replication slots                         │
+  │    25 reserved headroom                            │
+  └─────────────────────────────────────────────────┘
+```
+
+```
+APP-SIDE POOL SIZING FORMULA:
+
+  INPUTS:
+    RPS_per_pod    = requests per second this pod handles
+    query_per_req  = average DB queries per request
+    query_latency  = average query duration (seconds)
+    headroom       = 1.5 (50% safety margin)
+
+  FORMULA (from Little's Law):
+    connections_needed = RPS_per_pod × query_per_req × query_latency × headroom
+
+  EXAMPLE:
+    RPS_per_pod   = 200
+    query_per_req = 3
+    query_latency = 0.005 (5ms)
+    headroom      = 1.5
+
+    connections_needed = 200 × 3 × 0.005 × 1.5 = 4.5 → round up to 5
+
+    pool_size = 5  (persistent connections, always open)
+    max_overflow = 5  (burst connections, created on demand, closed when idle)
+    Total max per pod = 10
+
+  BUT ADD VARIANCE:
+    If 5% of queries take 200ms (slow queries, aggregations):
+      slow_query_connections = RPS_per_pod × query_per_req × 0.05 × 0.200
+                             = 200 × 3 × 0.05 × 0.200 = 6 connections
+    These 6 connections are held 40× longer than the fast ones.
+    They dominate pool usage even though they're 5% of queries.
+
+    ADJUSTED:
+      fast_query_conns = 200 × 3 × 0.95 × 0.005 = 2.85
+      slow_query_conns = 200 × 3 × 0.05 × 0.200 = 6.0
+      total = 2.85 + 6.0 = 8.85 → round to 10
+
+    pool_size = 10, max_overflow = 5
+    Total max per pod = 15
+
+  THE SLOW QUERY TRAP:
+    5% of queries consume 68% of connections (6 / 8.85).
+    This is why "our average query is 5ms" does not mean
+    "we need 5 connections." The TAIL matters.
+
+  PRACTICAL SQLALCHEMY SETTINGS:
+    pool_size=10         # baseline persistent connections
+    max_overflow=5       # burst capacity
+    pool_timeout=3       # fail fast if pool exhausted (not 30s default!)
+    pool_recycle=3600    # recycle connections every hour
+    pool_pre_ping=True   # detect stale connections before use
+```
+
+```
+AGGREGATE BUDGET — The Cross-Team Coordination:
+
+  GIVEN:
+    10 pods × 15 connections max = 150 connections from app
+    + 1 rolling-deploy pod × 15 = 15 connections (deploy surge)
+    + 5 monitoring connections (Datadog, pg_stat_activity)
+    + 5 DBA/migration connections
+    + 3 replication slots
+    ────────────────────────────
+    Total: 178 connections needed
+
+  WITHOUT PgBouncer:
+    PostgreSQL max_connections = 178 + 20% headroom = 214
+    Each PostgreSQL connection costs ~5-10MB of RAM.
+    214 connections × 10MB = 2.14GB just for connection state.
+    RDS db.r5.large (16GB RAM) loses 13% to connections alone.
+
+  WITH PgBouncer (transaction mode):
+    PgBouncer max_client_conn = 200 (accepts all app connections)
+    PgBouncer default_pool_size = 25 (actual DB connections)
+    PgBouncer reserve_pool_size = 5 (for slow transactions)
+
+    PostgreSQL max_connections = 25 + 5 + 10 + 5 = 45
+    45 connections × 10MB = 450MB. Much better.
+
+    WHY THIS WORKS (the multiplexing math):
+      In transaction pooling mode, PgBouncer assigns a DB connection
+      only for the duration of a transaction (BEGIN...COMMIT).
+      A query taking 5ms uses a DB connection for 5ms out of every
+      request (which might span 20ms including HTTP parsing, etc.).
+      Utilization ratio: 5ms / 20ms = 25%.
+      150 app connections × 25% utilization = 37.5 concurrent DB conns.
+      A pool of 25 + 5 reserve = 30 handles this with headroom.
+
+  FAILURE CASE — What happens without coordination:
+    App team sets pool_size=30 (generous, seems safe for one pod).
+    Infra scales to 20 pods for Black Friday.
+    20 × 30 = 600 connections to PostgreSQL.
+    max_connections = 200.
+    RESULT: connection errors at scale. 400 connections refused.
+    At 2 AM. On Black Friday. With the CEO watching dashboards.
+```
+
+---
+
+#### 13.9.5 Pod and Worker Sizing — CPU, Memory, and Concurrency Math
+
+```
+UVICORN WORKER COUNT — Why the Gunicorn formula doesn't apply:
+
+  GUNICORN FORMULA (sync workers):
+    workers = 2 × CPU_CORES + 1
+    Reasoning: each sync worker blocks on I/O. 2× CPU means when
+    half the workers are blocked on I/O, the other half use the CPU.
+
+  UVICORN FORMULA (async workers):
+    workers = CPU_CORES (start with 1:1)
+    Reasoning: each async worker runs an event loop that handles
+    THOUSANDS of concurrent connections. More workers add overhead:
+      - Each worker has its own memory space (~50-200MB base)
+      - Each worker has its own DB connection pool
+      - Each worker has its own HTTP client pool
+      - Context switching between workers costs CPU
+
+  THE MATH:
+    Assume: 4-core pod, handler is 2ms CPU + 8ms I/O wait.
+
+    With 1 async worker:
+      CPU capacity: 1000ms / 2ms = 500 RPS of CPU work per core.
+      But only 1 core is used. Max CPU-limited RPS = 500.
+      I/O concurrency: event loop handles thousands of awaits.
+      Bottleneck: CPU at 500 RPS.
+
+    With 4 async workers:
+      CPU capacity: 4 × 500 = 2000 RPS.
+      Each worker uses 1 core. All 4 cores utilized.
+      Memory: 4 × 150MB base = 600MB before any request state.
+
+    With 8 async workers (the "2n+1" mistake):
+      CPU capacity still 2000 RPS (only 4 cores exist).
+      Memory: 8 × 150MB = 1.2GB.
+      DB connections: 8 × pool_size. Probably too many.
+      OS context switching: non-trivial at 8 processes.
+      WORSE performance than 4 workers due to overhead.
+
+  EXCEPTIONS WHERE >1 WORKER PER CORE HELPS:
+    - Handler has synchronous blocking I/O (file reads, legacy sync DB)
+    - Handler calls CPU-bound code that doesn't release the GIL
+      (NumPy releases GIL; pure Python does not)
+    - In these cases: 2 × cores is appropriate (mitigates blocking)
+```
+
+```
+MEMORY SIZING — How to calculate pod memory limits:
+
+  FORMULA:
+    memory_limit = base_memory
+                 + (max_concurrent_requests × per_request_memory)
+                 + connection_pools
+                 + caches
+                 + safety_margin
+
+  COMPONENTS:
+    base_memory:
+      Python interpreter:          ~30MB
+      FastAPI + dependencies:      ~50-150MB (depends on imports)
+      Uvicorn per worker:          ~20MB
+      Total base per worker:       ~100-200MB
+
+    per_request_memory:
+      Request object:              1-5KB
+      Parsed JSON body:            0.1-100KB (depends on payload)
+      ORM objects loaded:          5-500KB (depends on query)
+      Response serialization:      1-100KB
+      Asyncio coroutine state:     2-8KB
+      TOTAL:                       ~10KB typical, ~500KB worst case
+
+    connection_pools:
+      SQLAlchemy pool (10 conns):  ~5MB
+      httpx client pool:           ~2MB
+      Redis client:                ~1MB
+      Total:                       ~10MB
+
+    caches:
+      In-memory LRU cache:         configured (e.g., 100MB)
+
+  EXAMPLE:
+    1 worker, limit-concurrency=200, 10KB per request average:
+      base:         150MB
+      requests:     200 × 10KB = 2MB
+      pools:        10MB
+      caches:       50MB
+      Total:        212MB → set limit to 300MB (40% headroom)
+
+    4 workers, limit-concurrency=200 each, 50KB per request (ORM-heavy):
+      base:         4 × 150MB = 600MB
+      requests:     4 × 200 × 50KB = 40MB
+      pools:        4 × 10MB = 40MB
+      caches:       50MB (shared via Redis, not per-worker)
+      Total:        730MB → set limit to 1024MB (1Gi)
+
+  THE OOM TRAP:
+    If you set memory limit WITHOUT concurrency limit:
+      Under 10,000 RPS spike with 100ms latency:
+        Concurrent requests: 10,000 × 0.1 = 1000
+        Memory: 1000 × 50KB = 50MB for requests alone. OK.
+      Under 10,000 RPS spike with 2s latency (downstream slow):
+        Concurrent requests: 10,000 × 2 = 20,000
+        Memory: 20,000 × 50KB = 1GB for requests alone. OOM.
+
+    Concurrency limit MUST be set so that:
+      max_concurrent × per_request_memory < memory_limit - base - pools
+      
+    In the 1Gi example:
+      budget = 1024MB - 600MB - 40MB - 50MB = 334MB for requests
+      max_concurrent = 334MB / 50KB ≈ 6,800 total across 4 workers
+      Per worker: 6,800 / 4 = 1,700
+      BUT: at 1,700 concurrent requests per worker, the event loop
+      is scheduling 1,700 coroutines. Performance degrades well
+      before that. A practical limit: 200-500 per worker.
+```
+
+```
+CPU REQUESTS AND LIMITS — The Kubernetes budgeting:
+
+  CPU REQUEST = guaranteed CPU (used for scheduling).
+  CPU LIMIT = max CPU (throttled if exceeded).
+
+  SIZING LOGIC:
+    CPU request = sustained_cpu_usage during normal load
+    CPU limit = peak_cpu_usage during spikes (or no limit)
+
+  MEASUREMENT:
+    Run load test at target RPS. Observe CPU:
+      At 1000 RPS: CPU usage = 200m (0.2 cores)
+      At 2000 RPS: CPU usage = 400m (0.4 cores)
+      Linear relationship: 0.2m per RPS.
+
+    For a target of 2000 RPS per pod:
+      CPU request: 400m (what it needs normally)
+      CPU limit: 800m (2× headroom for GC, serialization spikes)
+
+  CPU LIMIT DEBATE — Set or not?
+    WITH limit (e.g., 800m):
+      Pod gets throttled (CFS quota) when it hits 800m.
+      Latency spikes during throttling. Requests slow down.
+      BUT: pod doesn't starve other pods on the node.
+
+    WITHOUT limit (only request):
+      Pod can burst to full node CPU if available.
+      Great for bursty workloads. No throttling.
+      BUT: can steal CPU from other pods (noisy neighbor).
+
+    STANDARD PRACTICE:
+      Set request = measured sustained usage.
+      Set limit = 2-4× request OR omit for burst-tolerant workloads.
+      NEVER set limit < request (Kubernetes rejects it).
+      NEVER set request = 0 (pod gets scheduled on any node,
+        may land on an overloaded node with no guaranteed CPU).
+```
+
+---
+
+#### 13.9.6 Message Consumption Sizing — Prefetch, Batch, and Ack Math
+
+```
+RABBITMQ prefetch_count — The derivation:
+
+  GOAL: keep the consumer busy without buffering too many unacked messages.
+
+  THE PIPELINE MODEL:
+    Consumer has a "pipeline" of messages in flight:
+      - Some are being processed (active)
+      - Some are in the local buffer (prefetched, waiting)
+
+    If the buffer empties, the consumer IDLES waiting for the broker
+    to deliver the next batch. This is wasted throughput.
+
+    If the buffer is too full, crash = N messages redelivered.
+
+  FORMULA:
+    prefetch_count = throughput × round_trip_time × safety_factor
+
+    WHERE:
+      throughput = messages processed per second by this consumer
+      round_trip_time = time for broker to deliver next batch
+                        after consumer acks (network + broker latency)
+      safety_factor = 2-3 (buffer for variance)
+
+  EXAMPLE 1: Fast processing, local broker
+    throughput = 500 msg/s
+    round_trip_time = 2ms (same datacenter)
+    prefetch = 500 × 0.002 × 3 = 3 → set prefetch_count = 5
+
+    The consumer processes 1 message every 2ms.
+    Broker delivers next batch in 2ms.
+    3-5 prefetched messages ensure the consumer never idles.
+
+  EXAMPLE 2: Slow processing, remote broker
+    throughput = 10 msg/s (100ms per message)
+    round_trip_time = 50ms (cross-region)
+    prefetch = 10 × 0.050 × 3 = 1.5 → set prefetch_count = 2
+
+    Slow consumer: only 2 messages buffered. If it crashes,
+    only 2 messages are redelivered. Safe.
+
+  EXAMPLE 3: Batch processing
+    throughput = 1000 msg/s (but processes in batches of 100)
+    round_trip_time = 5ms
+    prefetch = 100 (match batch size)
+
+    Set prefetch = batch size so the consumer always has a full
+    batch ready. But understand: crash = 100 messages redelivered.
+
+  ANTI-PATTERNS:
+    prefetch_count = 0 (unlimited):
+      Broker dumps entire queue to consumer.
+      10,000 messages × 2KB each = 20MB of local buffer.
+      Consumer crash = 10,000 messages redelivered.
+      Other consumers get NOTHING (all messages are prefetched here).
+      THIS DEFEATS FAIR DISPATCH across multiple consumers.
+
+    prefetch_count = 10000 (too high):
+      Same as unlimited in practice.
+      Messages are "invisible" to other consumers.
+      Load balancing across consumers breaks down.
+
+    prefetch_count = 1 everywhere:
+      Safe but slow. Consumer processes 1, waits for ack round-trip,
+      gets next message. If round_trip = 5ms:
+        Max throughput = 1000ms / (processing_time + 5ms)
+        For 2ms processing: 1000 / 7 = 142 msg/s max
+        vs. prefetch=10: ~500 msg/s (pipeline is full)
+```
+
+```
+KAFKA max.poll.records AND BATCH SIZING:
+
+  KAFKA CONSUMER LOOP:
+    while True:
+        records = consumer.poll(timeout_ms=1000)
+        process(records)  # must complete before max.poll.interval.ms
+        consumer.commit()
+
+  CONSTRAINT:
+    processing_time(records) < max.poll.interval.ms (default: 5 minutes)
+
+  IF VIOLATED:
+    Consumer is considered dead → removed from group → rebalance.
+    All partitions reassigned. Processing of current batch is wasted.
+    Rebalance assigns same partitions to another consumer → reprocessing.
+
+  SIZING:
+    max.poll.records = max.poll.interval.ms / processing_time_per_record
+
+  EXAMPLE:
+    max.poll.interval.ms = 300,000 (5 minutes)
+    processing per record = 50ms
+    max.poll.records = 300,000 / 50 = 6,000
+
+    But leave 50% headroom for variance:
+    max.poll.records = 3,000
+
+  WITH SAFETY MARGIN:
+    max.poll.records = floor(max.poll.interval.ms / (2 × p99_processing_time))
+
+    If p99 processing is 200ms:
+      max.poll.records = floor(300,000 / (2 × 200)) = 750
+
+  PRACTICAL TUNING:
+    Start with max.poll.records = 100.
+    Measure: how long does processing 100 records take?
+    If 100 records take 2 seconds → well within 5-minute budget.
+    Increase to 500. 500 records take 10 seconds. Still fine.
+    Increase to 1000. Monitor. Stop when p99 batch time > 50% of
+    max.poll.interval.ms.
+```
+
+```
+CELERY WORKER CONCURRENCY — Prefork vs Eventlet vs Gevent:
+
+  PREFORK (default — multiprocessing):
+    Each worker is a separate OS process.
+    concurrency = N means N processes.
+    Each process handles 1 task at a time (synchronous).
+    Best for: CPU-bound tasks (image processing, ML inference).
+
+    SIZING:
+      concurrency = CPU_CORES (CPU-bound tasks)
+      Memory: N × per_process_memory (Python interpreter + task data)
+
+    EXAMPLE:
+      4-core pod, 200MB per process, tasks are CPU-bound:
+        concurrency = 4
+        Memory: 4 × 200MB = 800MB
+
+  EVENTLET / GEVENT (green threads — cooperative multitasking):
+    Each worker is 1 OS process with N green threads.
+    concurrency = N means N concurrent tasks (coroutines).
+    Best for: I/O-bound tasks (API calls, email sending, DB queries).
+
+    SIZING:
+      concurrency = target_throughput × avg_task_duration
+
+    EXAMPLE:
+      Target: 100 tasks/s, each takes 500ms (mostly I/O wait):
+        concurrency = 100 × 0.5 = 50 green threads
+        Memory: 1 process + 50 × task_data (~5KB each) = 200MB + 250KB
+
+  RATE LIMITING INTERACTION:
+    rate_limit="100/m" on a task class means: globally across all workers,
+    process at most 100 instances of this task per minute.
+
+    If you have 10 workers with concurrency=5 each:
+      Each worker gets ~10 of this task per minute.
+      Each worker can process 10 tasks in (10 × 0.5s) = 5s.
+      Workers are idle for 55 seconds per minute on this task class.
+      Other task classes fill the remaining capacity.
+```
+
+---
+
+#### 13.9.7 Health Probe Logic — What to Check and Why
+
+```
+THE THREE PROBES — Different questions, different answers:
+
+  LIVENESS: "Is this process stuck?"
+    Check:   Process responsive? Event loop running? No deadlock?
+    Effect:  FAIL → Kubernetes RESTARTS the pod (kills it, starts new one).
+    Danger:  False failure = unnecessary restart = dropped connections.
+
+    WHAT TO CHECK:
+      ✓ Return 200 immediately (proves event loop is responsive).
+      ✓ Optionally: check that worker threads are alive.
+      ✗ DO NOT: query the database.
+      ✗ DO NOT: call external services.
+      ✗ DO NOT: check disk space, queue depth, or error rate.
+      ✗ DO NOT: include any I/O that can time out.
+
+    WHY:
+      If the database is down, your process is NOT stuck. It's
+      healthy but cannot serve requests. That's READINESS, not LIVENESS.
+      Restarting the pod won't fix the database.
+      Restarting the pod WILL: drop in-flight requests, lose cache,
+      cold-start penalty, potentially cascade (all pods restart).
+
+    IMPLEMENTATION:
+      @app.get("/healthz")
+      async def liveness():
+          return {"status": "alive"}
+          # That's it. Nothing else. No I/O.
+
+    TUNING:
+      periodSeconds: 10       # check every 10 seconds
+      timeoutSeconds: 5       # allow 5s response time (event loop under load)
+      failureThreshold: 3     # 3 consecutive failures = restart
+      Total time to restart: 10 × 3 = 30 seconds of unresponsiveness.
+
+      IF this is too aggressive (restarts under heavy load):
+        Increase timeoutSeconds to 10.
+        Increase failureThreshold to 5.
+        Total: 10 × 5 = 50 seconds before restart.
+
+
+  READINESS: "Can this pod serve traffic?"
+    Check:   Dependencies available? Pool healthy? Initialized?
+    Effect:  FAIL → Kubernetes REMOVES pod from Service endpoints.
+             No traffic routed to this pod. Pod stays running.
+    Recover: When check passes again → pod re-added to endpoints.
+
+    WHAT TO CHECK:
+      ✓ Database connection pool: can acquire a connection in <100ms?
+      ✓ Redis connection: PING responds?
+      ✓ Critical downstream service: health endpoint responds?
+      ✓ Cache warmed? (for services that need warm cache)
+      ✓ Internal state: is the service past initialization?
+
+    WHY EACH CHECK:
+      DB pool check: if the pool is exhausted, this pod will time out
+        on every request. Stop sending traffic until connections free up.
+      Redis check: if cache is down and every request hits DB,
+        this pod will overload the database. Stop traffic until cache returns.
+      Downstream check: if a critical dependency is down, this pod
+        will just proxy errors. Better to fail readiness and let the
+        client hit a pod whose dependency IS up (different AZ, etc.).
+
+    IMPLEMENTATION:
+      @app.get("/ready")
+      async def readiness():
+          checks = {}
+
+          # DB pool check — can we get a connection?
+          try:
+              async with async_session() as session:
+                  await asyncio.wait_for(
+                      session.execute(text("SELECT 1")),
+                      timeout=0.1  # 100ms max
+                  )
+              checks["database"] = "ok"
+          except Exception:
+              checks["database"] = "failed"
+              return JSONResponse(
+                  status_code=503,
+                  content={"status": "not_ready", "checks": checks}
+              )
+
+          # Redis check
+          try:
+              await asyncio.wait_for(redis.ping(), timeout=0.05)
+              checks["redis"] = "ok"
+          except Exception:
+              checks["redis"] = "failed"
+              return JSONResponse(status_code=503, content={...})
+
+          return {"status": "ready", "checks": checks}
+
+    TUNING:
+      periodSeconds: 5         # check every 5s
+      timeoutSeconds: 3        # allow 3s (includes DB + Redis ping)
+      failureThreshold: 2      # 2 failures = remove from endpoints
+      successThreshold: 2      # 2 successes = re-add to endpoints
+      Time to remove: 5 × 2 = 10 seconds.
+      Time to recover: 5 × 2 = 10 seconds after deps recover.
+
+
+  STARTUP: "Has this pod finished initializing?"
+    Check:   Same as readiness, but only during startup.
+    Effect:  Until startup probe passes, liveness and readiness
+             probes are NOT checked. Pod stays in "starting" state.
+    Purpose: Prevent liveness probe from killing a slow-starting pod.
+
+    WHEN TO USE:
+      - Cache warming takes 30-60 seconds (loading product catalog).
+      - ML model loading takes 15-30 seconds.
+      - Database migration checks at startup.
+      - Any initialization > liveness failureThreshold × periodSeconds.
+
+    EXAMPLE:
+      Cache warming takes 45 seconds.
+      Liveness probe: period=10, threshold=3 → kills after 30 seconds.
+      WITHOUT startup probe: pod is killed during cache warming!
+      WITH startup probe: Kubernetes waits until startup succeeds.
+
+    CONFIGURATION:
+      startupProbe:
+        httpGet:
+          path: /ready  # same endpoint as readiness
+          port: 8000
+        periodSeconds: 5
+        failureThreshold: 30    # 5 × 30 = 150s max startup time
+        timeoutSeconds: 3
+
+    AFTER startup probe passes:
+      Liveness and readiness probes begin normal operation.
+      Startup probe is never checked again for this pod.
+```
+
+---
+
+#### 13.9.8 Rate Limiting — The App Defines, Infra Enforces Pattern
+
+```
+THE RATE LIMIT SIZING FORMULA:
+
+  STEP 1: Determine actual service capacity (load test).
+    Load test result: service sustains 5000 RPS at p99 < 200ms.
+
+  STEP 2: Set global rate limit below capacity.
+    Global limit = capacity × 0.8 = 4000 RPS
+    (20% headroom for internal traffic, retries, bursts)
+
+  STEP 3: Allocate per-tenant limits from the global budget.
+
+    STATISTICAL MULTIPLEXING:
+      Not all tenants peak simultaneously.
+      Sum of individual limits can exceed total capacity.
+      But each individual limit must be ≤ total capacity.
+
+    SIZING PER TIER:
+      Total capacity: 4000 RPS
+      Enterprise tenants (5 tenants, each pays for guaranteed capacity):
+        Per-tenant: 500 RPS → 5 × 500 = 2500 RPS committed
+      Business tenants (50 tenants, shared pool):
+        Per-tenant: 50 RPS → 50 × 50 = 2500 RPS theoretical max
+      Free tenants (unlimited count, heavily limited):
+        Per-tenant: 5 RPS
+
+      Sum: 2500 + 2500 + (N × 5) for free tenants.
+      If 200 free tenants: 2500 + 2500 + 1000 = 6000 RPS theoretical.
+      But at 4000 capacity, statistical multiplexing assumes
+      no more than ~60% of non-enterprise tenants peak simultaneously.
+
+    IF MULTIPLEXING ASSUMPTION FAILS:
+      (e.g., Black Friday, product launch, viral moment)
+      Per-tenant limits still hold. Total arrivals > capacity.
+      Free tier exhausts first (lowest limits).
+      Business tier hits limits next.
+      Enterprise tier is last to be affected.
+      This is PRIORITY BY RATE LIMIT SIZING — no code needed.
+
+  STEP 4: Convert to NGINX / Istio configuration.
+
+    NGINX (app team provides values, infra team deploys config):
+      # Per API key (extracted from header)
+      limit_req_zone $http_x_api_key zone=per_key:10m rate=50r/s;
+
+      # Global
+      limit_req_zone $server_name zone=global:1m rate=4000r/s;
+
+      location /api/ {
+          limit_req zone=per_key burst=10 nodelay;
+          limit_req zone=global burst=200 nodelay;
+          proxy_pass http://backend;
+      }
+
+    THE burst PARAMETER:
+      burst=10 means: allow 10 requests above the rate limit
+      to be queued instead of rejected.
+      nodelay: process burst immediately, don't delay.
+
+      WITHOUT burst: exactly 50 req/s per key. Any microsecond
+      burst above this is rejected. Too strict.
+      WITH burst=10: allows bursts of 60 req/s for short periods.
+      Tokens refill at 50/s.
+
+  STEP 5: The app handles what the rate limiter can't.
+
+    Rate limits at the gateway are COARSE:
+      - Per API key, per IP, or global.
+      - Cannot distinguish request types.
+      - Cannot cost-weight requests.
+
+    The APP adds FINE-GRAINED controls:
+      - Expensive query counts as 10 units against the limit.
+      - Read requests count as 1, writes as 5.
+      - Admin endpoints exempt from rate limits.
+      - Burst allowance varies by time of day.
+
+    IMPLEMENTATION:
+      class CostAwareRateLimiter:
+          """Counts request cost, not just request count."""
+          def __init__(self, redis, max_cost_per_minute: int):
+              self.redis = redis
+              self.max_cost = max_cost_per_minute
+
+          async def check(self, tenant_id: str, cost: int) -> bool:
+              key = f"rate:{tenant_id}:{minute_bucket()}"
+              current = await self.redis.incrby(key, cost)
+              if current == cost:  # first request this minute
+                  await self.redis.expire(key, 120)
+              return current <= self.max_cost
+
+      # Usage in endpoint:
+      COST_MAP = {
+          "/products": 1,       # simple lookup
+          "/search": 5,         # expensive query
+          "/reports": 50,       # very expensive aggregation
+      }
+
+      cost = COST_MAP.get(request.url.path, 1)
+      if not await rate_limiter.check(tenant_id, cost):
+          raise HTTPException(429, headers={"Retry-After": "10"})
+```
+
+---
+
+#### 13.9.9 The Envelope vs. Content Mental Model — Summary
+
+```
+THE COMPLETE MENTAL MODEL:
+
+  INFRA controls the ENVELOPE:
+  ─────────────────────────────
+  │ How many pods run            │ → HPA min/max, cluster autoscaler
+  │ How much CPU/memory each gets│ → resource requests/limits
+  │ How many DB connections exist│ → max_connections, PgBouncer sizing
+  │ How many partitions a topic  │ → Kafka broker config
+  │ Network policies and TLS     │ → Istio, NetworkPolicy, cert-manager
+  │                              │
+  │ FORMULA: infra sizes the BOX.│
+  │ The box is: N pods × M CPU  │
+  │   × K connections × P       │
+  │   partitions.               │
+  │ The box does not know what   │
+  │ is inside it.               │
+  └──────────────────────────────┘
+
+  APP controls the CONTENT:
+  ─────────────────────────────
+  │ Which requests to accept     │ → admission control middleware
+  │ Which requests are sheddable │ → priority classification
+  │ How to degrade gracefully    │ → degradation ladder (§13.9.1)
+  │ How to signal backpressure   │ → 429 + Retry-After (§13.9.2)
+  │ How to shut down safely      │ → SIGTERM handling (§13.9.3)
+  │ How to consume safely        │ → prefetch, ack, batch (§13.9.6)
+  │ Connection pool sizing       │ → Little's Law (§13.9.4)
+  │                              │
+  │ FORMULA: app fills the box   │
+  │ with meaning. Same box of    │
+  │ 10 pods can serve 100% of   │
+  │ traffic at Level 2           │
+  │ degradation, or crash at     │
+  │ Level 0 under 3× load.      │
+  │ The difference is APP logic. │
+  └──────────────────────────────┘
+
+  THE LINE:
+  ─────────────────────────────────────────────────────
+  │ Decision requires DOMAIN KNOWLEDGE?    → APP owns  │
+  │ Decision requires INFRA KNOWLEDGE?     → INFRA owns│
+  │ Decision requires BOTH?                → HYBRID     │
+  │   App sets the POLICY (values, rules, thresholds)  │
+  │   Infra ENFORCES it (config, tooling, automation)  │
+  └─────────────────────────────────────────────────────┘
+
+  LITMUS TEST for any new mechanism:
+    "Could an infra engineer configure this correctly
+     WITHOUT talking to the app team?"
+    YES → infra owns it (TLS, node sizing, network policy).
+    NO  → app owns it or it's hybrid.
+
+    "Could the app team implement this WITHOUT any
+     infrastructure changes?"
+    YES → app owns it (admission control, degradation logic).
+    NO  → infra owns it or it's hybrid.
+
+    Both NO → hybrid. Requires a COORDINATION CONTRACT
+    (documented, versioned, reviewed together).
+```
+
+```
+THE COORDINATION ANTI-PATTERNS — What breaks without alignment:
+
+  ANTI-PATTERN 1: "The app team doesn't know about PgBouncer"
+    App sets pool_size=50. PgBouncer has default_pool_size=20.
+    App connections pile up waiting for PgBouncer slots.
+    App sees: "database is slow" (it's not — PgBouncer is the bottleneck).
+    Fix: app team must know PgBouncer exists and its pool_size.
+
+  ANTI-PATTERN 2: "Infra set HPA to scale on CPU without asking app"
+    App has a background job that uses 80% CPU for batch processing.
+    HPA sees 80% CPU → scales to 20 pods.
+    Each new pod starts the batch job. CPU goes to 80% on every pod.
+    HPA scales to max_replicas. Cluster overloaded.
+    Fix: custom metric for scaling (queue depth, not CPU).
+    App team MUST define the scaling metric.
+
+  ANTI-PATTERN 3: "Infra configured Istio retries for all services"
+    Retry policy: retryOn: 5xx, attempts: 3, perTryTimeout: 10s.
+    App already has internal retries with backoff.
+    Total retries: 3 (Istio) × 3 (app) = 9 per request.
+    Under outage: 9× amplification on an already-failing service.
+    Fix: agree on ONE retry layer. Either mesh-level OR app-level.
+    Never both for the same error class.
+
+  ANTI-PATTERN 4: "Nobody owns the queue length"
+    Redis is used as a Celery broker.
+    Infra: "Redis is running, our job is done."
+    App: "We enqueue tasks, Celery picks them up."
+    Nobody checks: what happens when the queue grows to 10M items?
+    Redis OOMs. All queued tasks lost.
+    Fix: APP owns queue length enforcement (LLEN check).
+    INFRA owns maxmemory-policy=noeviction for queue Redis instances.
+```
+
+---
+
+*The ownership boundary is a **contract**, not a wall. Both teams must understand the full picture. The infra team must understand why `pool_size=50` is wrong even though 50 < max_connections. The app team must understand why scaling to 20 pods will exhaust the connection budget. The coordination checklist (§13.8) is the artifact of this contract — fill it out together before every production deployment.*
+
+---
+
+## 14. Interview Preparation — Adaptive Load Control & Backpressure
 
 Questions designed to test real-world judgment at the mid-to-staff engineer level. Every question is grounded in a concrete production scenario — FastAPI services, connection pools, Kubernetes pods, real numbers. For each question, think through the answer before reading the guidance. The best answers demonstrate that you can reason about overload quantitatively, not just name the patterns.
 
