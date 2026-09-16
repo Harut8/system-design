@@ -30,10 +30,13 @@ python3 run.py --list          # act names
 python3 run.py capacity        # just the arithmetic
 python3 run.py naive stack     # the before/after
 python3 test_resilience.py     # assertions, zero deps
+
+open simulator.html            # the interactive version — no server, no deps
 ```
 
-`production.py` is the same stack written with real libraries instead of from
-scratch — see §6.
+`simulator.html` is the same model in the browser, with the stack as a list you
+can reorder (§6). `production.py` is the same stack written with real libraries
+instead of from scratch (§7).
 
 ---
 
@@ -44,9 +47,10 @@ scratch — see §6.
 3. [The workload](#3-the-workload)
 4. [What the report shows](#4-what-the-report-shows)
 5. [The files](#5-the-files)
-6. [Doing this for real: libraries](#6-doing-this-for-real-libraries)
-7. [What this lab is not](#7-what-this-lab-is-not)
-8. [Exercises](#8-exercises)
+6. [The interactive simulator](#6-the-interactive-simulator)
+7. [Doing this for real: libraries](#7-doing-this-for-real-libraries)
+8. [What this lab is not](#8-what-this-lab-is-not)
+9. [Exercises](#9-exercises)
 
 ---
 
@@ -132,7 +136,7 @@ tool:
   which.
 - **Admission control** is the only pattern that closes the loop between
   "we are over capacity" and "so this specific feature stops" — which is why it
-  is also the only one with no library (§6).
+  is also the only one with no library (§7).
 
 ---
 
@@ -295,7 +299,9 @@ scenarios.py    traffic generator, turn pipeline, brownout/outage/step injectors
 run.py          the eight acts
 test_resilience.py   assertions
 
-production.py            the same stack with real libraries (§6)
+simulator.html           interactive: compose and reorder the stack (§6)
+resilience-sim.js        the browser port of the engine — also runs under node
+production.py            the same stack with real libraries (§7)
 requirements-production.txt
 ```
 
@@ -304,7 +310,98 @@ and is not executed.
 
 ---
 
-## 6. Doing this for real: libraries
+## 6. The interactive simulator
+
+`simulator.html` — open it directly, no server and no dependencies.
+
+**Learn tab** — ten experiments, in order, from one healthy call to a system
+shedding load on purpose. Each is *one* call class, *one* provider and *one*
+fault, and it draws **every individual request as a row**: each bar is an
+attempt, coloured by outcome, and the dotted gaps are waits. That is the only
+picture that makes a retry legible — you can see the second attempt and the gap
+before it.
+
+| # | step | what it shows |
+|---|---|---|
+| 1 | One healthy call | the baseline every later step deviates from |
+| 2 | The provider starts failing | with no retry, their error rate is your error rate |
+| 3 | Add a retry | it works, and what it costs in attempts |
+| 4 | When retrying cannot help | independent vs correlated failures |
+| 5 | 429: the provider says slow down | why `retry-after` exists |
+| 6 | Everyone retries at once | the thundering herd, and jitter |
+| 7 | A retry budget | how to stop retrying without turning retries off |
+| 8 | Fail fast: the circuit breaker | wasted time vs availability, honestly |
+| 9 | 429 must not trip the breaker | one line of code, one checkbox |
+| 10 | Too much load | queueing, timeouts, and shedding on purpose |
+
+Every step carries a **"Check the arithmetic"** panel that derives the expected
+numbers and compares them against what the simulation produced, so nothing on
+screen has to be taken on trust. With failure probability `p` and up to `n`
+attempts:
+
+```
+attempts per request  =  1 + p + p² + … + p^(n-1)  =  (1 - pⁿ) / (1 - p)
+chance it still fails =  pⁿ
+```
+
+At `p = 0.1, n = 3` that is 1.11 attempts per request, so 100 requests cost
+**111 attempts** and 0.1 of them still fail. Arrivals default to evenly spaced
+so `requests = rate × duration` exactly and the prediction is checkable to the
+request; switch the arrivals knob to `poisson` to see realistic burstiness and
+the sampling noise it brings.
+
+**Sandbox tab** — the full five-call-class workload with the stack as a list you
+can reorder. Note the unit changes here: one **user turn** fans out to 3.11 LLM
+calls across three model tiers, so 10 turns/s is about 31 calls/s, and a
+provider incident hits one tier. The tab says so at the top, because comparing
+these numbers against the Learn tab without knowing that is the fastest way to
+conclude the simulator is broken.
+
+Every pattern *wraps* the ones below it, so order is semantics. Reordering
+produces genuinely different runs — moving the retry gate above the quota gate
+makes every attempt take a fresh reservation; above the breaker, you retry into
+an open circuit.
+
+### The result that should bother you
+
+Run the `Brownout, defended` preset, then `Naive: retry only` on the same seed.
+The naive client answers roughly **twice** as many turns.
+
+That is not a bug. The breaker correctly detects a broken dependency and refuses
+in microseconds; because `answer` is the one class with `fallback: none`, every
+refusal is a failed turn. The naive client instead waits out the full timeout and
+collects whatever the degraded fleet still serves.
+
+Look at what it costs. On the same incident at 10 turns/s:
+
+| | turns answered | wasted spend | 529s generated |
+|---|---|---|---|
+| naive, retry only | 60% | $4.98 | 112 |
+| full stack | 28% | $1.71 | 0 |
+| full stack **+ a fallback for `answer`** | **65%** | **$1.02** | **0** |
+
+Those 529s are provider-wide: the naive client is converting its own incident
+into everyone's incident, including its own other call classes. And the third row
+is the actual lesson — **a breaker on a critical path with no fallback trades
+availability for blast-radius containment**, and if you cannot afford that trade
+the fix is to give the path somewhere to fall back to, not to delete the breaker.
+
+### Prior art
+
+I could not find a public interactive simulator that lets you compose and reorder
+resilience patterns and watch the cascade, which is why this exists. Adjacent
+things that do exist, with links in the tool's About tab: SimPy (the DES
+framework this kernel is a miniature of), Netflix `concurrency-limits` (the
+gradient algorithm for real), Resilience4j (the clearest written spec of these
+state machines), Envoy's adaptive-concurrency filter and retry budgets, Marc
+Brooker's blog, the AWS Builders' Library piece on jitter, and Google's SRE Book
+chapter on handling overload. Chaos tools (Gremlin, Chaos Mesh, Litmus) are
+complementary, not the same thing: they tell you what *your system* does, this
+tells you what *the pattern* does.
+
+---
+
+## 7. Doing this for real: libraries
 
 **None of the modules above should ship.** They exist to make mechanisms
 visible. `production.py` maps each one to the library that already does it:
@@ -344,7 +441,7 @@ shed-by-criticality, retry spend), because availability and error rate both
 
 ---
 
-## 7. What this lab is not
+## 8. What this lab is not
 
 **Every number in `config.py` and `provider.py` is invented.** The rate limits
 are shaped like a published API tier but are not one. The token counts are
@@ -377,7 +474,7 @@ per-tenant limiter exists in `admission.py` but only one act exercises it).
 
 ---
 
-## 8. Exercises
+## 9. Exercises
 
 1. **Port Act 1 to your own numbers.** Replace `MODELS` and `CLASSES` in
    `config.py` with your tier and your measured token counts, then run

@@ -1,0 +1,1161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Resilience — learn by breaking things</title>
+<style>
+  :root {
+    --bg:#0c1017; --panel:#141a24; --panel2:#1b2230; --line:#28313f;
+    --fg:#e2e8f2; --dim:#96a3b8; --faint:#66748a;
+    --ok:#2bb673; --warn:#e0a020; --bad:#e0524a; --info:#3f8ae0; --grey:#5d6b80;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f4f6fa; --panel:#fff; --panel2:#eef1f6; --line:#dde3ed;
+            --fg:#15202e; --dim:#54627a; --faint:#8593a8; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6
+         -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  h1,h2,h3 { margin:0; font-weight:650; letter-spacing:-.015em; }
+  a { color:var(--info); }
+  code { font-family:var(--mono); font-size:.88em; background:var(--panel2);
+         padding:1px 5px; border-radius:4px; }
+
+  header { border-bottom:1px solid var(--line); background:var(--panel);
+           padding:12px 22px; display:flex; align-items:center; gap:16px;
+           position:sticky; top:0; z-index:30; }
+  header h1 { font-size:15px; }
+  header .sub { font-size:12px; color:var(--faint); }
+  nav { margin-left:auto; display:flex; gap:3px; }
+  nav button { background:transparent; border:1px solid transparent; color:var(--dim);
+               padding:6px 15px; border-radius:7px; cursor:pointer; font-size:13.5px; font-weight:550; }
+  nav button:hover { color:var(--fg); background:var(--panel2); }
+  nav button.on { background:var(--panel2); color:var(--fg); border-color:var(--line); }
+
+  .wrap { display:grid; grid-template-columns:250px 1fr; min-height:calc(100vh - 53px); }
+  @media (max-width:900px) {
+    .wrap { grid-template-columns:1fr !important; }
+    aside { position:static !important; height:auto !important; border-right:0 !important;
+            border-bottom:1px solid var(--line); }
+  }
+
+  aside { border-right:1px solid var(--line); background:var(--panel);
+          padding:16px 12px; position:sticky; top:53px; height:calc(100vh - 53px); overflow:auto; }
+  aside .h { font-size:10.5px; text-transform:uppercase; letter-spacing:.09em;
+             color:var(--faint); padding:0 8px 8px; }
+  .step { display:flex; align-items:flex-start; gap:9px; padding:8px 9px; border-radius:8px;
+          cursor:pointer; color:var(--dim); font-size:13.5px; line-height:1.35; }
+  .step:hover { background:var(--panel2); color:var(--fg); }
+  .step.on { background:var(--panel2); color:var(--fg); font-weight:600; }
+  .step .n { flex:0 0 21px; height:21px; border-radius:50%; background:var(--panel2);
+             border:1px solid var(--line); font-size:11px; font-family:var(--mono);
+             display:flex; align-items:center; justify-content:center; color:var(--faint); }
+  .step.on .n { background:var(--info); border-color:var(--info); color:#fff; }
+  .step.done .n { background:transparent; border-color:var(--ok); color:var(--ok); }
+
+  main { padding:26px 30px 70px; max-width:1050px; }
+  .kicker { font-size:11.5px; text-transform:uppercase; letter-spacing:.09em; color:var(--info);
+            font-weight:650; }
+  main h2 { font-size:25px; margin:4px 0 8px; }
+  .question { font-size:16.5px; color:var(--fg); margin:0 0 18px; max-width:66ch; }
+
+  .setup { background:var(--panel); border:1px solid var(--line); border-radius:11px;
+           padding:14px 16px; margin-bottom:16px; }
+  .setup .lbl { font-size:10.5px; text-transform:uppercase; letter-spacing:.08em;
+                color:var(--faint); margin-bottom:5px; }
+  .setup .txt { font-family:var(--mono); font-size:12.5px; color:var(--dim); }
+
+  .knobs { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end;
+           margin-top:14px; padding-top:13px; border-top:1px solid var(--line); }
+  .knob { min-width:172px; }
+  .knob .kl { font-size:12px; color:var(--dim); margin-bottom:4px; display:flex;
+              justify-content:space-between; gap:10px; }
+  .knob .kv { font-family:var(--mono); color:var(--fg); font-weight:600; }
+  .knob input[type=range] { width:100%; accent-color:var(--info); margin:0; }
+  .toggle { display:flex; align-items:center; gap:8px; font-size:13.5px; color:var(--fg);
+            background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+            padding:8px 12px; cursor:pointer; user-select:none; }
+  .toggle input { accent-color:var(--info); width:16px; height:16px; margin:0; cursor:pointer; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { background:var(--panel2); border:0; color:var(--dim); padding:7px 13px;
+                font-size:12.5px; cursor:pointer; font-family:var(--mono); }
+  .seg button.on { background:var(--info); color:#fff; }
+
+  .viz { background:var(--panel); border:1px solid var(--line); border-radius:11px;
+         padding:14px 16px; margin-bottom:16px; }
+  .viz .vh { display:flex; align-items:baseline; gap:12px; margin-bottom:10px; flex-wrap:wrap; }
+  .viz .vh h3 { font-size:13px; }
+  .viz .vh span { font-size:11.5px; color:var(--faint); }
+  canvas { width:100%; display:block; }
+  .key { display:flex; flex-wrap:wrap; gap:14px; margin-top:10px; font-size:12px; color:var(--dim); }
+  .key i { width:11px; height:11px; border-radius:3px; display:inline-block;
+           margin-right:5px; vertical-align:-1px; }
+
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(125px,1fr));
+           gap:10px; margin-bottom:16px; }
+  .num { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:11px 13px; }
+  .num .k { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--faint); }
+  .num .v { font-size:22px; font-weight:650; font-family:var(--mono); margin-top:1px; }
+  .num .s { font-size:11.5px; color:var(--dim); font-family:var(--mono); }
+
+  .box { border-radius:11px; padding:14px 16px; margin-bottom:14px; font-size:14.5px; }
+  .box .bh { font-size:10.5px; text-transform:uppercase; letter-spacing:.08em;
+             margin-bottom:6px; font-weight:650; }
+  .look { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--info); }
+  .look .bh { color:var(--info); }
+  .take { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--ok); }
+  .take .bh { color:var(--ok); }
+  .take .t { white-space:pre-wrap; }
+
+  .math { background:var(--panel); border:1px solid var(--line); border-radius:11px;
+          padding:14px 16px; margin-bottom:14px; }
+  .math .bh { font-size:10.5px; text-transform:uppercase; letter-spacing:.08em;
+              color:var(--faint); font-weight:650; margin-bottom:9px; }
+  .math table { font-size:13px; }
+  .math td { padding:6px 8px; vertical-align:top; }
+  .math td:nth-child(1) { color:var(--dim); width:38%; }
+  .math td:nth-child(2) { font-family:var(--mono); font-weight:650; text-align:right;
+                          white-space:nowrap; width:14%; }
+  .math td:nth-child(3) { color:var(--faint); font-size:12px; font-family:var(--mono); }
+  .math .formula { font-family:var(--mono); font-size:12.5px; color:var(--dim);
+                   background:var(--panel2); border-radius:7px; padding:9px 11px;
+                   margin-bottom:10px; line-height:1.7; }
+
+  .foot { display:flex; align-items:center; gap:12px; margin-top:26px;
+          padding-top:18px; border-top:1px solid var(--line); flex-wrap:wrap; }
+  .foot .nx { margin-left:auto; text-align:right; }
+  .foot .nx .hint { font-size:12.5px; color:var(--faint); margin-bottom:5px; max-width:48ch; }
+  button.go { background:var(--info); color:#fff; border:0; border-radius:9px;
+              padding:10px 20px; font-size:14px; font-weight:600; cursor:pointer; }
+  button.go:hover { filter:brightness(1.12); }
+  button.alt { background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+               border-radius:9px; padding:10px 16px; font-size:13.5px; cursor:pointer; }
+  button.alt:hover { border-color:var(--dim); }
+  button.alt:disabled { opacity:.35; cursor:default; }
+
+  .prose { max-width:70ch; }
+  .prose p, .prose li { color:var(--dim); }
+  .prose h3 { margin:22px 0 8px; font-size:16px; color:var(--fg); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--faint); font-weight:500; font-size:11px;
+       text-transform:uppercase; padding:4px 8px 6px; border-bottom:1px solid var(--line); }
+  td { padding:6px 8px; border-bottom:1px solid var(--line); }
+  td.m { font-family:var(--mono); font-size:12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>LLM Resilience — learn by breaking things</h1>
+    <div class="sub">ten experiments, from one healthy call to a system shedding load on purpose</div>
+  </div>
+  <nav>
+    <button data-tab="learn" class="on">Learn</button>
+    <button data-tab="sandbox">Sandbox</button>
+    <button data-tab="about">About</button>
+  </nav>
+</header>
+
+<div class="wrap" id="tab-learn">
+  <aside>
+    <div class="h">Steps</div>
+    <div id="steplist"></div>
+  </aside>
+  <main id="lessonpane"></main>
+</div>
+
+<div class="wrap" id="tab-sandbox" style="display:none; grid-template-columns:1fr">
+  <main style="max-width:1150px">
+    <div class="kicker">Free play</div>
+    <h2>Sandbox</h2>
+    <p class="question">The full five-call-class workload, with the defence stack as a list you
+      can reorder. Each pattern <em>wraps</em> the ones below it, so order is semantics —
+      a retry above the quota gate re-reserves tokens on every attempt. Come here after
+      the ten steps.</p>
+    <div class="box look" style="margin-bottom:18px">
+      <div class="bh">Read this before comparing numbers with the Learn tab</div>
+      <div>Here the unit is a <b>user turn</b>, not a request. One turn fans out to
+      <b>3.11 LLM calls</b> — a safety classifier, usually a query rewrite, an answer,
+      sometimes a thinking escalation, sometimes a title. So 10 turns/sec for 10s is
+      100 turns but about <b>311 calls</b>, spread over three model tiers.
+      A provider incident hits <b>one tier</b> (Sonnet by default), so an error rate
+      applies only to the <code>answer</code> class — roughly a third of the calls.
+      If you want arithmetic you can check request-by-request, use the Learn tab.</div>
+    </div>
+    <div id="sandbox"></div>
+  </main>
+</div>
+
+<div class="wrap" id="tab-about" style="display:none; grid-template-columns:1fr">
+  <main class="prose">
+    <div class="kicker">About</div>
+    <h2>What this is</h2>
+    <p>A browser companion to the Python lab in this folder. The <b>Learn</b> tab is ten
+    small experiments — one call class, one provider, one fault at a time — where you watch
+    <em>individual requests</em> rather than aggregate charts. That is the only way a retry
+    becomes legible: you can see the second attempt and the gap before it.</p>
+    <p>The <b>Sandbox</b> tab is the full thing: five call classes across three model tiers,
+    three token meters, and a reorderable stack.</p>
+
+    <h3>Honesty</h3>
+    <p>Every number in the fixture is <b>invented</b>. The provider model is a plausible
+    shape, not a model of anyone's infrastructure. This simulates <em>mechanisms</em>.
+    Nothing here is a measurement of any provider and none of it should be quoted as one.
+    Runs are seeded and deterministic, so when you change one knob the difference you see
+    is caused by that knob.</p>
+    <p>Not modelled: token-level streaming, prompt caching's effect on rate-limit accounting,
+    multi-region failover, and anything at all about answer quality. This measures whether
+    you got an answer, never whether it was a good one.</p>
+
+    <h3>Prior art, and what doesn't exist</h3>
+    <p>I could not find a public interactive simulator that lets you compose and reorder
+    resilience patterns and watch the cascade, which is why this exists. Adjacent things
+    that do:</p>
+    <ul>
+      <li><a href="https://simpy.readthedocs.io/" target="_blank" rel="noopener">SimPy</a> — the Python discrete-event framework this kernel is a miniature of.</li>
+      <li><a href="https://github.com/Netflix/concurrency-limits" target="_blank" rel="noopener">Netflix concurrency-limits</a> — the gradient algorithm implemented for real.</li>
+      <li><a href="https://resilience4j.readme.io/" target="_blank" rel="noopener">Resilience4j</a> — the clearest written spec of these state machines.</li>
+      <li><a href="https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/adaptive_concurrency_filter" target="_blank" rel="noopener">Envoy adaptive concurrency</a> — where adaptive limits and retry budgets belong for most services.</li>
+      <li><a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">AWS Builders' Library on jitter</a> — the origin of the full-jitter formula in step 6.</li>
+      <li><a href="https://sre.google/sre-book/handling-overload/" target="_blank" rel="noopener">Google SRE Book: Handling Overload</a> — the criticality ladder behind step 10.</li>
+      <li><a href="https://brooker.co.za/blog/" target="_blank" rel="noopener">Marc Brooker's blog</a> — the best writing anywhere on retries, timeouts and queueing.</li>
+      <li>Chaos tools (Gremlin, Chaos Mesh, Litmus) tell you what <em>your system</em> does; this tells you what <em>the pattern</em> does.</li>
+    </ul>
+    <p style="font-size:12.5px;color:var(--faint)">Links were correct at the time of writing;
+    I have no network access from here, so verify before relying on any of them.</p>
+  </main>
+</div>
+
+<script src="resilience-sim.js"></script>
+<script src="lessons.js"></script>
+<script>
+(function () {
+  "use strict";
+  var R = window.RSIM, L = window.RLESSONS;
+  if (!R || !L) {
+    document.body.innerHTML = "<p style='padding:2rem;font:15px system-ui'>Could not load " +
+      "<code>resilience-sim.js</code> / <code>lessons.js</code> — keep all three files together.</p>";
+    return;
+  }
+
+  function $(s) { return document.querySelector(s); }
+  function el(t, c, x) { var n = document.createElement(t); if (c) n.className = c;
+    if (x !== undefined) n.textContent = x; return n; }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function f1(x) { return (x || 0).toFixed(1); }
+
+  /* ─────────────────────────────────────────────────────── tabs */
+
+  Array.prototype.forEach.call(document.querySelectorAll("nav button"), function (b) {
+    b.onclick = function () {
+      Array.prototype.forEach.call(document.querySelectorAll("nav button"),
+        function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      ["learn", "sandbox", "about"].forEach(function (t) {
+        $("#tab-" + t).style.display = t === b.dataset.tab ? "grid" : "none";
+      });
+      if (b.dataset.tab === "sandbox") buildSandbox();
+    };
+  });
+
+  /* ══════════════════════════════════════════════════ LEARN ══ */
+
+  var LESSONS = L.LESSONS;
+  var idx = 0, seen = {};
+  var cfgs = LESSONS.map(function (x) { return L.fullConfig(x.config); });
+
+  function get(o, path) { return path.split(".").reduce(function (a, k) { return a[k]; }, o); }
+  function set(o, path, v) {
+    var k = path.split("."), t = o;
+    for (var i = 0; i < k.length - 1; i++) t = t[k[i]];
+    t[k[k.length - 1]] = v;
+  }
+
+  function renderSteps() {
+    var box = $("#steplist"); box.innerHTML = "";
+    LESSONS.forEach(function (les, i) {
+      var d = el("div", "step" + (i === idx ? " on" : "") + (seen[i] && i !== idx ? " done" : ""));
+      d.appendChild(el("span", "n", seen[i] && i !== idx ? "✓" : String(i + 1)));
+      d.appendChild(el("span", null, les.title));
+      d.onclick = function () { go(i); };
+      box.appendChild(d);
+    });
+  }
+
+  function go(i) {
+    idx = Math.max(0, Math.min(LESSONS.length - 1, i));
+    seen[idx] = true;
+    renderSteps(); renderLesson();
+    window.scrollTo(0, 0);
+  }
+
+  function renderLesson() {
+    var les = LESSONS[idx], cfg = cfgs[idx];
+    var m = $("#lessonpane"); m.innerHTML = "";
+
+    m.appendChild(el("div", "kicker", "Step " + (idx + 1) + " of " + LESSONS.length));
+    m.appendChild(el("h2", null, les.title));
+    m.appendChild(el("p", "question", les.question));
+
+    var setup = el("div", "setup");
+    setup.appendChild(el("div", "lbl", "Setup — this line always reflects the knobs below"));
+    setup.appendChild(el("div", "txt", L.describe(cfg)));
+    var knobs = el("div", "knobs");
+    (les.knobs || []).forEach(function (k) { knobs.appendChild(makeKnob(k, cfg)); });
+    var reset = el("button", "alt", "Reset");
+    reset.style.marginLeft = "auto";
+    reset.onclick = function () { cfgs[idx] = L.fullConfig(les.config); renderLesson(); };
+    knobs.appendChild(reset);
+    setup.appendChild(knobs);
+    m.appendChild(setup);
+
+    var result;
+    try { result = L.runLesson(cfg); }
+    catch (e) {
+      m.appendChild(el("div", "box look", "Simulation error: " + e.message));
+      return;
+    }
+
+    m.appendChild(numbers(result));
+
+    var viz = el("div", "viz");
+    var vh = el("div", "vh");
+    vh.appendChild(el("h3", null, VIZ_TITLE[les.viz] || "Result"));
+    vh.appendChild(el("span", null, VIZ_HINT[les.viz] || ""));
+    viz.appendChild(vh);
+    var cv = el("canvas");
+    cv.setAttribute("height", les.viz === "timeline" ? "300" : les.viz === "split" ? "300" : "230");
+    viz.appendChild(cv);
+    var key = el("div", "key");
+    viz.appendChild(key);
+    m.appendChild(viz);
+    drawViz(les.viz, cv, key, result);
+
+    var look = el("div", "box look");
+    look.appendChild(el("div", "bh", "What happened"));
+    look.appendChild(el("div", null, les.notice(result)));
+    m.appendChild(look);
+
+    if (les.math) {
+      var mb = el("div", "math");
+      mb.appendChild(el("div", "bh", "Check the arithmetic"));
+      var fm = el("div", "formula");
+      fm.textContent =
+        "A request that fails with probability p, retried up to n times:\n" +
+        "   attempts per request  =  1 + p + p² + … + p\u207F\u207B\u00B9  =  (1 − p\u207F) / (1 − p)\n" +
+        "   chance it still fails =  p\u207F";
+      mb.appendChild(fm);
+      var mt = el("table");
+      les.math(result).forEach(function (row) {
+        var tr = el("tr");
+        tr.appendChild(el("td", null, row[0]));
+        tr.appendChild(el("td", null, String(row[1])));
+        tr.appendChild(el("td", null, row[2] || ""));
+        mt.appendChild(tr);
+      });
+      mb.appendChild(mt);
+      m.appendChild(mb);
+    }
+
+    var take = el("div", "box take");
+    take.appendChild(el("div", "bh", "The takeaway"));
+    take.appendChild(el("div", "t", les.takeaway));
+    m.appendChild(take);
+
+    var foot = el("div", "foot");
+    var prev = el("button", "alt", "← Previous");
+    prev.disabled = idx === 0;
+    prev.onclick = function () { go(idx - 1); };
+    foot.appendChild(prev);
+    var nx = el("div", "nx");
+    nx.appendChild(el("div", "hint", les.next || ""));
+    if (idx < LESSONS.length - 1) {
+      var next = el("button", "go", "Next: " + LESSONS[idx + 1].title + " →");
+      next.onclick = function () { go(idx + 1); };
+      nx.appendChild(next);
+    } else {
+      var sb = el("button", "go", "Open the Sandbox →");
+      sb.onclick = function () {
+        document.querySelector('nav button[data-tab="sandbox"]').click();
+      };
+      nx.appendChild(sb);
+    }
+    foot.appendChild(nx);
+    m.appendChild(foot);
+  }
+
+  function makeKnob(k, cfg) {
+    var cur = get(cfg, k.path);
+
+    if (k.bool) {
+      var lab = el("label", "toggle");
+      var cb = el("input"); cb.type = "checkbox"; cb.checked = !!cur;
+      cb.onchange = function () { set(cfg, k.path, cb.checked); renderLesson(); };
+      lab.appendChild(cb);
+      lab.appendChild(el("span", null, k.label));
+      return lab;
+    }
+
+    if (k.options) {
+      var w = el("div", "knob");
+      w.appendChild(el("div", "kl", k.label));
+      var seg = el("div", "seg");
+      k.options.forEach(function (o) {
+        var b = el("button", o === cur ? "on" : "", o);
+        b.onclick = function () { set(cfg, k.path, o); renderLesson(); };
+        seg.appendChild(b);
+      });
+      w.appendChild(seg);
+      return w;
+    }
+
+    var wrap = el("div", "knob");
+    var kl = el("div", "kl");
+    kl.appendChild(el("span", null, k.label));
+    var vv = el("span", "kv", k.pct ? Math.round(cur * 100) + "%" : String(cur));
+    kl.appendChild(vv);
+    wrap.appendChild(kl);
+    var r = el("input"); r.type = "range";
+    r.min = k.min; r.max = k.max; r.step = k.step; r.value = cur;
+    r.oninput = function () { vv.textContent = k.pct ? Math.round(r.value * 100) + "%" : r.value; };
+    r.onchange = function () { set(cfg, k.path, parseFloat(r.value)); renderLesson(); };
+    wrap.appendChild(r);
+    return wrap;
+  }
+
+  function numbers(r) {
+    var s = r.summary, box = el("div", "cards");
+    function card(k, v, sub, colour) {
+      var n = el("div", "num");
+      n.appendChild(el("div", "k", k));
+      var val = el("div", "v", v);
+      if (colour) val.style.color = colour;
+      n.appendChild(val);
+      if (sub) n.appendChild(el("div", "s", sub));
+      return n;
+    }
+    var sr = s.successRate;
+    box.appendChild(card("succeeded", Math.round(sr * 100) + "%", s.ok + " of " + s.requests,
+      sr > 0.95 ? css("--ok") : sr > 0.7 ? css("--warn") : css("--bad")));
+    if (s.failed) box.appendChild(card("failed", String(s.failed), "gave up", css("--bad")));
+    if (s.blocked) box.appendChild(card("refused", String(s.blocked), "by a pattern", css("--grey")));
+    if (s.shed) box.appendChild(card("shed", String(s.shed), "on purpose", css("--grey")));
+    box.appendChild(card("attempts sent", String(s.attempts),
+      s.amplification.toFixed(2) + "× per request",
+      s.amplification > 1.6 ? css("--bad") : s.amplification > 1.1 ? css("--warn") : ""));
+    if (r.provider.r429) box.appendChild(card("429s", String(r.provider.r429), "rate limited", css("--warn")));
+    if (r.breakerTrips) box.appendChild(card("breaker trips", String(r.breakerTrips), "circuit opened", css("--bad")));
+    box.appendChild(card("wasted time", f1(s.timeWasted) + "s", "on requests that failed"));
+    return box;
+  }
+
+  /* ───────────────────────────────────────── visualisations */
+
+  var VIZ_TITLE = {
+    timeline: "Every request, one per row",
+    histogram: "When attempts arrived at the provider",
+    chart: "Attempts and outcomes over time",
+    split: "Important work vs background work",
+  };
+  var VIZ_HINT = {
+    timeline: "time runs left to right · each bar is one attempt · dotted gaps are waits",
+    histogram: "each bar is a quarter-second",
+    chart: "",
+    split: "each row is one request",
+  };
+
+  var COL = {
+    ok: function () { return css("--ok"); },
+    "500": function () { return css("--bad"); },
+    "429": function () { return css("--warn"); },
+    timeout: function () { return "#b06be0"; },
+  };
+  function colourFor(status) { return (COL[status] || COL["500"])(); }
+
+  function prep(cv) {
+    var dpr = window.devicePixelRatio || 1;
+    var w = cv.clientWidth || 820, h = parseInt(cv.getAttribute("height"), 10);
+    cv.width = w * dpr; cv.height = h * dpr; cv.style.height = h + "px";
+    var g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    return { g: g, w: w, h: h };
+  }
+
+  function axis(g, w, h, pad, dur) {
+    g.strokeStyle = css("--line"); g.lineWidth = 1;
+    g.fillStyle = css("--faint"); g.font = "10px " + css("--mono"); g.textAlign = "center";
+    var stepS = dur <= 20 ? 2 : dur <= 45 ? 5 : 10;
+    for (var t = 0; t <= dur; t += stepS) {
+      var x = pad.l + (t / dur) * (w - pad.l - pad.r);
+      g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, h - pad.b); g.stroke();
+      g.fillText(t + "s", x, h - 4);
+    }
+  }
+
+  function faultBand(g, w, h, pad, r) {
+    var f = r.cfg.fault;
+    if (f.kind === "none" || f.kind === "ratelimit") return;
+    var dur = r.cfg.duration;
+    var X = function (t) { return pad.l + (Math.min(t, dur) / dur) * (w - pad.l - pad.r); };
+    g.fillStyle = "rgba(224,82,74,0.10)";
+    g.fillRect(X(f.from), pad.t, Math.max(1, X(f.to) - X(f.from)), h - pad.t - pad.b);
+    g.fillStyle = css("--bad"); g.font = "10px " + css("--mono"); g.textAlign = "left";
+    g.fillText("provider sick", X(f.from) + 4, pad.t + 11);
+  }
+
+  function breakerBand(g, w, h, pad, r) {
+    if (!r.breakerOpen.length) return;
+    var dur = r.cfg.duration;
+    var X = function (t) { return pad.l + (Math.min(t, dur) / dur) * (w - pad.l - pad.r); };
+    r.breakerOpen.forEach(function (b) {
+      g.fillStyle = "rgba(93,107,128,0.24)";
+      g.fillRect(X(b[0]), pad.t, Math.max(1, X(b[1]) - X(b[0])), h - pad.t - pad.b);
+    });
+    g.fillStyle = css("--grey"); g.font = "10px " + css("--mono"); g.textAlign = "left";
+    g.fillText("circuit open", X(r.breakerOpen[0][0]) + 4, h - pad.b - 5);
+  }
+
+  function legend(key, items) {
+    key.innerHTML = "";
+    items.forEach(function (it) {
+      var s = el("span");
+      var i = el("i"); i.style.background = it.c || "transparent";
+      if (it.dash) { i.style.borderTop = "2px dotted " + css("--faint"); i.style.borderRadius = "0";
+                     i.style.height = "2px"; i.style.marginBottom = "3px"; }
+      s.appendChild(i); s.appendChild(document.createTextNode(it.t));
+      key.appendChild(s);
+    });
+  }
+
+  function drawViz(kind, cv, key, r) {
+    if (kind === "timeline") return timeline(cv, key, r);
+    if (kind === "histogram") return histogram(cv, key, r);
+    if (kind === "split") return split(cv, key, r);
+    return chart(cv, key, r);
+  }
+
+  /* one row per request — the visual that makes retry legible */
+  function timeline(cv, key, r) {
+    var p = prep(cv), g = p.g, w = p.w, h = p.h;
+    var pad = { l: 34, r: 10, t: 6, b: 18 };
+    var dur = r.cfg.duration;
+    var X = function (t) { return pad.l + (Math.min(t, dur) / dur) * (w - pad.l - pad.r); };
+
+    faultBand(g, w, h, pad, r);
+    breakerBand(g, w, h, pad, r);
+    axis(g, w, h, pad, dur);
+
+    var rows = r.trace.slice();
+    var MAX = Math.floor((h - pad.t - pad.b - 14) / 5);
+    var truncated = false;
+    if (rows.length > MAX) {
+      truncated = true;
+      // keep a CONTIGUOUS slice centred on the interesting window — you want to
+      // see consecutive requests, not a scatter
+      var f = r.cfg.fault;
+      var centre = (f.kind !== "none" && f.kind !== "ratelimit") ? (f.from + f.to) / 2 : dur / 2;
+      rows.sort(function (a, b) {
+        return Math.abs(a.start - centre) - Math.abs(b.start - centre);
+      });
+      rows = rows.slice(0, MAX).sort(function (a, b) { return a.start - b.start; });
+    }
+    var rowH = Math.max(3, Math.min(9, (h - pad.t - pad.b - 14) / Math.max(1, rows.length)));
+
+    rows.forEach(function (rec, i) {
+      var y = pad.t + 6 + i * rowH;
+      var bh = Math.max(2, rowH - 1.5);
+
+      rec.waits.forEach(function (wt) {
+        g.strokeStyle = css("--faint"); g.globalAlpha = 0.75;
+        g.setLineDash([2, 2]); g.lineWidth = 1;
+        g.beginPath();
+        g.moveTo(X(wt.s), y + bh / 2); g.lineTo(X(wt.e), y + bh / 2);
+        g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+      });
+
+      rec.attempts.forEach(function (a) {
+        g.fillStyle = colourFor(a.status);
+        var x0 = X(a.s), x1 = Math.max(x0 + 1.5, X(a.e));
+        g.fillRect(x0, y, x1 - x0, bh);
+      });
+
+      if (rec.outcome === "blocked" || rec.outcome === "shed") {
+        g.fillStyle = css("--grey");
+        g.fillRect(X(rec.start), y, 4, bh);
+      }
+    });
+
+    g.fillStyle = css("--faint"); g.font = "10px " + css("--mono");
+    if (truncated) {
+      g.textAlign = "left";
+      g.fillText("showing " + rows.length + " of " + r.trace.length + " requests, around the fault",
+        pad.l + 4, h - pad.b - 5);
+    }
+
+    legend(key, [
+      { c: css("--ok"), t: "succeeded" },
+      { c: css("--bad"), t: "server error" },
+      { c: css("--warn"), t: "429 rate limited" },
+      { c: "#b06be0", t: "timed out" },
+      { c: css("--grey"), t: "refused by a pattern" },
+      { dash: true, t: "waiting (backoff or queue)" },
+    ]);
+  }
+
+  function histogram(cv, key, r) {
+    var p = prep(cv), g = p.g, w = p.w, h = p.h;
+    var pad = { l: 34, r: 10, t: 16, b: 18 };
+    var dur = r.cfg.duration;
+    var bins = r.bins.filter(function (b) { return b.t <= dur; });
+    var max = 1;
+    bins.forEach(function (b) { if (b.attempts > max) max = b.attempts; });
+    var bw = (w - pad.l - pad.r) / bins.length;
+
+    faultBand(g, w, h, pad, r);
+    axis(g, w, h, pad, dur);
+
+    bins.forEach(function (b, i) {
+      if (!b.attempts) return;
+      var bh = (b.attempts / max) * (h - pad.t - pad.b);
+      var x = pad.l + i * bw;
+      g.fillStyle = css("--bad");
+      g.fillRect(x, h - pad.b - bh, Math.max(1, bw - 0.6), bh);
+      var okH = (b.ok / b.attempts) * bh;
+      g.fillStyle = css("--ok");
+      g.fillRect(x, h - pad.b - okH, Math.max(1, bw - 0.6), okH);
+    });
+
+    g.fillStyle = css("--faint"); g.font = "10px " + css("--mono"); g.textAlign = "right";
+    g.fillText(String(max), pad.l - 6, pad.t + 10);
+    g.fillText("0", pad.l - 6, h - pad.b);
+    g.textAlign = "left";
+    g.fillStyle = css("--dim");
+    g.fillText("peak: " + max + " attempts in a single quarter-second", pad.l + 6, pad.t + 10);
+
+    legend(key, [{ c: css("--ok"), t: "succeeded" }, { c: css("--bad"), t: "failed" }]);
+  }
+
+  function chart(cv, key, r) {
+    var p = prep(cv), g = p.g, w = p.w, h = p.h;
+    var pad = { l: 34, r: 10, t: 16, b: 18 };
+    var dur = r.cfg.duration;
+    var bins = r.bins.filter(function (b) { return b.t <= dur; });
+    var max = 1;
+    bins.forEach(function (b) { if (b.attempts > max) max = b.attempts; });
+
+    faultBand(g, w, h, pad, r);
+    breakerBand(g, w, h, pad, r);
+    axis(g, w, h, pad, dur);
+
+    var X = function (i) { return pad.l + (i / Math.max(1, bins.length - 1)) * (w - pad.l - pad.r); };
+    var Y = function (v) { return h - pad.b - (v / max) * (h - pad.t - pad.b); };
+
+    [["attempts", css("--warn")], ["ok", css("--ok")], ["fail", css("--bad")]].forEach(function (s) {
+      g.strokeStyle = s[1]; g.lineWidth = 2; g.beginPath();
+      bins.forEach(function (b, i) { i ? g.lineTo(X(i), Y(b[s[0]])) : g.moveTo(X(i), Y(b[s[0]])); });
+      g.stroke();
+    });
+
+    g.fillStyle = css("--faint"); g.font = "10px " + css("--mono"); g.textAlign = "right";
+    g.fillText(String(max), pad.l - 6, pad.t + 10);
+
+    legend(key, [
+      { c: css("--warn"), t: "attempts sent" },
+      { c: css("--ok"), t: "succeeded" },
+      { c: css("--bad"), t: "failed" },
+    ]);
+  }
+
+  function split(cv, key, r) {
+    var p = prep(cv), g = p.g, w = p.w, h = p.h;
+    var dur = r.cfg.duration;
+    var half = (h - 40) / 2;
+    var X = function (t) { return 34 + (Math.min(t, dur) / dur) * (w - 44); };
+
+    ["important work — someone is waiting for it", "background work — nobody is waiting"]
+      .forEach(function (label, band) {
+        var top = 18 + band * (half + 14);
+        g.fillStyle = band === 0 ? css("--fg") : css("--faint");
+        g.font = "11.5px " + css("--mono"); g.textAlign = "left";
+        g.fillText(label, 34, top - 5);
+
+        var rows = r.trace.filter(function (x) { return x.priority === band; });
+        var MAX = Math.floor(half / 4);
+        if (rows.length > MAX) rows = rows.slice(0, MAX);
+        var rowH = Math.max(2.5, Math.min(7, half / Math.max(1, rows.length)));
+
+        rows.forEach(function (rec, i) {
+          var y = top + i * rowH, bh = Math.max(2, rowH - 1);
+          rec.waits.forEach(function (wt) {
+            g.strokeStyle = css("--faint"); g.globalAlpha = 0.6; g.setLineDash([2, 2]);
+            g.beginPath(); g.moveTo(X(wt.s), y + bh / 2); g.lineTo(X(wt.e), y + bh / 2);
+            g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+          });
+          rec.attempts.forEach(function (a) {
+            g.fillStyle = colourFor(a.status);
+            g.fillRect(X(a.s), y, Math.max(1.5, X(a.e) - X(a.s)), bh);
+          });
+          if (rec.outcome === "blocked" || rec.outcome === "shed") {
+            g.fillStyle = css("--grey"); g.fillRect(X(rec.start), y, 4, bh);
+          }
+        });
+      });
+
+    g.fillStyle = css("--faint"); g.font = "10px " + css("--mono"); g.textAlign = "center";
+    var stepS = dur <= 20 ? 2 : 5;
+    for (var t = 0; t <= dur; t += stepS) g.fillText(t + "s", X(t), h - 2);
+
+    legend(key, [
+      { c: css("--ok"), t: "succeeded" },
+      { c: "#b06be0", t: "timed out" },
+      { c: css("--grey"), t: "refused / shed immediately" },
+      { dash: true, t: "queued, waiting for a slot" },
+    ]);
+  }
+
+  window.addEventListener("resize", function () {
+    if ($("#tab-learn").style.display !== "none") renderLesson();
+  });
+
+  /* ══════════════════════════════════════════════ SANDBOX ══ */
+
+  var sbBuilt = false;
+  function buildSandbox() {
+    if (sbBuilt) return; sbBuilt = true;
+    var root = $("#sandbox");
+    var chain = R.DEFAULT_CHAIN.slice();
+    var params = R.defaultParams();
+    var open = {};                       // which pattern's config is expanded
+
+    var layout = el("div");
+    layout.style.cssText = "display:grid;grid-template-columns:330px 1fr;gap:16px;align-items:start";
+    var left = el("div"), right = el("div");
+    layout.appendChild(left); layout.appendChild(right);
+    root.appendChild(layout);
+
+    /* ── the stack, each row expandable ─────────────────────────────── */
+    var chainBox = el("div", "setup");
+    var ch = el("div", "lbl", "The stack — outermost first · ⚙ to configure");
+    chainBox.appendChild(ch);
+    var list = el("div"); chainBox.appendChild(list);
+    var add = el("div"); add.style.marginTop = "8px"; chainBox.appendChild(add);
+    left.appendChild(chainBox);
+
+    /* ── provider, fully configurable ───────────────────────────────── */
+    var P = { on: false, model: "sonnet", start: 20, end: 45,
+              fleet: 0.15, errors: 0.45, quota: 1 };
+    var provBox = el("div", "setup");
+    provBox.style.marginTop = "14px";
+    provBox.appendChild(el("div", "lbl", "Provider health"));
+    var provLab = el("label", "toggle");
+    var provCb = el("input"); provCb.type = "checkbox";
+    provCb.onchange = function () { P.on = provCb.checked; renderProvider(); run2(); };
+    provLab.appendChild(provCb);
+    provLab.appendChild(el("span", null, "inject a provider incident"));
+    provBox.appendChild(provLab);
+    var provKnobs = el("div");
+    provBox.appendChild(provKnobs);
+    left.appendChild(provBox);
+
+    function renderProvider() {
+      provKnobs.innerHTML = "";
+      if (!P.on) {
+        var okNote = el("div", null,
+          "Provider is healthy: 0.2% background error rate, full fleet, full quota.");
+        okNote.style.cssText = "font-size:11.5px;color:var(--faint);margin-top:9px;line-height:1.5";
+        provKnobs.appendChild(okNote);
+        return;
+      }
+      var mrow = el("div", "knob"); mrow.style.marginTop = "12px";
+      mrow.appendChild(el("div", "kl", "which model tier breaks"));
+      var seg = el("div", "seg");
+      [["haiku", "haiku"], ["sonnet", "sonnet"], ["opus", "opus"]].forEach(function (o) {
+        var b = el("button", P.model === o[0] ? "on" : "", o[1]);
+        b.onclick = function () { P.model = o[0]; renderProvider(); run2(); };
+        seg.appendChild(b);
+      });
+      mrow.appendChild(seg);
+      provKnobs.appendChild(mrow);
+
+      [["start", "starts at (s)", 0, 110, 5, null],
+       ["end", "ends at (s)", 5, 120, 5, null],
+       ["fleet", "fleet still up", 0.02, 1, 0.02, "pct"],
+       ["errors", "error rate", 0, 1, 0.05, "pct"],
+       ["quota", "quota still granted", 0.05, 1, 0.05, "pct"]
+      ].forEach(function (k) {
+        provKnobs.appendChild(simpleKnob(P, k[0], k[1], k[2], k[3], k[4], run2, k[5] === "pct"));
+      });
+
+      var hint = el("div");
+      hint.style.cssText = "font-size:11.5px;color:var(--faint);margin-top:11px;" +
+        "padding-top:9px;border-top:1px dashed var(--line);line-height:1.55";
+      hint.textContent =
+        "Three independent failure modes. Fleet loss makes calls queue and produces 529s. " +
+        "Error rate produces 500s. Quota cut produces 429s — and demands the opposite " +
+        "client response from the other two. Set them one at a time to see each signature.";
+      provKnobs.appendChild(hint);
+    }
+
+    /* ── load ───────────────────────────────────────────────────────── */
+    var S = { rps: 25, duration: 60, seed: 7 };
+    var scen = el("div", "setup");
+    scen.style.marginTop = "14px";
+    scen.appendChild(el("div", "lbl", "Load"));
+    [["rps", "user turns / sec", 1, 60, 1], ["duration", "duration (s)", 20, 120, 10],
+     ["seed", "random seed", 1, 50, 1]].forEach(function (k) {
+      scen.appendChild(simpleKnob(S, k[0], k[1], k[2], k[3], k[4], run2));
+    });
+    var callsNote = el("div");
+    callsNote.style.cssText = "font-size:11.5px;color:var(--faint);margin-top:10px";
+    scen.appendChild(callsNote);
+    left.appendChild(scen);
+
+    var resetAll = el("button", "alt");
+    resetAll.textContent = "Reset everything";
+    resetAll.style.cssText = "width:100%;margin-top:12px";
+    resetAll.onclick = function () {
+      chain = R.DEFAULT_CHAIN.slice();
+      params = R.defaultParams();
+      P.on = false; provCb.checked = false;
+      P.model = "sonnet"; P.start = 20; P.end = 45;
+      P.fleet = 0.15; P.errors = 0.45; P.quota = 1;
+      S.rps = 25; S.duration = 60; S.seed = 7;
+      sbBuilt = false; root.innerHTML = ""; buildSandbox();
+    };
+    left.appendChild(resetAll);
+
+    var out = el("div"); right.appendChild(out);
+
+    /* ── chain rendering, with per-pattern params ───────────────────── */
+    function renderChain() {
+      list.innerHTML = ""; add.innerHTML = "";
+      chain.forEach(function (k, i) {
+        var pat = R.PATTERN_BY_KEY[k];
+        var wrap = el("div");
+        wrap.style.cssText = "margin-bottom:6px;background:var(--panel2);" +
+          "border:1px solid var(--line);border-left:3px solid " + pat.colour +
+          ";border-radius:8px;overflow:hidden";
+
+        var row = el("div");
+        row.style.cssText = "display:flex;align-items:center;gap:6px;padding:7px 9px;font-size:13px";
+        row.appendChild(el("span", null, (i + 1) + ". " + pat.label));
+        var sp = el("span"); sp.style.flex = "1"; row.appendChild(sp);
+
+        var cfgBox = el("div");
+        cfgBox.style.cssText = "display:" + (open[k] ? "block" : "none") +
+          ";padding:2px 10px 10px;border-top:1px dashed var(--line)";
+
+        [["↑", i > 0, function () { var t = chain[i - 1]; chain[i - 1] = chain[i]; chain[i] = t; renderChain(); run2(); }, "move outward"],
+         ["↓", i < chain.length - 1, function () { var t = chain[i + 1]; chain[i + 1] = chain[i]; chain[i] = t; renderChain(); run2(); }, "move inward"],
+         ["⚙", (pat.params || []).length > 0, function () { open[k] = !open[k]; renderChain(); }, "configure"],
+         ["×", true, function () { chain.splice(i, 1); delete open[k]; renderChain(); run2(); }, "remove"]
+        ].forEach(function (b) {
+          var btn = el("button", null, b[0]);
+          btn.title = b[3];
+          btn.style.cssText = "background:transparent;border:1px solid var(--line);" +
+            "color:var(--dim);width:22px;height:22px;border-radius:5px;cursor:pointer;" +
+            "padding:0;font-size:11px";
+          if (!b[1]) { btn.disabled = true; btn.style.opacity = ".3"; }
+          else btn.onclick = b[2];
+          row.appendChild(btn);
+        });
+        wrap.appendChild(row);
+
+        if (open[k]) {
+          (pat.params || []).forEach(function (q) {
+            cfgBox.appendChild(patternKnob(k, q));
+          });
+          var why = el("div");
+          why.style.cssText = "font-size:11px;color:var(--faint);font-style:italic;" +
+            "margin-top:8px;line-height:1.5";
+          why.textContent = pat.why;
+          cfgBox.appendChild(why);
+          var rst = el("button", null, "reset this pattern");
+          rst.style.cssText = "background:transparent;border:1px solid var(--line);" +
+            "color:var(--dim);border-radius:6px;padding:3px 9px;font-size:11px;" +
+            "cursor:pointer;margin-top:8px";
+          rst.onclick = function () {
+            var fresh = R.defaultParams()[k];
+            for (var f in fresh) params[k][f] = fresh[f];
+            renderChain(); run2();
+          };
+          cfgBox.appendChild(rst);
+        }
+        wrap.appendChild(cfgBox);
+        list.appendChild(wrap);
+      });
+
+      R.PATTERNS.forEach(function (pat) {
+        if (chain.indexOf(pat.key) >= 0) return;
+        var c = el("button", null, "+ " + pat.label);
+        c.title = pat.blurb;
+        c.style.cssText = "background:var(--panel2);border:1px dashed " + pat.colour + ";" +
+          "color:var(--dim);border-radius:16px;padding:3px 10px;font-size:11.5px;" +
+          "cursor:pointer;margin:0 4px 4px 0";
+        c.onclick = function () { chain.push(pat.key); renderChain(); run2(); };
+        add.appendChild(c);
+      });
+      if (!chain.length) {
+        var none = el("div");
+        none.style.cssText = "font-size:11.5px;color:var(--faint);padding:6px 2px";
+        none.textContent = "No patterns. Every call goes straight to the provider " +
+          "with one global timeout.";
+        list.appendChild(none);
+      }
+    }
+
+    function patternKnob(pkey, q) {
+      var cur = params[pkey][q.k];
+      if (q.type === "bool") {
+        var lab = el("label");
+        lab.style.cssText = "display:flex;align-items:center;gap:7px;font-size:12px;" +
+          "color:var(--dim);margin-top:8px;cursor:pointer";
+        var cb = el("input"); cb.type = "checkbox"; cb.checked = !!cur;
+        cb.style.cssText = "accent-color:var(--info);margin:0";
+        cb.onchange = function () { params[pkey][q.k] = cb.checked; run2(); };
+        lab.appendChild(cb); lab.appendChild(el("span", null, q.label));
+        return lab;
+      }
+      if (q.type === "select") {
+        var w = el("div"); w.style.marginTop = "8px";
+        var l2 = el("div"); l2.style.cssText = "font-size:12px;color:var(--dim);margin-bottom:4px";
+        l2.textContent = q.label; w.appendChild(l2);
+        var seg = el("div", "seg");
+        q.opts.forEach(function (o) {
+          var b = el("button", o === cur ? "on" : "", o);
+          b.onclick = function () { params[pkey][q.k] = o; renderChain(); run2(); };
+          seg.appendChild(b);
+        });
+        w.appendChild(seg);
+        return w;
+      }
+      var w2 = el("div", "knob"); w2.style.marginTop = "8px";
+      var kl = el("div", "kl");
+      kl.appendChild(el("span", null, q.label));
+      var vv = el("span", "kv", String(cur));
+      kl.appendChild(vv); w2.appendChild(kl);
+      var r = el("input"); r.type = "range";
+      r.min = q.min; r.max = q.max; r.step = q.step; r.value = cur;
+      r.oninput = function () { vv.textContent = r.value; };
+      r.onchange = function () { params[pkey][q.k] = parseFloat(r.value); run2(); };
+      w2.appendChild(r);
+      return w2;
+    }
+
+    /* ── run + render ───────────────────────────────────────────────── */
+    function run2() {
+      var fanout = 0;
+      R.CLASSES.forEach(function (c) { fanout += c.perTurn; });
+      callsNote.innerHTML = "= <b>" + Math.round(S.rps * fanout) + " LLM calls/sec</b> " +
+        "(" + fanout.toFixed(2) + " per turn) across three model tiers";
+
+      var res;
+      try {
+        res = R.run({
+          scenario: {
+            turnsRps: S.rps, duration: S.duration, seed: S.seed, shape: "steady",
+            globalTimeout: 30,
+            incident: { enabled: P.on, model: P.model,
+                        start: Math.min(P.start, P.end - 1), end: Math.max(P.end, P.start + 1),
+                        scale: P.fleet, errorRate: P.errors, quotaScale: P.quota },
+          },
+          params: params, chain: chain,
+        });
+      } catch (e) {
+        out.innerHTML = "";
+        out.appendChild(el("div", "box look", "simulation error: " + e.message));
+        return;
+      }
+      out.innerHTML = "";
+
+      var cards = el("div", "cards");
+      function c(k, v, s2, col) {
+        var n = el("div", "num"); n.appendChild(el("div", "k", k));
+        var vv = el("div", "v", v); if (col) vv.style.color = col; n.appendChild(vv);
+        if (s2) n.appendChild(el("div", "s", s2)); return n;
+      }
+      var tc = res.turns.completion;
+      cards.appendChild(c("turns answered", Math.round(tc * 100) + "%",
+        res.turns.complete + " / " + res.turns.offered,
+        tc > 0.9 ? css("--ok") : tc > 0.5 ? css("--warn") : css("--bad")));
+      cards.appendChild(c("goodput", f1(res.goodput) + "/s",
+        "offered " + f1(res.offeredRps) + "/s"));
+      cards.appendChild(c("wasted spend", "$" + res.spend.wasted.toFixed(2),
+        Math.round(res.spend.wastedShare * 100) + "% of spend",
+        res.spend.wastedShare > 0.25 ? css("--bad") : ""));
+      cards.appendChild(c("attempts", String(res.attempts),
+        Math.round(res.retryRatio * 100) + "% retries"));
+      cards.appendChild(c("429 rate limited", String(res.provider["429"]), "quota"));
+      cards.appendChild(c("529 overloaded", String(res.provider["529"]), "fleet"));
+      cards.appendChild(c("500 errors", String(res.provider["500"]), "faults"));
+      cards.appendChild(c("breaker trips", String(res.breakerTrips), "circuits opened",
+        res.breakerTrips ? css("--bad") : ""));
+      out.appendChild(cards);
+
+      /* Some knobs legitimately cannot bite given the rest of the chain.
+       * Saying so beats letting someone conclude the slider is broken. */
+      var notes = [];
+      if (params.breaker.counts429 && res.provider["429"] === 0 && chain.indexOf("ratelimit") >= 0) {
+        notes.push("'count 429 as failure' had nothing to act on: the client rate limiter kept " +
+          "every request inside quota, so the provider never returned a 429. Remove the Client " +
+          "Rate Limiter from the chain, or cut the provider's quota, to see what that flag does.");
+      }
+      if (params.cache.hitRate > 0 && chain.indexOf("cache") < 0) {
+        notes.push("The cache hit rate is set but Response Cache is not in the chain — add it " +
+          "from the list below the stack.");
+      }
+      if (chain.indexOf("retry") < 0 && res.retryRatio === 0) {
+        notes.push("No Retries pattern in the chain, so every call gets exactly one attempt and " +
+          "the global timeout applies to all five call classes alike.");
+      }
+      if (chain.indexOf("admission") < 0) {
+        notes.push("No Admission Control in the chain: nothing is shed by criticality, so all " +
+          "five classes compete equally and the SHEDDABLE ones can crowd out the CRITICAL_PLUS one.");
+      }
+      if (notes.length) {
+        var nb = el("div", "box look");
+        nb.appendChild(el("div", "bh", "Why a knob may not have changed anything"));
+        notes.forEach(function (t) {
+          var d = el("div"); d.style.marginTop = "5px"; d.textContent = "• " + t;
+          nb.appendChild(d);
+        });
+        out.appendChild(nb);
+      }
+
+      var tblBox = el("div", "viz");
+      tblBox.appendChild(el("div", "lbl", "Per call class"));
+      var tbl = el("table");
+      var hd = el("tr");
+      ["call class", "model", "criticality", "offered", "served", "p50", "p95"]
+        .forEach(function (x) { hd.appendChild(el("th", null, x)); });
+      tbl.appendChild(hd);
+      res.perClass.forEach(function (cl) {
+        var tr = el("tr");
+        tr.appendChild(el("td", null, cl.name));
+        var md = el("td", "m", cl.model);
+        if (P.on && cl.model === P.model) { md.style.color = css("--warn"); md.textContent += " ◄"; }
+        tr.appendChild(md);
+        tr.appendChild(el("td", "m", cl.crit));
+        tr.appendChild(el("td", "m", String(cl.offered)));
+        var sv = el("td", "m", Math.round(cl.served * 100) + "%");
+        sv.style.color = cl.served > 0.9 ? css("--ok") : cl.served > 0.5 ? css("--warn") : css("--bad");
+        tr.appendChild(sv);
+        tr.appendChild(el("td", "m", cl.p50.toFixed(2) + "s"));
+        tr.appendChild(el("td", "m", cl.p95.toFixed(2) + "s"));
+        tbl.appendChild(tr);
+      });
+      tblBox.appendChild(tbl);
+      if (P.on) {
+        var mk = el("div");
+        mk.style.cssText = "font-size:11.5px;color:var(--faint);margin-top:9px";
+        mk.textContent = "◄ marks the tier the incident hits. Classes on other tiers are " +
+          "unaffected — which is why isolating them mattered.";
+        tblBox.appendChild(mk);
+      }
+      out.appendChild(tblBox);
+
+      var funBox = el("div", "viz");
+      funBox.appendChild(el("div", "lbl", "Where requests stopped"));
+      var fcv = el("canvas"); fcv.setAttribute("height", "120");
+      funBox.appendChild(fcv);
+      out.appendChild(funBox);
+      drawFunnel(fcv, res);
+
+      var logBox = el("div", "viz");
+      logBox.appendChild(el("div", "lbl", "What happened"));
+      var lg = el("div");
+      lg.style.cssText = "font-family:var(--mono);font-size:12px;max-height:230px;overflow:auto";
+      res.log.forEach(function (e) {
+        var d = el("div");
+        d.style.cssText = "padding:2px 0;border-bottom:1px solid var(--line);color:" +
+          (e.kind === "breaker" ? css("--bad") : e.kind === "incident" ? css("--warn")
+            : e.kind === "recover" ? css("--ok") : css("--dim"));
+        d.textContent = f1(e.t) + "s   " + e.text;
+        lg.appendChild(d);
+      });
+      logBox.appendChild(lg);
+      out.appendChild(logBox);
+    }
+
+    renderProvider();
+    renderChain();
+    run2();
+  }
+
+  var FUNNEL_LABEL = {
+    admission: "admission", cache: "cache hit", bulkhead: "bulkhead queue",
+    concurrency: "concurrency", breaker: "breaker open", ratelimit: "local quota",
+    retry: "retry gave up",
+  };
+
+  function drawFunnel(cv, r) {
+    var p = prep(cv), g = p.g, w = p.w, h = p.h;
+    var rows = [];
+    r.chain.forEach(function (k) {
+      if (k !== "fallback" && r.funnel[k]) {
+        rows.push({ k: k, n: r.funnel[k], c: R.PATTERN_BY_KEY[k].colour });
+      }
+    });
+    if (r.funnel.failed) rows.push({ k: "failed at provider", n: r.funnel.failed, c: css("--bad") });
+    rows.push({ k: "served", n: r.funnel.served, c: css("--ok") });
+    var total = rows.reduce(function (a, x) { return a + x.n; }, 0) || 1;
+
+    g.fillStyle = css("--faint"); g.font = "10px " + css("--mono"); g.textAlign = "left";
+    g.fillText("cheap to refuse  →  expensive to refuse", 6, 12);
+
+    var x = 6, top = 22, bh = 32;
+    rows.forEach(function (row) {
+      var wid = Math.max(2, (row.n / total) * (w - 12));
+      g.fillStyle = row.c; g.globalAlpha = row.k === "served" ? 0.85 : 0.6;
+      g.fillRect(x, top, wid, bh); g.globalAlpha = 1;
+      if (wid > 42) {
+        g.fillStyle = "#fff"; g.textAlign = "center";
+        g.fillText(String(row.n), x + wid / 2, top + bh / 2 + 4);
+      }
+      x += wid + 2;
+    });
+
+    x = 6;
+    var lane = 0, lastEnd = -999;
+    g.font = "10.5px " + css("--mono"); g.textAlign = "left";
+    rows.forEach(function (row) {
+      var wid = Math.max(2, (row.n / total) * (w - 12));
+      var label = (FUNNEL_LABEL[row.k] || row.k) + " " + Math.round((row.n / total) * 100) + "%";
+      var lw = g.measureText(label).width;
+      var lx = Math.min(w - lw - 4, x);
+      lane = lx < lastEnd + 6 ? (lane + 1) % 2 : 0;
+      var ly = top + bh + 14 + lane * 13;
+      g.fillStyle = row.c; g.fillRect(lx, ly - 8, 6, 6);
+      g.fillStyle = css("--dim"); g.fillText(label, lx + 9, ly - 2);
+      if (lane === 0) lastEnd = lx + lw + 9;
+      x += wid + 2;
+    });
+  }
+
+  function simpleKnob(obj, key, label, min, max, step, onChange, isPct) {
+    var w = el("div", "knob"); w.style.marginTop = "10px";
+    var kl = el("div", "kl");
+    kl.appendChild(el("span", null, label));
+    var show = function (v) { return isPct ? Math.round(v * 100) + "%" : String(v); };
+    var vv = el("span", "kv", show(obj[key]));
+    kl.appendChild(vv); w.appendChild(kl);
+    var r = el("input"); r.type = "range";
+    r.min = min; r.max = max; r.step = step; r.value = obj[key];
+    r.oninput = function () { vv.textContent = show(parseFloat(r.value)); };
+    r.onchange = function () { obj[key] = parseFloat(r.value); onChange(); };
+    w.appendChild(r);
+    return w;
+  }
+
+  /* ─────────────────────────────────────────────────── boot */
+  seen[0] = true;
+  renderSteps();
+  renderLesson();
+})();
+</script>
+</body>
+</html>

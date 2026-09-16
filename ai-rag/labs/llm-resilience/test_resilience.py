@@ -2,7 +2,7 @@
 
 These test *behaviour*, not implementation — they are the invariants that any
 correct version of this stack should hold, including one rebuilt from the
-libraries in production.py (README §6, exercise 7).
+libraries in production.py (README §7, exercise 7).
 """
 
 from __future__ import annotations
