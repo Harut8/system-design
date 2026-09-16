@@ -26,6 +26,7 @@ Prerequisites: familiarity with distributed system failure models from `00-primi
    - [9.6 Third-Party Webhook Delivery](#96-third-party-webhook-delivery-outbound)
    - [9.7 How to Derive Numbers for YOUR System](#97-how-to-derive-numbers-for-your-system)
 10. [Interview Preparation](#10-interview-preparation--resilience-patterns)
+11. [Sandbox Experiments — Run These Yourself](#11-sandbox-experiments--run-these-yourself)
 
 ---
 
@@ -2942,6 +2943,413 @@ These are rapid-fire questions where the interviewer wants a clear recommendatio
 ---
 
 *Use these questions for self-assessment: if you can answer each with specific numbers, concrete failure scenarios, and clear tradeoff reasoning — not just pattern names — you're operating at the level where you can design and debug resilience strategies in production systems.*
+
+---
+
+## 11. Sandbox Experiments — Run These Yourself
+
+Everything above is assertion until you have watched it happen. This section is a
+ladder of experiments, from a single LLM call with an error rate to a composed
+defence stack under a provider brownout. Each one gives you a setup, a
+**prediction you derive before running it**, and the numbers the run actually
+produces.
+
+**Where to run them.** The companion sandbox lives at
+`../ai-rag/labs/llm-resilience/simulator.html` — open it directly in a browser,
+no server and no dependencies. Steps 1–10 of its **Learn** tab correspond to
+experiments 1–7 below; the **Sandbox** tab is experiment 8. The same model runs
+headless in Python (`run.py`) if you would rather script the sweeps.
+
+> **What these numbers are.** They are *simulated*, from an invented fixture: a
+> chat product calling an LLM API with a plausible-but-fictional latency and
+> rate-limit profile. They demonstrate **mechanisms and orders of magnitude**,
+> and every one of them is reproducible from a seed. They are not measurements
+> of any provider, and none of them should be quoted as one. The *arithmetic* in
+> each "Predict" block, however, is exact — it is the part worth carrying to your
+> own system.
+
+---
+
+### 11.1 Experiment 1 — The raw failure rate passes straight through
+
+The simplest possible case, and the one everything else is measured against.
+
+```
+SETUP
+  10 requests/sec for 30 seconds       = 300 requests
+  provider returns 500 for 10% of calls
+  no retry, no breaker, 3s timeout
+```
+
+**Predict.** With no retry, your failure rate *is* their failure rate. Expect
+300 × 0.10 = **30 failures**, with a standard deviation of
+√(300 × 0.1 × 0.9) = 5.2 — so anything from 20 to 40 is unremarkable.
+
+**Observe.** 300 requests, **38 failures (87% success)**, 300 attempts, 15.5
+seconds of wall-clock burned on requests that returned nothing.
+
+**Why it matters.** This is the number a retry has to beat. Note the second-order
+point: 38 is 1.5 standard deviations above 30, which is ordinary. If you A/B two
+resilience configurations on 300 requests and see a 20% difference, you have
+measured noise. Sample-size discipline is part of resilience work.
+
+---
+
+### 11.2 Experiment 2 — Retry converts failures into load, on a known curve
+
+```
+SETUP
+  same 300 requests, same 10% error rate
+  retry up to n attempts, full jitter
+```
+
+**Predict.** Retries follow a geometric series. With per-attempt failure
+probability `p` and a cap of `n` attempts:
+
+```
+  attempts per request  =  1 + p + p² + … + p^(n-1)  =  (1 − pⁿ) / (1 − p)
+  residual failure rate =  pⁿ
+```
+
+At p = 0.1, n = 3: 1 + 0.1 + 0.01 = **1.11 attempts per request**, so 300
+requests should cost **333 attempts**, and 0.1³ = **0.1% of requests still fail**
+(0.3 of them).
+
+**Observe.** Mean over 30 seeds: **333.57 attempts, 0.43 failures.** The closed
+form is not an approximation — it is what the system does.
+
+The same two formulas across the whole error-rate range:
+
+```
+  p      amplification            residual failure rate
+         predicted  observed      predicted   observed
+  0.05     1.052     1.051          0.0001     0.0003
+  0.10     1.110     1.118          0.0010     0.0013
+  0.20     1.240     1.252          0.0080     0.0080
+  0.30     1.390     1.388          0.0270     0.0240
+  0.50     1.750     1.735          0.1250     0.1120
+  0.80     2.440     2.430          0.5120     0.4827
+```
+
+**Why it matters.** Two things fall out of that table that you can use in a
+design review tomorrow:
+
+1. **Amplification is bounded by `1/(1−p)`**, not by your attempt cap. At p = 0.1
+   three attempts cost 11% extra load, not 200%. People argue about attempt
+   caps as though they were the lever; at low error rates they are nearly free.
+2. **The cap stops mattering once p is large.** At p = 0.8, three attempts still
+   leave 48% of requests failing while nearly tripling your load. The lever that
+   works at low p is worthless at high p — which is exactly the regime an
+   incident puts you in.
+
+**Vary it.** Push `p` to 0.5 and watch amplification hit 1.75× while a ninth of
+requests still fail. That is the moment retries stop being a fix.
+
+---
+
+### 11.3 Experiment 3 — Independent vs. correlated failures
+
+Experiment 2's arithmetic assumes each attempt is an independent coin flip. Break
+that assumption and the whole calculation inverts.
+
+```
+SETUP
+  5 requests/sec for 40 seconds
+  provider returns 500 for EVERY call between t=10s and t=25s
+  retry up to n attempts
+```
+
+**Predict.** During the outage, `p = 1`, so `pⁿ = 1` — every retry fails too.
+Attempts rise linearly with the cap and rescue nothing. Any success you see comes
+from requests whose backoff happened to carry them past t=25s, which is a
+function of your backoff schedule, not of retrying.
+
+**Observe.**
+
+```
+  attempt cap   success   attempts   amplification   wall-clock wasted
+      n=1         63%        200         1.00×             30s
+      n=2         64%        275         1.38×             76s
+      n=3         68%        346         1.73×            127s
+      n=5         76%        474         2.37×            271s
+```
+
+**Why it matters.** Going from 1 to 5 attempts bought 13 percentage points of
+success and cost **9× the wasted time** and 2.4× the load — and the 13 points
+came from waiting out the outage, not from retrying. You could have bought the
+same thing with one retry and a longer backoff, at a fraction of the load.
+
+This is §2.1's retry amplification with numbers on it. **Retries are an
+availability tool when failures are independent (one bad node, one unlucky
+request) and a load-amplification tool when they are correlated (a bad deploy, a
+saturated dependency, a regional outage).** You do not get to choose which kind
+you have; you only get to choose whether your retry policy notices.
+
+**Vary it.** Set the cap to 5 and the base delay to 4s. Success climbs further —
+because you are now simply waiting out the outage. That is a *timeout* strategy
+wearing a retry costume, and it is much cheaper to implement as one.
+
+---
+
+### 11.4 Experiment 4 — Timeouts, and what a circuit breaker actually saves
+
+The most expensive failure is not an error. It is a dependency that accepts your
+connection and then says nothing.
+
+```
+SETUP
+  4 requests/sec for 40 seconds
+  provider latency ×20 between t=10s and t=30s (stalls, does not error)
+  3-second timeout
+  circuit breaker: trip at 50% failures, 10s window, stay open 3s, 2 probes to close
+```
+
+**Predict.** 20 seconds of stall × 4 req/s = **80 requests**, each burning the
+full 3s timeout = **240 seconds of connection-time held**, all of it producing
+nothing. A breaker should collapse most of that to near-zero, at the cost of
+also refusing some requests that would have squeaked through.
+
+**Observe.**
+
+```
+                    success   refused instantly   trips   wall-clock wasted
+  breaker OFF         49%            0              0          243s
+  breaker ON          39%           70              5           84s
+```
+
+**Why it matters.** The predicted 240s and the observed 243s agree, which tells
+you the model is doing what you think. Now read the trade honestly:
+
+- The breaker cut wasted connection-time by **65%** (243s → 84s). In a real
+  service that is thread-pool, connection-pool and file-descriptor pressure that
+  no longer propagates to the rest of your system. This is §1.2's cascade,
+  prevented.
+- It also cost **10 percentage points of success**. An open circuit refuses
+  requests indiscriminately, including ones the degraded dependency would have
+  served.
+
+**A circuit breaker trades a little availability for a large reduction in
+blast radius.** That is a good trade when the alternative is exhausting a shared
+resource, and a bad one when the protected path has no fallback and the
+dependency is only *partly* sick. If you cannot afford the 10 points, the fix is
+to give that path a fallback (§3.5), not to delete the breaker.
+
+**Vary it.** Set `stay open for` to 20s and watch success collapse further — the
+circuit is now open long after the stall ended at t=30s. This is why fixed reset
+timeouts must be shorter than your typical incident, and why exponential
+open-duration backoff (which compounds 3s → 6s → 12s → 24s across a single
+brownout) should be opt-in rather than the default.
+
+---
+
+### 11.5 Experiment 5 — 429 is not a failure
+
+One checkbox, and it is the highest value-per-line change in this chapter.
+
+```
+SETUP
+  6 requests/sec at a provider that allows 4/sec
+  provider is otherwise HEALTHY — it answers every call it has quota for
+  it returns 429 with a retry-after header for the rest
+  circuit breaker on, trip at 30% failures
+  the only variable: does a 429 count toward the failure ratio?
+```
+
+**Predict.** You are 50% over quota, so roughly a third of calls get a 429. A
+third exceeds the 30% trip threshold — so if 429s count, the breaker will open
+**on a healthy API**, and then refuse the requests that did have quota.
+
+**Observe.**
+
+```
+                      success   refused by breaker   trips   429s seen
+  counts 429 = true     47%            86              2        35
+  counts 429 = false    75%             0              0       164
+```
+
+**Why it matters.** The flag costs **28 percentage points of availability**, and
+it costs them against a dependency that was working correctly the whole time. The
+mechanism is worth stating precisely because it is counter-intuitive: counting
+429s makes the breaker open, which *reduces* the request rate, which is why the
+429 count falls from 164 to 35 — the metric that triggered the breaker improves
+*because* the breaker is hurting you. Every dashboard looks better; the product
+is worse.
+
+The fix is one early return:
+
+```python
+def record(self, status):
+    if status == 429:        # backpressure, not failure
+        return
+    ...
+```
+
+A circuit breaker exists to detect a **broken** dependency. One that is rate
+limiting you is working perfectly and has told you exactly how long to wait.
+Quota belongs to a rate limiter (§9.3 step 4); the breaker should never see it.
+
+**Vary it.** Untick the box, then raise your request rate to 12/sec. Success
+falls, but the breaker still never trips — because being over quota is not a
+dependency failure no matter how far over you are.
+
+---
+
+### 11.6 Experiment 6 — Jitter, measured
+
+```
+SETUP
+  40 clients, all calling the same provider
+  provider fails for 2 seconds (t=5s to t=7s) — a blip, not an outage
+  retry with a 2-second base delay
+  the only variable: jitter strategy
+```
+
+**Predict.** Every client fails inside the same 2-second window and schedules its
+retry 2 seconds later. With no jitter all 40 retries land in the same instant.
+Equal jitter spreads them over half the window; full jitter over all of it.
+
+**Observe.** Peak attempts in a single 0.25-second bucket:
+
+```
+  jitter = none    80 attempts   at t=7.00s
+  jitter = equal   59 attempts   at t=9.00s
+  jitter = full    52 attempts   at t=8.00s
+```
+
+**Why it matters.** Same total load (920 / 954 / 968 attempts — within noise),
+completely different *shape*. The no-jitter run delivers a **80-attempt spike**
+at a single instant, aimed at a provider that has just demonstrated it is unwell.
+Full jitter delivers 52 — a 35% lower peak — for one line of code:
+
+```python
+delay = random.uniform(0, min(cap, base * 2 ** attempt))
+```
+
+Note that the spike lands at exactly t=7.00s: base delay 2s after the failures
+began at t=5s. Synchronisation is not probabilistic, it is arithmetic. Any two
+clients that fail in the same second and share a backoff schedule *will* retry in
+the same second.
+
+**Vary it.** Raise clients to 60 with jitter off and watch the peak scale
+linearly. This is how a brief blip becomes a sustained outage: the spike causes
+the next failure, which schedules the next spike.
+
+---
+
+### 11.7 Experiment 7 — A retry budget self-cancels
+
+```
+SETUP
+  3 requests/sec for 36 seconds
+  provider completely down from t=8s to t=28s (a 20-second outage)
+  retry up to 3 attempts, full jitter
+  the variable: retry budget, as a fraction of successes
+```
+
+**Predict.** A budget is refilled by *successes*. During a total outage there are
+none, so the budget should drain and retries should stop — automatically, without
+anyone changing a config.
+
+**Observe.**
+
+```
+  budget      attempts   amplification   gave up early   success
+  0 (off)       224          2.07×             0           53%
+  0.05          119          1.10×            55           44%
+  0.10          120          1.11×            55           44%
+  0.25          124          1.15×            54           44%
+  1.00          143          1.32×            44           44%
+```
+
+**Why it matters.** The budget cut load by **47%** (224 → 120 attempts) at a cost
+of 9 points of success — and those 9 points, as Experiment 3 showed, came from
+waiting out the outage rather than from retrying. Notice that the exact budget
+value barely matters (0.05, 0.10 and 0.25 are within noise of each other): what
+matters is that a bound exists at all.
+
+This is the mechanism that makes retries safe to enable by default. A per-call-
+site attempt count multiplies load precisely when the dependency can least absorb
+it. A budget expressed as a fraction of successes is self-limiting in exactly the
+regime where retries cannot help — and stays fully available for the blip they
+*are* for.
+
+Envoy implements this natively (`retry_budget`); gRPC has it in the service
+config; in Python it is about thirty lines.
+
+---
+
+### 11.8 Experiment 8 — Composing the stack, and the trade nobody mentions
+
+Switch to the **Sandbox** tab. The workload is now a realistic product: every
+user turn fans out to 3.11 model calls across three tiers — a safety classifier,
+a query rewrite, a streamed answer, an occasional reasoning escalation, a title.
+They have different criticalities and different fallbacks.
+
+```
+SETUP
+  10 user turns/sec (about 31 LLM calls/sec)
+  provider incident on the answer tier: fleet at 10%, error rate 55%, t=20s–45s
+  compare three configurations on the same seed
+```
+
+**Predict.** The defended stack should waste less and generate fewer 529s. Its
+effect on *turn completion* is less obvious — think about it before running.
+
+**Observe.**
+
+```
+  configuration                        turns answered   wasted spend   529s generated
+  naive: 3 retries, one global timeout       60%            $6.20            141
+  full defence stack                         28%            $1.95              0
+  full stack + a fallback for `answer`       65%            $1.02              0
+```
+
+**Why it matters.** Read the first two rows and the stack looks like a
+regression. It is not, and the reason is the most important thing in this
+chapter.
+
+The breaker correctly detects a broken dependency and refuses traffic in
+microseconds. But `answer` is the one call class with `fallback: none` — so every
+refusal is a failed turn. The naive client instead waits out the full timeout on
+every call and collects whatever the degraded fleet still manages to serve. It
+buys availability with **3× the wasted spend and 141 provider-wide 529s** — and
+those 529s are not yours alone. You have converted your incident into every
+tenant's incident, including your own other call classes.
+
+The third row is the resolution. Give the critical path somewhere to fall back to
+— a cache, a cheaper model, a partial answer — and the defended stack beats the
+naive one on **every** axis simultaneously. The lesson is not "breakers cost
+availability". It is:
+
+> A circuit breaker on a critical path with no fallback trades availability for
+> blast-radius containment. If you cannot afford that trade, the answer is to
+> build the fallback, not to remove the breaker.
+
+**Vary it.** Reorder the stack. Drag `Retries` above `Client Rate Limiter` and
+every attempt now takes a fresh quota reservation. Drag it above `Circuit
+Breaker` and you retry into an open circuit. The list is not decoration — each
+pattern wraps the ones below it, so the order *is* the semantics.
+
+---
+
+### 11.9 A checklist you can take to a design review
+
+Each row is a number you should be able to produce for your own system, with the
+experiment that teaches you how to get it.
+
+| Question | How to answer it | Exp. |
+|---|---|---|
+| What is our dependency's failure rate, and is it independent or correlated? | Look at whether failures cluster in time. Clustered means retries will not help. | 1, 3 |
+| How much load will our retry policy add at that failure rate? | `(1 − pⁿ)/(1 − p)`. Compute it before arguing about attempt caps. | 2 |
+| What is our residual failure rate after retries? | `pⁿ`. If it is not low enough, the answer is a fallback, not more attempts. | 2 |
+| How much connection-time does a stalled dependency hold? | `arrival_rate × stall_duration × timeout`. This is the cascade budget. | 4 |
+| Does our breaker count 429s? | Read the code. This one line is worth ~28 points of availability. | 5 |
+| Do we jitter? What is our peak retry concurrency after a blip? | `clients` in one bucket at `t_fail + base`. | 6 |
+| What bounds our total retry load during a full outage? | If the answer is "the attempt cap", you have no bound. | 7 |
+| Which of our call paths have no fallback? | Those are the ones where a breaker costs availability. Fix the fallback. | 8 |
+
+If you can fill that table in with real numbers for your own dependencies, you
+are past pattern-name fluency and into the design work this chapter is about.
 
 ---
 

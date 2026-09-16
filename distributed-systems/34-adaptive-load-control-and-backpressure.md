@@ -22,6 +22,7 @@ Prerequisites: familiarity with reliability patterns from `33-resilience-pattern
 12. [Production Design Tradeoff Matrix](#12-production-design-tradeoff-matrix)
 13. [Cloud-Native Ownership — App vs. Infra vs. Hybrid](#13-cloud-native-ownership--app-vs-infra-vs-hybrid)
 14. [Interview Preparation — Adaptive Load Control & Backpressure](#14-interview-preparation--adaptive-load-control--backpressure)
+15. [Sandbox Experiments — Run These Yourself](#15-sandbox-experiments--run-these-yourself)
 
 ---
 
@@ -3833,6 +3834,389 @@ Additional: (4) Cost — auto-scaling up is easy; auto-scaling DOWN is where the
 ---
 
 *Use these questions for self-assessment: if you can trace the exact resource exhaustion path (threads, connections, memory, file descriptors, ports) through a specific failure scenario with real numbers, you understand overload defense at the level needed to design and debug production systems. Pattern names are necessary but insufficient — the difference between mid-level and staff-level is the ability to quantify what happens and predict when it breaks.*
+
+---
+
+## 15. Sandbox Experiments — Run These Yourself
+
+Overload is the failure mode you cannot reason about from a diagram, because the
+interesting behaviour is non-linear and arrives suddenly. This section is a ladder
+of experiments that make the knee visible: from a single concurrency limit and
+Little's Law, up to a product's capacity arithmetic and the exact moment a token
+bucket stops protecting you.
+
+**Where to run them.** The companion sandbox is at
+`../ai-rag/labs/llm-resilience/simulator.html` — open it directly, no server and
+no dependencies. Experiments 1–2 are steps 7 and 10 of its **Learn** tab; 3–7 use
+the **Sandbox** tab. `capacity.py` in the same folder does the arithmetic with no
+simulation at all, and that is the part to port to your own numbers first.
+
+> **What these numbers are.** Simulated, from an invented fixture — a chat
+> product in front of an LLM API with a plausible-but-fictional latency and
+> rate-limit profile. They demonstrate **mechanisms and orders of magnitude**,
+> reproducibly from a seed. They are not measurements of any provider. The
+> *arithmetic* in each "Predict" block is exact, and that is what to carry to
+> your own system.
+
+---
+
+### 15.1 Experiment 1 — Little's Law is not advice, it is a constraint
+
+Before any pattern, the number that determines everything else.
+
+```
+SETUP
+  N requests/sec, each holding a resource for L seconds
+  a hard concurrency limit of C
+  requests that cannot get a slot within 3s are rejected
+```
+
+**Predict.** Little's Law: concurrency required = `N × L`. If `C < N × L` the
+system cannot keep up *no matter what else you do* — the queue grows until
+something sheds. If `C > N × L` with headroom, queueing is negligible and latency
+is just service time.
+
+**Observe.**
+
+```
+  arrival   service   need      limit   success   p95 latency   rejected
+  6 /s      0.6s      3.6        4       100%       0.72s           0
+  12 /s     0.6s      7.2        4        61%       3.66s         141
+  12 /s     0.6s      7.2        8       100%       0.73s           0
+  12 /s     0.6s      7.2       16       100%       0.72s           0
+  24 /s     0.6s     14.4       16       100%       0.73s           0
+```
+
+**Why it matters.** Rows 2 and 3 differ only in a concurrency limit of 4 versus 8,
+against a requirement of 7.2. One is a 61%-success incident with 3.66s p95; the
+other is invisible. No tuning, no backoff curve and no breaker rescues row 2 — it
+is short of capacity by arithmetic.
+
+Rows 4 and 5 make the complementary point: raising the limit from 8 to 16 changes
+*nothing*, because 8 already exceeded the requirement. **Concurrency limits do not
+improve a system that is not concurrency-bound.** Most "we raised the pool size
+and it got better" stories are row 2 → row 3; most "we raised it and nothing
+happened" are row 3 → row 4.
+
+Size every pool — threads, connections, semaphores, provider concurrency — from
+`N × L` with headroom, and re-derive it when `L` changes. An LLM call's `L` is
+dominated by output tokens, so a prompt change silently moves your pool
+requirement.
+
+---
+
+### 15.2 Experiment 2 — Shedding reallocates; it does not create
+
+```
+SETUP
+  12 requests/sec, 0.6s each, concurrency limit 4  (need 7.2 — row 2 above)
+  half the traffic is "important" (someone is waiting), half is "background"
+  the variable: shed background work when the pool is >80% busy
+```
+
+**Predict.** Shedding cannot raise total throughput — the limit is still 4. What
+changes is *which* requests get the slots, and how fast the rest are refused.
+
+**Observe.**
+
+```
+                  important work      background work     p95 latency
+  shedding OFF    106/172  ( 62%)     113/188  ( 60%)        3.66s
+  shedding ON     171/171  (100%)      27/189  ( 14%)        0.97s
+```
+
+**Why it matters.** Total served is 219 in both rows — shedding produced zero
+extra capacity, exactly as predicted. But:
+
+- Important work went from **62% to 100%**. Every request someone was waiting for
+  succeeded.
+- p95 fell from **3.66s to 0.97s**, because the queue is no longer full of work
+  that will be discarded on arrival.
+- Background work absorbed the entire loss, which is the point.
+
+This is §4.1's counterintuitive truth with numbers on it: the system got *better*
+by doing *less*. Without shedding, both classes compete equally, so a request
+nobody is waiting for occupies a slot ahead of one a user is staring at — and both
+end up slow.
+
+**The caveat that matters in real systems** (Experiment 7 returns to it): shedding
+only helps if the shed work contends for the *same* resource.
+
+---
+
+### 15.3 Experiment 3 — Find the meter that actually binds
+
+Switch to the **Sandbox** tab, which runs a realistic product: each user turn fans
+out to 3.11 model calls across three tiers. Capacity is metered on three axes at
+once — requests/min, input tokens/min, output tokens/min.
+
+**Predict.** Compute each class's ceiling on all three axes and take the minimum.
+For a class sending `I` input tokens and producing `O` output tokens:
+
+```
+  by RPM   =  RPM_limit / 60
+  by ITPM  =  (ITPM_limit / 60) / I
+  by OTPM  =  (OTPM_limit / 60) / O
+```
+
+**Observe.** Per-class ceilings, requests/sec:
+
+```
+  class     tier      by RPM   by ITPM   by OTPM   binds   effective
+  guard     haiku      66.7     158.7    1111.1    RPM       66.67
+  rewrite   haiku      66.7      74.1     190.5    RPM       66.67
+  answer    sonnet     33.3      21.5      32.1    ITPM      21.51
+  think     opus        6.7       1.0       2.2    ITPM       0.56
+  title     haiku      66.7      41.7     476.2    ITPM      41.67
+```
+
+**Why it matters.** The published request limit says `answer` can do 33 req/s. It
+can do **21.5** — and for `think`, the RPM limit says 6.7 while the real ceiling is
+**0.56**, a factor of twelve. Anyone capacity-planning off the RPM number is wrong
+by an order of magnitude on the classes that matter most.
+
+Note `think`'s effective rate (0.56) is *below* even its ITPM ceiling (1.0). That
+gap is a second constraint: the output meter is charged against `max_tokens` at
+admission and reconciled afterwards, so `max_tokens` caps how many calls can be
+**in flight simultaneously**:
+
+```
+  concurrency_cap = OTPM_bucket / max_tokens
+```
+
+`think` asks for 8192 tokens, writes about 2400, and runs for ~70 seconds. It can
+hold 39 in flight where its own token quota would support 69. Sizing `max_tokens`
+to the p97 of observed output buys 1.77× on that class — one config line, no
+quality change. **On a long-running call, a generous `max_tokens` is a throughput
+setting.**
+
+Sustainable rate for the whole product: **6.94 turns/sec**. Write that number down
+before tuning anything.
+
+---
+
+### 15.4 Experiment 4 — The knee, and what "over capacity" looks like
+
+```
+SETUP
+  full defence stack, healthy provider
+  sweep offered load from well under capacity to 6x over
+```
+
+**Predict.** Below capacity, latency is service time and everything completes.
+Above it, §2.2's utilisation curve turns a corner: latency climbs, then goodput
+plateaus while completion collapses.
+
+**Observe.**
+
+```
+  offered      calls/s   turns answered   goodput   answer p95
+   3 turns/s      9           100%          9.8/s     15.8s
+   6 turns/s     19           100%         18.9/s     16.4s
+  10 turns/s     31           100%         29.4/s     16.5s
+  15 turns/s     47            56%         39.1/s     29.3s
+  25 turns/s     78            20%         51.5/s     34.2s
+  40 turns/s    124            11%         72.0/s     24.8s
+```
+
+**Why it matters.** Three readings, in increasing order of how much trouble they
+will save you:
+
+1. **The knee is sharp.** Between 10 and 15 turns/sec, completion falls from 100%
+   to 56%. There is no gentle slope to watch for on a dashboard — you are fine,
+   and then you are not. Provision against the knee, not the average.
+2. **Goodput keeps rising while the product collapses.** At 40 turns/s the system
+   completes *more calls per second* (72) than at 15 (39), while answering **11%
+   of turns instead of 56%**. Calls-per-second is the metric that will be on your
+   dashboard, and it says things are improving. Measure completed *user outcomes*,
+   not completed requests.
+3. **p95 is non-monotonic** — it peaks at 25 turns/s and then *falls* at 40.
+   Latency improved because the system started refusing work earlier; the
+   survivors are the fast ones. A latency graph alone cannot tell you whether you
+   are healthy or shedding hard.
+
+Availability and error rate both *improve* under load shedding, because requests
+you never admitted never had a chance to fail. The three metrics that stay honest
+are goodput of useful outcomes, shed-rate by criticality, and wasted spend.
+
+---
+
+### 15.5 Experiment 5 — A token bucket's burst is a fuse, and it has a length
+
+The experiment people get wrong, because the effect is delayed.
+
+```
+SETUP
+  6 turns/sec (comfortably inside capacity)
+  at t=20s the provider cuts your quota to 10% of normal
+  the variable: how long the cut lasts
+```
+
+**Predict.** This one needs arithmetic before you run it. A token bucket holds a
+full minute's allowance as burst. After a cut, the bucket drains at
+`demand − new_refill_rate`, so the delay before your first 429 is:
+
+```
+  drain_time  =  burst_capacity / (demand − new_refill_rate)
+```
+
+For this fixture — `answer` at 6 req/s × 6200 input tokens = 37,200 tokens/sec of
+demand, against an ITPM limit cut to 800,000/min:
+
+```
+  quota   burst          refill      demand       empties after
+   10%    800,000 tok    13,333/s    37,200/s        33.5s
+    5%    400,000 tok     6,667/s    37,200/s        13.1s
+    2%    160,000 tok     2,667/s    37,200/s         4.6s
+```
+
+So a **25-second incident at 10% should produce zero 429s** — the burst outlives
+the incident.
+
+**Observe.**
+
+```
+  incident            429s seen   turns answered
+  25s @ quota 10%          0          100%
+  70s @ quota 10%         18           67%
+  25s @ quota  2%         37           34%
+  70s @ quota  2%        162           32%
+```
+
+Zero, exactly as predicted, then 18 once the incident outlives the 33.5s fuse.
+
+**Why it matters.** Three consequences that bite in production:
+
+- **A short quota reduction is invisible.** Monitoring shows nothing; the bucket
+  absorbed it. That is what burst is *for* — but it means absence of 429s is not
+  evidence of absence of a quota problem.
+- **The failure arrives late and then all at once**, 33 seconds after the actual
+  event, with no proximate cause in your logs. Debugging that without the
+  drain-time formula is miserable.
+- **Burst hides your own bugs too.** A deploy that doubles prompt size looks fine
+  for the first half-minute of every process lifetime.
+
+**Vary it.** Raise load to 25 turns/sec and re-run the 25s @ 10% case. Demand
+rises, the fuse shortens, and the same incident now produces 429s. Drain time is a
+function of *your* demand, not just their limit.
+
+---
+
+### 15.6 Experiment 6 — Adaptive concurrency against a moving ceiling
+
+```
+SETUP
+  12 turns/sec
+  provider fleet drops to 20% between t=20s and t=45s
+  the variable: fixed limit vs AIMD vs Netflix gradient
+```
+
+**Predict.** A fixed limit is a guess about someone else's capacity, and it is
+wrong in both directions when that capacity moves. Feedback controllers should
+shed earlier and generate less provider-side overload.
+
+**Observe.**
+
+```
+  controller   turns answered   529s generated   wasted spend
+  gradient          34%               30            $3.61
+  AIMD              34%               30            $3.60
+  fixed             34%               93            $4.80
+```
+
+**Why it matters.** Completion is identical across all three — the capacity is
+gone, and no client-side controller conjures it back. The difference is entirely
+in **what you do to the provider while it is down**: the fixed limit generates
+**3× the 529s** and 33% more wasted spend, because it keeps pushing a
+pre-configured number of concurrent requests at a fleet that can no longer absorb
+them.
+
+Those 529s are provider-wide. A fixed limit does not merely fail to help; it
+extends the incident for every tenant, including your own other call classes.
+
+Two implementation details decide whether a controller works at all, and neither
+is the algorithm:
+
+1. **Scope it per call class.** Pool a 0.2s classifier and a 9s answer stream
+   behind one controller and the classifier's latency becomes the "no-load"
+   baseline. Every answer call then reads as congestion, the limit decays to the
+   floor, the floor causes real queueing, and the controller reads that as more
+   congestion. It death-spirals on its own output.
+2. **Feed it time-to-first-token, not total duration.** Total duration on an LLM
+   call is dominated by how many tokens the answer needed. A controller fed raw
+   latency shrinks the limit whenever users ask harder questions.
+
+A third, if you implement the gradient yourself: the sample window must scale with
+the limit. A fixed 24-sample window is fine at limit=100 and fatal at limit=4,
+where those samples take a minute to accumulate and the controller sits at the
+floor long after recovery.
+
+---
+
+### 15.7 Experiment 7 — Shedding only helps if it contends for the same resource
+
+The result that looks like a bug and is not.
+
+```
+SETUP
+  25 turns/sec (3.6x capacity), full stack, healthy provider
+  the variable: criticality ladder on vs never shed
+```
+
+**Observe.**
+
+```
+  criticality       class      ladder ON   ladder OFF
+  CRITICAL_PLUS     answer         17%         17%
+  CRITICAL          guard          93%         83%
+  CRITICAL          think          50%         53%
+  SHEDDABLE_PLUS    rewrite        81%         61%
+  SHEDDABLE         title         100%        100%
+```
+
+**Why it matters.** The ladder is supposed to shed `title` first and protect
+`answer`. Instead `title` is served **100% either way** and `answer` sits at 17%
+regardless.
+
+This is correct, and the reason is the most useful thing in this section: `title`
+runs on a tier with enormous headroom, and `answer` runs on one that is saturated.
+**Shedding titles frees capacity that `answer` cannot use.** The ladder is not
+broken; it is correctly declining to shed work that is not contending for
+anything.
+
+What the ladder *did* do is visible in the rows that share a tier: `rewrite` went
+from 61% to 81% and `guard` from 83% to 93%, because those three classes share the
+Haiku pool, and the ladder reordered *that* contention.
+
+The generalisation:
+
+> A criticality ladder must be scoped to the contended resource. Shedding
+> low-priority work that uses a different pool, tier, shard or quota is a no-op
+> dressed up as load management.
+
+Before building a shedding policy, answer: *which* resource is exhausted, and
+which classes actually compete for it? If your background jobs use a separate
+connection pool, shedding them will not help your API latency — and you will spend
+a sprint discovering that.
+
+---
+
+### 15.8 A checklist you can take to a capacity review
+
+| Question | How to answer it | Exp. |
+|---|---|---|
+| What concurrency do we need? | `arrival_rate × service_time`, per resource. Re-derive when service time changes. | 1 |
+| Are we concurrency-bound, or is raising the pool a no-op? | Compare pool size against `N × L`. Only row-2 systems benefit. | 1 |
+| When we shed, what goes first — and does it use the same resource? | If it uses a different pool, shedding it buys nothing. | 2, 7 |
+| Which meter actually binds each call path? | Compute all of them, take the minimum. It is rarely the request limit. | 3 |
+| Where is our knee? | Sweep load until completion falls. Provision against that, not the mean. | 4 |
+| Is our dashboard metric goodput-of-outcomes or requests-per-second? | The second rises while the product collapses. | 4 |
+| How long is our rate-limiter burst — how late does a quota problem surface? | `burst / (demand − refill_rate)`. | 5 |
+| Is our concurrency limit fixed? What does it do to the dependency mid-incident? | Fixed limits triple provider-side overload here. | 6 |
+| Is our adaptive controller scoped per call class, and fed TTFT? | If it pools dissimilar calls, it decays to the floor. | 6 |
+
+If you can produce those numbers for your own system, you can predict its overload
+behaviour instead of discovering it.
 
 ---
 
