@@ -1,0 +1,40 @@
+# Libraries referenced by production.py. NOT needed to run this lab — run.py
+# and test_resilience.py have zero dependencies. These are here so the mapping
+# from hand-rolled module to real library is concrete and installable.
+#
+# Versions are floors, not pins. Check the signatures against what you install:
+# pybreaker's `exclude` predicate form, LiteLLM's Router kwargs, and the
+# `limits` async storage API have all moved between releases.
+
+# the SDK. Its own max_retries + httpx.Timeout already cover most of retry.py
+anthropic>=0.40.0
+
+# retries with full jitter, deadline-aware stop conditions, per-class policy
+tenacity>=8.2.0
+# backoff>=2.2.0            # alternative; terser decorator, harder deadlines
+
+# circuit breaker. purgatory is the async-native equivalent
+pybreaker>=1.2.0
+# purgatory-circuitbreaker>=2.0  # async, with a Redis store
+
+# client-side metering: in-process
+aiolimiter>=1.1.0
+# fleet-wide, Redis-backed (the org quota is shared across your pods)
+limits>=3.6.0
+redis>=5.0.0
+
+# bulkheads need no library (asyncio.Semaphore), but anyio helps on trio
+anyio>=4.0.0
+
+# routing / fallback / cooldowns / shared TPM-RPM state across providers
+litellm>=1.40.0
+
+# the three metrics that stay honest while you are shedding on purpose
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+
+# ── not on PyPI, and that is the point ────────────────────────────────────
+# adaptive concurrency  -> Envoy `adaptive_concurrency` filter, at the sidecar
+# retry budgets         -> Envoy `retry_budget` / gRPC service config
+# LIFO queueing, CoDel  -> the proxy layer, not your application
+# admission control     -> yours. Only you know your criticality ladder.
