@@ -1383,95 +1383,502 @@ contaminates ranking — and pgvector won't warn you. The operator class is a de
 once, at `CREATE INDEX` time; verify it matches your normalization invariant before you have data
 in the table, not after.
 
-#### 12.7.3 Two models, same database — the migration pattern
+#### 12.7.3 Multiple models, same database — four patterns and when each wins
 
-During a migration (§12.4), you need both the old and new model's vectors queryable
-simultaneously. In pgvector, this means separate columns or separate tables — **not** the same
-column, because the dimensions may differ and the vectors are not comparable.
+During a migration (§12.4) or in any multi-model architecture (§12.9), you need vectors from
+different models to coexist in the same database. There are four distinct patterns for this, each
+with different trade-offs around schema flexibility, write-path bloat, query complexity, and
+long-term maintainability. The right choice depends on whether multi-model is a transitional state
+(migration) or a permanent one (tiered models, modality-specific models, A/B testing).
 
-**Option A — Separate columns (same table, preferred for smaller corpora):**
+Before the patterns: one invariant that applies to all of them. **During a partial migration, you
+must embed the query with BOTH models and search BOTH indexes** (or both partitions). You cannot
+search a mixed-model result set with a single query vector, because the old vectors and new vectors
+are in different coordinate spaces (§12.2). The query-side cost doubles during migration — two
+embedding API calls per query — but the alternative is silently broken retrieval on whatever
+fraction of the corpus hasn't been migrated yet.
+
+---
+
+**Option A — Separate columns (same table)**
+
+Add a new `vector(d)` column for each model version. Simple to understand, no JOINs needed.
 
 ```sql
--- Add the new model's column alongside the old one.
--- Different dimension is fine — each column has its own type.
 ALTER TABLE documents
-    ADD COLUMN embedding_v2 vector(1536);  -- new model outputs 1536 dims
+    ADD COLUMN embedding_v2 vector(1536);
 
--- Separate index on the new column.
 CREATE INDEX idx_documents_embedding_v2 ON documents
     USING hnsw (embedding_v2 vector_cosine_ops)
     WITH (m = 16, ef_construction = 200);
 
--- Track which rows have been re-embedded.
 ALTER TABLE documents
     ADD COLUMN embedding_v2_at TIMESTAMPTZ;
+```
 
--- Shadow-embed query: find rows not yet migrated.
-SELECT id, content FROM documents
-WHERE embedding_v2 IS NULL
-ORDER BY id
-LIMIT 1000;
+Query during migration — UNION both columns:
 
--- After re-embedding, update the row:
-UPDATE documents
-SET embedding_v2 = $1, embedding_v2_at = now()
-WHERE id = $2;
-
--- Query during migration — query the OLD index for un-migrated rows,
--- the NEW index for migrated rows, union and re-rank:
+```sql
 WITH old_results AS (
     SELECT id, content, 1 - (embedding <=> $1) AS similarity
     FROM documents
     WHERE embedding_v2 IS NULL
-    ORDER BY embedding <=> $1  -- $1 is query embedded with OLD model
+    ORDER BY embedding <=> $1  -- $1 = query from OLD model
     LIMIT 20
 ),
 new_results AS (
     SELECT id, content, 1 - (embedding_v2 <=> $2) AS similarity
     FROM documents
     WHERE embedding_v2 IS NOT NULL
-    ORDER BY embedding_v2 <=> $2  -- $2 is query embedded with NEW model
+    ORDER BY embedding_v2 <=> $2  -- $2 = query from NEW model
     LIMIT 20
 )
 SELECT * FROM (
-    SELECT * FROM old_results
-    UNION ALL
-    SELECT * FROM new_results
-) combined
-ORDER BY similarity DESC
-LIMIT 20;
+    SELECT * FROM old_results UNION ALL SELECT * FROM new_results
+) combined ORDER BY similarity DESC LIMIT 20;
 ```
 
-The query above is the critical detail most migration guides omit: **during a partial migration,
-you must embed the query with BOTH models and search BOTH indexes.** You cannot search a mixed
-index with a single query vector, because the old vectors and new vectors are in different
-coordinate spaces (§12.2). The query-side cost doubles during migration — two embedding API calls
-per query — but the alternative is silently broken retrieval on whatever fraction of the corpus
-hasn't been migrated yet.
+**When it wins:** small corpus, one-time migration you'll finish in days, ≤2 model versions in
+the table's lifetime.
 
-**Option B — Separate tables (preferred for large corpora or clean separation):**
+**When it hurts:**
+- Schema sprawl: every migration adds columns and indexes. After three model changes the table
+  has `embedding`, `embedding_v2`, `embedding_v3`, each with its own HNSW index.
+- The re-embed step is an `UPDATE`, which under PostgreSQL's MVCC writes a full new heap tuple
+  plus new TOAST chunks — see §12.7.6 for why this matters.
+- Rollback is "null out a column on N million rows" + vacuum, not a clean drop.
+
+---
+
+**Option B — Separate tables per version**
+
+A fresh table for each model version. The re-embed job is a pure INSERT pipeline.
 
 ```sql
--- Entirely separate table for the new model.
-CREATE TABLE documents_v2 (
+CREATE TABLE document_embeddings_v2 (
     id            BIGSERIAL PRIMARY KEY,
-    source_id     BIGINT REFERENCES documents(id),  -- link to original
+    document_id   BIGINT NOT NULL REFERENCES documents(id),
     embedding     vector(1536),
-    model_config  JSONB NOT NULL,
     embedded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_documents_v2_embedding ON documents_v2
+CREATE INDEX idx_doc_emb_v2 ON document_embeddings_v2
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 200);
 ```
 
-Separate tables are operationally cleaner for large migrations: the re-embed job is a pure insert
-pipeline into a fresh table (no row-level locks on the production table), the new index is built
-from scratch (no index bloat from updates), and rollback is "drop the new table" rather than
-"null out a column on 50 million rows."
+Query during migration — same UNION pattern, but against two tables:
 
-#### 12.7.4 HNSW index parameters across model changes
+```sql
+WITH old_results AS (
+    SELECT d.id, d.content, 1 - (e.embedding <=> $1) AS similarity
+    FROM document_embeddings_v1 e
+    JOIN documents d ON d.id = e.document_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM document_embeddings_v2 e2
+        WHERE e2.document_id = e.document_id
+    )
+    ORDER BY e.embedding <=> $1
+    LIMIT 20
+),
+new_results AS (
+    SELECT d.id, d.content, 1 - (e.embedding <=> $2) AS similarity
+    FROM document_embeddings_v2 e
+    JOIN documents d ON d.id = e.document_id
+    ORDER BY e.embedding <=> $2
+    LIMIT 20
+)
+SELECT * FROM (
+    SELECT * FROM old_results UNION ALL SELECT * FROM new_results
+) combined ORDER BY similarity DESC LIMIT 20;
+```
+
+**When it wins:** large corpus where re-embed takes days, you want zero interference with
+production reads, and rollback = `DROP TABLE document_embeddings_v2`.
+
+**When it hurts:**
+- Table proliferation: `_v1`, `_v2`, `_v3` tables accumulate. Each needs its own indexes,
+  vacuum config, and monitoring.
+- JOINs required to get document content alongside similarity scores.
+- If multi-model is permanent (not just a migration), the application layer must know which table
+  to query for which model — routing logic lives in application code, not in the schema.
+
+---
+
+**Option C — Normalized embedding table with FK to a version registry (recommended default)**
+
+This is the relational-database-native answer to the versioning problem: separate the *what* (the
+document) from the *how it was embedded* (the model config), linked by foreign keys. One
+`embedding_versions` table holds the model metadata. One `document_embeddings` table holds every
+embedding ever produced, with a composite unique constraint on `(document_id, version_id)` — at
+most one embedding per document per model version. New rows are always INSERTs, never UPDATEs.
+
+This pattern is documented in production systems including the
+[Pulso project](https://github.com/dinhostork/pulso/issues/25) (ArticleEmbedding with
+`model_key` + `UniqueConstraint`), [Timescale's pgvector guide](https://github.com/timescale/docs/blob/latest/ai/key-vector-database-concepts-for-understanding-pgvector.md)
+(document_embedding with FK to document), and is the schema recommended by the
+[Lantern blog](https://lantern.dev/blog/async-embedding-tables) for async embedding generation
+(separate embedding table to avoid TOAST bloat on the source table).
+
+```sql
+-- 1. Version registry — one row per embedding configuration.
+--    This is the "schema" for your embedding layer.
+CREATE TABLE embedding_versions (
+    id              SERIAL PRIMARY KEY,
+    model_name      TEXT NOT NULL,        -- "voyage-4", "text-embedding-3-small"
+    model_version   TEXT NOT NULL,        -- "4.0", "2024-01-25"
+    dimensions      INT NOT NULL,         -- stored dimension (after MRL truncation)
+    full_dimensions INT NOT NULL,         -- model's native output dimension
+    quantization    TEXT NOT NULL DEFAULT 'float32',  -- "float32","int8","binary"
+    distance_metric TEXT NOT NULL DEFAULT 'cosine',   -- what the index uses
+    input_type_doc  TEXT,                 -- "search_document" / "document" / null
+    input_type_qry  TEXT,                 -- "search_query" / "query" / null
+    context_method  TEXT NOT NULL DEFAULT 'none',  -- "contextual_retrieval","late_chunking"
+    is_active       BOOLEAN NOT NULL DEFAULT false,  -- only ONE version serves queries
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    notes           TEXT,                 -- "migrating from v2, 67% complete"
+
+    UNIQUE (model_name, model_version, dimensions, quantization)
+);
+
+-- 2. Embeddings table — one row per (document, version).
+--    Always INSERT, never UPDATE. This is critical for avoiding MVCC bloat (§12.7.6).
+CREATE TABLE document_embeddings (
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_id      INT NOT NULL REFERENCES embedding_versions(id),
+    embedding       vector(1024),         -- dimension matches version's config
+    content_hash    TEXT NOT NULL,         -- hash of the source text that was embedded;
+                                           -- enables idempotent re-embed (§12.7.7)
+    embedded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE (document_id, version_id)      -- at most one embedding per doc per version
+);
+
+-- 3. Partial index — ONLY on the active version. The planner skips inactive versions
+--    entirely, so old/migrating embeddings don't bloat the hot search path.
+CREATE INDEX idx_active_embeddings ON document_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200)
+    WHERE version_id = (SELECT id FROM embedding_versions WHERE is_active = true);
+```
+
+**The partial index is the key insight.** Instead of building a global HNSW index over all
+embeddings (mixing model versions that shouldn't be compared), the `WHERE version_id = X` clause
+means the index contains *only* vectors from the active model. The planner uses this index when
+the query includes the matching filter. During migration, you build a second partial index for the
+new version:
+
+```sql
+-- While migration is in progress: add an index for the new version too.
+CREATE INDEX CONCURRENTLY idx_embeddings_v3 ON document_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200)
+    WHERE version_id = 3;
+```
+
+**Re-embedding is a pure INSERT pipeline:**
+
+```sql
+-- Find documents not yet embedded under the new version.
+SELECT d.id, d.content
+FROM documents d
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_embeddings de
+    WHERE de.document_id = d.id AND de.version_id = 3  -- new version
+)
+ORDER BY d.id
+LIMIT 1000;
+
+-- After embedding, insert (never update):
+INSERT INTO document_embeddings (document_id, version_id, embedding, content_hash)
+VALUES ($1, 3, $2, $3)
+ON CONFLICT (document_id, version_id) DO NOTHING;  -- idempotent
+```
+
+**Query during migration — dual-query with version filtering:**
+
+```sql
+-- Application embeds query with BOTH models, then:
+WITH old_results AS (
+    SELECT de.document_id, d.content,
+           1 - (de.embedding <=> $1) AS similarity  -- $1 = old model query vec
+    FROM document_embeddings de
+    JOIN documents d ON d.id = de.document_id
+    WHERE de.version_id = 2  -- old version
+      AND NOT EXISTS (
+          SELECT 1 FROM document_embeddings de2
+          WHERE de2.document_id = de.document_id AND de2.version_id = 3
+      )
+    ORDER BY de.embedding <=> $1
+    LIMIT 20
+),
+new_results AS (
+    SELECT de.document_id, d.content,
+           1 - (de.embedding <=> $2) AS similarity  -- $2 = new model query vec
+    FROM document_embeddings de
+    JOIN documents d ON d.id = de.document_id
+    WHERE de.version_id = 3  -- new version
+    ORDER BY de.embedding <=> $2
+    LIMIT 20
+)
+SELECT * FROM (
+    SELECT * FROM old_results UNION ALL SELECT * FROM new_results
+) combined ORDER BY similarity DESC LIMIT 20;
+```
+
+**Cutover — one UPDATE, zero re-embedding:**
+
+```sql
+-- Once all documents are embedded under v3 and golden-set evaluation passes:
+BEGIN;
+UPDATE embedding_versions SET is_active = false WHERE is_active = true;
+UPDATE embedding_versions SET is_active = true WHERE id = 3;
+COMMIT;
+
+-- Drop the old version's partial index (the hot path no longer needs it).
+DROP INDEX idx_active_embeddings;
+
+-- Optionally: delete old version's embeddings to reclaim space.
+-- Or keep them for rollback — they cost storage but enable instant revert.
+DELETE FROM document_embeddings WHERE version_id = 2;
+```
+
+**Rollback — flip `is_active` back, old embeddings are still there:**
+
+```sql
+BEGIN;
+UPDATE embedding_versions SET is_active = false WHERE id = 3;
+UPDATE embedding_versions SET is_active = true WHERE id = 2;
+COMMIT;
+-- Old embeddings never left the table. Instant rollback, no re-embedding.
+```
+
+**When it wins:** production systems that will change models more than once, multi-tenant setups,
+A/B testing embedding models, any case where you want rollback without re-embedding, systems
+where the embedding layer is managed by a team that treats model versions as first-class schema.
+
+**When it hurts:**
+- JOIN required on every query (document_embeddings → documents). For most workloads the JOIN
+  cost is negligible (it's a PK lookup after the ANN scan returns 20 IDs), but measure it.
+- The partial index must be rebuilt when `is_active` changes (or you maintain one partial index
+  per version and let the planner pick — slightly more storage, zero rebuild).
+- More complex schema to set up than Options A/B. Worth it if you'll migrate more than once.
+
+---
+
+**Option D — Untyped vector column with expression + partial indexes per model_id**
+
+pgvector supports an untyped `vector` column (no dimension specified) that accepts vectors of
+*any* dimension. Combined with a `model_id` discriminator and partial expression indexes, this
+stores everything in one table — even across dimension changes — and lets the planner pick the
+right index per model. This is from
+[pgvector's own README](https://github.com/pgvector/pgvector):
+
+```sql
+-- Single table, untyped vector column, model discriminator.
+CREATE TABLE document_embeddings (
+    document_id   BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    model_id      INT NOT NULL,           -- FK to embedding_versions if desired
+    embedding     vector,                 -- untyped: any dimension accepted
+    content_hash  TEXT NOT NULL,
+    embedded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (document_id, model_id)
+);
+
+-- Expression + partial index: cast the untyped vector to the known dimension
+-- for this specific model. The planner uses this index ONLY when the query
+-- includes WHERE model_id = 2.
+CREATE INDEX idx_emb_model_2 ON document_embeddings
+    USING hnsw ((embedding::vector(1024)) vector_cosine_ops)
+    WHERE (model_id = 2);
+
+-- Different model, different dimension — separate partial index.
+CREATE INDEX idx_emb_model_3 ON document_embeddings
+    USING hnsw ((embedding::vector(1536)) vector_cosine_ops)
+    WHERE (model_id = 3);
+```
+
+Query:
+
+```sql
+-- The planner picks idx_emb_model_3 because of WHERE model_id = 3.
+SELECT de.document_id, d.content,
+       1 - (de.embedding::vector(1536) <=> $1) AS similarity
+FROM document_embeddings de
+JOIN documents d ON d.id = de.document_id
+WHERE de.model_id = 3
+ORDER BY de.embedding::vector(1536) <=> $1
+LIMIT 20;
+```
+
+**When it wins:** you need different dimensions in one table with minimal schema changes — add a
+row to `embedding_versions`, create one partial index, done. No new columns, no new tables. The
+cleanest DDL for ongoing multi-model coexistence.
+
+**When it hurts:**
+- The `::vector(d)` cast in every query and index definition is easy to get wrong — use the wrong
+  dimension and pgvector silently truncates or pads with zeros depending on direction.
+- No compile-time dimension safety: the untyped column accepts any length, so a pipeline bug that
+  produces 768-dim vectors for a 1024-dim model inserts successfully and silently degrades
+  retrieval (the partial index silently ignores rows that don't cast cleanly).
+- Expression indexes can't use all pgvector optimizations available to natively-typed columns.
+
+---
+
+#### 12.7.4 Trade-off summary — which option when
+
+| | **A: Separate columns** | **B: Separate tables** | **C: Normalized FK (recommended)** | **D: Untyped + partial index** |
+|---|---|---|---|---|
+| **Schema changes per migration** | ALTER TABLE add column + index | CREATE TABLE + index | INSERT into version table + index | INSERT into version table + index |
+| **Write path** | UPDATE (MVCC bloat) | INSERT into new table | INSERT into same table | INSERT into same table |
+| **Bloat risk (§12.7.6)** | **High** — UPDATE doubles heap + TOAST | **None** — insert-only | **None** — insert-only | **None** — insert-only |
+| **Query complexity** | UNION, no JOINs | UNION + JOIN | UNION + JOIN + version filter | JOIN + version filter + cast |
+| **Rollback** | Null column + vacuum | DROP TABLE | Flip `is_active`, old rows intact | Delete rows by model_id |
+| **Multi-model permanent** | Poor (column sprawl) | OK (table sprawl) | **Best** (one table, N versions) | Good (one table, N indexes) |
+| **Dimension safety** | Compile-time (`vector(d)`) | Compile-time | Compile-time | **Runtime only** (untyped) |
+| **Best fit** | Quick one-off migration, small corpus | Large corpus, clean separation needed | **Production default** — multiple migrations, A/B, rollback | Advanced: mixed-dimension models, pgvector-native |
+
+**Recommendation:** start with **Option C** unless you have a specific reason not to. It pays the
+JOIN cost (negligible for most workloads — it's a PK lookup on 20 rows after the ANN scan) in
+exchange for: insert-only writes (no MVCC bloat), instant rollback (flip a boolean), clean
+multi-version coexistence (one table, N versions), and a version registry that serves as a
+machine-readable audit trail of every embedding-layer change. Options A and B are simpler for
+one-time migrations where you know you won't need rollback or multi-version permanently; Option D
+is the pgvector-native alternative when you need mixed dimensions without schema changes.
+
+#### 12.7.5 The dual-write pattern for zero-downtime migration
+
+All four options above describe how to *store* vectors from two models. The dual-write pattern
+describes how to *produce* them during migration without missing documents:
+
+```
+1. ENABLE DUAL WRITES — every new document that arrives during migration
+   gets embedded with BOTH models and inserted into BOTH version slots.
+   This prevents a gap where new documents only have old-model vectors
+   and never get picked up by the backfill job.
+
+2. BACKGROUND BACKFILL — a separate job scrolls through existing documents
+   and embeds them with the new model. Keyed on (document_id, version_id)
+   with ON CONFLICT DO NOTHING, so it's idempotent: dual-written documents
+   that already have the new embedding are skipped, crashed batches resume
+   from the last committed ID.
+
+3. PROGRESS TRACKING — query the gap:
+   SELECT COUNT(*) FROM documents d
+   WHERE NOT EXISTS (
+       SELECT 1 FROM document_embeddings de
+       WHERE de.document_id = d.id AND de.version_id = 3
+   );
+   When this hits 0, the backfill is complete.
+
+4. CUTOVER — flip the active version (Option C), swap the alias (Qdrant
+   pattern), or switch the query routing. Dual writes can stop once the
+   old version is dropped.
+
+5. HOLD THE OLD VERSION — keep old embeddings queryable as rollback.
+   Delete them only after the new version has survived real traffic long
+   enough to trust (§12.4 step 6).
+```
+
+The dual-write pattern is documented across vector database vendors: Qdrant's
+[named vectors migration](https://qdrant.tech/documentation/tutorials-operations/embedding-model-migration/)
+(scroll + dual-write + alias swap), Google Cloud's
+[zero-downtime embedding migration](https://medium.com/google-cloud/migrating-vector-embeddings-in-production-without-downtime-8a0464af6f55)
+(shadow deployment + canary reads), and
+[TianPan's reindex playbook](https://tianpan.co/blog/2026/07/05/retiring-an-embedding-model-reindex-without-downtime)
+(insert-only backfill with content-hash idempotency). The mechanism differs by database; the
+discipline is the same: dual-write new, backfill old, verify, cut over, hold rollback.
+
+#### 12.7.6 PostgreSQL-specific: MVCC bloat and why INSERT beats UPDATE for re-embedding
+
+This is the single most important PostgreSQL operational detail for embedding pipelines, and it's
+the strongest argument for Options B/C/D over Option A.
+
+PostgreSQL's MVCC (Multi-Version Concurrency Control) treats every `UPDATE` as a delete-of-the-old
++ insert-of-the-new. The old row version becomes a "dead tuple" that occupies space until
+`VACUUM` reclaims it. For embedding vectors, this means:
+
+```
+One UPDATE of a 1536-dim float32 vector:
+  old tuple:  1536 × 4 bytes = 6,144 bytes (dead, waiting for vacuum)
+  new tuple:  1536 × 4 bytes = 6,144 bytes (live)
+  total:      12,288 bytes temporarily, 6,144 bytes of dead space
+
+Scale that to a corpus re-embed:
+  500,000 documents × 6,144 bytes dead per UPDATE = 3.07 GB of dead tuples
+  ...accumulating BEFORE autovacuum catches up.
+```
+
+This is worse than it looks because of **TOAST** (The Oversized-Attribute Storage Technique).
+Vectors at 768 dimensions and above (~3 KB) exceed PostgreSQL's ~2 KB inline threshold and spill
+to the TOAST relation — a separate physical table with **its own autovacuum schedule**. An UPDATE
+that changes a TOASTed vector writes new TOAST chunks AND dead TOAST chunks, and the TOAST
+table's bloat is invisible to `pg_stat_user_tables` (you need `pg_stat_all_tables` filtered to the
+TOAST relation's OID). A re-embed job that UPDATEs 500K vectors can silently double a 400 GB
+table overnight and leave autovacuum chewing through the TOAST relation for days.
+
+**INSERT-only patterns (Options B/C/D) avoid this entirely.** New embeddings are INSERTs into rows
+that never existed before — no dead tuples, no TOAST churn, no vacuum pressure. Old embeddings
+sit untouched until you explicitly DELETE them after cutover, and that DELETE is a one-time
+operation you can schedule during a maintenance window with aggressive vacuum settings, not a
+continuous bloat source during the multi-day backfill.
+
+If you must use Option A (UPDATE-based re-embedding), mitigate the bloat:
+
+```sql
+-- Aggressive autovacuum on the embedding table during re-embed.
+ALTER TABLE documents SET (
+    autovacuum_vacuum_scale_factor = 0.01,   -- vacuum at 1% dead tuples (default 20%)
+    autovacuum_vacuum_cost_delay = 2,        -- less throttling during vacuum
+    autovacuum_analyze_scale_factor = 0.01
+);
+
+-- After the re-embed job completes:
+REINDEX INDEX CONCURRENTLY idx_documents_embedding_v2;  -- compact the HNSW index
+VACUUM (VERBOSE, TOAST) documents;                       -- reclaim dead TOAST chunks
+```
+
+Even with these mitigations, UPDATE-based re-embedding puts sustained write pressure on the
+production table (row-level locks per UPDATE) while INSERT-based patterns write to a cold path
+that doesn't compete with read traffic.
+
+#### 12.7.7 Idempotent re-embedding — content hash as a skip key
+
+A re-embed backfill job will crash, get OOM-killed, hit API rate limits, or be interrupted by a
+deploy. If restarting the job re-embeds documents it already processed, you're paying for the
+same embedding API calls twice and generating unnecessary write IO. The fix is a content hash:
+
+```sql
+-- On INSERT, compute a hash of the source text that was embedded.
+INSERT INTO document_embeddings (document_id, version_id, embedding, content_hash)
+VALUES ($1, 3, $2, encode(sha256($3::bytea), 'hex'))
+ON CONFLICT (document_id, version_id) DO NOTHING;
+
+-- Backfill query: skip documents already embedded AND unchanged.
+SELECT d.id, d.content
+FROM documents d
+LEFT JOIN document_embeddings de
+    ON de.document_id = d.id AND de.version_id = 3
+WHERE de.id IS NULL                    -- not yet embedded under this version
+   OR de.content_hash != encode(sha256(d.content::bytea), 'hex')  -- content changed
+ORDER BY d.id
+LIMIT 1000;
+```
+
+The `content_hash` serves two purposes:
+1. **Crash recovery** — if `(document_id, version_id)` already exists, `DO NOTHING` skips it.
+   The job resumes from where it left off.
+2. **Content drift detection** — if the source document was edited after embedding, the hash
+   mismatch triggers a re-embed of that specific document, without re-embedding the entire corpus.
+
+This pattern is documented in [LevelOp's versioning guide](https://levelop.dev/blog/vector-embedding-models-generation-versioning-drift)
+as "key each vector on a content hash of its chunk plus the model version — if the hash and
+version already exist in the store, skip it — turns a full rebuild into a cheap no-op when nothing
+changed, and it turns a crash recovery into a resume rather than a restart."
+
+#### 12.7.8 HNSW index parameters across model changes
 
 HNSW's `m` (edges per node) and `ef_construction` (beam width during build) are not universal
 constants — their optimal values depend on the embedding's dimensionality and the corpus size.
@@ -1501,7 +1908,7 @@ When you migrate models, rebuild the index from scratch with parameters appropri
 dimensionality — don't assume the old model's `m=16` is still right for a model that outputs twice
 as many dimensions.
 
-#### 12.7.5 halfvec, bit, and sparsevec — pgvector's native quantized types
+#### 12.7.9 halfvec, bit, and sparsevec — pgvector's native quantized types
 
 pgvector supports quantized storage types directly, which map to §7's quantization strategies
 without needing to manage the byte packing yourself:
