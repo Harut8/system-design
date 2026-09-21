@@ -45,6 +45,7 @@
 14. [Anti-patterns](#14-anti-patterns)
 15. [Mental models — the compressed set](#15-mental-models--the-compressed-set)
 16. [Lab exercises](#16-lab-exercises)
+17. [Interview questions and system design prompts](#17-interview-questions-and-system-design-prompts)
 
 ---
 
@@ -1581,6 +1582,281 @@ this from a one-off calculation into something you can re-run after every ingest
 "we're changing embedding models" — the real cost of the model decision, made concrete.
 *Time:* ~15 minutes once corpus token count is known.
 *Unblocks:* `11-token-accounting-and-cost.md`.
+
+---
+
+## 17. Interview questions and system design prompts
+
+This section maps the chapter's content to the questions you'll actually face — in system design
+rounds, ML-focused interviews, and architecture reviews. Each question below names the sections it
+draws from and gives the answer structure an interviewer expects, not just the facts.
+
+### 17.1 Conceptual questions — "explain X"
+
+**Q: What is an embedding, and how is the notion of "similarity" defined?**
+*Sections: §2.1, §2.2*
+Lead with the one-sentence definition: a learned mapping `f: text → ℝ^d` trained via contrastive
+learning so related inputs cluster and unrelated inputs separate. Then make the non-obvious point
+that separates a strong answer from a textbook one: **"similarity" is not a universal property —
+it's whatever the training pairs made it.** A model trained on (query, passage) pairs encodes a
+different geometry than one trained on (sentence, paraphrase) pairs, even at the same
+dimensionality. Mention InfoNCE loss and temperature `τ` only if the interviewer signals they want
+math; the insight that matters is "the positive pairs define the space," not the formula.
+
+Follow up with the metric identity: on L2-normalized vectors, cosine, dot-product, and
+inverse-Euclidean rankings are identical. Breaking normalization breaks that identity — and it
+breaks silently (§2.2). This is the bridge to a systems-thinking answer: "normalization is
+load-bearing infrastructure, not a cosmetic step."
+
+**Q: What are anisotropy and hubness, and why do they matter?**
+*Section: §2.3*
+Anisotropy: embeddings from transformer models cluster in a narrow cone rather than filling the
+sphere uniformly, compressing the range of cosine similarities and making it hard to distinguish
+"very relevant" from "somewhat relevant" by threshold alone. Hubness: certain points become
+nearest neighbors to disproportionately many queries regardless of actual relevance — a
+high-dimensional geometry artifact, not a model bug. Both argue against hardcoded similarity
+thresholds (`cosine > 0.8 means relevant`) and in favor of rank-based metrics (recall@k, MRR,
+nDCG). A strong answer names these as reasons to distrust a raw score and prefer set-based
+evaluation (§8 in `08-evaluation-methodology.md`).
+
+**Q: Explain the difference between symmetric and asymmetric embedding.**
+*Section: §3*
+A query and a document are different kinds of text. Asymmetric embedding gives the model a
+signal about which role each input is playing — via `input_type` (Cohere, Voyage), string templates
+(EmbeddingGemma), or free-text instructions (Qwen3-Embedding, Gemini embedding-2). The key
+interview insight: **this bug fails silently.** The API call succeeds, a vector comes back, nothing
+errors — retrieval quality just degrades, and nothing short of a golden-set recall measurement
+catches it. Mention that OpenAI's `text-embedding-3-*` family doesn't expose the concept at all,
+and that Gemini removed its typed `task_type` field between `embedding-001` and `embedding-2` and
+replaced it with "put the instruction in the prompt yourself" — showing that even the same vendor
+can break the API contract across generations.
+
+**Q: What is Matryoshka Representation Learning (MRL)?**
+*Section: §6*
+MRL trains an embedding so that **prefixes are independently useful** — the model is supervised at
+`O(log d)` prefix lengths during training, not post-hoc truncated. No additional forward pass
+needed: embed once at full dimension, slice to any supported prefix. Contrast this with PCA/SVD,
+which find directions of maximum variance in an already-trained space — OpenAI's own docs state
+that even 10% PCA reduction "generally results in worse downstream performance." MRL avoids that
+because the prefix property is baked into training, not retrofitted.
+
+Critical follow-up: truncating a normalized vector un-normalizes it. You must renormalize after
+slicing, or dot-product rankings silently break (§6.2). Two models from the same vendor (Gemini
+`embedding-001` vs `embedding-2`) disagree on who owns this step.
+
+**Q: Explain binary quantization and the rescore trick.**
+*Sections: §7.1, §7.3*
+Threshold each dimension at 0 → 1 bit per dimension instead of 32 → **32x** space reduction and
+up to **32x** faster retrieval (XOR + popcount vs float multiply-adds). Retention: ~92.5% without
+rescoring, ~96% with it (HF benchmark, 15 MTEB retrieval tasks, top-100, 4x rescore multiplier).
+The rescore trick: retrieve `rescore_multiplier × top_k` candidates via cheap Hamming search over
+binary vectors, then rescore that small candidate set against the **float32 query vector** and
+int8/float32 document vectors. The asymmetry is the trick: one query stays full-precision (free),
+millions of documents stay cheap (binary in RAM). Mention the bit-packing gotcha (§7.2): a
+1024-dim model produces 128 bytes, not 1024 — the single most common integration bug.
+
+### 17.2 System design round — "design a RAG pipeline"
+
+These are the questions where everything in this chapter converges. The interviewer isn't asking
+you to recite embedding facts — they're asking you to make connected decisions under constraints.
+
+**Q: You're building a retrieval-augmented generation system for internal company documents.
+Walk me through the embedding layer.**
+
+Structure your answer as a chain of decisions, each justified by its downstream consequences:
+
+```
+1. MODEL SELECTION
+   - Start with hard constraints: context length ≥ longest document,
+     budget, open-weight requirement, multimodal if corpus has images/PDFs.
+   - Shortlist 3–5 candidates from the landscape (§4), NOT by picking the
+     top MTEB row — explain why leaderboards mislead (contamination,
+     saturation, domain shift — §5.2).
+   - Final decision: 50-query golden set on YOUR corpus, recall@k with
+     bootstrap CI (§5.3).
+
+2. ASYMMETRIC EMBEDDING
+   - Set input_type/template correctly for query vs document sides (§3).
+   - Add a test that asserts query-side and document-side calls use
+     different settings — this bug is silent.
+
+3. DIMENSIONALITY
+   - Use MRL truncation, not PCA — trained prefix vs post-hoc guess (§6.1).
+   - Find the "knee" via a truncation sweep on your corpus (Lab 3).
+   - Always renormalize after truncation (§6.2).
+
+4. QUANTIZATION
+   - Binary for the hot path (in-memory, Hamming search), int8 on disk
+     for rescore (§7.3–§7.5).
+   - Calibrate int8 on a representative sample; recalibrate when corpus
+     distribution shifts.
+   - Stacking MRL + binary: reductions multiply (8x × 32x = 256x — §7.6).
+
+5. CONTEXT AND TRUNCATION
+   - Force loud failure on over-length input in ingestion (§8.1) —
+     truncation=False (Voyage), truncate=NONE (Cohere), client-side
+     token count for vendors with no flag.
+   - Chunking policy must respect model's context ceiling.
+
+6. REPRESENTATION GAPS
+   - Contextual retrieval (§9.2) if using short-context model —
+     LLM-generated blurb prepended before embedding.
+   - Late chunking (§9.3) if using long-context model (Cohere 128k) —
+     no LLM cost, fully deterministic.
+   - Late interaction (§9.4, ColBERT) if precision-critical and budget
+     allows per-token storage.
+
+7. VERSIONING AND MIGRATION
+   - Record model version per vector, not per collection (§12.1).
+   - Dual-index migration: shadow-embed, golden-set comparison with CI,
+     cut over only after new model clears old (§12.4).
+```
+
+**What interviewers are listening for:**
+- You frame the embedding model as a schema decision with migration cost proportional to corpus
+  size — not a config flag you tune later (§1).
+- You mention silent failures: wrong `input_type`, un-renormalized truncation, silent context
+  truncation. These show operational awareness.
+- You quantify tradeoffs: MRL 8x reduction, binary 32x, stacked 256x — with the caveat that
+  retention numbers are corpus-specific and must be measured.
+- You name the one exception to "models aren't cross-compatible": Voyage 4-series shared space
+  (§4.1).
+
+**Q: How would you handle an embedding model migration in production?**
+*Sections: §12.3, §12.4, §12.5*
+
+Walk through the playbook step by step:
+
+```
+1. Dual index — new model alongside production, no traffic change.
+2. Shadow-embed — re-embed corpus into new index. Watch for the §3 bug
+   (wrong input_type in freshly written migration code). Treat this as
+   a pipeline-reliability problem (at-least-once, idempotent writes,
+   no silent document loss).
+3. Golden-set comparison — recall@k on BOTH indexes, bootstrap CI over
+   the 50-query golden set.
+4. Cut over reads — only when new model clears old with interval
+   accounted for.
+5. Hold old index — keep it live and queryable as rollback until new
+   index proves itself on real traffic, not just the golden set.
+6. Drop old index — only after the confidence gate passes.
+```
+
+Compute the re-embed cost: `total_corpus_tokens × price_per_token(new_model)`. For a 500M-token
+corpus on OpenAI: $10 on `3-small`, $65 on `3-large`, $50 on legacy `ada-002`. Note that
+migrating off `ada-002` to `3-small` is both a quality upgrade AND a 5x price cut — "we already
+use ada-002" has the cost argument backwards.
+
+Three kinds of drift to name: model version drift (vendor deprecation), corpus drift (documents
+change distribution over time), query drift (users start asking about new topics). All three
+argue for periodic golden-set refresh.
+
+### 17.3 Rapid-fire questions — short answers, deep signal
+
+| Question | Strong answer (1–2 sentences) | Section |
+|---|---|---|
+| Why can't you incrementally migrate embedding models? | There's no meaningful in-between state — vectors from two models don't share a coordinate system, so a mixed index computes meaningless similarity scores. The migration unit is the entire corpus. | §1 |
+| Cosine vs dot product — when does the choice matter? | On L2-normalized vectors, they rank identically. The choice matters only when normalization breaks — truncation (§6.2), quantization (§7), or pipeline bugs that skip the normalize step. | §2.2 |
+| Why is `ada-002` a bad choice in 2026? | It's strictly dominated: worse retrieval (61.0% vs `3-small`'s 62.3% on OpenAI's own MTEB table) at 5x the price ($0.10 vs $0.02/M tokens). | §4, §14 |
+| How do you evaluate an embedding model? | 50-query golden set on YOUR corpus, recall@k with bootstrap CI. Not MTEB — contamination, saturation, and domain shift make it a weak proxy (§5.2). | §5.3 |
+| What's the difference between MRL and PCA for dimensionality reduction? | MRL trains the model so prefixes are independently useful; PCA fits variance directions post-hoc. OpenAI's docs: even 10% PCA reduction "generally results in worse downstream performance." | §6.1 |
+| Binary quantization: how much space does it save? | 32x — one bit per dimension instead of 32. A 1024-dim model produces 128 bytes packed, not 1024. Add rescoring for ~96% retention (from ~92.5% without). | §7.1–§7.3 |
+| What's the biggest silent failure in RAG pipelines? | Over-length document truncation at ingest — the vendor silently embeds the first half, the vector enters the index indistinguishable from a complete one, and the second half becomes permanently unretrievable. | §8.1 |
+| When should you fine-tune an embedder? | Last resort, after fixing input_type (§3), chunking (§9), hybrid retrieval, and reranking (`04`). Fine-tuning is the most expensive, least reversible lever. | §10.1 |
+| A chunk says "revenue grew 3%." Why might retrieval fail? | The chunk lacks context — no company name, no quarter, no year. The embedding faithfully encodes what's there; it can't encode what isn't. Fix: contextual retrieval (§9.2), late chunking (§9.3), or late interaction (§9.4). | §9.1 |
+| How do you store vectors from multiple model versions safely? | Version-tag at the vector/row level, not the collection level. Refuse to compare vectors across versions at query time. The only documented exception: Voyage 4-series shared space. | §12.1 |
+
+### 17.4 Architecture whiteboard prompts
+
+These are the open-ended prompts interviewers use to see how you think through tradeoffs. For
+each, the section references tell you where the facts live; the structure below tells you how to
+present them.
+
+**"Design the embedding layer for a legal document search system."**
+
+Key moves:
+- Legal documents are long → need a model with large context (Cohere 128k, or Voyage/Qwen3 at
+  32k). EmbeddingGemma at 2k is disqualifying.
+- Legal terminology is domain-specific → cross-lingual retrieval (§11.1) degrades on specialized
+  vocabulary. If multilingual, golden set must include each language pair.
+- Late chunking (§9.3) is a natural fit if using a long-context model — deterministic, no LLM
+  cost. Contextual retrieval (§9.2) as the alternative if context window is shorter.
+- Fine-tuning may be needed for domain-specific terminology (§10), but exhaust cheaper fixes
+  first. Hard-negative mining with positive-aware filtering (§10.3) if you do.
+- Cost at scale: legal corpora grow monotonically (documents are never deleted). Storage cost
+  dominates (§13.1) → MRL truncation + quantization are not optional.
+
+**"We have 100M documents and queries in 12 languages. Design the retrieval layer."**
+
+Key moves:
+- Multilingual embedding model is required (§11.1). Qwen3-Embedding ranks #1 on MTEB
+  multilingual; Gemini `embedding-2` and Cohere `embed-v4` also support it.
+- 100M documents at 1024 dims × 4 bytes = 400 GB float32. MRL to 256 dims = 100 GB. Binary
+  quantization on top = ~3 GB in memory + int8 on disk for rescore. This is the §7.6 stacking
+  argument — without it, the index doesn't fit in RAM.
+- Golden set must cover every language pair served, not just English (§11.1).
+- Migration at 100M scale is expensive — version-tag from day one (§12.1), rehearse the migration
+  playbook (§12.4) before you need it.
+
+**"Our recall dropped 5% after switching embedding models. Diagnose."**
+
+Diagnostic checklist (ordered by likelihood and cost to check):
+1. Wrong `input_type` on the query side in the new code (§3) — the #1 silent bug in migrations.
+2. Truncation without renormalization (§6.2) — if the new model has different dimensionality.
+3. Mixed-version vectors in the index (§12.2) — partial migration left old vectors alongside new.
+4. Silent context truncation (§8.1) — new model has a shorter context limit than the old one.
+5. int8 calibration mismatch (§7.4) — calibrated on old model's distribution, applied to new.
+6. Corpus drift (§12.3) — the corpus changed since the golden set was built; the drop is real
+   but not the new model's fault.
+
+### 17.5 Common interview mistakes
+
+**1. Saying "just use cosine similarity" without the normalization precondition.**
+Interviewers will follow up: "what if the vectors aren't normalized?" If you can't explain
+how dot-product ranking diverges from cosine ranking on un-normalized vectors (§2.2), you've
+shown you memorized the metric without understanding the precondition.
+
+**2. Treating MTEB as ground truth.**
+Citing a leaderboard score as evidence a model is good for your task reveals you haven't
+understood contamination, saturation, or domain shift (§5.2). The strong answer: "MTEB is a
+shortlist, not a decision — the decision comes from a golden set on our own corpus."
+
+**3. Recommending fine-tuning first.**
+Fine-tuning is the most expensive, least reversible lever (§10.1). An interviewer asking about
+retrieval quality wants to hear you exhaust the cheap, reversible fixes — input_type, chunking,
+hybrid retrieval, reranking — before reaching for training infrastructure.
+
+**4. Ignoring the migration cost of the embedding model decision.**
+The embedding model is a schema decision (§1). If you propose a model without mentioning that
+changing it later requires re-embedding the entire corpus at O(corpus-size) cost, you've missed
+the most important operational property of the choice.
+
+**5. Not mentioning silent failures.**
+Strong candidates name specific ways things break without errors: wrong `input_type` (§3),
+un-renormalized truncation (§6.2), silent context truncation (§8.1), mixed-version vectors
+(§12.2). This is what distinguishes "read the docs" from "built and debugged a real system."
+
+### 17.6 Behavioral and scenario questions
+
+**Q: Tell me about a time you had to choose between two embedding models.**
+*Framework:* constraints first (context length, cost, multimodal, open-weight), shortlist from
+landscape, golden-set evaluation with recall@k, bootstrap CI to distinguish signal from noise.
+The story should end with "and here's the measured recall difference on our corpus" — not
+"the leaderboard said model A was better."
+
+**Q: How would you convince your team to invest time in building a golden set?**
+*Framework:* it's an afternoon of labeling, not a research project (§5.3). It's also not a one-off
+— it's the foundation for every future model evaluation, every migration decision, and the eval
+harness in `08-evaluation-methodology.md`. The cost of *not* having one is making schema-level
+decisions (§1) based on vibes and leaderboard scores.
+
+**Q: Your team wants to save money on vector storage. What do you recommend?**
+*Framework:* two independent axes that multiply (§7.6). MRL truncation: 2048 → 256 = 8x (§6.3).
+Binary quantization: 32x (§7.1). Stacked: 256x. But retention is corpus-specific — you need
+the truncation sweep (Lab 3) and the quantization benchmark (Lab 4) before committing, because
+the "knee" where recall drops faster than savings justify is different for every corpus.
+Storage cost dominates at scale because it's a monthly recurring charge, not a one-time bill
+(§13.1) — this is the economic argument that justifies the engineering effort.
 
 ---
 
