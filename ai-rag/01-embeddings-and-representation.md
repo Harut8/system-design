@@ -1243,6 +1243,489 @@ just a quality upgrade (per OpenAI's own MTEB table in §4, 62.3% vs 61.0%) — 
 cut** ($0.02 vs $0.10 per million tokens). "We already use ada-002" being framed as a reason not to
 migrate has the cost argument backwards: staying is the expensive option, on both axes at once.
 
+### 12.6 Vector metadata schema — what to record, concretely
+
+§12.1 says "record the model version on every vector." This subsection says exactly *what* to
+record and *why each field exists* — because "model version" alone is not enough to reconstruct
+what happened to a vector or decide whether two vectors are comparable.
+
+**The minimum viable version tag, as a structured record:**
+
+```
+embedding_config {
+    model_name:       string    -- "text-embedding-3-small", "voyage-4", "embed-v4.0"
+    model_version:    string    -- "3-small-2024-01-25" or the vendor's version string;
+                                   vendors version silently (same name, different weights)
+    dimensions:       int       -- the STORED dimension, after MRL truncation if applied
+    full_dimensions:  int       -- the model's native output dimension before truncation
+    quantization:     string    -- "float32", "float16", "int8", "binary", "ubinary", or "none"
+    distance_metric:  string    -- "cosine", "dotproduct", "l2" — what the INDEX is configured for
+    input_type:       string    -- "search_document" / "search_query" / null — what was used at
+                                   embed time; store the DOCUMENT-side value on the vector, since
+                                   query-side input_type is an ephemeral query-time concern
+    normalized:       bool      -- whether L2 normalization was applied before storage
+    context_method:   string    -- "none", "contextual_retrieval", "late_chunking" — from §9
+    embedded_at:      timestamp -- when this vector was produced; critical for corpus-drift
+                                   detection (§12.3) and for knowing which vectors predate a
+                                   model's silent update
+}
+```
+
+Why each field matters beyond `model_name`:
+
+- **`dimensions` vs `full_dimensions`** — you need both because a vector stored at 256 dims could
+  be a 256-dim model's native output or a 2048-dim model's MRL-truncated prefix. These are not
+  the same representation, they are not comparable in the same index, and only the pair of numbers
+  tells you which case you're in.
+- **`quantization`** — a float32 vector and an int8 vector from the *same model at the same
+  dimension* cannot share an index column (different byte widths, different distance computations).
+  More subtly, the int8 calibration range (§7.4) is itself a parameter: vectors quantized against
+  different calibration datasets are not directly comparable even at the same byte width.
+- **`distance_metric`** — this is an index-level setting, not a vector-level one, but recording it
+  alongside the vector catches the bug where someone creates a new index with a different metric
+  than the old one and expects similarity scores to be comparable. They aren't.
+- **`normalized`** — if a vector was stored un-normalized in a dot-product index, it's already
+  wrong (§2.2). The boolean lets a migration script detect and fix this retroactively.
+- **`embedded_at`** — a vendor's "same model name, updated weights" silent refresh means vectors
+  embedded before and after the refresh are potentially in different spaces, even though
+  `model_name` and `model_version` haven't changed. The timestamp is the fallback discriminator.
+
+**In practice, most of these fields are collection-level, not row-level.** If your entire
+collection uses one model at one dimension with one quantization scheme — which is the common case
+for a single-purpose index — you store the config once as collection metadata and don't repeat it
+per row. The per-row version tag from §12.1 becomes critical only during migrations (when two
+configs coexist in the same collection) and in multi-model architectures (§12.9). The full
+`embedding_config` record belongs in a metadata table or a config store joined by a version ID;
+the per-vector payload carries just that version ID as a foreign key.
+
+### 12.7 Database index configuration — pgvector and multi-model coexistence
+
+The rest of this chapter is database-agnostic. This subsection is not — it gives you the concrete
+SQL for pgvector (the most common vector store in PostgreSQL-based stacks) because the gap between
+"version-tag your vectors" and "actually configure a database to enforce this" is where the bugs
+live.
+
+#### 12.7.1 One model, one collection — the simple case
+
+```sql
+-- pgvector: one embedding model, one dimension, one index.
+-- This is the day-one setup that works until you need a second model.
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+    id            BIGSERIAL PRIMARY KEY,
+    content       TEXT NOT NULL,
+    chunk_id      TEXT NOT NULL,        -- foreign key to chunk metadata
+    embedding     vector(1024),         -- dimension must match model output exactly
+    model_config  JSONB NOT NULL DEFAULT '{
+        "model_name": "voyage-4",
+        "model_version": "4.0",
+        "dimensions": 1024,
+        "quantization": "float32",
+        "distance_metric": "cosine",
+        "input_type": "search_document",
+        "normalized": true
+    }',
+    embedded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- HNSW index — the parameters here are load-bearing; see
+-- ../databases/11-hnsw-vector-search-internals.md for why.
+CREATE INDEX idx_documents_embedding ON documents
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+
+-- At query time: set ef_search per session for recall/speed tradeoff.
+SET hnsw.ef_search = 100;
+
+SELECT id, content, 1 - (embedding <=> query_vector) AS similarity
+FROM documents
+ORDER BY embedding <=> query_vector  -- <=> is cosine distance in pgvector
+LIMIT 20;
+```
+
+The `vector(1024)` column declaration is a **hard constraint**: pgvector will reject any insert
+where the vector length doesn't match. This is good — it means a dimension mismatch between your
+embedding pipeline and your schema is a loud error at insert time, not a silent corruption. But it
+also means **you cannot store vectors of different dimensionalities in the same column**. A model
+swap that changes dimensions (e.g. 1024 → 1536) requires a new column or a new table, not just
+new data in the same column.
+
+#### 12.7.2 pgvector operator classes — picking the right one
+
+pgvector's distance metric is set by the **operator class** on the index, not by a query-time
+flag. Pick wrong at index creation time and every query computes the wrong distance:
+
+```sql
+-- Cosine distance (1 - cosine_similarity). Use this when vectors are
+-- L2-normalized and you want cosine semantics. The <=> operator.
+CREATE INDEX idx_cosine ON documents
+    USING hnsw (embedding vector_cosine_ops);
+
+-- Inner product (negative, because pgvector's <#> returns negative inner
+-- product for ORDER BY ASC to work). Use this when vectors are normalized
+-- and you want dot-product speed without the division. The <#> operator.
+CREATE INDEX idx_ip ON documents
+    USING hnsw (embedding vector_ip_ops);
+
+-- L2 (Euclidean) distance. Use this when you specifically need geometric
+-- distance, not angular similarity. The <-> operator.
+CREATE INDEX idx_l2 ON documents
+    USING hnsw (embedding vector_l2_ops);
+```
+
+On L2-normalized vectors, all three rank identically (§2.2) — but **pgvector doesn't know your
+vectors are normalized.** It uses whichever distance computation the operator class specifies,
+whether or not that's the one your vectors were designed for. If you create a
+`vector_ip_ops` index but your vectors aren't normalized, you get the §2.2 bug — magnitude
+contaminates ranking — and pgvector won't warn you. The operator class is a decision you make
+once, at `CREATE INDEX` time; verify it matches your normalization invariant before you have data
+in the table, not after.
+
+#### 12.7.3 Two models, same database — the migration pattern
+
+During a migration (§12.4), you need both the old and new model's vectors queryable
+simultaneously. In pgvector, this means separate columns or separate tables — **not** the same
+column, because the dimensions may differ and the vectors are not comparable.
+
+**Option A — Separate columns (same table, preferred for smaller corpora):**
+
+```sql
+-- Add the new model's column alongside the old one.
+-- Different dimension is fine — each column has its own type.
+ALTER TABLE documents
+    ADD COLUMN embedding_v2 vector(1536);  -- new model outputs 1536 dims
+
+-- Separate index on the new column.
+CREATE INDEX idx_documents_embedding_v2 ON documents
+    USING hnsw (embedding_v2 vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+
+-- Track which rows have been re-embedded.
+ALTER TABLE documents
+    ADD COLUMN embedding_v2_at TIMESTAMPTZ;
+
+-- Shadow-embed query: find rows not yet migrated.
+SELECT id, content FROM documents
+WHERE embedding_v2 IS NULL
+ORDER BY id
+LIMIT 1000;
+
+-- After re-embedding, update the row:
+UPDATE documents
+SET embedding_v2 = $1, embedding_v2_at = now()
+WHERE id = $2;
+
+-- Query during migration — query the OLD index for un-migrated rows,
+-- the NEW index for migrated rows, union and re-rank:
+WITH old_results AS (
+    SELECT id, content, 1 - (embedding <=> $1) AS similarity
+    FROM documents
+    WHERE embedding_v2 IS NULL
+    ORDER BY embedding <=> $1  -- $1 is query embedded with OLD model
+    LIMIT 20
+),
+new_results AS (
+    SELECT id, content, 1 - (embedding_v2 <=> $2) AS similarity
+    FROM documents
+    WHERE embedding_v2 IS NOT NULL
+    ORDER BY embedding_v2 <=> $2  -- $2 is query embedded with NEW model
+    LIMIT 20
+)
+SELECT * FROM (
+    SELECT * FROM old_results
+    UNION ALL
+    SELECT * FROM new_results
+) combined
+ORDER BY similarity DESC
+LIMIT 20;
+```
+
+The query above is the critical detail most migration guides omit: **during a partial migration,
+you must embed the query with BOTH models and search BOTH indexes.** You cannot search a mixed
+index with a single query vector, because the old vectors and new vectors are in different
+coordinate spaces (§12.2). The query-side cost doubles during migration — two embedding API calls
+per query — but the alternative is silently broken retrieval on whatever fraction of the corpus
+hasn't been migrated yet.
+
+**Option B — Separate tables (preferred for large corpora or clean separation):**
+
+```sql
+-- Entirely separate table for the new model.
+CREATE TABLE documents_v2 (
+    id            BIGSERIAL PRIMARY KEY,
+    source_id     BIGINT REFERENCES documents(id),  -- link to original
+    embedding     vector(1536),
+    model_config  JSONB NOT NULL,
+    embedded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_documents_v2_embedding ON documents_v2
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+```
+
+Separate tables are operationally cleaner for large migrations: the re-embed job is a pure insert
+pipeline into a fresh table (no row-level locks on the production table), the new index is built
+from scratch (no index bloat from updates), and rollback is "drop the new table" rather than
+"null out a column on 50 million rows."
+
+#### 12.7.4 HNSW index parameters across model changes
+
+HNSW's `m` (edges per node) and `ef_construction` (beam width during build) are not universal
+constants — their optimal values depend on the embedding's dimensionality and the corpus size.
+The general theory is in
+[`../databases/11-hnsw-vector-search-internals.md`](../databases/11-hnsw-vector-search-internals.md);
+the operational consequence for this chapter is: **changing the embedding model can change the
+optimal index parameters, not just the data inside it.**
+
+Rules of thumb (these are starting points to benchmark from, not final values):
+
+```
+Higher dimensionality → higher m may help (more edges to navigate a
+    higher-dimensional graph) but costs more memory per node.
+    Typical range: m=16 for dims ≤1024, m=24–32 for dims >1024.
+
+Larger corpus → higher ef_construction helps build quality but slows
+    index creation. Typical range: ef_construction=128 for <1M vectors,
+    200–400 for 1M–10M, 400+ for >10M.
+
+ef_search is a QUERY-TIME knob, not an index-build knob — you can
+    change it per session without rebuilding anything.
+    Higher ef_search = better recall, slower queries.
+    Start at ef_search=100, raise until recall@k stops improving.
+```
+
+When you migrate models, rebuild the index from scratch with parameters appropriate to the new
+dimensionality — don't assume the old model's `m=16` is still right for a model that outputs twice
+as many dimensions.
+
+#### 12.7.5 halfvec, bit, and sparsevec — pgvector's native quantized types
+
+pgvector supports quantized storage types directly, which map to §7's quantization strategies
+without needing to manage the byte packing yourself:
+
+```sql
+-- halfvec: float16 (2 bytes/dim instead of float32's 4 bytes). 2x savings.
+-- Available since pgvector 0.7.0.
+ALTER TABLE documents ADD COLUMN embedding_f16 halfvec(1024);
+
+CREATE INDEX idx_f16 ON documents
+    USING hnsw (embedding_f16 halfvec_cosine_ops);
+
+-- bit: binary quantization (1 bit/dim). 32x savings vs float32.
+-- Hamming distance search via <~> operator.
+ALTER TABLE documents ADD COLUMN embedding_bin bit(1024);
+
+CREATE INDEX idx_bin ON documents
+    USING hnsw (embedding_bin bit_hamming_ops);
+
+-- The bit column stores exactly d bits — no manual packbits needed,
+-- pgvector handles the packing internally. The column width is d (bits),
+-- not d/8 (bytes), in the type declaration.
+
+-- sparsevec: sparse representation for high-dimensional, mostly-zero vectors.
+-- Useful for SPLADE-style learned sparse representations, not for dense embeddings.
+ALTER TABLE documents ADD COLUMN embedding_sparse sparsevec(30000);
+```
+
+The **two-stage rescore pattern from §7.3** implemented in pgvector:
+
+```sql
+-- Stage 1: fast Hamming search over binary index, retrieve 4x candidates.
+WITH binary_candidates AS (
+    SELECT id, embedding  -- keep the float32 column for rescoring
+    FROM documents
+    ORDER BY embedding_bin <~> $1::bit(1024)  -- $1 is binary-quantized query
+    LIMIT 80  -- 4x the final top_k of 20
+)
+-- Stage 2: rescore the 80 candidates using float32 cosine similarity.
+SELECT id, 1 - (embedding <=> $2) AS similarity  -- $2 is float32 query vector
+FROM binary_candidates
+ORDER BY embedding <=> $2
+LIMIT 20;
+```
+
+This gives you binary-index speed for the corpus scan (the expensive part) and float32 precision
+for the final ranking (the cheap part, because it only touches 80 rows).
+
+### 12.8 The cascade — what changes when you change each parameter
+
+This is the subsection that answers: "I changed X — what else breaks?" Every embedding parameter
+change propagates downstream. The table below maps each change to its full blast radius.
+
+| What you changed | What must be re-embedded | What index changes are needed | What query-time code changes | What you must NOT do |
+|---|---|---|---|---|
+| **Model (e.g. `ada-002` → `3-small`)** | Entire corpus — every vector | New index (likely new dimensions). New HNSW params if dims changed. New operator class if distance metric assumption changes. | Query embedding must use new model. `input_type`/template must be set correctly for new model (§3). Query-side caching (if any) must be invalidated. | Search old vectors with new model's query embedding — meaningless similarity (§12.2). |
+| **Dimensions (MRL truncation, e.g. 1024 → 256)** | Entire corpus — every vector must be re-truncated and re-normalized (§6.2) | New `vector(256)` column or table. New index on that column. Old index at 1024 dims is a separate index. | Query vector must be truncated to same dimension and re-normalized. Similarity thresholds (if hardcoded, which they shouldn't be — §2.3) are no longer valid. | Mix 1024-dim and 256-dim vectors in the same column — pgvector rejects this at insert, but other stores may not. |
+| **Quantization (e.g. float32 → binary)** | Not re-embedded, but every vector must be re-quantized from the float32 source | New column (`bit(d)` for binary, `halfvec(d)` for float16). New index with matching operator class (`bit_hamming_ops`). Keep float32 or int8 column for rescore stage. | Query must be quantized the same way for the first-stage search. Rescore pipeline (§7.3) must be implemented if not already. Similarity scores are no longer in the same range. | Drop the float32 vectors after quantizing — you need them for rescoring and for future re-quantization if you change calibration. |
+| **Distance metric (e.g. cosine → dot product)** | Nothing — vectors stay the same | **Rebuild the index** with the new operator class. In pgvector, the operator class is baked into the index at creation time; you cannot change it without `DROP INDEX` + `CREATE INDEX`. | Query operator changes (`<=>` → `<#>` in pgvector). Score interpretation changes (cosine distance is `[0, 2]`, negative inner product is `(-∞, 0]`). | Assume scores from the old metric are comparable to scores from the new one — they aren't, even on the same vectors. Any hardcoded threshold breaks. |
+| **`input_type` / template (§3)** | Entire corpus re-embedded if you were using the WRONG `input_type` and are fixing it. If you were already correct, nothing. | Index may need rebuild if the new embeddings' distribution is different enough that HNSW parameters should change (rare in practice). | Query-side `input_type` must be checked and corrected too — fixing document-side without fixing query-side (or vice versa) is a new bug. | Fix only one side. The document-side `input_type` and query-side `input_type` are a matched pair; changing one without the other creates a new asymmetry. |
+| **Normalization (e.g. adding L2 norm where it was missing)** | Every un-normalized vector must be normalized in place or re-embedded | If switching from `vector_cosine_ops` to `vector_ip_ops` (which is now safe after normalization), rebuild the index. Otherwise no index change needed. | If query vectors were also un-normalized, normalize them too. If switching to dot-product operator, change query code. | Normalize new vectors while leaving old vectors un-normalized in the same index — this is the §2.2 bug, just introduced mid-corpus instead of at the start. |
+| **Context method (e.g. none → contextual retrieval, §9.2)** | Every document must be re-processed (LLM call to generate context blurb) AND re-embedded with the prepended context | New vectors go into the index; old un-contextualized vectors should be replaced, not mixed. | Query embedding does NOT change — the query is embedded as-is; only the document side gets the prepended context. This asymmetry is intentional and correct. | Embed the query WITH a context blurb too — the context blurb is document-side only. |
+| **Chunk boundaries (from `02`)** | Every affected document must be re-chunked AND re-embedded — new chunks may not have 1:1 correspondence with old chunks | Old chunk vectors must be deleted and replaced, not updated in place (chunk IDs change). Index is effectively rebuilt for the affected documents. | No query-side change, but result interpretation changes — different chunks may surface. | Leave old chunk vectors alongside new ones for the same source document — this doubles the document's representation in the index and biases retrieval toward it. |
+
+### 12.9 Multi-model coexistence — when you run more than one embedding model by design
+
+The migration in §12.4 and §12.7.3 treats multi-model as a *transitional* state you pass through
+on the way to a single model. But some architectures run multiple embedding models *permanently*,
+by design:
+
+**Pattern 1 — Tiered models (Voyage 4-series shared space, §4.1).**
+Embed the document corpus with the cheap model (`voyage-4-lite`), embed queries at request time
+with the expensive model (`voyage-4-large`). Both land in the same coordinate space — no dual
+index needed. This is the only case on this fact sheet where mixed-model vectors are comparable.
+
+```sql
+-- Single column, single index — the Voyage 4-series shared space makes this safe.
+CREATE TABLE documents (
+    id         BIGSERIAL PRIMARY KEY,
+    content    TEXT NOT NULL,
+    embedding  vector(1024),
+    model_tier TEXT NOT NULL  -- "voyage-4-lite" (documents) or "voyage-4-large" (if re-embedded)
+);
+
+-- Query with voyage-4-large — works because same coordinate space.
+SELECT id, 1 - (embedding <=> $1) AS similarity  -- $1 from voyage-4-large
+FROM documents ORDER BY embedding <=> $1 LIMIT 20;
+```
+
+**Pattern 2 — Modality-specific models.**
+Text documents embedded with a text model, images with a multimodal model, code with a code model.
+Each modality has its own index (different dimensions, different distance properties), and the
+query router decides which index to search based on query classification.
+
+```sql
+-- Three tables, three indexes, three embedding configs.
+CREATE TABLE text_documents (
+    id BIGSERIAL PRIMARY KEY, content TEXT,
+    embedding vector(1024)  -- voyage-4 for text
+);
+CREATE TABLE image_documents (
+    id BIGSERIAL PRIMARY KEY, image_url TEXT,
+    embedding vector(1536)  -- embed-v4.0 for images
+);
+CREATE TABLE code_documents (
+    id BIGSERIAL PRIMARY KEY, code TEXT, language TEXT,
+    embedding vector(1024)  -- voyage-code-3 for code
+);
+
+-- Each gets its own HNSW index with params tuned to its dimensionality and corpus size.
+```
+
+The query router is load-bearing here: a text query sent to the image index (or vice versa)
+doesn't crash — it returns results that are geometrically close but semantically unrelated,
+because the embedding spaces encode different modalities. This is the multi-modal analog of the
+§12.2 cross-model comparison bug, except it's by design rather than by accident, so it needs an
+explicit routing layer rather than a per-vector version tag.
+
+**Pattern 3 — A/B testing embedding models in production.**
+Route a percentage of traffic to the new model's index, log recall metrics on both, and compare
+over time before committing to a full migration. This is a more conservative version of §12.4's
+playbook, stretched over weeks instead of done in a single cutover:
+
+```sql
+-- Application-level routing pseudocode.
+-- model_assignment = hash(user_id) % 100
+-- if model_assignment < 10:  → query new_index with new_model
+-- else:                      → query old_index with old_model
+-- Log: { user_id, model, query, results, clicks }
+-- After 2 weeks: compare click-through and recall metrics by cohort.
+```
+
+This pattern catches quality differences that a 50-query golden set (§5.3) might miss — it
+measures on real traffic, with real queries, at real scale — but it requires running two indexes
+and two embedding-API call paths simultaneously, which is exactly the operational cost §12.4 was
+designed to be fast enough to avoid. Use it when the corpus is large enough that a bad cutover
+is expensive to reverse, and the golden set is too small to give you confidence on its own.
+
+### 12.10 Version manifest — the artifact that ties it all together
+
+All the per-vector metadata in §12.6, the index configurations in §12.7, and the cascade rules in
+§12.8 converge into one operational artifact: a **version manifest** that captures the complete
+state of your embedding layer at any point in time. This is the document you hand to an on-call
+engineer when something looks wrong, and it's the document you diff against when planning a
+migration.
+
+```yaml
+# embedding-manifest.yaml — checked into the repo, updated on every
+# embedding-layer change, reviewed like any other schema change.
+
+current_version: "v3"
+created_at: "2026-03-15T00:00:00Z"
+
+versions:
+  v3:
+    status: "active"           # active | migrating | deprecated | dropped
+    model:
+      name: "voyage-4"
+      version: "4.0"
+      vendor: "voyageai"
+      input_type_document: "document"
+      input_type_query: "query"
+    representation:
+      full_dimensions: 2048
+      stored_dimensions: 1024  # MRL-truncated
+      quantization: "float32"  # storage quantization
+      binary_index: true       # binary column exists for first-stage search
+      normalized: true
+    index:
+      database: "pgvector"
+      distance_metric: "cosine"
+      operator_class: "vector_cosine_ops"
+      hnsw_m: 16
+      hnsw_ef_construction: 200
+      hnsw_ef_search: 100
+    context:
+      method: "contextual_retrieval"  # none | contextual_retrieval | late_chunking
+      context_model: "claude-sonnet"  # LLM used for context generation
+    table: "documents_v3"
+    vector_column: "embedding"
+    binary_column: "embedding_bin"
+
+  v2:
+    status: "deprecated"       # still queryable for rollback, not receiving new vectors
+    model:
+      name: "text-embedding-3-small"
+      version: "2024-01-25"
+      vendor: "openai"
+      input_type_document: null    # OpenAI doesn't support asymmetric
+      input_type_query: null
+    representation:
+      full_dimensions: 1536
+      stored_dimensions: 1536
+      quantization: "float32"
+      binary_index: false
+      normalized: true
+    index:
+      database: "pgvector"
+      distance_metric: "cosine"
+      operator_class: "vector_cosine_ops"
+      hnsw_m: 16
+      hnsw_ef_construction: 200
+      hnsw_ef_search: 100
+    context:
+      method: "none"
+    table: "documents_v2"
+    vector_column: "embedding"
+
+migration_log:
+  - from: "v2"
+    to: "v3"
+    started: "2026-02-01"
+    completed: "2026-03-15"
+    reason: "asymmetric embedding support, MRL truncation for storage reduction"
+    re_embed_cost: "$42.00"
+    corpus_tokens: 2_100_000_000
+    recall_delta: "+4.2% recall@20 (p<0.05, bootstrap CI on 50-query golden set)"
+```
+
+The manifest is version-controlled alongside the application code. A migration is a PR that
+changes the manifest — reviewable, auditable, revertable. The `migration_log` section is the
+institutional memory that prevents the next team from re-learning the same lessons: why you
+moved, what it cost, and whether it was worth it.
+
 Cross-references: the versioning discipline in §12.1 generalizes the same pattern this repo
 already documents for observability schemas —
 [`../sre-observability/34-schema-and-semantic-conventions-governance.md`](../sre-observability/34-schema-and-semantic-conventions-governance.md).
