@@ -580,6 +580,30 @@ output with no recovered layout) and the wrong choice everywhere structure survi
 also the correct *baseline*: every strategy below should be measured against fixed-size splitting
 at matched token budget, and a surprising number of them fail to beat it (§6.4).
 
+#### 6.1.1 Implementations
+
+| Library | Class / function | Unit | Notes |
+|---|---|---|---|
+| LangChain | `CharacterTextSplitter` | characters (default) | splits on a single separator, no recursion — the simplest possible splitter |
+| LangChain | `TokenTextSplitter` | tokens (`tiktoken`) | token-aware fixed-size; uses the model's actual tokenizer, which is what §5.4 demands |
+| LlamaIndex | `TokenTextSplitter` | tokens | similar to LangChain's; distinct from LlamaIndex's `SentenceSplitter` which is recursive |
+| `tiktoken` + 10 lines | manual | tokens | often the right call — the logic is a for-loop and a token counter, and owning it means owning the edge cases (what happens at document boundaries, how overlap aligns) |
+
+**When this is the right call:**
+- Truly unstructured text where no separator carries meaning (raw OCR, concatenated log lines,
+  audio transcripts without speaker diarization).
+- As the mandatory *control* in any chunking comparison — every strategy in §6.2–§6.5 should
+  demonstrate a measured improvement over this baseline before earning its complexity.
+- When you need a throughput guarantee — fixed-size splitting is O(n) with no branching, no
+  embedding calls, no LLM calls, and no parser dependencies. At scale that predictability has
+  value.
+
+**When it's wrong:**
+- Any corpus where structure survived parsing. Cutting mid-sentence is not a tradeoff you're
+  making — it's information you're discarding for no reason.
+- Tabular content — a fixed-size cut through a table produces chunks with orphaned cells that
+  embed to noise (§3.4).
+
 ### 6.2 Recursive character/token splitting
 
 The workhorse default, and worth understanding rather than importing. Given an ordered list of
@@ -651,6 +675,48 @@ LlamaIndex's sentence splitter to roughly a thousand *tokens* — different unit
 magnitudes, both chosen as generic middles rather than for your corpus. Check the defaults in the
 version you have pinned; treat any splitter parameter you didn't set deliberately as unset.
 
+#### 6.2.1 Implementations and library specifics
+
+| Library | Class / function | Key behavior | Watch out for |
+|---|---|---|---|
+| LangChain | `RecursiveCharacterTextSplitter` | the canonical implementation; counts in **characters** by default — pass `from_tiktoken_encoder()` or `from_huggingface_tokenizer()` class method for token counting | default separators lack sentence terminators (see the Chroma finding above); default `chunk_size` is characters, not tokens, and the default value has changed across versions |
+| LangChain | `RecursiveCharacterTextSplitter.from_tiktoken_encoder(encoding_name="cl100k_base", chunk_size=512)` | token-counting variant | still splits on *character* separators, but measures chunk size in *tokens* — a subtle but correct behavior: boundaries fall on separator characters, limits are enforced in tokens |
+| LlamaIndex | `SentenceSplitter` | recursive with built-in sentence detection; defaults to ~1024 tokens | sentence detection uses regex, not a model — good enough for prose, fails on abbreviations and code |
+| LlamaIndex | `SentenceWindowNodeParser` | splits per-sentence, stores a configurable window of surrounding sentences as metadata for §7's retrieval-unit decoupling | one vector per sentence — read §12.2's storage cost before committing to this at scale |
+| Unstructured | `chunk_by_title()` | recursive splitting that also respects element boundaries from the parser | tightly coupled to Unstructured's own element model — if you use a different parser, this won't help |
+| `text-splitter` (Rust crate, also Python via `semantic-text-splitter`) | `TextSplitter` | Rust-native, tokenizer-aware, fast enough for 100M+ token corpora in minutes | less configurability than LangChain; the tradeoff is speed for knobs |
+
+**The separator list cheat sheet — what to use per format:**
+
+```python
+SEPARATORS_BY_FORMAT = {
+    "markdown":    ["\n## ", "\n### ", "\n#### ", "\n\n", "\n", ".", "?", "!", " ", ""],
+    "html":        ["\n\n", "\n", ".", "?", "!", " ", ""],  # after stripping tags
+    "pdf_prose":   ["\n\n", "\n", ".", "?", "!", " ", ""],  # paragraph breaks may be \n not \n\n
+    "code_python": ["\nclass ", "\ndef ", "\n\n", "\n", " ", ""],
+    "code_js_ts":  ["\nfunction ", "\nclass ", "\nexport ", "\n\n", "\n", " ", ""],
+    "legal":       ["\n\n", "\n", ".", ";", " ", ""],       # semicolons are clause boundaries
+    "transcript":  ["\n\n", "\n", ".", "?", "!", " ", ""],
+}
+```
+
+The key insight: the separator list is the *only* thing you tune in recursive splitting. Get it
+right for your format and you've captured most of the value. Get it wrong (or accept the default)
+and you're splitting mid-sentence on a format where sentence boundaries are available for free.
+
+**When this is the right call:**
+- The sane default for any corpus — start here, measure, and switch to a more complex strategy
+  only if the measurement shows a gap.
+- Mixed-format corpora where you can't rely on consistent heading structure but text is
+  well-punctuated.
+- When you need determinism, zero ingest-time API calls, and stable chunk IDs (§9.1).
+
+**When to graduate to something else:**
+- If your corpus has real heading structure, §6.3 (structure-aware) is strictly better and equally
+  free.
+- If recall@budget on your golden set shows a gap that the separator list can't close, test
+  semantic chunking (§6.4) as a hypothesis — but measure the ingest cost alongside the quality.
+
 ### 6.3 Structure-aware splitting
 
 Use the document's own hierarchy as the boundary set: Markdown headings, HTML section elements,
@@ -683,6 +749,65 @@ facts stated elsewhere in the document body — an LLM-generated context can pul
 quarter's revenue was $314 million," and this cannot — so it isn't a strict replacement. It is the
 thing to do *first*, before paying for the LLM version, so that the LLM version's measured
 improvement is measured against a fair baseline rather than against a straw man.
+
+#### 6.3.1 Implementations and library specifics
+
+| Library / tool | Class / function | Format coverage | Notes |
+|---|---|---|---|
+| LangChain | `MarkdownHeaderTextSplitter` | Markdown | splits on heading levels you specify; outputs chunks with heading metadata attached — the heading path in §6.3's `contextualize()` comes for free |
+| LangChain | `MarkdownTextSplitter` | Markdown | recursive splitting with Markdown-aware separators (headers, code fences, lists) — combines §6.2 and §6.3 |
+| LangChain | `HTMLHeaderTextSplitter` | HTML | splits on `<h1>`–`<h6>` tags; strips surrounding markup by default |
+| LangChain | `HTMLSectionSplitter` | HTML | splits on `<section>`, `<article>`, `<div>` boundaries from a Readability-style extractor — handles application-shaped pages better than header-only splitting |
+| LlamaIndex | `HierarchicalNodeParser` | any (you supply the structure) | builds a parent→child hierarchy natively, which feeds §7's parent-document retrieval directly; configurable at multiple chunk sizes (e.g. 2048/512/128) |
+| LlamaIndex | `MarkdownNodeParser` | Markdown | heading-level splitting with metadata propagation |
+| Docling | `HierarchicalChunker` | any Docling-parsed document | operates on Docling's structured `DoclingDocument` model rather than raw text — the cleanest path from tier-2 parsing (§3.3) to structure-aware chunks; headings, tables, list items are typed elements, not string patterns |
+| Docling | `HybridChunker` | any Docling-parsed document | combines hierarchical structure with a token-budget fallback — if a section exceeds the limit, it splits within it using token counting rather than discarding structure |
+| Unstructured | `chunk_by_title(elements, max_characters=...)` | any Unstructured-parsed document | respects element type boundaries (Title, NarrativeText, Table, etc.) from the parser; `combine_text_under_n_chars` merges small adjacent elements — the same orphan-merge §6.2 recommends |
+| `mistune` / `markdown-it-py` | manual | Markdown | parse to AST, walk nodes, split at heading boundaries — 30 lines if you need full control over the hierarchy walk |
+| `beautifulsoup4` | manual | HTML | `soup.find_all(['h1','h2','h3',...])` to get section boundaries, then extract text between them — the simplest custom implementation |
+| `python-docx` | manual | DOCX | iterate `doc.paragraphs`, check `paragraph.style.name` for `'Heading 1'` etc. — DOCX heading levels are explicit styles, not heuristic |
+| `tree-sitter` | manual | code (any language) | parse to AST, split at function/class/module boundaries — the gold standard for code chunking (§3.7) |
+
+**The practical decision per format:**
+
+```
+Markdown  → MarkdownHeaderTextSplitter (LangChain) or MarkdownNodeParser (LlamaIndex)
+            or Docling HierarchicalChunker if the doc was Docling-parsed.
+            Trivial: headings are literal syntax. No reason to use anything less.
+
+HTML      → HTMLHeaderTextSplitter after Readability extraction (§3.5).
+            Run repeated-block detection first — structure-aware splitting on
+            boilerplate-heavy HTML splits the chrome into perfectly structured garbage.
+
+PDF       → The parser tier (§3.3) decides this. Tier-1 (geometric) rarely recovers
+            heading structure, so you fall back to recursive (§6.2). Tier-2 (layout
+            model) recovers section types → use Docling HierarchicalChunker or
+            Unstructured chunk_by_title on the parsed elements.
+
+DOCX      → python-docx heading styles → split on Heading 1/2/3 boundaries.
+            The most underexploited format: DOCX has real heading levels, real
+            lists, real tables — and most teams dump it through a text extractor
+            that discards all of it.
+
+Code      → tree-sitter → split at function/class definitions (§3.7).
+            Carry enclosing context (file path, class signature, imports).
+```
+
+**When this is the right call:**
+- Any corpus where the parser recovered heading/section structure. This is the **recommended
+  starting point** for all structured corpora — not recursive splitting.
+- When you want free contextualization: the heading path is the document's own table of contents,
+  and prepending it is zero-cost contextual retrieval.
+- When chunk-ID stability matters: structure-aware boundaries are deterministic and tied to the
+  document's own organization, so they survive minor edits within a section.
+
+**When it falls short:**
+- Documents with flat structure (no headings, no sections) — you're back to recursive splitting.
+- Sections that are individually larger than the embedding model's context limit — you need a
+  within-section fallback, which is why Docling's `HybridChunker` and LlamaIndex's
+  `HierarchicalNodeParser` with multiple size tiers exist. The fallback should be recursive
+  splitting (§6.2), not fixed-size — don't throw away sentence boundaries inside a section just
+  because the section itself was too long.
 
 ### 6.4 Semantic chunking, and an honest verdict
 
@@ -767,6 +892,59 @@ trying to infer genuinely aren't available. On a corpus of Markdown or well-pars
 paying an embedding pass to guess at headings you already have. And if you do test it, test a
 size-controlled variant — the uncontrolled percentile version is the one that came last.
 
+#### 6.4.1 Implementations and library specifics
+
+| Library | Class / function | Variant | Size control | Notes |
+|---|---|---|---|---|
+| LlamaIndex | `SemanticSplitterNodeParser` | adjacent-pair distance, percentile threshold (Kamradt) | **none** — this is the variant that came last | pass `breakpoint_percentile_threshold` to tune sensitivity; even so, there is no `max_chunk_size` parameter — chunks can exceed the embedding model's context limit |
+| LangChain (experimental) | `SemanticChunker` | adjacent-pair distance | optional `min_chunk_size` only (no max) | marked as experimental; three threshold modes: `percentile`, `standard_deviation`, `interquartile` |
+| Chroma | `ClusterSemanticChunker` | within-chunk similarity maximization | **yes** — `max_chunk_size` parameter | the variant that won on IoU in their evaluation; not a pip-installable library as of 2026 — it's in their research code, so you'd port it |
+| `semantic-text-splitter` (Rust + Python) | `TextSplitter(...)` with `semantic` mode | adjacent-pair distance with a configurable model | yes — `capacity` sets the token limit | Rust-native, fast; one of the few semantic chunkers that enforces a hard size ceiling |
+| Greg Kamradt's notebook | reference implementation | the original breakpoint algorithm | **none** | the pedagogical version — read it to understand the algorithm, don't ship it |
+
+**The ingest-cost arithmetic, made explicit:**
+
+```python
+def semantic_chunking_cost(corpus_tokens: int, avg_sentence_tokens: int,
+                           embed_price_per_m: float) -> dict:
+    """What semantic chunking actually costs, beyond the quality question."""
+    n_sentences = corpus_tokens / avg_sentence_tokens
+    sentence_embed_tokens = corpus_tokens           # embed every sentence once
+    chunk_embed_tokens = corpus_tokens              # then embed every chunk once
+    total_embed_tokens = sentence_embed_tokens + chunk_embed_tokens
+
+    return {
+        "sentence_embedding_calls": int(n_sentences),
+        "total_embed_tokens": int(total_embed_tokens),
+        "embed_cost": total_embed_tokens / 1e6 * embed_price_per_m,
+        "overhead_vs_recursive": "2x embedding cost (sentence pass + chunk pass)",
+    }
+
+# Example: 100M token corpus, ~20 tokens/sentence, $0.02/M tokens (3-small)
+# → 5M sentence embedding calls, $4 total vs $2 for recursive-only.
+# The 2x token cost is the floor; the 5M API calls are the throughput bottleneck.
+```
+
+**When this is the right call:**
+- Corpora with genuine topic shifts but **no heading structure** — long-form prose, research
+  papers with run-on sections, interviews, narrative reports.
+- When you've tried recursive splitting with a tuned separator list and structure-aware splitting
+  isn't available, and recall@budget on your golden set shows a gap.
+- Only the **size-controlled** variants (`ClusterSemanticChunker`, `semantic-text-splitter` with
+  capacity) — the uncontrolled ones can't guarantee chunks fit the model's context window.
+
+**When it's wrong:**
+- Any corpus with real structure. You're paying an embedding pass per sentence to infer boundaries
+  the author already annotated.
+- When embedding-model migration is plausible in the next year. Semantic chunking welds your chunk
+  boundaries to your model version — a model change re-chunks, which re-IDs every chunk, which
+  invalidates citations, eval labels, and feedback data (§9.1).
+- When ingest throughput matters. The sentence-embedding pass is the bottleneck: 5M embedding API
+  calls for a 100M-token corpus with 20-token sentences, versus zero for recursive or
+  structure-aware splitting.
+- At scale without a strong golden-set result proving it earns the cost — the default
+  implementation came last in the only rigorous public evaluation.
+
 ### 6.5 LLM-based chunking
 
 Hand a document (or a window of it) to an LLM and ask it to emit boundaries or to rewrite the
@@ -792,6 +970,106 @@ proposition and cite the original.
 Where it earns its cost: small, high-value, structurally hostile corpora — the same profile that
 justifies tier-3 parsing in §3.3.
 
+#### 6.5.1 Implementations and approaches
+
+Two distinct patterns exist under the "LLM-based chunking" umbrella, and they have different
+failure modes:
+
+**Pattern A — Boundary detection.** Hand a document (or a sliding window) to the LLM and ask it
+to emit split points. The LLM reads the text and returns positions where topic shifts occur. The
+chunk text itself is the original document text, unchanged. This pattern can fabricate *boundaries*
+but not *content* — the chunks are still verbatim source text, so citations remain faithful.
+
+**Pattern B — Proposition extraction (Dense X Retrieval, arXiv 2312.06648).** The LLM rewrites
+each passage into self-contained atomic propositions. "The company's revenue grew by 3% over the
+previous quarter" becomes "ACME Corp's Q2 2023 revenue of $1,318M grew 3% versus Q1 2023 revenue
+of $1,275M." Each proposition embeds and retrieves beautifully — it contains the entity, the date,
+and the fact in one self-contained sentence. It is also a **rewrite**, and the LLM can inject facts
+the source doesn't support. This is §6.5's fabrication risk, and it is specific to pattern B.
+
+| Library / tool | Pattern | Notes |
+|---|---|---|
+| LlamaIndex `LLMTextSplitter` | A (boundary detection) | sends a prompt asking the LLM to identify logical section breaks; returns original text between breaks |
+| Custom prompt + any LLM | A or B | most teams roll their own; the prompt is the strategy |
+| LlamaIndex propositions extractor (`SummaryExtractor` / custom `NodePostprocessor`) | B (propositions) | extracts atomic facts; store alongside original spans for faithful citation |
+| `dense-x-retrieval` (reference code) | B (propositions) | the original implementation from the Chen et al. paper |
+
+**Prompt patterns that work, with the tradeoffs named:**
+
+```python
+BOUNDARY_DETECTION_PROMPT = """Given the following document, identify the positions
+where the topic meaningfully shifts. Return a JSON list of character offsets where
+splits should occur.
+
+Document:
+{document_text}
+
+Rules:
+- Each resulting chunk should be 200-800 tokens.
+- Prefer splitting at paragraph boundaries.
+- Never split mid-sentence.
+"""
+
+PROPOSITION_EXTRACTION_PROMPT = """Break the following passage into self-contained
+atomic propositions. Each proposition should:
+- Be understandable without the surrounding context
+- Include the specific entity, date, and quantity if mentioned
+- Be one sentence
+
+Passage:
+{chunk_text}
+
+IMPORTANT: Only state facts present in the passage. Do not infer or add information.
+"""
+```
+
+The `IMPORTANT` line in the proposition prompt is necessary and insufficient — it reduces
+fabrication but does not eliminate it. Temperature 0 reduces non-determinism but does not
+eliminate it either. These are mitigations, not fixes.
+
+**The cost, made concrete:**
+
+```python
+def llm_chunking_cost(corpus_tokens: int, generation_price_per_m_input: float,
+                      generation_price_per_m_output: float,
+                      output_ratio: float = 0.3) -> dict:
+    """Pattern B (propositions) cost. Pattern A is cheaper — roughly the input cost
+    only, since the output is just a list of offsets."""
+    input_cost = corpus_tokens / 1e6 * generation_price_per_m_input
+    output_tokens = corpus_tokens * output_ratio
+    output_cost = output_tokens / 1e6 * generation_price_per_m_output
+    return {
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total": input_cost + output_cost,
+        "vs_embedding": f"~{(input_cost + output_cost) / (corpus_tokens / 1e6 * 0.02):.0f}x "
+                        f"the cost of embedding with text-embedding-3-small",
+    }
+
+# Example: 100M tokens, Claude Sonnet at $3/$15 per M input/output tokens:
+# Input: $300, Output (30M tokens): $450, Total: $750
+# vs embedding at $0.02/M: $2. That's ~375x more expensive.
+```
+
+Three hundred and seventy-five times the cost of embedding, to process the same corpus, for a
+quality improvement that must be measured against the free alternatives (§6.3's heading-path
+prefix, `01` §9.2's contextual retrieval at ~$1/M) before it can be justified.
+
+**When this earns its cost:**
+- Small, high-value corpora where per-document investment is justified (contracts, patents,
+  compliance documents — tens of thousands of documents, not millions).
+- Structurally hostile documents that defeated both recursive and structure-aware splitting.
+- Pattern A (boundary detection) over pattern B (propositions) when faithfulness is non-negotiable —
+  it can't fabricate content, only misplace a boundary.
+
+**When it's wrong:**
+- At scale. The cost arithmetic above makes this non-viable for corpora above a few hundred
+  thousand documents unless the per-document value justifies it.
+- When determinism matters for chunk-ID stability (§9.1). Reprocessing an unchanged document may
+  yield different boundaries or different proposition wordings, churning IDs.
+- As a default. This is the last resort, after §6.1–§6.4 have been tried and measured. The
+  ordering in this section is deliberate.
+
 ### 6.6 Decision table
 
 | Strategy | Structure used | Determinism | Ingest cost | Chunk-ID stability | Best fit |
@@ -801,6 +1079,130 @@ justifies tier-3 parsing in §3.3.
 | Structure-aware | headings, layout, AST | total | free (parser already paid) | stable | any corpus with real structure — start here |
 | Semantic | inferred from embeddings | total, but coupled to model version | +1 embedding pass per sentence | **unstable across model changes** | unstructured corpora, as a tested hypothesis |
 | LLM-based | inferred by a generator | none (mitigable, not removable) | generation-priced | **unstable run to run** | small, high-value, structurally hostile corpora |
+
+### 6.7 The library landscape — a practical map
+
+The decision isn't just "which strategy" — it's "which library implements the strategy you chose
+with the controls you need." This section maps the ecosystem as of mid-2026 and names the
+tradeoffs that the library READMEs don't.
+
+#### 6.7.1 The three ecosystems
+
+**LangChain** (`langchain_text_splitters`) — the widest breadth of splitter types. Strengths: every
+strategy from §6.1–§6.5 has an implementation, format-specific splitters for Markdown/HTML/JSON/
+code, and the `from_tiktoken_encoder()` pattern for token-aware splitting is well-designed.
+Weaknesses: defaults are routinely wrong for production use (character-based sizes, missing sentence
+terminators), the abstraction boundary puts the splitter far from the parser (you lose element types
+that a parser like Unstructured recovered), and the class hierarchy is deeper than the problem
+warrants — `TextSplitter` → `RecursiveCharacterTextSplitter` → `MarkdownTextSplitter` is three
+classes for what is one function with a different separator list.
+
+**LlamaIndex** (`llama_index.core.node_parser`) — the most opinionated about the full pipeline.
+Strengths: `HierarchicalNodeParser` builds the parent→child tree §7 needs natively, `SentenceWindowNodeParser` implements §7.2's sentence-window pattern out of the box, and the
+`NodePostprocessor` pipeline makes it natural to chain splitting with enrichment. Weaknesses: the
+`Node` abstraction is heavier than a dict, which adds friction when integrating with non-LlamaIndex
+stores, and `SentenceSplitter`'s regex-based sentence detection fails on abbreviations and
+non-English punctuation.
+
+**Docling** (IBM, Linux Foundation) — the tightest coupling between parser and chunker. Strengths:
+`HierarchicalChunker` and `HybridChunker` operate on Docling's structured `DoclingDocument`, which
+means the chunker knows the difference between a heading, a paragraph, a table, and a list item —
+not just text with `\n\n` between blocks. This is the cleanest path from tier-2 parsing (§3.3)
+to structure-aware chunks on PDFs and DOCX. Weaknesses: works only with Docling-parsed documents;
+if you parse with something else, you can't use Docling's chunkers.
+
+#### 6.7.2 Standalone tools worth knowing
+
+| Tool | What it does | When to reach for it |
+|---|---|---|
+| `semantic-text-splitter` (Rust + Python) | fast tokenizer-aware splitting with optional semantic mode; enforces hard size ceilings | when you need throughput above what Python-native splitters deliver, or a semantic chunker that guarantees max chunk size |
+| `chonkie` | lightweight Python chunking library; token-aware, semantic, and recursive modes without framework dependencies | when LangChain/LlamaIndex is too heavy and you want a focused library |
+| `unstructured` chunking functions | `chunk_by_title()`, `chunk_elements()` — operate on Unstructured's element model | when you already use Unstructured for parsing and want chunking on the same elements |
+| `text_splitter` (Hugging Face) | minimal token-aware splitter | when you want the thinnest dependency and own the rest |
+| `spaCy` sentencizer | rule-based or model-based sentence segmentation | when you need accurate sentence boundaries as input to any chunking strategy — better than regex for non-English or abbreviation-heavy text |
+| `tree-sitter` + bindings | AST-based code splitting | the only correct tool for code chunking (§3.7); language grammars are maintained upstream |
+
+#### 6.7.3 Framework comparison for real decisions
+
+| Dimension | LangChain | LlamaIndex | Docling | Custom (own code) |
+|---|---|---|---|---|
+| **Strategies covered** | all five (§6.1–6.5) | all five | structure-aware + hybrid | whatever you build |
+| **Token counting** | opt-in (class methods) | built-in | built-in | you own it |
+| **Size control** | `chunk_size` + `chunk_overlap` | `chunk_size` / `chunk_overlap` | `max_tokens` | you own it |
+| **Parent-child** | manual (`parent_id` metadata) | native (`HierarchicalNodeParser`) | native (hierarchy from doc model) | you own it |
+| **Parser coupling** | loose — any text in, chunks out | loose-to-medium | **tight** — Docling-parsed docs only | none |
+| **Overhead** | medium (class hierarchy, `Document` model) | medium-high (`Node` graph) | low (if already using Docling) | zero |
+| **Best for** | prototyping, breadth of formats | full RAG pipeline with parent-child retrieval | PDF/DOCX-heavy corpora with tier-2 parsing | production systems that need full control, or when framework overhead exceeds benefit |
+
+#### 6.7.4 The custom-code argument
+
+Chunking is a 50–200 line function. The algorithm in §6.2 is 20 lines. Structure-aware splitting
+on Markdown headings is 30 lines. The `recursive_split` implementation in this chapter is a
+complete, tested, production-ready recursive splitter with token counting.
+
+The argument for rolling your own:
+
+- **You need to own the edge cases.** What happens when a document has no separators at all? When
+  a single sentence exceeds the token limit? When a table straddles a heading boundary? Each
+  framework answers these differently, and the answer is often "silently drop the content" or
+  "produce a chunk that exceeds the limit." When you own the code, you own the behavior.
+- **You need format-specific normalization between parse and split.** PDF extracted text needs
+  de-hyphenation and header stripping (§3.2, §4.1) before any splitter sees it — and that
+  normalization is pipeline-specific, not library-generic.
+- **You need the ingest pipeline to be debuggable.** A 200-line function with a breakpoint is
+  faster to debug than a framework class hierarchy when a specific document produces broken chunks.
+- **The dependency cost is real.** `langchain-text-splitters` pulls in `langchain-core`. LlamaIndex's
+  node parsers pull in the core framework. For a chunking function you call once at ingest, that's
+  a dependency graph you maintain for a for-loop.
+
+The argument for using a library:
+
+- **You don't want to reimplement sentence detection, token counting, and overlap windowing.**
+  These are fiddly and the libraries have them right (mostly).
+- **Parent-child indexing is a data-model problem**, and LlamaIndex's `HierarchicalNodeParser`
+  solves it cleanly enough that re-inventing it is a waste.
+- **The team is already in the ecosystem.** If you're using LangChain or LlamaIndex for retrieval
+  and generation, using their splitters too keeps the pipeline in one idiom.
+
+The reasonable posture: **use a library for the first prototype; migrate to owned code when the
+library's edge cases become your edge cases.** That migration is cheap — it's 200 lines — and it
+tends to happen when you hit your first format that the library handles poorly.
+
+#### 6.7.5 The ordering you should try things in
+
+This is the practical summary of §6.1–§6.6, ordered by effort and expected return:
+
+```
+1. Structure-aware splitting (§6.3) on any corpus with headings.
+   Prepend the heading path. This is the starting point, not the
+   optimization.
+   → Library: LangChain MarkdownHeaderTextSplitter, LlamaIndex
+     MarkdownNodeParser, Docling HierarchicalChunker, or 30 lines
+     of custom code.
+
+2. Recursive splitting (§6.2) with a tuned separator list for your format.
+   Add sentence terminators. Set chunk size in tokens, not characters.
+   Merge orphan tails.
+   → Library: LangChain RecursiveCharacterTextSplitter.from_tiktoken_encoder()
+     or LlamaIndex SentenceSplitter.
+
+3. Measure 1 and 2 against fixed-size baseline (§6.1) at matched token budget.
+   If neither beats the baseline with statistical significance, your problem
+   is upstream (parsing) or downstream (retrieval), not in the chunker.
+
+4. If the gap persists and structure isn't available: test semantic chunking
+   (§6.4) with a size-controlled variant only. Measure at 2x the embedding
+   cost of step 2.
+   → Library: semantic-text-splitter (Rust, enforces max size) or port
+     Chroma's ClusterSemanticChunker.
+
+5. If the corpus is small, high-value, and structurally hostile: test
+   LLM-based boundary detection (§6.5 pattern A). Price it before
+   committing.
+
+6. LLM-based proposition extraction (§6.5 pattern B) — last resort. Keep
+   the original spans for citation. Accept the cost.
+```
 
 ---
 
