@@ -2060,6 +2060,469 @@ golden set, not your corpus. Stratify the query set by type, report per-stratum,
 the strata disagree — if they do, that's an argument for §7's decoupling or for query-type routing
 (`05-query-understanding.md`), not for picking whichever chunk size wins on aggregate.
 
+### 11.7 Worked example: building a golden set from scratch
+
+Everything above is methodology. This section walks through actually creating a golden set on a
+concrete text, so the mechanics are visible and the common mistakes have an example to point at.
+
+#### 11.7.1 The source corpus
+
+Suppose you're building a RAG system over a company's internal documentation. Here's a realistic
+fragment from an HR policy document — 580 words, the kind of text that actually lives in corporate
+knowledge bases:
+
+```text
+# Employee Leave Policy
+
+## 1. Annual Leave
+
+All full-time employees are entitled to 20 working days of paid annual leave per calendar year.
+Part-time employees receive a pro-rata allocation based on their contracted hours. Leave accrues
+at the rate of 1.67 days per month and may be carried over up to a maximum of 5 days into the
+following year. Any carried-over leave must be used by March 31.
+
+New employees hired after July 1 receive a pro-rata allocation for their first year. The accrual
+rate remains 1.67 days per month regardless of start date.
+
+## 2. Sick Leave
+
+Employees are entitled to 10 days of paid sick leave per year. Sick leave does not accrue or
+carry over — unused days expire on December 31. For absences exceeding 3 consecutive working
+days, a medical certificate is required. The company reserves the right to request an independent
+medical examination for absences exceeding 10 consecutive working days.
+
+Short-term disability (STD) coverage begins on the 11th consecutive sick day and provides 60%
+of base salary for up to 26 weeks. Long-term disability (LTD) coverage begins after the STD
+period and provides 50% of base salary.
+
+## 3. Parental Leave
+
+Primary caregivers are entitled to 16 weeks of paid parental leave at full salary. Secondary
+caregivers are entitled to 4 weeks of paid parental leave at full salary. Both may be extended
+by up to 12 weeks of unpaid leave. Parental leave must begin within 12 months of the child's
+birth or adoption date.
+
+Employees on parental leave continue to accrue annual leave and receive employer pension
+contributions during the paid period. Benefits are suspended during the unpaid extension unless
+the employee elects to self-pay the premiums.
+
+## 4. Bereavement Leave
+
+Employees are entitled to 5 days of paid bereavement leave for the death of an immediate family
+member (spouse, child, parent, sibling). For extended family members, 2 days of paid leave are
+provided. Additional unpaid leave may be approved at the manager's discretion.
+```
+
+This is the **source document.** Character 0 is `#` in `# Employee Leave Policy`. Every span
+reference below points into this exact text.
+
+#### 11.7.2 The golden set — labeling spans, not chunks
+
+For this document, a domain expert (an HR team member who answers employee questions daily) writes
+queries that real employees actually ask, then highlights exactly where in the document the answer
+lives. They are labeling spans in the source text, not chunks — because chunks don't exist yet.
+
+```python
+GOLDEN_SET = [
+    {
+        "query_id": "leave_q01",
+        "query": "How many vacation days do I get per year?",
+        "query_type": "factoid",
+        "answer_spans": [
+            {
+                "doc_id": "hr_policy_leave_v3",
+                "char_start": 42,     # "All full-time employees are entitled to 20..."
+                "char_end": 195,      # "...contracted hours."
+                "rationale": "States the 20-day entitlement and part-time pro-rata rule",
+            },
+        ],
+    },
+    {
+        "query_id": "leave_q02",
+        "query": "Can I carry over unused vacation days?",
+        "query_type": "factoid",
+        "answer_spans": [
+            {
+                "doc_id": "hr_policy_leave_v3",
+                "char_start": 195,    # "Leave accrues at the rate..."
+                "char_end": 339,      # "...must be used by March 31."
+                "rationale": "Accrual rate, 5-day carry-over cap, March 31 deadline",
+            },
+        ],
+    },
+    {
+        "query_id": "leave_q03",
+        "query": "What happens if I'm sick for more than a week?",
+        "query_type": "multi_part",
+        "answer_spans": [
+            {
+                "doc_id": "hr_policy_leave_v3",
+                "char_start": 600,    # "For absences exceeding 3 consecutive..."
+                "char_end": 755,      # "...10 consecutive working days."
+                "rationale": "Medical certificate requirement and independent exam",
+            },
+            {
+                "doc_id": "hr_policy_leave_v3",
+                "char_start": 757,    # "Short-term disability (STD)..."
+                "char_end": 950,      # "...50% of base salary."
+                "rationale": "STD kicks in on day 11, then LTD after STD period",
+            },
+        ],
+    },
+    {
+        "query_id": "leave_q04",
+        "query": "Do I keep accruing PTO while on parental leave?",
+        "query_type": "factoid",
+        "answer_spans": [
+            {
+                "doc_id": "hr_policy_leave_v3",
+                "char_start": 1185,   # "Employees on parental leave continue..."
+                "char_end": 1420,     # "...self-pay the premiums."
+                "rationale": "Yes during paid period; benefits suspended during unpaid",
+            },
+        ],
+    },
+    {
+        "query_id": "leave_q05",
+        "query": "Compare the parental leave policy for primary and secondary caregivers",
+        "query_type": "synthesis",
+        "answer_spans": [
+            {
+                "doc_id": "hr_policy_leave_v3",
+                "char_start": 975,    # "Primary caregivers are entitled..."
+                "char_end": 1185,     # "...birth or adoption date."
+                "rationale": "Both caregiver types, durations, extension rules",
+            },
+        ],
+    },
+]
+```
+
+**Why the `rationale` field exists:** it's not for the scorer — it's for the next person who looks
+at this golden set and needs to decide whether a span label is correct without re-reading the
+source. Every labeling mistake you catch at review time is one fewer phantom regression in your
+eval results.
+
+**Why `query_type` matters:** §11.6 said to stratify. Tagging each query lets you compute metrics
+per stratum and catch the situation where small chunks win on factoids but lose on synthesis,
+which an aggregate number hides.
+
+#### 11.7.3 Scoring a chunking against this golden set
+
+Now chunk the document with two different strategies and score both against the same golden set.
+
+```python
+import tiktoken
+
+enc = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(text: str) -> int:
+    return len(enc.encode(text))
+
+# Strategy A: 200-token chunks, no overlap
+chunks_a = recursive_split(document, chunk_size=200, overlap=0)
+# Produces roughly 6-7 chunks, boundaries at paragraph breaks
+
+# Strategy B: 400-token chunks, 50-token overlap
+chunks_b = recursive_split(document, chunk_size=400, overlap=50)
+# Produces roughly 3-4 chunks with some boundary blurring
+
+# Score both at the same 600-token budget
+for name, chunks in [("200/0", chunks_a), ("400/50", chunks_b)]:
+    for entry in GOLDEN_SET:
+        ranked = retrieve_top_k(entry["query"], chunks, k=10)
+        recall = recall_at_budget(ranked, entry["answer_spans"], budget_tokens=600, count=count_tokens)
+        iou = token_iou(ranked, entry["answer_spans"], budget_tokens=600, count=count_tokens)
+        print(f"{name} | {entry['query_id']} | recall={recall:.2f} | IoU={iou:.3f}")
+```
+
+Expected pattern on this corpus:
+- `leave_q01` (factoid, one sentence): **200/0 wins on IoU** — the answer fits in one small chunk
+  with minimal wasted tokens.
+- `leave_q05` (synthesis, full section): **400/50 wins on recall** — the answer spans multiple
+  paragraphs, and a larger chunk captures more of it in one retrieval.
+- Both strategies achieve similar recall on most queries — §11.4's point that recall barely
+  discriminates.
+
+This is exactly the pattern that argues for decoupling (§7): retrieve with small chunks, expand
+to the parent for generation.
+
+#### 11.7.4 How to create a golden set — the practical workflow
+
+**Step 1: Sample queries from real traffic.** If you have a production system or a support ticket
+archive, sample from it. If you don't, have 2–3 domain experts independently write queries they
+expect users to ask. The queries should include:
+- Factoid (single-fact lookup): ~40%
+- Multi-part (answer spans multiple locations): ~30%
+- Synthesis (requires reasoning over a section): ~20%
+- Unanswerable (answer is not in the corpus): ~10%
+
+Unanswerable queries test whether your system hallucinates. They don't test chunking directly, but
+they test the pipeline end-to-end.
+
+**Step 2: Label answer spans in the source document.** The labeler reads the query, highlights the
+minimal sufficient text in the source document, and records `(doc_id, char_start, char_end)`. Two
+rules:
+
+1. **Minimal:** don't highlight the whole paragraph when one sentence answers the question. The
+   span should be the text a human would copy-paste into a chat response.
+2. **Sufficient:** the span must contain enough to answer without external context. If the answer
+   requires two separated passages, label both as separate spans.
+
+Use a tool that shows character offsets — a simple web UI over the document text with
+click-to-select is enough. Don't ask labelers to count characters manually; they'll make errors.
+
+```python
+def build_labeling_tool(doc_text: str, doc_id: str):
+    """Minimal labeling helper — returns char offsets for a selected substring."""
+    def label_span(selected_text: str) -> dict:
+        idx = doc_text.find(selected_text)
+        if idx == -1:
+            # Try normalized match if exact match fails
+            norm_doc = normalize(doc_text)
+            norm_sel = normalize(selected_text)
+            idx = norm_doc.find(norm_sel)
+            if idx == -1:
+                raise ValueError(f"Selected text not found in document: {selected_text[:50]}...")
+        return {
+            "doc_id": doc_id,
+            "char_start": idx,
+            "char_end": idx + len(selected_text),
+            "text_preview": selected_text[:80] + "..." if len(selected_text) > 80 else selected_text,
+        }
+    return label_span
+```
+
+**Step 3: Validate with inter-annotator agreement.** Have two labelers independently label the
+same 50 queries. Compute span overlap (Jaccard over characters) between their annotations. If
+agreement is below 0.7, your guidelines are ambiguous — fix the guidelines before labeling the
+rest of the set, because disagreement in labeling becomes noise in your metric.
+
+```python
+def span_agreement(spans_a: list[dict], spans_b: list[dict], doc_id: str) -> float:
+    """Character-level Jaccard between two sets of span labels for the same query."""
+    chars_a = set()
+    chars_b = set()
+    for s in spans_a:
+        if s["doc_id"] == doc_id:
+            chars_a.update(range(s["char_start"], s["char_end"]))
+    for s in spans_b:
+        if s["doc_id"] == doc_id:
+            chars_b.update(range(s["char_start"], s["char_end"]))
+    if not chars_a and not chars_b:
+        return 1.0
+    return len(chars_a & chars_b) / len(chars_a | chars_b)
+```
+
+**Step 4: Size the golden set.** How many queries do you need? The answer depends on the
+confidence interval you want on the *delta* between two chunkings, not on the metrics themselves.
+
+Rule of thumb from §11.4's variance observation (SD 25–40 against means 84–92 on Chroma's eval):
+
+| Desired CI on delta | Queries needed (approximate) |
+|---|---|
+| ±5 points on recall | ~60–100 |
+| ±2 points on recall | ~400–600 |
+| ±1 point on recall | ~1500+ |
+
+Most teams need ±5 to make decisions. 100 labeled queries is a realistic weekend of work for one
+domain expert, and it's enough to distinguish a 200/0 strategy from a 400/50 strategy.
+
+#### 11.7.5 Common mistakes building golden sets
+
+**Mistake 1: Labeling against chunks instead of source text.** You ran your current chunker,
+showed the labeler the chunks, and asked "is this chunk relevant?" Now your golden set is
+married to that chunking. Change the chunker and your labels are invalid. Label in the source
+document (§11.2).
+
+**Mistake 2: Expert-written queries that nobody actually asks.** A domain expert writes "Describe
+the accrual mechanism for annual leave entitlements." No employee has ever typed that. Sample
+from real traffic — support tickets, search logs, Slack questions. Expert-written queries
+overrepresent formal language and underrepresent the way people actually ask things.
+
+**Mistake 3: Span labels that are too broad.** The labeler highlighted the entire "Annual Leave"
+section for the query "how many vacation days do I get." The answer is one sentence (20 working
+days). A too-broad span makes every chunking look equally good on recall and hides precision
+differences — exactly the saturation effect §11.4 warned about.
+
+**Mistake 4: No unanswerable queries.** Every query in your golden set has an answer. Your eval
+can't tell you whether the system hallucinates answers to questions the corpus doesn't cover. Add
+10% unanswerable queries and measure how often the system returns high-confidence results for
+them.
+
+**Mistake 5: Labeling only the primary answer.** The query "what happens if I'm sick for more
+than a week?" has two answer locations — the medical certificate rule and the STD/LTD coverage.
+A labeler who only marks the first span will penalize a chunking that retrieves both (lower
+precision, same recall) and reward one that misses the disability coverage (higher precision, same
+recall — a backwards signal).
+
+**Mistake 6: Not storing the document version.** You labeled spans against version 3 of the
+leave policy. Six months later the policy is updated (version 4) and your char offsets no longer
+point at the same text. The golden set silently measures the wrong thing. See §11.7.6.
+
+#### 11.7.6 When the corpus changes — keeping the golden set valid
+
+Source documents change. The leave policy gets updated, a new section is added, paragraph wording
+is revised. Your golden set spans point into the old version. If you re-run eval against the new
+version without updating the labels, character offsets point at the wrong text and your metrics
+are garbage.
+
+**The core invariant: the golden set's spans must always point into the version of the document
+they were labeled against.**
+
+Three strategies to maintain this:
+
+**Strategy 1: Version-pinned golden sets (simplest, recommended for most teams).**
+
+```python
+GOLDEN_SET_ENTRY = {
+    "query_id": "leave_q01",
+    "query": "How many vacation days do I get per year?",
+    "corpus_version": "2024-03-15",       # golden set is pinned to this corpus snapshot
+    "answer_spans": [
+        {
+            "doc_id": "hr_policy_leave_v3",  # note: v3, not "latest"
+            "char_start": 42,
+            "char_end": 195,
+        },
+    ],
+}
+```
+
+Eval always runs against the corpus snapshot the golden set was labeled on. The golden set is
+valid indefinitely as long as you keep the old snapshot. New corpus versions get their own golden
+set (or a delta — see Strategy 2).
+
+Cost: you keep old document versions around. For text corpora this is trivially cheap —
+a snapshot is just a Git tag or a timestamped S3 prefix.
+
+**Strategy 2: Diff-and-relabel (for actively evolving corpora).**
+
+When a document changes, compute the text diff between the old and new version. For each golden
+set entry whose doc_id matches:
+
+1. If the span's text is unchanged in the new version, recompute `char_start` and `char_end`
+   by finding the same text at its new offset. This is automated.
+2. If the span's text was modified, flag it for human re-labeling. The query may still be
+   answerable from the new text, but the span needs a human to re-highlight.
+3. If the span's text was deleted, the query may now be unanswerable — flag for review.
+
+```python
+import difflib
+
+def migrate_spans(old_text: str, new_text: str, spans: list[dict]) -> list[dict]:
+    """Attempt to migrate span labels from old_text to new_text.
+
+    Returns migrated spans with a 'status' field:
+    - 'migrated': text found at new offset, span updated automatically
+    - 'needs_review': text changed or deleted, human must re-label
+    """
+    migrated = []
+    for span in spans:
+        old_excerpt = old_text[span["char_start"]:span["char_end"]]
+        new_idx = new_text.find(old_excerpt)
+        if new_idx >= 0:
+            migrated.append({
+                **span,
+                "char_start": new_idx,
+                "char_end": new_idx + len(old_excerpt),
+                "status": "migrated",
+            })
+        else:
+            # Text was modified — try fuzzy match to locate approximately
+            matcher = difflib.SequenceMatcher(None, old_excerpt, new_text)
+            best = matcher.find_longest_match(0, len(old_excerpt), 0, len(new_text))
+            migrated.append({
+                **span,
+                "char_start": best.b,
+                "char_end": best.b + best.size,
+                "status": "needs_review",
+                "original_text": old_excerpt[:100],
+                "best_match_text": new_text[best.b:best.b + best.size][:100],
+            })
+    return migrated
+```
+
+Cost: proportional to the number of changed documents × labeled spans per document. For a corpus
+that changes 5% per quarter, this is a few hours of review per cycle.
+
+**Strategy 3: Query-stable evaluation (when you can't keep old versions).**
+
+If you can't keep old corpus snapshots (compliance, storage), evaluate at the query level rather
+than the span level: for each golden query, check whether the system's generated answer is
+factually correct against the *current* document, using an LLM-as-judge evaluation
+(`08-evaluation-methodology.md`). This sacrifices the precision and reproducibility of
+character-level spans for a metric that's always computed against the live corpus.
+
+This is a fallback. It's more expensive (LLM calls per eval query), noisier (LLM judge agreement
+~0.85 vs human span matching ~0.95), and not reproducible across runs. Use it only when
+Strategy 1 or 2 is impractical.
+
+**How often to rebuild the golden set:**
+
+| Corpus change rate | Golden set cadence | Strategy |
+|---|---|---|
+| Static (regulatory, legal) | Once, then never | Strategy 1 — pin and forget |
+| Slow (quarterly policy updates) | Quarterly diff-and-relabel | Strategy 2 |
+| Fast (daily wiki edits, support articles) | Monthly snapshot + sample relabel | Strategy 2 + periodic full relabel |
+| Real-time (news, social) | Don't use span-level golden sets — use LLM-as-judge | Strategy 3 |
+
+#### 11.7.7 When chunking changes — migrating eval infrastructure
+
+Changing the chunker (§4.8) invalidates more than the index — it invalidates anything in your
+eval pipeline that assumed specific chunk boundaries. Here's what breaks and what doesn't:
+
+**Things that survive a chunker change (by construction):**
+- The golden set (labeled on source spans, not chunks) — §11.2's whole point
+- recall@budget (computed on character overlap, not chunk IDs) — §11.3
+- Token-level IoU (same) — §11.2's Chroma metric
+
+**Things that break:**
+- Cached retrieval results keyed by `(query_id, chunker_config)` — invalidated, recompute
+- Per-chunk feedback labels ("this chunk was helpful") — the chunk no longer exists; see §4.8.3
+- Regression baselines — your old recall@budget number was computed against the old chunking; the
+  comparison is still valid (same golden set, same metric) but the absolute number shifts
+
+**The migration workflow:**
+
+```python
+def eval_chunker_migration(golden_set, old_chunker, new_chunker, retriever, budget_tokens):
+    """Side-by-side evaluation of old vs new chunker on the same golden set."""
+    results = {"old": [], "new": []}
+
+    for entry in golden_set:
+        doc = load_document(entry["answer_spans"][0]["doc_id"])
+
+        for label, chunker in [("old", old_chunker), ("new", new_chunker)]:
+            chunks = chunker(doc)
+            index = build_temp_index(chunks)
+            ranked = retriever(entry["query"], index, k=20)
+
+            recall = recall_at_budget(ranked, entry["answer_spans"], budget_tokens, count_tokens)
+            iou = token_iou(ranked, entry["answer_spans"], budget_tokens, count_tokens)
+            results[label].append({
+                "query_id": entry["query_id"],
+                "query_type": entry.get("query_type", "unknown"),
+                "recall": recall,
+                "iou": iou,
+                "chunks_retrieved": len(ranked),
+            })
+
+    # Report per-stratum and aggregate with bootstrap CIs on the delta
+    for query_type in set(e.get("query_type") for e in golden_set):
+        old_recalls = [r["recall"] for r in results["old"] if r["query_type"] == query_type]
+        new_recalls = [r["recall"] for r in results["new"] if r["query_type"] == query_type]
+        delta = sum(new_recalls) / len(new_recalls) - sum(old_recalls) / len(old_recalls)
+        ci = bootstrap_ci([n - o for n, o in zip(new_recalls, old_recalls)])
+        print(f"{query_type}: delta={delta:+.3f} CI=[{ci[0]:+.3f}, {ci[1]:+.3f}]")
+```
+
+The point: because the golden set is span-labeled and the metrics are character-level, the
+*evaluation infrastructure survives chunker changes intact.* That is the payoff for §11.2's
+insistence on labeling spans instead of chunks. If you labeled chunks, every chunker change would
+require re-labeling your entire golden set — which means either nobody changes the chunker (too
+expensive) or nobody re-labels (eval is broken and nobody knows).
+
 ---
 
 ## 12. Cost model for the chunking layer
