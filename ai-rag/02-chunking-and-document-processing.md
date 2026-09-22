@@ -49,6 +49,7 @@
 13. [Anti-patterns](#13-anti-patterns)
 14. [Mental models — the compressed set](#14-mental-models--the-compressed-set)
 15. [Lab exercises](#15-lab-exercises)
+16. [Interview questions and system design prompts](#16-interview-questions-and-system-design-prompts)
 
 ---
 
@@ -1637,6 +1638,403 @@ counts.
 touches the whole document; the no-op case writes nothing; the deleted section is unretrievable.
 *Time:* ~3 hours.
 *Unblocks:* `15-ingestion-pipelines-and-freshness.md`.
+
+---
+
+## 16. Interview questions and system design prompts
+
+This section maps the chapter's content to the questions you'll actually face — in system design
+rounds, ML-focused interviews, and architecture reviews. Each question below names the sections it
+draws from and gives the answer structure an interviewer expects, not just the facts.
+
+### 16.1 Conceptual questions — "explain X"
+
+**Q: Why is chunking a schema decision?**
+*Sections: §1, §12.3*
+Lead with the migration cost: changing the chunk size from 512 to 1024 tokens requires re-chunking
+every document, re-embedding every chunk, and rebuilding the index — the identical operation a model
+migration triggers, at the identical cost. Then state the ordering claim that separates a strong
+answer: **parsing sets the ceiling; chunking decides how much of it you reach; the embedding model
+only exploits what's left.** No embedding model recovers information the parser destroyed, and no
+chunking strategy recovers information that was never parsed. The improvement order people use is
+almost always backwards — they swap embedding models before reading their own extracted text.
+
+Follow up with the hidden cost most people miss: chunk IDs leak into places that aren't the index —
+citations in saved conversations, eval result rows, feedback labels, caches. A re-chunk invalidates
+all of them, and that cost is the one that bites harder than the re-embed bill.
+
+**Q: What are the four constraints that determine chunk size?**
+*Section: §5*
+Two push down: **C1** — the embedding model's context limit is a hard ceiling (exceed it and most
+vendors silently truncate, producing a partial vector stored as if complete); **C2** — pooling
+dilution (averaging over six topics produces a vector that points at their centroid, near all six
+and specific to none — large chunks drift toward the corpus mean and become less discriminative).
+Two push up: **C3** — a chunk must contain enough context to be judged relevant (a sentence with
+no entity, date, or subject is unmatchable); **C4** — fixed per-chunk overhead is real (vector
+storage, payload, metadata, HNSW graph node), and halving chunk size roughly doubles all of it.
+
+The strong answer makes explicit that these constraints interact: chunk size and `k` are one joint
+decision (§5.3), because retrieving `k=10` chunks of 256 tokens gives the generator 2,560 tokens
+while `k=10` at 1,024 gives it 10,240 — those are not comparable configurations.
+
+**Q: Explain the difference between fixed-size, recursive, and structure-aware chunking.**
+*Section: §6*
+Fixed-size: cut every C tokens with O overlap, ignoring all structure. Predictable cost, trivially
+parallel, cuts mid-sentence. Right for genuinely unstructured text and as a mandatory baseline.
+Recursive: tries to split on the most meaningful separator (paragraph → line → sentence → word →
+character) that keeps pieces under the size limit. The key insight: **the separator list is the
+entire strategy** — adding sentence terminators (`.`, `?`, `!`) to the default list was a
+precondition for it performing competitively at all in Chroma's evaluation. Structure-aware: uses
+the document's own hierarchy — Markdown headings, HTML sections, DOCX heading levels, AST nodes.
+A section boundary is a semantic boundary the author already drew; spending an embedding pass to
+infer it (semantic chunking) when it's already in the document is paying for something you have
+for free.
+
+The interview winner: mention heading-path prefixing as the free version of contextual retrieval —
+prepend `"ACME 10-K 2023 > Item 7 > Liquidity"` to each chunk, deterministic, no LLM call, and
+measure what's left before paying for the LLM version.
+
+**Q: What is semantic chunking, and why did it come last on recall in Chroma's evaluation?**
+*Sections: §6.4*
+Mechanism: embed each sentence, compute cosine similarity between consecutive sentence embeddings,
+place a boundary where similarity drops sharply. The default Kamradt chunker scored **83.6 recall**
+— below every recursive configuration in Chroma's table, including the naïve 800/400 one. The
+reason is structural: the percentile threshold is relative to the observed distance distribution,
+so the algorithm has **no chunk-size control at all** — it produced ~660-token chunks on that
+corpus, can't guarantee chunks fit the embedding model's context window (a correctness problem
+before a quality problem), and couples chunk boundaries to the embedding model (change the model,
+boundaries move, every chunk ID changes, two schema decisions welded together).
+
+The variants that *did* win — `ClusterSemanticChunker` (91.3 recall) and `LLMChunker` (91.9) —
+both fix the size-control defect. The lesson: "semantic chunking is bad" is wrong; "the published
+version can't control its own output" is right.
+
+**Q: Explain parent-document retrieval and why it matters.**
+*Sections: §7.1, §7.2*
+The constraints C2 (dilution wants small chunks) and C3 (context wants large chunks) only conflict
+if the retrieval unit and the generation unit must be the same object. They don't. Embed and index
+a small, precise unit (a paragraph, a table row); return a larger unit that contains it (the
+enclosing section, the whole table). This is parent-document retrieval, and it costs one extra store
+lookup per result and a `parent_id` on every chunk. It dissolves the C2/C3 conflict instead of
+compromising on it.
+
+Mention auto-merging as the adaptive variant: retrieve leaf chunks, and if *m* of a parent's *n*
+children appear in the result set, replace them with the parent — the returned granularity adapts
+to how concentrated the evidence is.
+
+**Q: Why is PDF extraction hard, and how does it affect retrieval?**
+*Sections: §3.2, §3.3*
+PDF is a **print format, not a document format**. A content stream contains glyph-placement
+operators, not paragraphs — "draw these glyphs at x=72.0, y=650.3." Everything above the glyph
+level (lines, paragraphs, reading order, tables) is reconstructed by heuristics from geometry.
+Name the failure modes: column interleaving (two-column pages read across the gutter), header/footer
+injection, hyphenation artifacts, ligatures breaking lexical match, missing ToUnicode maps producing
+mojibake, and empty text layers in scanned documents producing zero chunks and zero errors. The last
+one is the most dangerous: a scanned PDF that extracts to the empty string produces zero vectors and
+*nothing reports an error* — the document simply doesn't exist as far as retrieval is concerned.
+
+The strong follow-up: name the three parser tiers (geometric extraction, layout models, VLM page
+understanding) and state that the tier decision should be driven by measurement — parse a sample at
+two tiers, run the golden set against both, and see whether the recall difference justifies the
+cost difference.
+
+### 16.2 System design round — "design the ingestion pipeline"
+
+These are the questions where everything converges. The interviewer wants connected decisions under
+constraints, not a recitation of chunking facts.
+
+**Q: You're building an ingestion pipeline for a RAG system over enterprise documents. Walk me
+through the design.**
+
+Structure your answer as a pipeline of stages, each with its own failure mode and version:
+
+```
+1. PARSE
+   - Identify the format taxonomy (§3.1): Markdown (trivial), HTML (easy,
+     boilerplate is the problem), PDF (hard — print format, not document
+     format), spreadsheets (wrong tool — route to a query engine).
+   - Choose a parser tier per corpus type (§3.3): geometric for born-digital
+     single-column, layout model for mixed/multi-column, VLM for high-value
+     visually complex.
+   - Add extraction-yield and script-sanity gates (§3.2) — a scanned PDF
+     that extracts to "" produces zero vectors and zero errors.
+   - For tables: serialize as row-wise sentences for retrieval, keep full
+     HTML for generation (§3.4). Repeat the header row in every chunk of
+     a split table.
+
+2. NORMALIZE
+   - Unicode NFC, strip zero-width chars, de-hyphenate across line breaks,
+     expand ligatures — the safe transforms (§4.1).
+   - Do NOT lowercase or remove stopwords — dense models were trained on
+     natural text (§4.2).
+   - Store one canonical text; derive the dense branch (text as-is) and
+     the lexical branch (lowercase, stem, fold) from it (§4.3).
+
+3. SPLIT
+   - Count tokens, not characters (§5.4) — character-based splitters
+     produce wildly variable token counts across content types.
+   - Use structure-aware splitting (§6.3) on any corpus with headings.
+     Prepend the heading path to each chunk — the free contextual retrieval.
+   - Fall back to recursive splitting with sentence terminators in the
+     separator list (§6.2) — the one-line change that makes the default
+     competitive.
+   - Use overlap only when structure isn't available; price it (§5.5):
+     20% overlap costs 25% more, not 20%.
+
+4. ENRICH
+   - Heading-path prefix (§6.3) — free, deterministic.
+   - LLM contextual retrieval (01 §9.2) — $1.02/M doc tokens, only if
+     heading paths aren't enough (measure first, §15 lab 6).
+
+5. IDENTITY AND UPDATE
+   - Content-addressed chunk IDs (§9.1) — hash(doc_id, chunker_version,
+     normalized_text). A one-word edit costs one re-embed, not the whole
+     document.
+   - Diff-based update (§9.2) — upsert new, delete removed, skip unchanged.
+   - Deletion is not optional (§9.2) — a removed section that stays
+     retrievable is confidently wrong output with a citation.
+
+6. EMBED AND INDEX
+   - Set truncation to fail loudly (§8, 01 §8.1) — truncation=False on
+     Voyage, truncate=NONE on Cohere.
+   - Record parser_version, chunker_version, embedding_model_version on
+     every chunk (§8.1).
+
+7. PERSIST INTERMEDIATES
+   - Keep the output of each stage in object storage (§2). Changing the
+     chunker now costs re-running stages 4–7, not re-downloading and
+     re-parsing 400k PDFs.
+```
+
+**What interviewers are listening for:**
+- You frame chunking as upstream of embedding, not downstream — and you can state the ceiling
+  chain (§1) that justifies the ordering.
+- You name the parsing stage as the highest-leverage and most-neglected stage.
+- You mention silent failures: empty text layers, silent truncation, position-addressed IDs
+  causing unnecessary re-embeds.
+- You separate the retrieval unit from the generation unit (§7) — that single pattern dissolves
+  the chunk-size dilemma.
+- You persist intermediate artifacts and version each stage independently.
+
+**Q: How would you evaluate and compare two chunking strategies?**
+*Sections: §11, §5.3*
+
+Walk through the methodology that avoids the common traps:
+
+```
+1. LABEL SPANS, NOT CHUNKS (§11.2)
+   - Chunk IDs only exist relative to a chunking — labels defined against
+     chunker A's output are meaningless for chunker B.
+   - Label (doc_id, char_start, char_end) in the canonical normalized text.
+   - A span-labeled golden set is valid across every chunker you'll ever try.
+
+2. FIX THE TOKEN BUDGET, NOT k (§11.3, §5.3)
+   - k=10 at 256 tokens ≠ k=10 at 1024 tokens. Comparing at fixed k
+     silently gives larger chunks a larger context budget.
+   - Compare at recall@budget: retrieve in rank order until the token
+     budget is exhausted, then score.
+
+3. REPORT TOKEN-LEVEL IoU, NOT JUST RECALL (§11.4)
+   - Recall barely separates chunkings: 8.3-point spread in Chroma's table.
+   - Token efficiency separates them by 5.7×–7.2×. Evaluate on recall
+     alone and you'll conclude chunking doesn't matter — a fact about the
+     metric, not about chunking.
+   - Think of chunks as bounding boxes and relevant excerpts as ground-truth
+     boxes, exactly as in object detection.
+
+4. STATE THE HIT RULE (§11.2)
+   - Any overlap, span containment, coverage ≥ τ, or union coverage ≥ τ.
+   - Never compare figures computed under different rules.
+
+5. BOOTSTRAP THE DELTA (§11.5)
+   - Per-query variance dwarfs between-strategy differences (SDs of 25–40
+     against means of 84–92 in Chroma's table).
+   - A delta without a confidence interval is a coin flip with a decimal.
+
+6. STRATIFY BY QUERY TYPE (§11.6)
+   - Factoid queries favor small chunks (dilution is binding); synthesis
+     queries favor large chunks or parent expansion (context is binding).
+   - A golden set that's 90% factoids will tell you small chunks win —
+     that conclusion is about your golden set, not your corpus.
+```
+
+### 16.3 Rapid-fire questions — short answers, deep signal
+
+| Question | Strong answer (1–2 sentences) | Section |
+|---|---|---|
+| Why is parsing the most important stage in a RAG pipeline? | Every downstream stage can only pass through or destroy what the parser extracted. A frontier embedding model applied to text with interleaved columns produces a precise vector pointing at garbage. | §1 |
+| How does a scanned PDF with no text layer fail in a RAG pipeline? | It extracts to the empty string, produces zero chunks, zero vectors, and zero errors — the document silently doesn't exist. An extraction-yield gate is a data-loss check, not a nice-to-have. | §3.2 |
+| Should you lowercase text before embedding? | No. Dense models were trained on cased text; case carries entity signal (`US` vs `us`, `Polish` vs `polish`). Lowercasing is correct for the BM25 branch only — store one canonical text, derive both forms from it. | §4.2, §4.3 |
+| What does 20% overlap actually cost? | 25% more chunks, tokens, and bytes — `1/(1-f)`, not `f`. It costs that on both the one-time embedding bill and the recurring storage bill. And it inflates recall@k while deflating the distinct information in the top-k. | §5.5 |
+| Why does chunk size interact with `k`? | Retrieving k=10 chunks of 256 tokens gives the generator 2,560 tokens; k=10 at 1,024 gives it 10,240. Any result that changed chunk size at fixed k and attributed the difference to chunk size alone is confounded. | §5.3 |
+| What's the single most impactful one-line change to a recursive text splitter? | Add sentence terminators (`.`, `?`, `!`) to the separator list. Without them, a paragraph exceeding chunk size falls straight through to splitting on `" "` — mid-sentence at an arbitrary word. Chroma found this was necessary for the default splitter to perform competitively at all. | §6.2 |
+| When is semantic chunking the wrong choice? | On any corpus with usable structure — Markdown headings, HTML sections, DOCX heading levels. You're paying an embedding pass per sentence to infer boundaries the author already annotated. | §6.3, §6.4 |
+| What's the danger of LLM-based chunking? | It can *add* information. A proposition-extraction pass that rewrites text can introduce statements the source doesn't support, cited to a real document that doesn't say it — a faithfulness failure injected at ingest, where no output-side guardrail catches it. | §6.5 |
+| Content-addressed vs position-addressed chunk IDs — which and why? | Content-addressed: `hash(doc_id, chunker_version, normalized_text)`. A one-word edit re-embeds one chunk and its neighbors. Position-addressed: a one-word edit shifts every subsequent ordinal, re-embedding the entire document. | §9.1 |
+| Why can't chunk-level labels compare two chunking strategies? | Chunk IDs only exist relative to a chunking — labels defined against chunker A's output don't name anything in chunker B's output. Label character spans in the canonical source text instead; the golden set is then valid across every chunker. | §11.2 |
+| Why does recall barely separate chunking strategies? | In Chroma's evaluation, the recall spread across 13 configurations was 8.3 points (83.6–91.9). Token-level precision spread 5.7×, Precision_Ω spread 7.2×. Every strategy retrieves the relevant tokens most of the time; they differ by an order of magnitude in how much irrelevant text they drag along. | §11.4 |
+| What does a re-chunk cost beyond the re-embed? | Invalidating every stored chunk_id reference — citations in saved conversations, eval result rows, feedback labels, caches. Storing citations as `(doc_id, char_start, char_end)` instead of `chunk_id` makes them survive. | §12.3 |
+
+### 16.4 Architecture whiteboard prompts
+
+These are open-ended prompts where the interviewer watches you navigate tradeoffs. The section
+references tell you where the facts live; the structure below tells you how to present them.
+
+**"Design the document processing pipeline for a legal RAG system with 10K filings."**
+
+Key moves:
+- 10K filings are PDFs, often multi-column with complex tables — tier-2 parsing minimum (§3.3),
+  layout model that recovers reading order and table structure.
+- Tables are the make-or-break case: serialize row-wise for retrieval, keep full HTML for
+  generation, repeat the header row in every chunk of a split table (§3.4).
+- Structure-aware splitting on section headings (Item 1, Item 7, etc.) with heading-path prefix
+  (§6.3) — the filing's own TOC is the chunk boundary set.
+- Parent-document retrieval (§7.1): index paragraphs, return sections. A query about "MD&A
+  discussion of liquidity" retrieves the paragraph, the generator gets the full section.
+- Content-addressed IDs (§9.1): filings are amended and restated — only changed sections should
+  re-embed.
+- Metadata: `filing_type`, `company`, `fiscal_year`, `section_path` as filterable payload (§8.2),
+  not embedded text. The section heading path goes in the embedded text.
+
+**"We're processing 500K support tickets. How do you chunk them?"**
+
+Key moves:
+- Support tickets are short — most fit in a single chunk. The question is really about
+  deduplication and metadata.
+- Exact dedup (§10.1) first: the same template response attached to hundreds of tickets.
+  Near-dedup (§10.2) for revised templates and copy-pasted paragraphs.
+- Quoted email replies (§10.3): strip at parse time and index thread structure as metadata,
+  don't deduplicate after the fact.
+- Metadata is the retrieval lever: `product`, `category`, `resolution_status`, `created_at` as
+  filterable fields (§8.1), not embedded in the text (§8.2).
+- Retrieval-time near-duplicate suppression (§10.4) matters more than ingest-time dedup — four
+  copies of the same template answer in the top-10 waste context budget.
+- Small chunks with parent expansion (§7.1): a single sentence from a resolution note retrieves
+  well; the full ticket provides the context the generator needs.
+
+**"Our retrieval recall is fine but the generated answers are unfocused. Diagnose."**
+
+Diagnostic checklist (ordered by likelihood):
+1. **Chunks are too large** (§5.1 C2) — the vectors are diluted, landing near many queries and
+   specific to none. The top-k contains relevant passages wrapped in irrelevant text. Check:
+   measure token-level IoU (§11.4) — if recall is high but IoU/precision is low, this is it.
+2. **No parent-document decoupling** (§7) — trying to serve both retrieval precision and generator
+   context with one chunk size. Fix: index small, return large.
+3. **Overlap-inflated top-k** (§5.5) — adjacent overlapping chunks are retrieved together,
+   consuming top-k slots with near-duplicates. The metric says 10 results, the generator sees 7
+   distinct passages. Fix: retrieval-time near-duplicate suppression (§10.4, MMR).
+4. **Metadata in the embedded text** (§8.2) — dates, IDs, and structured attributes are adding
+   uniform noise to every vector. Fix: move structured fields to filterable payload.
+
+**"Design a chunking strategy for a corpus mixing Markdown docs, PDFs, and source code."**
+
+Key moves:
+- **Per-format strategy** — one chunker does not fit all, and the decision table (§6.6) is
+  per-format:
+  - Markdown: structure-aware splitting on headings (§6.3). The format makes this trivial.
+  - PDFs: tier-2 parser to recover structure first (§3.3), then structure-aware splitting.
+    Add extraction-yield gates (§3.2) to route scans to OCR.
+  - Code: split at AST boundaries with tree-sitter (§3.7). Carry enclosing context (file path,
+    class signature, imports). Keep the docstring with the code.
+- **Shared normalization** (§4.1): Unicode NFC, zero-width char stripping, de-hyphenation apply
+  to all three. But the separator list for recursive splitting differs by format.
+- **Unified metadata schema** (§8.1): `content_type`, `source_uri`, `parser_version`,
+  `chunker_version` on every chunk, so the same query pipeline handles all three.
+- **One canonical text per chunk** (§4.3): dense branch sees text as-written, lexical branch
+  gets its own analyzed form. Never let the code formatter's output become what you embed.
+
+### 16.5 Common interview mistakes
+
+**1. Optimizing the embedding model before reading extracted text.**
+The parser sets the ceiling (§1). Swapping `text-embedding-3-small` for a frontier model while
+feeding it PDF text with interleaved columns is spending money to represent garbage more
+precisely. The first hour should be §15's Lab 1: extract 20 documents, read the extractions by
+eye. It is the highest-yield hour available and the one most consistently skipped.
+
+**2. Quoting a chunk size as "the answer" without naming the corpus.**
+"512 tokens with 15% overlap" is someone else's measurement on someone else's corpus. The answer
+is corpus-dependent and must be measured (§11), not looked up. A strong candidate says "I'd run a
+sweep at 256/512/1024 on our corpus, at fixed token budget, and pick based on recall@budget and
+IoU" — not "I'd use 512."
+
+**3. Comparing chunking strategies at fixed `k`.**
+This is the most common methodology error and it always favors large chunks (§5.3). Fix the
+token budget, not `k`. An interviewer who hears you correct this assumption unprompted knows
+you've actually evaluated a chunking strategy, not just read about one.
+
+**4. Reporting recall alone.**
+Recall barely separates chunkings (8.3-point spread in Chroma's table); token efficiency separates
+them by 5.7×–7.2× (§11.4). Reporting recall alone produces the widespread and false conclusion
+that chunking doesn't matter. Always report IoU or an equivalent token-efficiency metric alongside
+recall.
+
+**5. Using chunk-level labels to compare chunkings.**
+Chunk IDs are defined relative to a chunking (§11.2). Labels defined against chunker A are
+meaningless for chunker B. The fix is trivial — label character spans in the source document — but
+the trap is well-camouflaged because every tutorial and every eval library shows the chunk-level
+format.
+
+**6. Treating semantic chunking as a strict upgrade.**
+Semantic chunking couples chunk boundaries to the embedding model, adds an embedding call per
+sentence at ingest, and its uncontrolled variant (Kamradt) can't guarantee chunks fit the model's
+context window (§6.4). On a corpus with usable structure, you're paying an embedding pass to guess
+at headings you already have. Test it against structure-aware splitting as a hypothesis, not an
+upgrade.
+
+**7. Skipping deletes on document update.**
+A removed section whose chunks stay in the index is worse than missing data — it's confidently
+wrong output with a citation (§9.2). Interviewers asking about incremental update are listening
+for you to name deletion as a non-optional step, not just upsert.
+
+**8. Proposing overlap as the fix for bad boundaries.**
+Overlap is the fallback for corpora that genuinely lack structure, not the default (§5.5). It
+costs `1/(1-f)` on both embedding and storage, and it inflates recall while deflating the
+distinct information in the top-k. The structural alternative — splitting on structure the author
+provided — is usually better and free.
+
+### 16.6 Behavioral and scenario questions
+
+**Q: Tell me about a time you had to debug poor retrieval quality.**
+*Framework:* walk the ceiling chain from §1. "The first thing I checked was the parser output —
+I read 20 extracted documents by eye and found [column interleaving / missing tables / empty text
+layers]." The story should show you starting from the top of the pipeline, not from the model, and
+should end with a measured improvement: "after fixing the parser, recall@budget improved from X to
+Y on our golden set, without changing the embedding model or the chunk size."
+
+**Q: How would you convince your team to invest in span-labeled golden sets instead of
+chunk-level ones?**
+*Framework:* the cost is labeling character offsets instead of chunk IDs — marginally more effort
+per query, once. The payoff: the golden set survives every re-chunk, every strategy change, and
+every future evaluation (§11.2). Without it, every chunking comparison is structurally incapable
+of being fair, because the labels are defined in terms of one of the things being compared. It's
+an afternoon of work that converts every subsequent decision from a guess to a measurement.
+
+**Q: Your team is debating 256 vs 512 vs 1024 token chunks. How do you settle it?**
+*Framework:* refuse to settle it by argument — settle it by measurement (§15, lab 5). State the
+four constraints (§5), note that chunk size and `k` are one joint decision (§5.3), then describe
+the correct experiment: sweep at fixed token budget (not fixed `k`), report recall@budget *and*
+token-level IoU (§11.4), stratify by query type (§11.6), bootstrap the delta. If recall intervals
+overlap, check whether IoU separates them (it usually does — §11.4). If neither separates them,
+the honest answer is "no measurable difference, pick the cheaper one."
+
+**Q: Your ingestion pipeline takes 6 hours to reprocess after a chunker change. How do you
+speed it up?**
+*Framework:* the fix is architectural, not algorithmic (§2). Persist each stage's output to object
+storage and version each stage independently. Parsing is typically the most expensive stage (§12.1)
+and the one you least often need to redo. A chunker change should re-run stages 4–7 from cached
+parse output, not re-download and re-parse 400k PDFs. Content-addressed chunk IDs (§9.1) then
+ensure that unchanged chunks skip re-embedding entirely — the cost is proportional to what
+*changed*, not to the corpus size.
+
+**Q: You need to handle a corpus with PDFs, HTML pages, and code files. How do you design the
+chunker?**
+*Framework:* one chunker does not fit all (§6.6). Each format has different structure available,
+so each needs a different strategy. But the output contract is shared: every chunk, regardless of
+source format, has the same metadata schema (§8.1), the same content-addressed ID scheme (§9.1),
+and feeds the same embed → index pipeline. The format-specific logic is in parse and split; the
+downstream stages are format-agnostic by design. The per-format decisions: structure-aware on
+Markdown, tier-2-parsed structure-aware on PDFs with extraction-yield gates, AST-boundary on code
+with enclosing context carried into each chunk (§3.7).
 
 ---
 
