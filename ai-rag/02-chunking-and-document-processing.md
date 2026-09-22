@@ -433,6 +433,357 @@ text, or at minimum the pipeline should retain the canonical text and record eac
 (`18-failure-modes-and-incident-walkthrough.md`). Retrofitting offsets after the fact means
 re-running ingestion; recording them costs two integers per chunk.
 
+### 4.5 Building a correct normalization pipeline
+
+§4.1 says *what* the safe transforms are. This section says how to compose them into a pipeline
+that is correct and testable — because teams ship normalizers as ad-hoc one-off scripts, then
+discover twelve months later that ingest and query are running different code.
+
+**The normalizer is a pure function with a version.** Wrap every transform in a single,
+deterministic function and stamp its output with a version string. That version appears in chunk
+IDs (§9.1) and in the stored metadata, so you can answer "which normalizer produced this chunk?"
+without guessing.
+
+```python
+import unicodedata, re
+
+NORMALIZER_VERSION = "v3"   # bump on any change — §4.8 explains why
+
+_ZERO_WIDTH = re.compile(r"[​‌‍﻿­]")
+_WHITESPACE_RUN = re.compile(r"[^\S\n]+")                    # collapse spaces, keep \n
+_PARA_BREAK = re.compile(r"\n{3,}")                           # cap paragraph gaps at 2 newlines
+_LINE_HYPHEN = re.compile(r"(\w)-\n(\w)")                     # "organi-\nzational"
+
+# Explicit compatibility replacements you want — not the whole NFKC table.
+_COMPAT_MAP = str.maketrans({
+    "ﬁ": "fi",   # ﬁ
+    "ﬂ": "fl",   # ﬂ
+    "ﬃ": "ffi",  # ﬃ
+    "ﬄ": "ffl",  # ﬄ
+    "‘": "'",    # left single quote
+    "’": "'",    # right single quote
+    "“": '"',    # left double quote
+    "”": '"',    # right double quote
+    "–": "-",    # en dash → hyphen
+    "—": "-",    # em dash → hyphen (your corpus may want to keep em dashes — decide once)
+})
+
+
+def normalize(text: str) -> str:
+    """Deterministic, audited normalization pipeline.
+
+    Order matters: NFC before hashing (§9), ligatures before whitespace collapse,
+    de-hyphenation before paragraph-break normalization.
+    """
+    text = unicodedata.normalize("NFC", text)       # canonical composition — always first
+    text = _ZERO_WIDTH.sub("", text)                 # strip invisible characters
+    text = text.translate(_COMPAT_MAP)               # targeted ligatures and quote folding
+    text = _LINE_HYPHEN.sub(r"\1\2", text)           # de-hyphenate across line breaks
+    text = _WHITESPACE_RUN.sub(" ", text)             # collapse runs, preserve newlines
+    text = _PARA_BREAK.sub("\n\n", text)              # cap paragraph gaps
+    return text.strip()
+```
+
+Three properties this pipeline satisfies that a bag of regex replaces doesn't:
+
+1. **Idempotent.** `normalize(normalize(x)) == normalize(x)` for all input. If this doesn't hold,
+   applying the normalizer on both ingest and query gives different text than applying it once — a
+   silent recall bug. Test this property with property-based testing (Hypothesis, fast-check), not
+   hand-picked examples.
+2. **No semantic loss.** `²` stays `²`, `½` stays `½`, full-width CJK stays full-width. Any
+   mapping you add to `_COMPAT_MAP` is one you reviewed.
+3. **Deterministic.** No locale-dependent rules, no randomness, same output on every platform.
+   Python's `unicodedata.normalize` is deterministic for a given Unicode version — pin it in your
+   `pyproject.toml` so a Python upgrade doesn't silently change NFC tables.
+
+**Where the normalizer lives:** a shared library — literally a published package or a Git
+submodule — imported by both the ingestion service and the query service. Not a copy. Not
+"keep them in sync." One import path. Two call sites.
+
+### 4.6 Choosing a normalization strategy per corpus type
+
+Different source materials break under different transforms. The decision is not "which normalizer
+is best" but "which transforms are safe for *this* corpus."
+
+| Corpus type | Safe transforms | Dangerous transforms | Notes |
+|---|---|---|---|
+| **General prose** (blogs, wiki, docs) | All of §4.1 + ligature expansion + quote folding | NFKC, lowercasing | Baseline — everything in the pipeline above works |
+| **Scientific / math** | NFC, zero-width strip, whitespace collapse | NFKC (`²`→`2`), quote folding (primes), dash normalization (`−` vs `-`) | Keep Unicode math symbols intact; `−` (minus sign) ≠ `-` (hyphen-minus) |
+| **Legal / regulatory** | NFC, zero-width strip, de-hyphenation, whitespace collapse | Section symbols (`§`→`S`), pilcrows, dash normalization | `§1.2(a)(iii)` is a precise reference; NFKC may mangle it |
+| **CJK text** | NFC, zero-width strip | Full-width → half-width folding, whitespace collapse (CJK uses full-width space intentionally) | `Ｔｏｋｙｏ` and `Tokyo` are stylistic variants; whether to fold is a domain choice |
+| **Source code** | NFC, zero-width strip only | *Everything else* — whitespace is syntactic, quotes are syntactic, dashes are operators | Normalize only the invisible characters that break tools |
+| **Medical / pharmaceutical** | NFC, zero-width strip, ligature expansion | Lowercasing (`pH`, `IgG`), NFKC, dash folding (chemical names use en-dash) | Drug name casing is regulated; `Aspirin` vs `aspirin` can be distinct in a regulatory index |
+| **Transcripts / conversational** | NFC, zero-width strip, whitespace collapse, quote folding | De-hyphenation (spoken text has no line-break hyphens), ligature expansion (rarely present) | Transcripts have their own noise: filler words, partial words — those are a parser problem (§3), not normalization |
+
+**How to decide for a new corpus you haven't seen before:**
+
+1. **Sample first.** Pull 100–200 representative documents. Run `unicodedata.category(c)` and
+   `unicodedata.name(c)` over every non-ASCII character. Tally the results. You'll see immediately
+   whether your corpus has math symbols, CJK, or just typographic variants.
+2. **Build a lossy-transform report.** Run NFKC on the sample and diff against NFC. Every
+   character that changed is a candidate for semantic loss. Review the diff — if it's all ligatures
+   and curly quotes, NFKC is fine. If it contains `²`, `½`, `™`, or full-width forms, switch to
+   NFC + explicit map.
+3. **Test with retrieval, not eyeballs.** After choosing transforms, run your eval set (§11)
+   with and without each transform. A transform that doesn't improve retrieval metrics is
+   complexity you're carrying for no benefit.
+
+```python
+import unicodedata
+from collections import Counter
+
+def normalization_audit(texts: list[str]) -> dict:
+    """Audit a corpus sample for characters that NFKC would change."""
+    nfc_vs_nfkc = Counter()
+    categories = Counter()
+
+    for text in texts:
+        nfc_text = unicodedata.normalize("NFC", text)
+        nfkc_text = unicodedata.normalize("NFKC", text)
+        for i, (c_nfc, c_nfkc) in enumerate(zip(nfc_text, nfkc_text)):
+            if c_nfc != c_nfkc:
+                nfc_vs_nfkc[f"{c_nfc!r} → {c_nfkc!r} ({unicodedata.name(c_nfc, '?')})"] += 1
+        for c in nfc_text:
+            if ord(c) > 127:
+                categories[unicodedata.category(c)] += 1
+
+    return {
+        "nfkc_would_change": nfc_vs_nfkc.most_common(20),
+        "non_ascii_categories": categories.most_common(20),
+        "recommendation": "NFC + explicit map" if nfc_vs_nfkc else "NFKC is safe for this corpus",
+    }
+```
+
+### 4.7 Handling document changes over time — normalization's role in change detection
+
+Documents change: a policy page is updated, a product spec gets a new section, an employee
+handbook is revised quarterly. The normalizer is the first stage that touches the text, so it's
+the first stage that can cause false positives (unchanged text looks changed) or false negatives
+(changed text looks unchanged) in your incremental update pipeline (§9.2).
+
+**False positives — unchanged content looks changed:**
+
+The most common cause: a new parser version or a different extraction tool produces the same
+logical text with different whitespace, different Unicode forms, or different invisible characters.
+Your normalizer is the defense: if it collapses all those variants to the same canonical text, the
+content-addressed chunk ID (§9.1) stays stable and you don't re-embed.
+
+This is why normalization must be aggressive on *formatting* variance and conservative on
+*semantic* content. Collapse whitespace, normalize NFC, strip invisible characters — those prevent
+false-positive churn. Leave `²` as `²` — that preserves meaning.
+
+**False negatives — changed content goes undetected:**
+
+This can't happen with content-addressed IDs (§9.1) as long as the normalizer is deterministic:
+if the text changes at all post-normalization, the hash changes. The risk is a normalizer that's
+*too* aggressive — one that maps genuinely different content to the same string. NFKC on a math
+corpus can do this: `x²` and `x2` normalize to the same output, so an update that changes one to
+the other produces the same chunk ID and the change is silently swallowed.
+
+**Document versioning at the normalization layer:**
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+
+@dataclass
+class NormalizedDocument:
+    doc_id: str
+    source_hash: str          # hash of raw extracted text, before normalization
+    normalized_hash: str      # hash of text after normalize()
+    normalizer_version: str   # NORMALIZER_VERSION from §4.5
+    extracted_at: datetime
+    source_uri: str
+
+    def content_changed(self, previous: "NormalizedDocument") -> bool:
+        """Did the meaningful content change, ignoring formatting noise?"""
+        return self.normalized_hash != previous.normalized_hash
+
+    def source_changed(self, previous: "NormalizedDocument") -> bool:
+        """Did the raw source change at all, even if normalization absorbs it?"""
+        return self.source_hash != previous.source_hash
+
+    def normalizer_changed(self, previous: "NormalizedDocument") -> bool:
+        """Did we change the normalizer itself?"""
+        return self.normalizer_version != previous.normalizer_version
+```
+
+Keep both `source_hash` and `normalized_hash`. When `source_changed()` is true but
+`content_changed()` is false, you know the source document changed cosmetically (whitespace,
+encoding) but the normalizer absorbed it — log it but don't re-embed. When `normalizer_changed()`
+is true, you need to re-normalize and possibly re-embed everything (§4.8).
+
+**Handling duplicate documents across sources:**
+
+The same logical document often appears in multiple systems: a policy PDF on the intranet, a copy
+in Confluence, a version emailed as an attachment. §10 covers deduplication in general; here's
+what the normalization layer specifically contributes:
+
+- **Same content, different extraction noise:** Different parsers produce different whitespace,
+  different ligature handling, different header extraction. Your normalizer should collapse these
+  to the same canonical text so content-addressed IDs match and you don't store duplicate vectors.
+  This only works if you use the *same* normalizer for all sources — another argument for the
+  single shared module (§4.5).
+- **Same content, different versions over time:** A document updated in Confluence but not yet
+  re-uploaded as PDF. The `source_uri` and `extracted_at` fields distinguish them. Don't try to
+  merge them at normalization time — that's a freshness and provenance decision that belongs in the
+  ingestion pipeline (`15-ingestion-pipelines-and-freshness.md`).
+- **Near-identical content:** Headers, footers, and boilerplate differ. This is §10.2's
+  near-duplicate detection problem, not a normalization problem — don't try to solve it by
+  normalizing harder.
+
+### 4.8 When normalization or chunking changes — migration strategies
+
+This is the question teams don't ask until they need the answer urgently: "we improved our
+normalizer / changed our chunking strategy / upgraded our embedding model — how do we migrate
+without downtime and without losing the ability to roll back?"
+
+The key insight: **a normalizer change, a chunker change, and an embedding model change are all
+the same migration problem.** Each one invalidates stored chunk IDs and/or vectors, each one
+requires re-processing the corpus, and each one can break downstream references (citations,
+feedback labels, eval golden sets). The strategies below apply to all three; §12.3 covers the cost
+model, and `01` §12 covers the embedding-specific migration. This section covers the mechanics.
+
+#### 4.8.1 Why you version the normalizer
+
+The `NORMALIZER_VERSION` string in §4.5 appears in the chunk ID formula (§9.1):
+`hash(doc_id, chunker_version, normalized_text)`. A normalizer change produces different
+`normalized_text`, which produces different chunk IDs, which means the diff-based update algorithm
+(§9.2) sees the entire corpus as "all old chunks deleted, all new chunks added." That's a full
+reindex, not an incremental update — and it happens by accident if you change the normalizer
+without bumping its version, because the system has no way to know the old and new IDs represent
+the same content under a different normalization.
+
+Versioning makes the migration explicit: old chunks have `normalizer_v2` in their ID, new chunks
+have `normalizer_v3`, and both can coexist in the index during the transition.
+
+#### 4.8.2 Migration patterns
+
+**Pattern 1: Shadow reindex (zero-downtime, doubles storage temporarily).**
+
+The safest approach. Build a second index in parallel, then swap reads.
+
+```
+Timeline:
+─────────────────────────────────────────────
+  t₀: start shadow reindex with new normalizer/chunker
+  t₁: shadow index caught up to corpus; run eval (§11) on both
+  t₂: if eval passes, swap read traffic to new index
+  t₃: drain old index references (citations, caches); delete old index
+─────────────────────────────────────────────
+
+Cost: 2× storage + 1× full embed cost during [t₀, t₃]
+Risk: low — reads hit the old index until you explicitly swap
+Rollback: don't swap; delete the shadow index
+```
+
+This is the pattern for any migration where you can afford the temporary storage cost. It is
+essentially the blue-green deployment model applied to a vector index.
+
+**Pattern 2: In-place incremental migration (for normalizer-only changes when chunk boundaries
+don't move).**
+
+If you changed the normalizer but not the chunker, chunk *boundaries* are the same — only the
+text within each chunk changed. You can re-normalize and re-embed each chunk in place, document
+by document, without building a second index.
+
+```python
+def incremental_normalizer_migration(store, new_normalize_fn, new_version: str):
+    """Re-normalize and re-embed chunks in place.
+
+    Only works when chunk boundaries haven't changed — i.e., you changed
+    the normalizer but not the chunker.
+    """
+    for doc_id in store.all_doc_ids():
+        old_chunks = store.chunks_for_doc(doc_id)
+        for chunk in old_chunks:
+            new_text = new_normalize_fn(chunk.raw_text)  # requires storing raw text
+            new_id = chunk_id(doc_id, new_version, new_text)
+            if new_id != chunk.id:
+                new_vector = embed(new_text)
+                store.upsert(Chunk(id=new_id, text=new_text, vector=new_vector, doc_id=doc_id))
+                store.delete(chunk.id)
+    # After all docs processed, update the version marker
+    store.set_metadata("normalizer_version", new_version)
+```
+
+This costs 1× embed for the changed chunks (which may be all of them if the normalization change
+is pervasive) but doesn't require a second index. The risk is higher: during the migration,
+the index contains a mix of old-normalized and new-normalized chunks, and queries are running the
+new normalizer. If a chunk's text changes under the new normalizer, the query normalizer
+matches the new form but the old chunk is still indexed under the old form — a recall gap.
+
+**Pattern 3: Dual-write with cutover (for chunker changes).**
+
+When chunk *boundaries* change, in-place update doesn't work — old and new chunks don't
+correspond 1:1. Dual-write lets you migrate incrementally:
+
+```
+1. Deploy new ingestion path that writes to BOTH old and new index
+2. Backfill: re-chunk and re-embed entire corpus into new index
+3. Once new index is caught up, swap reads to new index
+4. Stop writing to old index; drain and delete
+```
+
+This is Shadow Reindex (Pattern 1) with the added property that new documents arriving during
+the migration land in both indexes, so neither falls behind.
+
+**Pattern 4: Versioned collections (simplest for small corpora).**
+
+If your corpus is small enough that a full reindex completes in minutes, don't bother with
+incremental migration. Create a new collection (`chunks_v3`), reindex into it, swap the
+read pointer, delete the old collection. The migration is one pipeline run.
+
+```python
+# Simple versioned-collection migration for small corpora
+NEW_COLLECTION = f"chunks_{NORMALIZER_VERSION}"
+
+def full_reindex(corpus, store):
+    store.create_collection(NEW_COLLECTION)
+    for doc in corpus:
+        raw_text = parse(doc)
+        normalized = normalize(raw_text)
+        chunks = chunk(normalized)
+        store.upsert_to(NEW_COLLECTION, embed_all(chunks))
+    store.swap_alias("chunks_live", NEW_COLLECTION)
+    store.drop_old_collections(keep_latest=2)  # keep one rollback version
+```
+
+#### 4.8.3 Protecting downstream references during migration
+
+Chunk IDs leak outside the index — into places you don't control and can't migrate atomically:
+
+| Reference type | Where it lives | Survives migration? | Mitigation |
+|---|---|---|---|
+| Citations in saved conversations | Chat history database | No — old chunk_id points to nothing | Store citations as `(doc_id, char_start, char_end)` (§4.4) instead of chunk_id |
+| Evaluation golden sets | Eval dataset files | No — span labels keyed by chunk_id break | Key golden sets by `(doc_id, char_offset)`, not chunk_id; re-derive chunk alignment at eval time |
+| User feedback labels | Feedback store | No — "this chunk was helpful" loses its referent | Store feedback against `(doc_id, normalized_text_hash)` — content-addressed, survives re-chunking |
+| Analytics / dashboards | Metrics database | Breaks on ID change | Accept the break; aggregate by doc_id or time, not chunk_id |
+| Cache entries | Query cache | Stale | Invalidate cache on migration (it's a cache — that's what caches are for) |
+
+The pattern: **never use chunk_id as a long-lived foreign key in any system outside the index.**
+Use content-addressed identifiers (`doc_id` + character offsets, or `doc_id` + content hash) for
+anything that needs to survive a re-chunking. Chunk IDs are internal to the index and should be
+treated as ephemeral.
+
+#### 4.8.4 Deciding when a migration is worth it
+
+Not every normalizer improvement justifies a reindex. The decision framework:
+
+1. **Measure the impact first.** Re-normalize your eval set's queries and golden-set documents
+   with the new normalizer. Run retrieval eval (§11). If recall doesn't improve, the migration
+   costs more than it saves.
+2. **Estimate the cost.** Full reindex cost from §12.1, plus engineering time for the migration,
+   plus the risk of a mixed-state index during transition. Compare against the measured recall
+   gain.
+3. **Batch migrations.** If you're also planning a chunker change or an embedding model upgrade,
+   combine them into one migration. Each migration has a fixed operational cost (dual-write setup,
+   validation, cutover); batching amortizes it.
+4. **New corpora get the new normalizer for free.** Even if you don't reindex existing data, new
+   documents ingest with the latest normalizer. Over time, as documents are updated and
+   re-ingested, the old normalization ages out. This is the "do nothing and wait" strategy, and
+   for normalizer changes that affect a small fraction of the corpus, it's often the right one.
+
 ---
 
 ## 5. What chunk size actually trades off
