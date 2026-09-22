@@ -491,6 +491,483 @@ and arithmetic you already have the code for once `08`'s harness exists. **This 
 less than one afternoon and outperforms every leaderboard, because it measures the only thing that
 was ever going to matter: your corpus, your queries, your definition of relevant.**
 
+### 5.4 Worked example: choosing an embedding model for a real corpus
+
+The five-step procedure above is a checklist. This section is the actual execution — what the code
+looks like, what the output looks like, and what decisions fall out of it.
+
+#### 5.4.1 Step 1 — Apply hard constraints to build a shortlist
+
+Suppose you're building a RAG system for an internal legal knowledge base: ~200k documents,
+English-only, maximum document length ~12k tokens, no images, budget of $500/month total
+embedding cost, and you need to self-host retrieval (no vendor lock-in on the index side, but
+API embedding is fine).
+
+| Constraint | Filter |
+|---|---|
+| Context ≥ 12k tokens | Eliminates EmbeddingGemma (2,048), Gemini (8,192) |
+| English text only | Multimodal not required, but not disqualifying |
+| Budget ≤ $500/mo at ~200k docs | Eliminates models with high per-token cost at scale (check §13) |
+| Fine-tuning optionality | Eliminates OpenAI (cannot fine-tune); keeps Voyage (enterprise), Cohere, open-weight |
+
+Surviving shortlist from §4's table:
+1. `voyage-4` (32k context, 1024d default, closed API, enterprise fine-tuning)
+2. `embed-v4.0` (Cohere, 128k context, 1536d default, closed API)
+3. `Qwen3-Embedding-8B` (32k context, 4096d, open-weight, self-hostable)
+4. `text-embedding-3-large` (OpenAI, 8,192 context — tight but sufficient, no fine-tuning — kept
+   as a strong baseline because it's cheap and widely benchmarked)
+
+Four candidates is a comfortable shortlist. More than five wastes evaluation time; fewer than
+three risks missing something.
+
+#### 5.4.2 Step 2 — Build a golden set on your corpus
+
+For a legal knowledge base, the queries come from actual lawyer and paralegal questions. If you
+have a support ticket system or search logs, sample from them. If not, have two domain experts
+independently write queries.
+
+```python
+GOLDEN_SET = [
+    {
+        "query_id": "legal_q01",
+        "query": "What is the limitation period for breach of contract in Delaware?",
+        "query_type": "factoid",
+        "relevant_doc_ids": ["de_code_title6_ch36", "de_ucc_art2"],
+        "relevant_chunks": None,  # filled per-model after embedding
+        "answer_spans": [
+            {
+                "doc_id": "de_code_title6_ch36",
+                "char_start": 12480,
+                "char_end": 12690,
+                "text_preview": "Actions on contracts not under seal must be commenced within 3 years...",
+            },
+        ],
+    },
+    {
+        "query_id": "legal_q02",
+        "query": "Can a non-compete clause be enforced if the employee was terminated without cause?",
+        "query_type": "synthesis",
+        "relevant_doc_ids": ["employment_law_ch7", "recent_ftc_rule_2024"],
+        "answer_spans": [
+            {
+                "doc_id": "employment_law_ch7",
+                "char_start": 8340,
+                "char_end": 8790,
+                "text_preview": "Courts generally apply a reasonableness test considering...",
+            },
+            {
+                "doc_id": "recent_ftc_rule_2024",
+                "char_start": 1200,
+                "char_end": 1580,
+                "text_preview": "The FTC's 2024 final rule banning most non-compete agreements...",
+            },
+        ],
+    },
+    # ... 48 more queries, stratified:
+    # ~40% factoid (single-fact lookup)
+    # ~30% multi-part (answer spans multiple docs)
+    # ~20% synthesis (reasoning across paragraphs)
+    # ~10% unanswerable (answer not in corpus)
+]
+```
+
+**Labeling discipline:** the answer_spans point into the *canonical normalized text* of each
+document (§4 of `02-chunking-and-document-processing.md`). The labeler highlights the minimal
+text a lawyer would cite when answering the question. Every span gets a `text_preview` so the
+next person reviewing the golden set can spot-check without opening the source document.
+
+#### 5.4.3 Step 3 — Embed and retrieve
+
+```python
+import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class EvalCandidate:
+    name: str
+    embed_fn: callable       # (texts: list[str]) -> np.ndarray
+    input_type_doc: str       # §3 — what to pass for documents
+    input_type_query: str     # §3 — what to pass for queries
+    dimensions: int
+    price_per_m_tokens: float
+
+candidates = [
+    EvalCandidate("voyage-4",    voyage_embed,   "document",        "query",           1024, 0.06),
+    EvalCandidate("embed-v4.0",  cohere_embed,   "search_document", "search_query",    1536, 0.10),
+    EvalCandidate("qwen3-8b",    qwen_embed,     None,              "Instruct: ...",   4096, 0.00),  # self-hosted
+    EvalCandidate("oai-3-large", openai_embed,   None,              None,              3072, 0.13),
+]
+
+
+def evaluate_candidate(candidate: EvalCandidate, corpus_chunks, golden_set, k=20):
+    """Full evaluation pipeline for one embedding model candidate."""
+    # Embed all corpus chunks with document input_type
+    doc_vectors = candidate.embed_fn(
+        [c.text for c in corpus_chunks],
+        input_type=candidate.input_type_doc,
+    )
+
+    results = []
+    for entry in golden_set:
+        # Embed query with query input_type (§3 — this is where the bug lives)
+        q_vector = candidate.embed_fn(
+            [entry["query"]],
+            input_type=candidate.input_type_query,
+        )
+
+        # Cosine similarity retrieval (all models in §4 output normalized vectors)
+        scores = doc_vectors @ q_vector.T
+        top_k_indices = np.argsort(scores.flatten())[-k:][::-1]
+        retrieved_chunks = [corpus_chunks[i] for i in top_k_indices]
+
+        # Score against span-level golden set (02 §11.2's method)
+        recall = recall_at_budget(retrieved_chunks, entry["answer_spans"], budget_tokens=2048)
+        iou = token_iou(retrieved_chunks, entry["answer_spans"], budget_tokens=2048)
+        mrr = mean_reciprocal_rank(retrieved_chunks, entry["relevant_doc_ids"])
+
+        results.append({
+            "query_id": entry["query_id"],
+            "query_type": entry["query_type"],
+            "recall": recall,
+            "iou": iou,
+            "mrr": mrr,
+        })
+
+    return results
+```
+
+**Critical detail on `input_type`:** §3 showed that using the wrong input_type silently degrades
+recall by 5–15 points. The `EvalCandidate` struct carries the correct input_type for each model
+because the evaluation is worthless if you get this wrong — and it's the #1 mistake teams make
+when comparing models. Voyage wants `"document"` / `"query"`. Cohere wants `"search_document"` /
+`"search_query"`. OpenAI has no input_type. Qwen uses instruction prefixes. Get it from the
+vendor's docs, not from a tutorial.
+
+#### 5.4.4 Step 4 — Compare with confidence intervals
+
+```python
+import numpy as np
+
+def bootstrap_ci(values, n_bootstrap=10000, ci=0.95):
+    """Bootstrap confidence interval on the mean."""
+    rng = np.random.default_rng(42)
+    means = [np.mean(rng.choice(values, size=len(values), replace=True))
+             for _ in range(n_bootstrap)]
+    alpha = (1 - ci) / 2
+    return np.quantile(means, alpha), np.quantile(means, 1 - alpha)
+
+
+def compare_models(all_results: dict[str, list[dict]]):
+    """Side-by-side comparison with bootstrap CIs."""
+    print(f"{'Model':<20} {'Recall@2048':>12} {'95% CI':>16} {'IoU':>8} {'MRR':>8}")
+    print("-" * 70)
+
+    for model_name, results in all_results.items():
+        recalls = [r["recall"] for r in results]
+        ious = [r["iou"] for r in results]
+        mrrs = [r["mrr"] for r in results]
+
+        recall_ci = bootstrap_ci(recalls)
+        mean_recall = np.mean(recalls)
+        mean_iou = np.mean(ious)
+        mean_mrr = np.mean(mrrs)
+
+        print(f"{model_name:<20} {mean_recall:>11.3f} [{recall_ci[0]:.3f}, {recall_ci[1]:.3f}]"
+              f" {mean_iou:>8.3f} {mean_mrr:>8.3f}")
+
+    # Per-stratum breakdown
+    for qtype in ["factoid", "multi_part", "synthesis", "unanswerable"]:
+        print(f"\n--- {qtype} queries ---")
+        for model_name, results in all_results.items():
+            stratum = [r for r in results if r["query_type"] == qtype]
+            if stratum:
+                mean_r = np.mean([r["recall"] for r in stratum])
+                mean_i = np.mean([r["iou"] for r in stratum])
+                print(f"  {model_name:<18} recall={mean_r:.3f}  IoU={mean_i:.3f}")
+```
+
+Typical output on a legal corpus (illustrative — your numbers will differ):
+
+```
+Model                Recall@2048          95% CI      IoU      MRR
+----------------------------------------------------------------------
+voyage-4                   0.847 [0.801, 0.889]    0.142    0.723
+embed-v4.0                 0.831 [0.782, 0.874]    0.128    0.698
+qwen3-8b                   0.819 [0.768, 0.864]    0.135    0.685
+oai-3-large                0.802 [0.749, 0.851]    0.119    0.671
+
+--- factoid queries ---
+  voyage-4           recall=0.891  IoU=0.198
+  embed-v4.0         recall=0.878  IoU=0.175
+  qwen3-8b           recall=0.855  IoU=0.181
+  oai-3-large        recall=0.842  IoU=0.162
+
+--- synthesis queries ---
+  voyage-4           recall=0.762  IoU=0.074
+  embed-v4.0         recall=0.780  IoU=0.082   <-- wins on synthesis
+  qwen3-8b           recall=0.751  IoU=0.078
+  oai-3-large        recall=0.723  IoU=0.065
+```
+
+**How to read this:**
+- The CIs overlap for all models — a 50-query golden set can distinguish "roughly the same" from
+  "clearly different," not "0.847 from 0.831." That's fine; it's enough to eliminate oai-3-large
+  and focus the decision on voyage-4 vs embed-v4.0.
+- IoU is low across the board (0.12–0.14) — this is normal at a 2048-token budget on a legal
+  corpus with long answer spans. The absolute number matters less than the relative ranking.
+- Cohere wins on synthesis queries — its 128k context may be capturing more relevant context per
+  chunk. Worth investigating whether it's the model or the context window.
+- The "unanswerable" stratum (not shown) should have recall = 0.0; if any model returns
+  high-confidence results for unanswerable queries, that's a hallucination risk signal.
+
+#### 5.4.5 Step 5 — Factor in cost and latency
+
+The model with the best recall isn't automatically the right choice. The decision is
+recall × cost × latency × operational complexity:
+
+```python
+def total_cost_comparison(candidates: list[EvalCandidate], corpus_tokens: int, monthly_queries: int,
+                          avg_query_tokens: int = 30):
+    """Monthly cost estimate for each candidate."""
+    print(f"{'Model':<20} {'Embed cost':>12} {'Query cost':>12} {'Total/mo':>12} {'Self-host?':>12}")
+    print("-" * 72)
+    for c in candidates:
+        embed_cost = corpus_tokens / 1e6 * c.price_per_m_tokens  # one-time, amortized
+        query_cost = monthly_queries * avg_query_tokens / 1e6 * c.price_per_m_tokens
+        total = embed_cost / 12 + query_cost  # amortize ingest over 12 months
+        self_host = "yes" if c.price_per_m_tokens == 0 else "no"
+        print(f"{c.name:<20} ${embed_cost:>10.2f} ${query_cost:>10.2f} ${total:>10.2f} {self_host:>12}")
+```
+
+For 200k documents at ~2k tokens each (400M tokens) and 100k queries/month:
+
+```
+Model                Embed cost   Query cost    Total/mo   Self-host?
+------------------------------------------------------------------------
+voyage-4               $24.00        $0.18       $2.18           no
+embed-v4.0             $40.00        $0.30       $3.63           no
+qwen3-8b                $0.00        $0.00       GPU cost        yes
+oai-3-large            $52.00        $0.39       $4.72           no
+```
+
+At this corpus size, embedding cost is trivial for all API models — the decision is dominated by
+recall quality and operational considerations, not price. At 10× the corpus (4B tokens), the
+cost picture changes and self-hosting Qwen becomes the clear economic winner.
+
+**The decision matrix:**
+
+| Factor | voyage-4 | embed-v4.0 | qwen3-8b | oai-3-large |
+|---|---|---|---|---|
+| Recall (your eval) | Best | Close second | Good | Baseline |
+| IoU | Best | Third | Second | Fourth |
+| Cost/mo | $2.18 | $3.63 | GPU cost | $4.72 |
+| Fine-tune option | Enterprise | Enterprise | Self-serve | **No** |
+| Vendor lock-in | Medium | Medium | None | Medium |
+| Context ceiling | 32k | 128k | 32k | 8,192 |
+| Latency (API) | ~100ms | ~120ms | depends on GPU | ~80ms |
+
+For this corpus: **voyage-4 wins** — best recall, lowest API cost, fine-tuning available if
+needed later. Keep Qwen3 as the fallback plan if you need to go self-hosted or need fine-tuning
+without an enterprise contract.
+
+### 5.5 The evaluation harness — reusable code
+
+The model comparison above is a one-time selection exercise. The harness below is the reusable
+artifact — the thing you run again when a new model drops, when your corpus changes
+significantly, or when you suspect quality has degraded.
+
+```python
+import json, time
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+
+@dataclass
+class EvalRun:
+    run_id: str
+    model_name: str
+    model_version: str
+    chunker_version: str
+    normalizer_version: str
+    golden_set_version: str
+    k: int
+    budget_tokens: int
+    timestamp: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    results: list[dict] = field(default_factory=list)
+    aggregate: dict = field(default_factory=dict)
+
+
+def run_eval(model, corpus_chunks, golden_set, k=20, budget_tokens=2048) -> EvalRun:
+    """Run a complete evaluation and return a serializable result."""
+    run = EvalRun(
+        run_id=f"{model.name}_{int(time.time())}",
+        model_name=model.name,
+        model_version=model.version,
+        chunker_version=corpus_chunks[0].chunker_version,
+        normalizer_version=corpus_chunks[0].normalizer_version,
+        golden_set_version=golden_set["version"],
+        k=k,
+        budget_tokens=budget_tokens,
+    )
+
+    for entry in golden_set["queries"]:
+        result = evaluate_single_query(model, corpus_chunks, entry, k, budget_tokens)
+        run.results.append(result)
+
+    # Aggregate
+    recalls = [r["recall"] for r in run.results]
+    ious = [r["iou"] for r in run.results]
+    run.aggregate = {
+        "mean_recall": float(np.mean(recalls)),
+        "recall_ci_95": [float(x) for x in bootstrap_ci(recalls)],
+        "mean_iou": float(np.mean(ious)),
+        "n_queries": len(run.results),
+        "per_stratum": compute_per_stratum(run.results),
+    }
+
+    return run
+
+
+def save_eval_run(run: EvalRun, output_dir: Path):
+    """Persist an eval run for historical comparison."""
+    path = output_dir / f"{run.run_id}.json"
+    path.write_text(json.dumps(asdict(run), indent=2))
+    return path
+
+
+def compare_eval_runs(runs: list[EvalRun]):
+    """Compare historical eval runs — detect regressions."""
+    sorted_runs = sorted(runs, key=lambda r: r.timestamp)
+    baseline = sorted_runs[0]
+
+    for run in sorted_runs[1:]:
+        delta = run.aggregate["mean_recall"] - baseline.aggregate["mean_recall"]
+        ci = bootstrap_ci_on_delta(baseline.results, run.results)
+        status = "REGRESSION" if ci[1] < -0.02 else "IMPROVEMENT" if ci[0] > 0.02 else "NO CHANGE"
+        print(f"{run.model_name} vs {baseline.model_name}: "
+              f"delta={delta:+.3f} CI=[{ci[0]:+.3f}, {ci[1]:+.3f}] → {status}")
+```
+
+**What the harness tracks that ad-hoc scripts don't:**
+- `model_version` and `chunker_version` — so you can tell whether a recall change is from the
+  model or the chunker or the normalizer.
+- `golden_set_version` — so you never accidentally compare results from different golden sets.
+- `timestamp` — so you can plot quality over time and detect drift (§12.3).
+- Per-stratum breakdown — so a regression on synthesis queries doesn't hide behind an improvement
+  on factoids.
+
+### 5.6 Common model selection mistakes
+
+**Mistake 1: Choosing on MTEB score alone.** §5.2 explains why structurally. The practical
+consequence: teams pick the #1 MTEB model, deploy it, measure 3 months later, and find it
+performs comparably to a model ranked 30 spots lower on the leaderboard. They wasted a quarter
+not because the model is bad, but because the leaderboard score was never predictive of their
+domain.
+
+**Mistake 2: Evaluating without the correct input_type.** §3 covers this in detail. In
+evaluation, it manifests as: "we compared voyage-4 and text-embedding-3-large, and voyage-4
+was only marginally better." If you passed `input_type="document"` for your query embeddings
+on Voyage (or omitted `input_type` entirely and got the wrong default), you evaluated a
+misconfigured model against a correctly configured one. The comparison is void.
+
+**Mistake 3: No confidence interval.** A 50-query golden set has wide variance. `voyage-4` at
+0.847 recall and `embed-v4.0` at 0.831 may have overlapping 95% CIs — meaning you can't
+distinguish them at this sample size. Reporting the means without intervals and picking the
+higher one is a coin flip presented as a decision. Either increase sample size or accept that
+the models are indistinguishable on your data and choose on cost/latency instead.
+
+**Mistake 4: Evaluating at one chunk size.** You evaluate all models at 512-token chunks, pick
+the winner, and later switch to 256-token chunks for better precision. The model ranking *may
+change at a different chunk size* because the models encode different amounts of context — a model
+trained on longer passages may degrade more on very short chunks. Evaluate at the chunk size
+you'll deploy, or at multiple sizes if you're still deciding.
+
+**Mistake 5: Not testing the unanswerable case.** All your golden set queries have answers in the
+corpus. Your eval can't tell you that Model A returns high-confidence results for questions the
+corpus doesn't cover while Model B correctly returns low scores. Add 10% unanswerable queries
+and measure whether the model's top-k score distribution separates answerable from unanswerable.
+
+**Mistake 6: Ignoring latency.** API embedding latency varies 2–5× across providers, and it hits
+every query at runtime. If your p95 retrieval latency budget is 200ms and the embedding call alone
+takes 150ms, the model doesn't fit regardless of its recall score. Measure latency during the
+evaluation, not after deployment.
+
+**Mistake 7: Treating the selection as permanent.** New models ship quarterly. The eval harness
+(§5.5) should run monthly against 2–3 new candidates and your current production model, so you
+know when a swap would improve quality. A model selection is a decision with a shelf life, not
+a one-time choice.
+
+### 5.7 Ongoing model monitoring — detecting when your model stops working
+
+Model selection is not a one-time event. Three things change after deployment that can silently
+degrade your embedding model's effectiveness:
+
+**1. Corpus drift.** Your corpus evolves — new document types, new terminology, new domains.
+The model was evaluated on the corpus as it existed at selection time. If 30% of your corpus
+is now from a domain the model was never tested on, recall may have degraded without any model
+change.
+
+**2. Query drift.** Users change how they ask questions. A new product launch brings new
+terminology. A new user population asks differently from the early adopters. Your golden set,
+built from early query traffic, no longer represents actual usage.
+
+**3. Model deprecation.** Vendors deprecate models (§12). OpenAI deprecated `ada-002` in favour
+of `text-embedding-3-small`. Voyage deprecated the `01/02` series. When your model gets a
+deprecation notice, that's a forced migration — the eval harness should already be running
+against the replacement candidate.
+
+**Monitoring checklist:**
+
+```python
+@dataclass
+class MonitoringConfig:
+    eval_cadence: str = "monthly"          # run full eval monthly
+    canary_queries: int = 20               # subset of golden set for weekly spot-checks
+    drift_threshold: float = 0.03          # alert if recall drops more than 3 points
+    cost_alert_threshold: float = 1.5      # alert if cost exceeds 1.5× baseline
+
+
+def weekly_canary_check(model, corpus_chunks, canary_set, baseline_recall: float, config: MonitoringConfig):
+    """Fast weekly check using a small query subset."""
+    recalls = []
+    for entry in canary_set:
+        result = evaluate_single_query(model, corpus_chunks, entry, k=20, budget_tokens=2048)
+        recalls.append(result["recall"])
+
+    current_recall = np.mean(recalls)
+    delta = current_recall - baseline_recall
+
+    if delta < -config.drift_threshold:
+        alert(f"Recall degradation detected: {delta:+.3f} "
+              f"(baseline={baseline_recall:.3f}, current={current_recall:.3f}). "
+              f"Run full eval to confirm.")
+    return current_recall
+
+
+def monthly_full_eval(model, corpus_chunks, golden_set, previous_runs: list[EvalRun]):
+    """Full monthly evaluation with regression detection."""
+    run = run_eval(model, corpus_chunks, golden_set)
+    save_eval_run(run, Path("eval_runs/"))
+
+    if previous_runs:
+        latest = previous_runs[-1]
+        compare_eval_runs([latest, run])
+
+    # Check for query drift: are canary queries still representative?
+    if golden_set["created_at"] < months_ago(6):
+        alert("Golden set is >6 months old. Sample recent query traffic and check "
+              "whether the query distribution has shifted. Consider refreshing 20% "
+              "of the golden set from recent queries.")
+
+    return run
+```
+
+**When to re-evaluate model choice (not just the current model):**
+- Your corpus size crosses a 10× threshold (cost model changes)
+- A new model generation ships from your vendor or a competitor
+- Your eval shows recall below the threshold that triggered model selection originally
+- You're planning a chunking or normalization migration (§4.8 of `02`) — batch the model eval
+  with it since you're re-embedding anyway
+
 ---
 
 ## 6. Dimensionality and Matryoshka Representation Learning
