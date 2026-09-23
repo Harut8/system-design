@@ -40,6 +40,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why LangGraph exists: the gap between a chain and a loop](#1-why-langgraph-exists-the-gap-between-a-chain-and-a-loop)
 2. [Core concepts: StateGraph, nodes, edges, compilation](#2-core-concepts-stategraph-nodes-edges-compilation)
 3. [State management in depth: schemas, reducers, and merge semantics](#3-state-management-in-depth-schemas-reducers-and-merge-semantics)
@@ -59,10 +60,97 @@
 17. [Anti-patterns](#17-anti-patterns)
 18. [Interview questions, with weak and strong answers](#18-interview-questions-with-weak-and-strong-answers)
 19. [Lab exercises](#19-lab-exercises)
+20. [Real-world cases — incidents with numbers](#20-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A simple LLM app runs in a straight line: take the question, fetch documents, write
+an answer, done. An agent does not. It thinks, calls a tool, looks at the result, and decides what to
+do next, maybe many times. It may need to wait hours for a person to approve something, and it must
+not forget where it was if the server restarts. Writing that loop by hand with a `while` loop and a
+few variables works in a demo and breaks in production. LangGraph gives you the loop as a
+**graph**: boxes (nodes) that do work, arrows (edges) that say what runs next, and one shared
+**state** object that is saved after every step.
+
+**A real-world example: a refund agent for an online shop.** (Numbers are illustrative.)
+
+1. A customer writes: "My blender arrived broken, please refund order 88123."
+2. The **agent node** (an LLM call) decides it needs two facts and asks for two tools at once:
+   `lookup_order` and `check_return_policy`. Both run **in parallel, in the same step**.
+   - *Without a reducer* on the `messages` field, both tools try to write the same field in the same
+     step and LangGraph stops with an `InvalidUpdateError`.
+   - *With a reducer* (`add_messages`), both results are appended to the history. (§3)
+3. The order is $640. Shop policy says refunds over $500 need a staff member's OK. The agent calls
+   `interrupt()`: the graph saves its state and stops. (§6)
+4. The staff member approves 2 hours later. In those 2 hours the team deployed twice.
+   - *Without a persistent checkpointer* (state only in memory), the conversation is gone. At 35
+     in-flight conversations per deploy and 2 deploys a day, that is 70 lost conversations a day.
+   - *With `PostgresSaver`*, a new server process loads the saved state by `thread_id` and continues
+     exactly where it stopped. (§5)
+5. The refund API returns an odd error, and the model keeps retrying the identical call.
+   - *With only the default limit* (`recursion_limit = 25` steps ≈ 12 model calls), each call
+     re-reads a ~4,000-token history: 12 × 4,000 = 48,000 tokens ≈ $0.14 at $3 per million input
+     tokens, and the user gets a raw error.
+   - *With a retry counter that gives up after 3 attempts*: 12,000 tokens ≈ $0.04, and the user gets
+     "I couldn't finish this; a person will follow up." (§12)
+6. While all this runs, the chat window shows progress using **streaming** (§7), and every step is
+   visible in a trace (§16).
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| State | one shared object holding everything the agent knows right now | a shared whiteboard in a meeting room |
+| Node | a Python function that reads the state and returns changes | one worker at a station on an assembly line |
+| Edge | a fixed arrow: after node A, always run node B | a one-way corridor between two rooms |
+| Conditional edge / router | a small function that picks the next node from the state | a receptionist who sends you to the right office |
+| `START` / `END` | markers for where the graph begins and stops | the entrance and exit doors |
+| Reducer | a rule for combining two writes to the same field | "add new receipts to the pile" instead of "replace the pile" |
+| `add_messages` | the built-in reducer for chat history: append, or replace a message with the same id | a chat log that also lets you edit a sent message |
+| Super-step | one round in which all scheduled nodes run in parallel, then their changes are merged | everyone hands in their exam at the bell, then the teacher grades them together |
+| Checkpointer | saves the whole state after every super-step | the auto-save in a video game |
+| Thread (`thread_id`) | the ID of one conversation's saved history | a save slot with your name on it |
+| Interrupt | pause the graph and wait for a person's input | a form waiting on a manager's signature |
+| `Command` | a return value that updates state and/or says where to go next (or resumes after an interrupt) | a note saying "done, now pass it to Bob" |
+| `Send` | start N copies of a node in parallel, each with its own input | handing one question each to 8 researchers |
+| `ToolNode` | a ready-made node that runs the tools the LLM asked for | a clerk who carries out the boss's requests |
+| Subgraph | a whole compiled graph used as one node inside a bigger graph | a department that looks like one desk from outside |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `thread_id` | ID of one conversation's saved history | any string you derive from a trusted session | `"user-42-session-7"` |
+| `checkpoint_id` | ID of one saved snapshot inside a thread | generated by LangGraph | resume from the snapshot 3 steps back (§5.4) |
+| super-step | one round of parallel node execution; the unit that gets checkpointed | 2 per ReAct round (agent, then tools) | 25 super-steps ≈ 12 tool round trips |
+| `recursion_limit` | max super-steps per `invoke` call before `GraphRecursionError` | 25 (default at time of writing) | 12 agent+tools rounds use 24 super-steps |
+| `stream_mode` | what each streamed chunk contains | `"updates"` in production | `"messages"` for token-by-token typing |
+| `n` | number of messages in the history | 10 – 200 | a 20-message conversation |
+| `O(n)`, `O(n²)` | "grows roughly like"; `O(n²)` = double the history, four times the data | — | `values` streaming sends `O(n²)` data over a run, `updates` sends `O(n)` (§7.7) |
+| `max_attempts` | `RetryPolicy`: total tries for a node | 3 | 1 try + 2 retries |
+| `initial_interval` | `RetryPolicy`: wait before the first retry, in seconds | 0.5 | wait 0.5 s, then 1.0 s → 1.5 s total waiting |
+| `backoff_factor` | `RetryPolicy`: multiply the wait by this after each retry | 2.0 | 0.5 s → 1.0 s → 2.0 s |
+| `retry_on` | which exception types are worth retrying | `(ConnectionError, TimeoutError)` | a timeout is retried; a bad-argument error is not |
+| `max_tokens` (trimming) | token budget for the history sent to the model | 8,000 | 200-turn chat trimmed to the last ~8,000 tokens |
+| summarize threshold | message count that triggers a summary (§3.9) | 20 messages, keep last 10 | messages 1–N−10 become one summary message |
+| `tool_call_attempts` | counter used to give up cleanly (§12.2) | give up at 5 | the 6th identical retry never happens |
+| `turn_count`, `total_cost_usd` | per-thread ceilings across many turns (§12.3) | 50 turns, $5.00 | a chat that has cost $5.01 is stopped |
+| signature window | how many recent tool-call hashes to remember (§12.4) | 5 | same `search("X")` twice in a row is caught |
+| approval threshold | amount above which a human must approve (§6) | $10,000 in the examples | a $15,000 trade pauses; a $2,000 trade does not |
+| `handle_tool_errors` | whether `ToolNode` turns tool errors into messages for the model | `True`, `False`, or a fixed string | "Tool call failed. Check your arguments." |
+| `return_direct` | tool result goes straight to the user, no extra model call | `False` (default) | an "escalate to human" tool ends the turn |
+| retention N days | how long to keep checkpoints before pruning (§5.7) | 30 – 90 days | delete threads idle for 30 days |
+| `model_name`, `temperature` | runtime config read from `config["configurable"]` (§16.1) | `"gpt-4o"`, 0.0 | send 5% of threads to a new model |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Why LangGraph exists: the gap between a chain and a loop
+
+> **In plain words.** A chain runs steps once, in one direction. An agent needs to loop: think, use a tool, look at the result, and maybe go back. It also needs to remember where it was, pause for a person, and survive a restart. LangGraph is a library for exactly that loop.
+>
+> **Real-world example.** A travel-booking bot searches flights, finds none under $400, and must go back and try other dates. A chain cannot go back to step 2; a graph with an edge from "check price" back to "search" can, and can stop after, say, 3 tries.
 
 Start with what a chain actually is, mechanically, because the limitation is not a matter of taste —
 it is structural. A LangChain "chain" (whether built with the legacy `Chain` classes or the modern
@@ -106,7 +194,7 @@ model-provider abstraction and a handful of well-tested utilities (message types
 `create_react_agent`), LangGraph for everything about control flow. Conversely you can use LangChain's
 model and tool abstractions with a hand-rolled loop and no LangGraph at all — plenty of production
 systems did exactly this before LangGraph existed and some still do. What LangGraph specifically buys
-you, and the reason it has become the default answer to "how do I orchestrate agents" in 2025–2026,
+you, and the reason it has become a common answer to "how do I orchestrate agents" in 2025–2026,
 is the combination of four things none of which is individually hard to build but which are annoying
 to build *well* and *together*: an explicit state schema with declarative merge semantics (§3), a
 conditional-routing model that is just Python functions (§4), a checkpointer abstraction that
@@ -144,6 +232,10 @@ binding, wired into a graph that inspects and extends rather than a black box.
 ---
 
 ## 2. Core concepts: StateGraph, nodes, edges, compilation
+
+> **In plain words.** You build a LangGraph app from four parts: a **state** (the shared whiteboard), **nodes** (functions that return changes), **edges** (arrows saying what runs next), and `compile()`, which turns the drawing into something you can run. Nodes that are ready at the same time run together in one round called a **super-step**.
+>
+> **Real-world example.** A support bot with nodes `agent` and `tools`: `START → agent`, then "if the LLM asked for a tool go to `tools`, else `END`", then `tools → agent`. Those 3 edges are the whole agent loop.
 
 Every LangGraph application is built from four kinds of object: a **state schema**, **nodes**,
 **edges**, and the **compiled graph**. Get comfortable with the vocabulary before the mechanics,
@@ -205,8 +297,9 @@ route `agent -> tools` again is what a chain fundamentally cannot express, and i
 this is a graph library and not a pipe library.
 
 **Compilation** is the step that turns the graph *definition* into a runnable. `graph.compile()`
-validates the graph (every node reachable from `START`, no dangling edges to nodes that were never
-added, at least one path to `END`), and returns a `CompiledStateGraph` that implements the same
+runs basic structural checks (there is an entry edge out of `START`, and every edge points at a node
+that was actually added — it does not prove that every node is reachable or that `END` is reachable),
+and returns a `CompiledStateGraph` that implements the same
 `Runnable` interface as everything else in LangChain — `.invoke()`, `.stream()`, `.ainvoke()`,
 `.batch()`. This is a deliberate design choice: once compiled, a graph is indistinguishable from any
 other LangChain runnable to code that calls it, which is what lets you nest a compiled graph as a node
@@ -275,6 +368,10 @@ service is a thread-pool exhaustion hazard waiting for enough concurrent load to
 
 ## 3. State management in depth: schemas, reducers, and merge semantics
 
+> **In plain words.** Each node returns only the fields it changed. By default a new value replaces the old one. A **reducer** changes that rule for one field, for example "append to the list" or "add to the total". Without one, two parallel nodes writing the same field in one step cause an error.
+>
+> **Real-world example.** Three search branches each return 5 documents. With a dedupe reducer the state ends up with, say, 12 unique documents. With no reducer LangGraph raises `InvalidUpdateError`; with plain `operator.add` you get all 15, including 3 duplicates.
+
 State is the part of LangGraph that looks trivial and is not. The schema is "just a `TypedDict`," but
 the *merge semantics* — what happens when two things write to the same key — is where most of the
 subtlety, and most of the production bugs, live.
@@ -337,17 +434,19 @@ add_messages(old, new)   # -> [AIMessage(content="final", id="msg-1")]  — repl
 
 The reason this is not a stylistic nicety is concurrency. When a node fans out into multiple parallel
 branches (either via multiple edges out of one node, or via the `Send` API in §13.3 for dynamic
-fan-out), each branch runs concurrently and each branch's return value is merged into the shared state
-*independently*, in whatever order they complete. If two branches both return `{"messages": [...]}`
-without a reducer, the second one to be merged silently discards the first one's contribution — a bug
-that is invisible in a serial test and appears only under real concurrency, exactly the class of bug
-`../python-mastery/29-async-patterns-and-pitfalls.md` catalogs for asyncio generally. A reducer is what
-makes "two branches append independently" a well-defined, order-independent operation instead of a
-race. This is precisely why `add_messages` and `operator.add` are commutative and associative
-(concatenation and addition both are) — a reducer that isn't commutative will produce results that
-depend on branch completion order, which is its own subtle bug class worth naming explicitly if asked
-"can a reducer be badly designed": yes, if it is order-sensitive over concurrent inputs, you have
-reintroduced the race one level up.
+fan-out), each branch runs concurrently, and all of their return values are applied together at the end of the
+super-step (§2.1). If two branches in the same super-step both write a key that has *no* reducer,
+LangGraph cannot pick a winner, so it raises `InvalidUpdateError` ("Can receive only one value per
+step. Use an Annotated key to handle multiple values."). The hazard is that this error appears only
+once the graph really fans out: a serial test, or a graph where the two writers happen to run in
+different super-steps (so the later one silently overwrites the earlier one), never shows it — the
+same class of "works until real concurrency" bug `../python-mastery/29-async-patterns-and-pitfalls.md`
+catalogs for asyncio generally. A reducer is what makes "two branches append independently" a
+well-defined operation. LangGraph applies one super-step's writes in a deterministic task order, not in
+completion order, so `operator.add` on lists (associative but *not* commutative: `[a]+[b] != [b]+[a]`)
+still gives a repeatable result. A reducer can still be badly designed, though: one whose result
+depends on the order of its inputs in a way your logic cares about (for example "keep the last write")
+has quietly turned "which branch is listed first" into business logic.
 
 ### 3.4 Custom reducers
 
@@ -405,7 +504,8 @@ class InternalState(TypedDict):
 graph = StateGraph(InternalState, input=InputState, output=OutputState)
 ```
 
-Callers can only pass `question` and only see `answer` come back; `retrieved_docs` and `retry_count`
+(Newer versions name these parameters `input_schema=` and `output_schema=`; the older `input=`/`output=`
+names are deprecated.) Callers can only pass `question` and only see `answer` come back; `retrieved_docs` and `retry_count`
 exist for nodes to coordinate through but are invisible at the boundary. This is the LangGraph
 equivalent of a private field in a class — it lets internal implementation (how many retries did this
 take, what did we retrieve) evolve without breaking the calling contract, which matters enormously
@@ -431,10 +531,10 @@ case a single un-reduced dict replace is exactly the semantics you want.
 than imitating blindly: it has zero runtime overhead (a `TypedDict` is a plain `dict` at runtime; the
 "typing" is purely a static-analysis annotation that tools like mypy check but Python itself never
 enforces), which matters because state is read and merged on every single super-step. `StateGraph`
-also accepts a Pydantic `BaseModel` as the schema, which buys real **runtime validation** — a node that
-returns a partial update with the wrong type for a field raises immediately at the state-merge
-boundary instead of silently propagating a malformed value three nodes downstream until something
-finally chokes on it:
+also accepts a Pydantic `BaseModel` as the schema, which buys real **runtime validation** — LangGraph validates
+state when it is handed to the *next* node, so a node that writes the wrong type for a field fails
+one step later instead of silently propagating a malformed value three nodes downstream until
+something finally chokes on it (validation runs on node inputs, not on the final graph output):
 
 ```python
 from pydantic import BaseModel, Field
@@ -446,7 +546,7 @@ class AgentState(BaseModel):
 ```
 
 The tradeoff is exactly the one you'd expect from any dynamic-validation layer: Pydantic validates
-every merged update, which is real per-super-step CPU cost, and it will raise a hard `ValidationError`
+state on every node input, which is real per-super-step CPU cost, and it will raise a hard `ValidationError`
 that propagates as an uncaught node exception (§11.3) if any node ever returns a value outside the
 declared constraints — behavior you want for a field like `confidence` where an out-of-range value is
 a real bug worth surfacing loudly, and behavior you don't want for a scratch field being iterated on
@@ -527,6 +627,10 @@ exist only inside that transcript.
 ---
 
 ## 4. Conditional edges and routing
+
+> **In plain words.** A conditional edge is a tiny function that looks at the state and returns the name of the next node. Keep it cheap: read a field, return a string. Do real work (like an LLM classification) in a node and store the result for the router to read.
+>
+> **Real-world example.** A classifier node labels a message `billing`, `technical`, or `escalate`. The router just returns that label, so a billing question goes to the billing agent in 1 step with no extra LLM call.
 
 Routing is the mechanism by which a graph's execution path depends on runtime data rather than being
 fixed at construction time, and it is expressed entirely as ordinary Python functions — no special DSL.
@@ -690,9 +794,13 @@ readable at that location.
 
 ## 5. Checkpointing and persistence: the killer feature
 
+> **In plain words.** A checkpointer saves the whole state after every step, under a conversation ID (`thread_id`). If the server restarts, or the graph pauses for days, you load the saved state and continue. `MemorySaver` is for tests only; production uses a database such as Postgres.
+>
+> **Real-world example.** A 10-step research task crashes at step 7 during a deploy. With `PostgresSaver`, calling `invoke(None, config)` on the new server re-runs only step 7. With in-memory state, all 7 steps (and their LLM cost) are lost.
+
 If there is one section of this document to have flawless recall of in an interview, it is this one.
 Every other feature of LangGraph is a reasonable design choice a competent team could have converged
-on independently; checkpointing is the feature that actually explains why LangGraph won adoption over
+on independently; checkpointing is, in this chapter's view, the main reason teams pick LangGraph over
 hand-rolled agent loops, because building a correct, crash-safe, resumable version of it yourself is
 weeks of work that has nothing to do with your actual product.
 
@@ -734,7 +842,7 @@ process restarts, is shared across horizontally-scaled API instances, and gives 
 checkpoint history for debugging and analytics. `SqliteSaver` is the right middle ground for a
 single-process service or a local tool that still needs persistence across restarts. There is also a
 Redis-backed checkpointer maintained as a separate package for teams that already run Redis and want
-sub-millisecond checkpoint writes.
+fast in-memory checkpoint writes.
 
 ### 5.2 Threads: the unit of persistence
 
@@ -769,7 +877,7 @@ and the graph continues as if no time had passed.
 
 Every checkpoint has both a `thread_id` and a `checkpoint_id`; `get_state(config)` returns the latest
 checkpoint for a thread, and `get_state_history(config)` returns every checkpoint ever taken for that
-thread, oldest first. Passing a specific `checkpoint_id` in the config lets you **replay from any
+thread, newest first. Passing a specific `checkpoint_id` in the config lets you **replay from any
 historical point** — not just the latest:
 
 ```python
@@ -811,9 +919,9 @@ succeeded, their successful writes are already durably recorded and are not re-e
 the failed one is. This is a meaningfully different (and cheaper) guarantee than re-running the entire
 super-step from scratch, and it is the concrete mechanism behind the retry behavior described in §11.1
 — retries are scoped to the node, not the super-step, because the writes table already has the
-sibling nodes' results. State snapshots are serialized (by default via a fast msgpack-based scheme
-LangGraph calls its serde layer, with a pluggable `JsonPlusSerializer` for compatibility) rather than
-raw `pickle`, specifically so that a Postgres row is portable across process restarts and language
+sibling nodes' results. State snapshots are serialized by LangGraph's serde layer (the default
+`JsonPlusSerializer`, which encodes with msgpack and falls back to JSON; pickle is used only if you
+explicitly enable a pickle fallback) rather than raw `pickle`, specifically so that a Postgres row is portable across process restarts and language
 versions rather than tied to Python's pickle protocol version, and so state schemas that don't
 round-trip cleanly through JSON (raw file handles, open database connections, un-serializable
 closures) surface an explicit serialization error at checkpoint time rather than corrupting a pickle
@@ -830,8 +938,8 @@ data is not self-pruning — a `PostgresSaver` table grows with every super-step
 forever unless the operator adds retention. A simple, concrete policy: delete checkpoints for threads
 with no activity in N days (or copy them to cold storage first, if a "resume this six-month-old
 support ticket" requirement exists), keyed off the checkpoint metadata's timestamp, run as an ordinary
-scheduled job against the checkpoint tables directly — there is no LangGraph-provided TTL mechanism as
-of this writing, so this is squarely an operator responsibility, easy to overlook until the table's
+scheduled job against the checkpoint tables directly — the open-source checkpointers do not prune anything for you (LangGraph Platform added a
+checkpoint TTL setting, but a self-hosted `PostgresSaver` has none), so this is squarely an operator responsibility, easy to overlook until the table's
 size starts showing up in a slow-query report.
 
 ### 5.8 Why this is the killer feature
@@ -851,6 +959,10 @@ Temporal/Step-Functions sense.
 ---
 
 ## 6. Human-in-the-loop: interrupt, resume, approve
+
+> **In plain words.** You can make the graph stop and wait for a person before a risky action. Either always stop before a named node (`interrupt_before`), or call `interrupt()` inside a node only when needed. You continue later with `Command(resume=...)`. Careful: the paused node runs again from its first line when resumed.
+>
+> **Real-world example.** Trades over $10,000 need sign-off. A $15,000 trade pauses; a manager clicks Approve 20 minutes later; the graph continues. A $2,000 trade never pauses.
 
 Production agents that take consequential actions — sending an email, executing a trade, deleting a
 record, spending money — need a point where a human can review and approve before the action
@@ -903,11 +1015,11 @@ def execute_trade(state: State) -> dict:
     return {"status": "executed", "result": result}
 ```
 
-Calling `interrupt(payload)` raises a special exception internally that LangGraph catches: it
-checkpoints the state *as of that point in the node*, surfaces `payload` to the caller as the
-invocation's result (with a distinguished `__interrupt__` marker), and halts. Critically, resuming
-does not restart the node from its top — it resumes the node function from exactly the `interrupt()`
-call, with `decision` bound to whatever value you resume with:
+Calling `interrupt(payload)` raises a special exception internally that LangGraph catches: it saves a
+checkpoint (the state from before this node ran — the node's own partial work is not saved), surfaces
+`payload` to the caller as the invocation's result (under an `__interrupt__` key), and halts. When you
+resume, `interrupt()` returns the value you resume with, so `decision` is bound to it — but, as the
+next paragraph explains, the node gets there by running again from its first line:
 
 ```python
 result = app.invoke({"trade_amount": 15_000, "symbol": "ACME"}, config)
@@ -916,8 +1028,8 @@ result = app.invoke({"trade_amount": 15_000, "symbol": "ACME"}, config)
 app.invoke(Command(resume="approved"), config)   # decision == "approved" inside the node, execution continues
 ```
 
-This "resume the function from the interrupt call" behavior relies on the node function being
-re-executed from the start on resume with the interrupt call short-circuited to return the resume
+This "continue from the interrupt call" behavior is implemented by re-executing the node function
+from the start on resume with the interrupt call short-circuited to return the resume
 value — which has an important corollary: **any side effect before the `interrupt()` call in that
 node will run again on resume**, so a node that calls `interrupt()` should either put the side effect
 after the interrupt, or make the pre-interrupt work idempotent. This is one of the sharper edges of the
@@ -1006,6 +1118,10 @@ app.update_state(
 app.invoke(None, config)   # resumes from the interrupt with the corrected state already in place
 ```
 
+This edit-then-`invoke(None)` path is for a **static** breakpoint (`interrupt_before=["execute"]`). If
+the pause came from a dynamic `interrupt()` call inside a node, `invoke(None)` would re-run that node
+and hit `interrupt()` again; there you resume with `Command(resume=..., update={...})` (§6.3) instead.
+
 The `as_node="propose"` argument matters here for the same reason it did in §5.5: it makes the
 correction look, to any node inspecting execution history, like `propose` itself produced the corrected
 value, which keeps downstream logic that might branch on "did propose run" or audit logs that record
@@ -1015,6 +1131,10 @@ provenance gap between "what propose said" and "what the human actually approved
 ---
 
 ## 7. Streaming: values, updates, messages, events, custom
+
+> **In plain words.** Streaming lets the UI show progress while the graph runs. Pick what you want to see: the full state each step (`values`), only what changed (`updates`), LLM tokens as they are typed (`messages`), your own progress messages (`custom`), or every internal event (`astream_events`).
+>
+> **Real-world example.** In a 20-turn chat (about 1 KB per message, 3 steps per turn), `values` resends the growing history every step, about 1,260 KB in total; `updates` sends about 60 KB. That is 21 times less data.
 
 Streaming in LangGraph is not one mode — it is five, each answering a different question about "what
 do you want to see as the graph runs," and picking the wrong one is the most common cause of "why is my
@@ -1056,7 +1176,10 @@ for msg_chunk, metadata in app.stream({"messages": [...]}, config, stream_mode="
 
 ### 7.4 `stream_mode="events"` (`astream_events`)
 
-The most granular mode: a stream of fine-grained lifecycle events (`on_chain_start`, `on_chat_model_stream`,
+Strictly speaking, `"events"` is not a `stream_mode` value — it is a separate method,
+`astream_events()`; the fifth built-in `stream_mode` is `"debug"` (newer versions also add
+`"checkpoints"` and `"tasks"`). It is listed here because it is the most granular option: a stream of
+fine-grained lifecycle events (`on_chain_start`, `on_chat_model_stream`,
 `on_tool_start`, `on_tool_end`, and so on) across every runnable inside the graph, LangChain-wide, not
 LangGraph-specific. This is what you reach for when you need to build a detailed execution trace UI —
 "show me every tool call, every model call, every retry, in order, with timing" — and it is verbose
@@ -1123,6 +1246,10 @@ $O(n)$ by construction.
 
 ## 8. Subgraphs: composing graphs out of graphs
 
+> **In plain words.** A subgraph is a whole graph used as one node inside a bigger graph, like calling a function. Use it when that part is reused, tested, or owned separately. Otherwise, plain nodes are simpler.
+>
+> **Real-world example.** A "research" subgraph (split question, search 3 sources, merge) is used by both the support bot and an internal analyst bot. One team maintains it; both bots call it as a single node.
+
 A **subgraph** is a compiled `StateGraph` used as a single node inside a larger, parent graph. This is
 the composition mechanism that keeps large agent systems from becoming one enormous, unreadable graph
 definition, and it mirrors ordinary software composition: a subgraph is a function with a well-defined
@@ -1164,8 +1291,8 @@ implicit key-matching that breaks silently if either schema changes.
 ### 8.2 State mapping and isolation
 
 A subgraph run via the direct-nesting form shares checkpointing with the parent under the hood — a
-single `thread_id` covers the whole nested execution, and `get_state_history` with `subgraphs=True`
-lets you see checkpoints from inside the subgraph too. This matters for human-in-the-loop: an
+single `thread_id` covers the whole nested execution, and `get_state(config, subgraphs=True)`
+lets you see the state inside the subgraph too. This matters for human-in-the-loop: an
 `interrupt()` called inside a subgraph node pauses the *entire* parent invocation, not just the
 subgraph, and resuming resumes the whole nested structure from that exact point. Subgraph state is
 otherwise isolated — fields private to the subgraph's own schema are not visible to the parent unless
@@ -1188,6 +1315,10 @@ a subgraph.
 ---
 
 ## 9. Tool calling with LangGraph: ToolNode and the agent loop
+
+> **In plain words.** The model answers either with text (done) or with tool requests. `ToolNode` runs the requested tools and adds each result to the chat history, tagged with the request's id. Then the model is called again. Tool errors can be sent back to the model as messages so it can try something else.
+>
+> **Real-world example.** The model asks for `get_weather("Paris")` and `search("Paris events")` in one reply. Both run in parallel; 2 results come back; the next model call writes the final answer.
 
 Tool calling is where LangGraph and the underlying model provider's function-calling API meet, and
 `ToolNode` is LangGraph's prebuilt, opinionated implementation of the "execute whatever tools the model
@@ -1257,8 +1388,9 @@ result answers which call.
 
 ### 9.4 Tool error handling
 
-`ToolNode`'s default behavior on a tool raising an exception is to catch it and return a `ToolMessage`
-containing the error text, rather than letting the exception propagate and crash the graph — this
+`ToolNode`'s default behavior on a tool raising an exception has been to catch it and return a
+`ToolMessage` containing the error text (check your version: newer releases narrowed the default to
+catching mainly bad-argument errors and re-raising the rest), rather than letting the exception propagate and crash the graph — this
 lets the *next* LLM call see "tool X failed with error Y" and decide how to react (retry with different
 arguments, try a different tool, apologize to the user) instead of the whole conversation dying. This
 default can be disabled (`ToolNode(tools, handle_tool_errors=False)`) when you want failures to
@@ -1330,6 +1462,10 @@ code, decided the width of.
 
 ## 10. The ReAct pattern and create_react_agent
 
+> **In plain words.** ReAct means: reason, act (call a tool), observe the result, repeat. It is so common that LangGraph ships it ready-made as `create_react_agent`, one function call. Start there, and switch to your own graph only when you hit a concrete need it cannot cover.
+>
+> **Real-world example.** A help-desk bot with 4 tools works fine with the prebuilt. When the team adds a second agent that reviews answers before they are sent, they move to a hand-built graph.
+
 **ReAct** (Reason + Act, Yao et al. 2022) is the pattern of interleaving explicit reasoning with tool
 invocation: the model reasons about what it needs, acts (calls a tool), observes the result, and
 reasons again — the loop from §9.1 is a ReAct loop whether or not the model's reasoning is exposed as
@@ -1357,6 +1493,10 @@ result = agent.invoke(
     {"configurable": {"thread_id": "t1"}},
 )
 ```
+
+Version note: with the LangChain/LangGraph 1.0 releases (late 2025), `create_react_agent` is
+deprecated in favor of LangChain's `create_agent`, which builds the same kind of loop on LangGraph. The
+concepts in this section carry over unchanged.
 
 `create_react_agent` returns a fully compiled `CompiledStateGraph` — not a black box distinct from
 everything else in this document, but literally the `agent`/`tools` two-node graph from §9.2,
@@ -1431,6 +1571,10 @@ prebuilt already has a documented seam for exactly that.
 ---
 
 ## 11. Error handling and retry
+
+> **In plain words.** Failures come in three kinds. Short network glitches: retry automatically. Wrong input or a business rule: route to a repair or fallback step, because retrying the same thing fails again. Real bugs: let them fail loudly.
+>
+> **Real-world example.** A model API times out: `RetryPolicy(max_attempts=3)` waits 0.5 s, then 1.0 s, and the third try succeeds. The API says "rate limit" for 20 minutes: after 5 failures a circuit breaker sends everyone to a backup model at once instead of making each user wait through retries.
 
 Production graphs fail in three qualitatively different ways, and conflating them is the most common
 error-handling mistake: **transient infrastructure failures** (a timeout, a 503, a dropped connection)
@@ -1553,6 +1697,10 @@ system needs for poison messages, applied to a graph thread instead of a queue m
 
 ## 12. Preventing infinite loops
 
+> **In plain words.** A graph with a loop can run forever, and models do sometimes repeat the same failing tool call. LangGraph stops any run after `recursion_limit` steps (25 by default), but that ends with an error. Better: count attempts in the state and end politely, and cap cost per conversation.
+>
+> **Real-world example.** A tool keeps returning a wrong date format. Without a counter the agent burns about 12 model calls and crashes; with "give up after 3 attempts" it stops after 3 calls and tells the user a person will follow up.
+
 A graph with a cycle can, definitionally, run forever, and an LLM that decides "let me try that tool
 call again" is a more common cause of runaway loops than most people expect going in — the model isn't
 malicious, it's just occasionally bad at recognizing that a tool call already failed for a reason that
@@ -1622,7 +1770,7 @@ class State(TypedDict):
 
 def check_limits(state: State) -> dict:
     if state["turn_count"] > 50 or state["total_cost_usd"] > 5.00:
-        raise ThreadLimitExceeded(state["thread_id"])
+        raise ThreadLimitExceeded("turn or cost ceiling reached")
     return {"turn_count": state["turn_count"] + 1}
 ```
 
@@ -1669,6 +1817,10 @@ count cannot tell you.
 ---
 
 ## 13. Multi-agent architectures
+
+> **In plain words.** Use several agents only when the thinking itself should be split: different instructions, tools, or models. A **supervisor** agent picks which worker goes next; or workers hand off to each other directly. Many tools on one agent is not a multi-agent system.
+>
+> **Real-world example.** A coding assistant has a researcher, a coder, and a reviewer. The supervisor sends the task to the researcher, then the coder, then the reviewer: 3 worker turns plus 4 supervisor turns, so at least 7 LLM calls where one agent might need 3.
 
 A single ReAct agent with many tools is not a multi-agent system — it's one agent with a wide toolbox,
 and the distinction matters because the failure modes and design questions are different. Multi-agent
@@ -1841,6 +1993,10 @@ problem.
 
 ## 14. Durable execution: LangGraph versus workflow engines
 
+> **In plain words.** "Durable" means work survives a crash. LangGraph saves after every step, so a crash loses at most the step that was running. It is not a full workflow engine like Temporal: no week-long timers, no saving inside a step, and it cannot stop a payment from running twice. That needs an idempotency key.
+>
+> **Real-world example.** A node charges a card, then the server dies before the step is saved. On resume the node runs again. Without an idempotency key the customer is charged twice; with one, the payment API ignores the second request.
+
 "Durable execution" means a workflow's progress survives the process that's running it — a crash,
 a redeploy, or a deliberate pause does not lose work already done, and resuming continues from the
 last durable point rather than from scratch. LangGraph's checkpointing (§5) gives you a real, if
@@ -1932,6 +2088,10 @@ and a system that needs both should not contort one engine to do both jobs badly
 
 ## 15. LangGraph Platform, Server, and Studio
 
+> **In plain words.** The LangGraph library is free and open source and is enough for production. LangGraph Platform is a paid product on top: a hosted API server, a visual debugger (Studio), and deployment tools. Buying it is a cost-versus-effort decision, not a requirement.
+>
+> **Real-world example.** A 3-person team with one agent runs the library inside their FastAPI service with Postgres. A 40-person org with 12 agents and non-engineers approving actions may find the Platform cheaper than building the same tooling.
+
 It is important to separate what is open-source and free (the `langgraph` Python/JS library covered in
 every section above) from what is a hosted commercial product (LangGraph Platform), because "do you
 need the Platform to use LangGraph" is a real decision point and the answer is no.
@@ -1948,7 +2108,7 @@ that exposes a compiled graph as a REST/streaming API with authentication, horiz
 managed persistence layer, out of the box; **LangGraph Studio**, a visual debugger/IDE for stepping
 through graph executions, inspecting state at each node, and editing-and-replaying from any checkpoint
 without writing the `get_state_history` calls from §5.4 by hand; and integrated deployment tooling
-(`langgraph.json` configuration, `langgraph deploy`, revisioning) for shipping graphs as versioned,
+(`langgraph.json` configuration, the `langgraph` CLI's `dev`/`build`/`up` commands, revisioning) for shipping graphs as versioned,
 independently-scalable services.
 
 ### 15.2 What the Server actually solves
@@ -2008,6 +2168,10 @@ webhook and gets pushed a notification the instant one occurs.
 
 ## 16. Production patterns: config, testing, observability, deployment
 
+> **In plain words.** In production: read model names and settings from runtime config instead of hard-coding them, test at three levels (single node, graph wiring, full recorded run), trace every step, and treat the checkpoint database as real infrastructure with backups and cleanup.
+>
+> **Real-world example.** Changing `model_name` in config sends 5% of conversations to a new model with no redeploy. A recorded end-to-end test catches that the router now sends refunds to the wrong node before users see it.
+
 ### 16.1 Configuration management
 
 Graphs should treat model choice, temperature, tool availability, and feature flags as **runtime
@@ -2053,7 +2217,7 @@ model non-determinism or burn API budget in CI.
 LangSmith (LangChain's tracing/observability product, usable independently of LangGraph Platform) is
 the default way to get a trace tree — every node execution, every model call inside it with full
 prompt/completion, every tool call and its latency, and the exact state at each checkpoint — with zero
-code changes beyond setting `LANGCHAIN_TRACING_V2=true` and an API key, because LangGraph's runnables
+code changes beyond setting `LANGSMITH_TRACING=true` (older name: `LANGCHAIN_TRACING_V2=true`) and an API key, because LangGraph's runnables
 already emit the same callback events every LangChain runnable does. For a team not using LangSmith,
 `stream_mode="events"` (§7.4) is the raw material to build an equivalent trace view against your own
 observability stack (OpenTelemetry spans per node and per model call is the natural mapping), matching
@@ -2131,9 +2295,11 @@ string" belongs in a node whose output the router then reads.
 
 **Not using reducers, or using the wrong default.** The most common concrete bug from §3.3: a state
 field intended to accumulate (a list of tool results across parallel branches, a running cost total)
-declared without a reducer, silently losing all but the last writer's contribution the first time two
-branches genuinely run concurrently — invisible in sequential testing, visible only under real
-production concurrency, and easy to misdiagnose as a flaky model rather than a state-merge bug.
+declared without a reducer. When two branches write it in the same super-step, LangGraph raises
+`InvalidUpdateError`; when the writers land in different super-steps, the later write silently
+replaces the earlier one. Both are invisible in sequential testing, show up only once the graph
+really fans out, and the silent-overwrite case is easy to misdiagnose as a flaky model rather than a
+state-merge bug.
 
 **Treating `MemorySaver` as good enough for production.** Because it satisfies the same interface as
 `PostgresSaver`, it is trivially easy to ship a service that "works in every test" and loses every
@@ -2176,6 +2342,10 @@ migration the moment it touches state, whether or not it is treated like one.
 
 ## 18. Interview questions, with weak and strong answers
 
+> **In plain words.** Interviewers want to hear the plain idea first ("a graph with saved state"), then one mechanism by name (reducer, checkpoint, interrupt, super-step), then one trade-off or gotcha. The weak/strong pairs below show the difference.
+>
+> **Real-world example.** Asked "how do you add human approval?", a strong answer fits in 30 seconds: `interrupt()` inside the node, resume with `Command(resume=...)`, and move side effects after the interrupt because the node re-runs.
+
 **1. What problem does LangGraph solve that LangChain chains don't?**
 Weak: "LangGraph is for agents, chains are for simple stuff." Strong: names the structural gap
 directly — chains have no cycles and no persisted cross-step state without hand-rolling it; an agent
@@ -2185,12 +2355,13 @@ rather than an extension of the pipe operator (§1).
 **2. What is a reducer, and why does it matter?**
 Weak: "It's how you combine state." Strong: explains the default is overwrite, that `Annotated[Type,
 fn]` attaches a custom merge function, that `add_messages` both appends and replaces-by-id, and gives
-the concrete concurrency hazard — two parallel branches writing the same un-reduced key silently lose
-one branch's contribution, a bug invisible under sequential testing (§3.2–3.3).
+the concrete concurrency hazard — two parallel branches writing the same un-reduced key in one
+super-step make LangGraph raise `InvalidUpdateError`, and writers in different super-steps silently
+overwrite each other; neither shows up under sequential testing (§3.2–3.3).
 
 **3. Walk me through what happens when you call `graph.compile()`.**
-Weak: "It builds the graph." Strong: validates every node is reachable from `START` and every declared
-edge target exists, wires in the checkpointer and any static interrupts passed at compile time, and
+Weak: "It builds the graph." Strong: runs structural checks (an entry edge from `START` exists, every
+declared edge source and target is a real node), wires in the checkpointer and any static interrupts passed at compile time, and
 returns a `CompiledStateGraph` implementing the standard LangChain `Runnable` interface, which is what
 lets a compiled graph be used as a subgraph node elsewhere (§2, §8).
 
@@ -2275,9 +2446,9 @@ asserting on final state and the node-visitation sequence from `stream_mode="upd
 
 **16. Your state has a `documents: list[dict]` field fed by three parallel retrieval branches. What
 goes wrong if you don't give it a reducer, and how do you fix it?**
-Weak: "Add `operator.add`." Strong: without a reducer, whichever branch's update merges last silently
-overwrites the other two's contributions instead of failing loudly, because the default merge is
-replace, not append; `operator.add` fixes the "keep everything" case but a real fix here needs
+Weak: "Add `operator.add`." Strong: without a reducer, the three branches' writes land in the same
+super-step and LangGraph raises `InvalidUpdateError` ("Can receive only one value per step"), because
+the default merge is replace and it refuses to guess which write wins; `operator.add` fixes the "keep everything" case but a real fix here needs
 deduplication by document ID with score-based tie-breaking (§3.4's `merge_documents`), because a plain
 concatenation reducer would let the same document appear three times from three branches (§3.3–3.4).
 
@@ -2333,13 +2504,14 @@ Weak: "For performance, I guess." Strong: names the actual execution model — L
 Pregel-style bulk synchronous parallel system, where every node in a super-step runs against a common
 prior state and their updates are merged only once the whole super-step completes; that isolation is
 what makes concurrent execution safe and fast, but it also means the runtime has no ordering
-information to fall back on when two nodes touch the same key, which is exactly why a commutative,
-associative reducer is the only well-defined way to combine them (§2.1, §3.3).
+information to fall back on when two nodes touch the same key, which is exactly why it raises
+`InvalidUpdateError` for an un-reduced key and why a reducer is the only well-defined way to combine
+them (§2.1, §3.3).
 
 **24. When would you choose a Pydantic `BaseModel` over a `TypedDict` for your state schema?**
 Weak: "Pydantic is more modern." Strong: `TypedDict` has zero runtime cost and is the right default;
-Pydantic buys real validation at the state-merge boundary — catching a malformed value the instant a
-node writes it rather than three nodes later when something finally chokes on it — which is worth the
+Pydantic buys real validation on node inputs — catching a malformed value as soon as the next node
+receives it rather than three nodes later when something finally chokes on it — which is worth the
 per-super-step validation cost specifically for fields where an out-of-range or wrongly-typed value is
 a correctness bug, most often structured LLM output a downstream node trusts implicitly (§3.8).
 
@@ -2385,12 +2557,12 @@ your hand-written version did line by line. *Time:* ~2 hours.
 **Lab 2 — Reducer failure, reproduced on purpose.**
 *Goal:* make §3.3's concurrent-write hazard a thing you've seen fail, not just read about. *Steps:*
 build a graph that fans out to three nodes writing to a shared `results: list` field with no reducer;
-run it enough times to observe non-deterministic loss of results depending on completion order; add
-`operator.add`, confirm all three survive; then engineer a case where `operator.add` over-counts
+run it and observe the `InvalidUpdateError`; then move one writer to a later super-step and
+observe the silent overwrite instead; add `operator.add`, confirm all three results survive; then engineer a case where `operator.add` over-counts
 (duplicate results from overlapping branches) and fix it with a dedup reducer like §3.4's
 `merge_documents`. *Artifact:* a short script demonstrating all three states (broken, naively fixed,
 correctly fixed) with printed output for each. *Success criterion:* you can point at the exact line
-that caused data loss and explain why the reducer's algebra (commutative? idempotent?) matters.
+that caused data loss and explain why the reducer's algebra (order-sensitive? idempotent?) matters.
 *Time:* ~1.5 hours.
 
 **Lab 3 — Checkpointing and crash recovery, for real.**
@@ -2503,3 +2675,110 @@ manual instrumentation didn't capture (typically: full prompt/completion payload
 can explain concretely what LangSmith is buying you beyond what a few dozen lines of OpenTelemetry
 wrapping gets you for free, which is the actual basis for a build-versus-buy decision on observability
 tooling. *Time:* ~2.5 hours.
+
+---
+
+## 20. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of problem teams hit when running LangGraph agents: what
+> users saw, why it happened in simple terms, the numbers, and the fix.
+>
+> **Real-world example.** Case 2 below: a service quietly kept conversations in memory, and every
+> deploy wiped about 35 of them.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+Quick index: `InvalidUpdateError` after adding a parallel branch → Case 1 · conversations vanish after
+deploys → Case 2 · customers get duplicate emails after approval → Case 3 · token bill spike and
+`GraphRecursionError` in logs → Case 4 · slow chat UI on long conversations → Case 5 · checkpoint
+database keeps growing → Case 6 · paused threads fail after a release → Case 7.
+
+### Case 1 — A new retrieval branch breaks every fan-out request
+
+- **Setup:** A support agent retrieved documents from one search index. The team added a second
+  branch (keyword search) that runs in parallel with the first, both writing `documents`.
+- **Symptom:** 18% of requests failed with `InvalidUpdateError: Can receive only one value per step`.
+  Unit tests, which ran each retrieval node alone, all passed.
+- **Diagnosis:** Only questions routed to *both* branches (18% of traffic) had two writes to
+  `documents` in the same super-step. The field had no reducer, so LangGraph refused to pick one (§3.3).
+- **Fix:** `documents: Annotated[list[dict], merge_documents]` with dedupe by id (§3.4). Errors went
+  from 18% to 0%. On those requests the merged set averaged 14 documents from 2 × 10 retrieved, so
+  6 duplicates were removed before reranking.
+- **Lesson:** Any field written by parallel branches needs a reducer, and a test that runs the real
+  fan-out, not just each node alone.
+
+### Case 2 — Conversations vanish after every deploy
+
+- **Setup:** A chat agent was built with `MemorySaver` during the prototype and shipped as is. The
+  team deployed twice a day.
+- **Symptom:** Users complained that the bot "forgot everything" mid-conversation, in bursts.
+- **Diagnosis:** The complaints lined up with deploy times. About 35 conversations were in flight per
+  deploy: 2 × 35 = 70 lost conversations a day, about 2,100 a month (§5.1, §17).
+- **Fix:** Switched to `PostgresSaver` with `thread_id` derived from the authenticated session. Lost
+  conversations per deploy: 35 → 0. Extra latency per step for the checkpoint write was a few
+  milliseconds, small next to a 1–2 s LLM call.
+- **Lesson:** `MemorySaver` passes every test and fails on the first restart. Check the checkpointer
+  in the production config, not just in code review.
+
+### Case 3 — Customers get the same email twice after approval
+
+- **Setup:** A node sent a "your request is being reviewed" email and *then* called `interrupt()` to
+  wait for a manager's approval.
+- **Symptom:** Every customer whose request needed approval got the email twice.
+- **Diagnosis:** On resume, LangGraph re-runs the paused node from its first line (§6.2), so the email
+  code ran again. 1,200 approvals a week → 1,200 duplicate emails a week.
+- **Fix:** Moved the email into a separate node before the gate, so it is saved as done in its own
+  checkpoint. Duplicates: 1,200 → 0 per week.
+- **Lesson:** Anything before `interrupt()` in the same node runs again. Put side effects in their
+  own node, after the interrupt, or behind an idempotency key.
+
+### Case 4 — A tool loop that burns tokens
+
+- **Setup:** A booking agent with a date-parsing tool that returned an error for one date format. The
+  model kept retrying the identical call. Only the default `recursion_limit` of 25 protected it.
+- **Symptom:** `GraphRecursionError` in the logs for 4% of 10,000 daily threads (400 threads), and a
+  visible jump in the token bill.
+- **Measurement:** Each failed thread made about 12 model calls with a ~6,000-token context:
+  72,000 tokens ≈ $0.22 at $3 per million input tokens. 400 × $0.216 ≈ $86 a day, and every one of
+  those users saw an error page.
+- **Fix:** Repeated-call detection (§12.4) plus "give up after 3 attempts" (§12.2). Each bad thread
+  now costs 3 × 6,000 = 18,000 tokens ≈ $0.05, about $22 a day for 400 threads, and ends with a
+  polite hand-off message instead of an error. The date-format bug in the tool was fixed the same
+  week, once the repeated-call metric pointed straight at it.
+- **Lesson:** `recursion_limit` is a safety net. The graph should stop for a reason it can explain.
+
+### Case 5 — The chat UI gets slower as conversations get longer
+
+- **Setup:** The frontend used `stream_mode="values"` to render the chat.
+- **Symptom:** Turn 1 felt instant; by turn 20 the UI lagged, and mobile users on slow networks
+  complained most.
+- **Measurement:** About 1 KB per message, 2 messages added per turn, 3 super-steps per turn.
+  `values` resent the whole history every step: about 1,260 KB over 20 turns. `updates` would send
+  about 60 KB, 21 times less (§7.7).
+- **Fix:** Switched to `updates` for state changes and `messages` for token typing. Data sent per
+  20-turn chat: ~1,260 KB → ~60 KB, plus the token stream.
+- **Lesson:** `values` grows with the size of the state, not with what changed. Use it for debugging.
+
+### Case 6 — The checkpoint database keeps growing
+
+- **Setup:** 50,000 threads a day, about 8 super-steps each, about 30 KB per checkpoint, no
+  retention policy.
+- **Symptom:** A slow-query alert after three months; the checkpoint tables had become the largest
+  thing in the database.
+- **Measurement:** 50,000 × 8 × 30 KB = 12 GB a day, about 1.08 TB after 90 days (§5.7).
+- **Fix:** A nightly job that deletes threads idle for 30 days (after copying the few flagged ones to
+  cold storage). Steady-state size: about 30 × 12 GB = 360 GB, a two-thirds cut from the 90-day size.
+- **Lesson:** Checkpoint storage never cleans itself. Plan retention before launch.
+
+### Case 7 — Paused threads fail after a release
+
+- **Setup:** A loan-approval graph had 3,400 threads paused at a human-review interrupt. A release
+  added a required state field `risk_score`, read with `state["risk_score"]`.
+- **Symptom:** Every one of the 3,400 old threads failed with `KeyError: 'risk_score'` when a reviewer
+  clicked Approve. New threads worked.
+- **Diagnosis:** The old checkpoints were saved before the field existed (§17, schema migration).
+- **Fix:** Read the field with `state.get("risk_score")` and compute it on first access if missing.
+  Resume failures: 3,400 → 0.
+- **Lesson:** Changing the state schema is a data migration. Assume old threads will resume with
+  the old shape.
