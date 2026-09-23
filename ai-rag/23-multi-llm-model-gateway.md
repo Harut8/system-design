@@ -54,6 +54,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why a model gateway — the N×M problem](#1-why-a-model-gateway--the-nm-problem)
 2. [Gateway architecture and the request lifecycle](#2-gateway-architecture-and-the-request-lifecycle)
 3. [The provider abstraction layer](#3-the-provider-abstraction-layer)
@@ -71,10 +72,101 @@
 15. [Comparison with existing solutions — build vs buy](#15-comparison-with-existing-solutions--build-vs-buy)
 16. [Interview questions](#16-interview-questions)
 17. [Lab exercises](#17-lab-exercises)
+18. [Real-world cases — incidents with numbers](#18-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A company starts using AI models in many apps. Each team picks its own provider
+(OpenAI, Anthropic, Azure, Bedrock…) and writes its own code for keys, retries, limits and logging.
+Soon nobody knows who spends how much, one provider outage takes down some apps but not others, and
+switching models means changing code in every app. A **model gateway** is one shared service that
+sits between all apps and all providers, so these jobs are done once, in one place.
+
+**A real-world example.** A mid-size online retailer has 6 apps that use LLMs (support bot, product
+description writer, search helper, fraud notes, HR bot, internal coding assistant) and 4 providers.
+The numbers below are illustrative.
+
+1. **Without a gateway.** Up to 6 × 4 = 24 separate integrations. The support bot's provider has a
+   45-minute outage and the bot is down for all 45 minutes, because only that team's code knows about
+   one provider. Finance asks "who spent the $38,000 on AI last month?" and it takes a week of
+   spreadsheets to answer. One app has a bug that loops, sends 2 million tokens a minute, and
+   causes 429 "too many requests" errors for every other app sharing the same provider account.
+2. **Put a gateway in front.** Now 6 + 4 = 10 integrations: each app connects to the gateway once,
+   and each provider is connected to the gateway once.
+3. **Routing (§4).** Apps ask for `model="default"` or `model="fast"`. The gateway decides which real
+   model answers. Short, easy questions go to a cheaper model.
+4. **Fallback (§5).** When the support bot's main provider fails, a circuit breaker notices after 5
+   failures and sends traffic to a backup provider. Users see answers again within seconds.
+5. **Rate limits (§6).** Each app has a token budget per minute, so the looping app is stopped at
+   its own limit instead of hurting the other 5.
+6. **Cost tracking (§7).** Every call is recorded with its team, model, tokens and cost. "Who spent
+   the $38,000?" becomes one query.
+7. **Keys and permissions (§8).** Provider keys live only in the gateway. A leaked key is rotated in
+   one place, not searched for in 6 codebases.
+8. **The catch (§1.3, §14).** If the gateway goes down, all 6 apps go down. So it must run as many
+   copies, with shared state, careful health checks and safe deploys.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Model gateway | one service every app calls instead of calling providers directly | a building's reception desk: visitors don't wander to offices on their own |
+| Provider | a company or server that runs the model (OpenAI, Anthropic, self-hosted vLLM) | a supplier |
+| Adapter | code that translates the gateway's common format into one provider's format | a travel plug adapter |
+| Canonical format | the one request/response shape used inside the gateway | a company's standard order form, whatever the supplier |
+| Alias | a nickname like "default" that points to a real model in config | a speed-dial button: you change the number, not the button |
+| Routing | choosing which real model answers a request | a dispatcher assigning a taxi |
+| Fallback chain | an ordered list of backups to try if the first one fails | plan A, plan B, plan C |
+| Circuit breaker | stops calling a provider that keeps failing, and tests it again later | a fuse that trips, then gets reset carefully |
+| Rate limit / quota | the most tokens or requests a team may use per minute or month | a data cap on a phone plan |
+| Token bucket | a limiter that refills at a steady rate and allows short bursts | a jar of coins refilled every second; spend them, then wait |
+| Reserve-then-settle | block an estimated amount up front, then correct to the real amount | a hotel holding $200 on your card, then charging the actual bill |
+| Prompt caching (provider side) | the provider reuses work for a repeated start of the prompt and charges less | a copy shop that already has your first 50 pages ready |
+| Semantic cache | reusing an answer for a question that looks similar | answering from memory because the question "sounds like" one you heard |
+| TTFT | time until the first word of the answer arrives | how long until the waiter brings the first dish |
+| RBAC | rules for which team may use which model | key cards that open only some doors |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `N`, `M` | number of applications, number of providers | 5 – 100 apps; 2 – 6 providers | 6 apps × 4 providers = 24 links without a gateway, 6 + 4 = 10 with one |
+| TPM / RPM | tokens per minute / requests per minute a provider or tenant may use | set per contract or per tenant | a team capped at 100,000 TPM |
+| 429 | HTTP status "too many requests" (you hit a rate limit) | — | the provider refuses because the org's shared TPM is used up |
+| 5xx / 400 | server-side error (retry or fall back) / bad request (don't retry) | — | a 503 goes to the backup; a malformed request does not |
+| `input_tokens`, `output_tokens` | tokens sent to the model / tokens it generated | 100 – 100,000 / 50 – 4,000 | a 3,000-token prompt and a 400-token answer |
+| `cached_input_tokens` | input tokens served from the provider's prompt cache (cheaper) | 0 – 90% of input | 5,000 of a 6,000-token prompt reused |
+| `reasoning_tokens` | hidden "thinking" tokens on reasoning models, billed as output | 0 – many thousands | a hard math question uses 3,000 invisible tokens |
+| `max_tokens` | the most output tokens the model may generate | 256 – 8,192 | `max_tokens=1,000` caps a long answer |
+| `temperature` | how random the output is; 0 = most repeatable | 0 – 1 | 0 for extraction, 0.7 for creative text |
+| `input_per_1k`, `output_per_1k`, `cached_input_per_1k` | price per 1,000 tokens of each kind (the code's dated examples) | fractions of a cent | $0.0025 per 1K = $2.50 per million |
+| `weight`, `canary_pct` | share of traffic sent to one target / to the new canary model | 0 – 1 | `canary_pct=0.05` → 5% of sessions try the new model |
+| p50 / p95 / p99 | latency that 50% / 95% / 99% of requests are faster than | ms to s | p95 = 3 s → 1 request in 20 is slower than 3 s |
+| TTFT | time to first token of a streamed answer | 0.3 – 2 s | first word shows after 0.6 s |
+| `latency_slo_ms` | the latency target the router tries to meet | 1,000 – 5,000 ms | pick the cheapest model with p50 under 2,000 ms |
+| `error_rate_ceiling` | error rate above which a target counts as unhealthy | 0.10 | 12 errors in 100 calls → skipped |
+| `window_seconds` | how far back the health tracker looks | 60 s | only the last minute of calls counts |
+| `failure_threshold` | failures in a row before the circuit breaker opens | 5 | 5 timeouts → stop calling that model |
+| `recovery_timeout_s` | how long the breaker stays open before a test call | 30 s | after 30 s, one trial request is allowed |
+| `half_open_max_calls` | trial calls allowed while testing recovery | 1 | one request checks whether the provider is back |
+| `connect_timeout_s`, `first_token_timeout_s`, `total_timeout_s`, `per_fallback_hop_timeout_s` | time limits for connecting, first token, the whole call, and each backup step | 5 s, 10 s, 60 s, 15 s | a stuck provider is abandoned after 10 s with no first token |
+| `max_attempts`, `base_delay_s`, `max_delay_s` | retry count and wait times (doubling each try, plus jitter) | 3, 0.5 s, 8 s | waits 0.5 s, then 1 s, then gives up |
+| `capacity`, `refill_rate_per_s` | token bucket size and how fast it refills | e.g. 100,000 and 1,667/s | 1,667 × 60 ≈ 100,000 tokens per minute |
+| `delta` | actual tokens minus reserved tokens at settlement | usually negative | reserved 4,000, used 3,400 → `delta = -600`, 600 refunded |
+| `monthly_limit_usd`, `soft_alert_threshold` | a team's monthly budget and the share that triggers an alert | $5,000, 0.8 | alert at $4,000 spent |
+| `similarity_threshold` | how similar two questions must be to share a semantic-cache answer | 0.97 (conservative) | 0.98 → reuse, 0.95 → call the model |
+| TTL | how long a cache entry or credential is kept before refresh | seconds to hours | `refresh_interval_s=300` re-reads keys every 5 min |
+| `fallback_depth` | which step of the backup list served the request (0 = primary) | 0 – 2 | 1 → the first backup answered |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Why a model gateway — the N×M problem
+
+> **In plain words.** Without a gateway, every app talks to every AI provider on its own, and each team rebuilds the same retries, keys and logging slightly differently. A gateway is one shared front door: apps talk only to it, and it talks to the providers.
+>
+> **Real-world example.** 6 apps and 4 providers can mean up to 6 × 4 = 24 separate integrations. With a gateway it is 6 + 4 = 10: each app connects once, each provider is connected once. The price: one more network hop, and one service that must never go down.
 
 ### 1.1 The integration explosion
 
@@ -160,6 +252,10 @@ that line.
 ---
 
 ## 2. Gateway architecture and the request lifecycle
+
+> **In plain words.** A request passes through a short line of checkpoints: who are you, which model should serve this, are you allowed, are you over your limit, then translate and send. Each checkpoint does one job.
+>
+> **Real-world example.** The support bot sends "model=default". The router turns that into a concrete model, the policy check confirms the support team may use it, the rate limiter sees they have used 40% of this minute's token budget, and the adapter converts the request into that provider's format.
 
 ### 2.1 The full pipeline
 
@@ -281,7 +377,7 @@ class Usage:
     input_tokens: int
     output_tokens: int
     cached_input_tokens: int = 0     # provider-side prompt cache hits (§11)
-    reasoning_tokens: int = 0        # o-series / extended-thinking tokens billed separately
+    reasoning_tokens: int = 0        # o-series / extended-thinking tokens, reported separately, billed at the output rate
 
 
 @dataclass
@@ -320,6 +416,10 @@ would defeat LangChain's protocol in `20`.
 ---
 
 ## 3. The provider abstraction layer
+
+> **In plain words.** Each provider speaks a slightly different dialect. An adapter is a translator for one provider, so the rest of the gateway only ever sees one common format.
+>
+> **Real-world example.** OpenAI puts the system prompt inside the message list; Anthropic wants it as a separate field. The Anthropic adapter moves it. The app never knows, and adding a fifth provider means writing one new adapter file, not changing 6 apps.
 
 ### 3.1 The common interface
 
@@ -410,7 +510,7 @@ class OpenAIAdapter:
         payload: dict = {
             "model": request.model,          # already resolved to a concrete OpenAI model by the router
             "messages": messages,
-            "max_tokens": request.max_tokens,
+            "max_tokens": request.max_tokens,   # o-series reasoning models take max_completion_tokens instead
             "temperature": request.temperature,
             "stream": request.stream,
         }
@@ -439,7 +539,9 @@ class OpenAIAdapter:
             usage=Usage(
                 input_tokens=resp.usage.prompt_tokens,
                 output_tokens=resp.usage.completion_tokens,
-                cached_input_tokens=getattr(resp.usage, "prompt_tokens_details", {}).get("cached_tokens", 0),
+                # prompt_tokens_details is an object (or None), not a dict
+                cached_input_tokens=getattr(getattr(resp.usage, "prompt_tokens_details", None),
+                                            "cached_tokens", 0) or 0,
             ),
             finish_reason=self._map_finish_reason(choice.finish_reason),
             latency_ms=latency_ms,
@@ -538,9 +640,16 @@ class AnthropicAdapter:
             model=resp.model,
             provider=self.name,
             usage=Usage(
-                input_tokens=resp.usage.input_tokens,
+                # Anthropic's input_tokens EXCLUDES cache reads and cache writes; OpenAI's
+                # prompt_tokens INCLUDES cached tokens. The canonical input_tokens is the
+                # total (OpenAI-style), so add them back here — otherwise §7.1's
+                # `input_tokens - cached_input_tokens` subtracts the cached part twice.
+                # (Cache writes are billed at a premium over base input; not modeled here.)
+                input_tokens=(resp.usage.input_tokens
+                              + (getattr(resp.usage, "cache_read_input_tokens", 0) or 0)
+                              + (getattr(resp.usage, "cache_creation_input_tokens", 0) or 0)),
                 output_tokens=resp.usage.output_tokens,
-                cached_input_tokens=getattr(resp.usage, "cache_read_input_tokens", 0),
+                cached_input_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
             ),
             finish_reason={"end_turn": "stop", "max_tokens": "length",
                            "tool_use": "tool_calls"}.get(resp.stop_reason, "stop"),
@@ -557,7 +666,7 @@ class AnthropicAdapter:
 | **Azure OpenAI** | Same wire shape as OpenAI, but the endpoint is per-deployment (a customer-chosen deployment name, not a model name), auth is an Azure AD token or API key against a resource-scoped URL, and model *availability* is region- and quota-allocated rather than globally uniform — the adapter's `model` resolution has to map alias → (deployment name, region), not alias → model string. |
 | **Google Vertex AI** | Auth is a GCP service-account credential exchanged for a short-lived OAuth token, not a static API key — the adapter needs a token-refresh background task. Gemini's content-blocks format is closer to Anthropic's than OpenAI's (parts, not messages-with-string-content), and safety-filter rejections come back as a distinct `finish_reason` that must be mapped to the canonical `content_filter` value. |
 | **AWS Bedrock** | Not one API — Bedrock is a routing layer over heterogeneous model families (Anthropic, Meta, Cohere, Amazon Titan/Nova), each with a *different* request body shape even though they share one HTTP surface (`InvokeModel` / `Converse`). Prefer the newer `Converse` API specifically because it normalizes tool-calling and message format across model families — using per-model `InvokeModel` bodies means the gateway's Bedrock adapter re-derives its own internal mini-abstraction-layer, one abstraction too many. Auth is SigV4 request signing, not a bearer token. |
-| **Self-hosted (vLLM / TGI)** | Usually the easiest adapter to write, because both serve an OpenAI-compatible `/v1/chat/completions` endpoint — the OpenAI adapter often works unmodified with a different `base_url`. The real work is elsewhere: health checks need to distinguish "pod is up" from "model weights are loaded and warm" (a cold vLLM replica returns 200 on `/health` well before it can serve a request with production latency), and there is no vendor SLA — the gateway's circuit breaker (§5) is the *only* thing standing between a degraded self-hosted replica and every caller. |
+| **Self-hosted (vLLM / TGI)** | Usually the easiest adapter to write, because both serve an OpenAI-compatible `/v1/chat/completions` endpoint — the OpenAI adapter often works unmodified with a different `base_url`. The real work is elsewhere: health checks need to distinguish "pod is up" from "model weights are loaded and warm" (a basic liveness check can pass before a fresh replica serves at production latency, so readiness should be gated on a real test generation), and there is no vendor SLA — the gateway's circuit breaker (§5) is the *only* thing standing between a degraded self-hosted replica and every caller. |
 
 ### 3.5 Handling provider-specific feature divergence
 
@@ -588,6 +697,10 @@ always the `usage` block the provider returns after the call completes.
 ---
 
 ## 4. Model routing
+
+> **In plain words.** Routing decides which real model answers a request. It can be a fixed table, or it can pick based on price, speed, or how hard the question looks.
+>
+> **Real-world example.** An HR bot gets 10,000 questions a day. Short ones like "How many vacation days do I have?" go to a cheap, fast model; long policy comparisons go to a stronger, pricier one. A canary sends 5% of users to a new model to compare quality before switching everyone.
 
 ### 4.1 Static routing
 
@@ -638,7 +751,8 @@ class StaticRouter:
         return targets[-1]
 ```
 
-Config, not code, drives this:
+Config, not code, drives this (the model names here and in §12.1 are dated examples; several of these
+snapshots have since been superseded or retired, so use whatever your providers currently offer):
 
 ```yaml
 routes:
@@ -812,6 +926,10 @@ applied in a fixed order, not one function with accumulating `if` statements.
 ---
 
 ## 5. Fallback and resilience
+
+> **In plain words.** Providers fail. The gateway keeps a backup list, stops calling a provider that keeps failing (a circuit breaker), and gives up quickly instead of waiting forever. Retrying is only safe for some errors.
+>
+> **Real-world example.** The primary provider starts timing out at 14:00. After 5 failures in a row the breaker opens and requests go straight to the backup, so users see answers again within seconds instead of 60-second hangs. A malformed request (HTTP 400) is not retried on the backup, because it would fail there too.
 
 ### 5.1 Provider chains
 
@@ -1000,8 +1118,8 @@ async def retry_with_backoff(fn, *args, max_attempts: int = 3,
     raise last_exc
 ```
 
-Respecting a provider's `Retry-After` header when present, and only jittering the fallback computed
-delay, is the detail that separates a backoff implementation that plays well with a provider's own
+Respecting a provider's `Retry-After` header when present, and adding a small jitter on top so that
+many clients don't retry in lockstep, is the detail that separates a backoff implementation that plays well with a provider's own
 load-shedding from one that fights it.
 
 ### 5.6 The idempotency problem
@@ -1037,6 +1155,10 @@ the retry boundary accordingly rather than blanket-retrying everything that look
 ---
 
 ## 6. Rate limiting and quota management
+
+> **In plain words.** Rate limits stop one team from using up everyone's shared capacity. For LLMs you limit tokens, not just requests, because one request can be 50 tokens or 50,000.
+>
+> **Real-world example.** Team A has 100,000 tokens per minute. A request with a 3,000-token prompt and `max_tokens=1,000` reserves 4,000 tokens up front. The answer uses only 400, so 600 are returned to the budget when the call finishes.
 
 ### 6.1 The dimensions that need independent limits
 
@@ -1204,6 +1326,10 @@ ceiling are surprised when 429s appear despite every individual tenant reporting
 
 ## 7. Cost management
 
+> **In plain words.** Every call costs money based on tokens in and tokens out. The gateway computes the cost of each call, records who made it, and can warn or block a team that goes over budget.
+>
+> **Real-world example.** With illustrative prices of $3 per million input tokens and $15 per million output tokens, a call with 2,000 input and 500 output tokens costs 2,000 × $3/1M + 500 × $15/1M = $0.006 + $0.0075 = $0.0135. At 80% of a $5,000 monthly budget ($4,000) the team gets an alert; at 100% the gateway switches them to a cheaper model.
+
 ### 7.1 Per-request cost calculation
 
 ```python
@@ -1211,9 +1337,11 @@ ceiling are surprised when 429s appear despite every individual tenant reporting
 class ModelPricing:
     input_per_1k: float
     output_per_1k: float
-    cached_input_per_1k: float = 0.0   # typically ~10% of input_per_1k (provider prompt caching, §11.4)
+    cached_input_per_1k: float = 0.0   # typically 10%–50% of input_per_1k, varies by provider (§11.4)
 
 
+# ILLUSTRATIVE, DATED prices (list prices for these snapshots around late 2024).
+# Do not copy them: load current prices from the vendors' pricing pages as config (§12).
 PRICING: dict[str, ModelPricing] = {
     "openai:gpt-4o": ModelPricing(input_per_1k=0.0025, output_per_1k=0.010, cached_input_per_1k=0.00125),
     "anthropic:claude-3-5-sonnet-20241022": ModelPricing(input_per_1k=0.003, output_per_1k=0.015,
@@ -1233,7 +1361,7 @@ def calculate_cost(provider: str, model: str, usage: Usage) -> float:
 ```
 
 Note the `PRICING` table is itself a liability that needs an owner: provider pricing changes without
-warning (new model releases, tiered pricing by context length above 128K tokens on some models, promo
+warning (new model releases, higher prices above a context-length threshold on some models, promo
 pricing), and a stale table silently misattributes cost. Treat it as versioned, alerted-on
 configuration (§12), not a constant baked into code.
 
@@ -1322,17 +1450,18 @@ Four token categories now need independent accounting on modern provider APIs, a
 them into "total tokens" produces wrong cost and wrong capacity-planning numbers:
 
 - **Input tokens** — priced lowest, generally.
-- **Output tokens** — typically 3-5x the input price, because generation is autoregressive and cannot
+- **Output tokens** — typically 3-5x the input price (4x and 5x for the two dated examples in §7.1), because generation is autoregressive and cannot
   be batched across the sequence dimension the way prompt processing can.
 - **Cached input tokens** — provider-side prompt caching (Anthropic's explicit cache-control blocks,
-  OpenAI's automatic prefix caching) reprices repeated prefix content at a steep discount (often
-  ~90% off), and a gateway that doesn't track this separately will show cost *increases* after
+  OpenAI's automatic prefix caching) reprices repeated prefix content at a steep discount (roughly
+  50% to 90% off depending on provider and model; Anthropic also charges a premium for cache writes), and a gateway that doesn't track this separately will show cost *increases* after
   enabling caching optimizations that are actually saving money, because the discount silently
   vanishes into an undifferentiated "input tokens" bucket.
-- **Reasoning tokens** — o-series and extended-thinking models bill internal reasoning tokens
-  separately from visible output tokens, frequently at the output rate, and they do not appear in the
-  response content at all — a cost dashboard that only sums visible-content length against output
-  price will systematically undercount spend on these models.
+- **Reasoning tokens** — o-series and extended-thinking models bill internal reasoning tokens at the
+  output-token rate, and they do not appear (or appear only summarized) in the response content — a
+  cost dashboard that estimates output from visible-content length will systematically undercount
+  spend on these models. Check each provider's usage shape: OpenAI reports `reasoning_tokens` as a
+  breakdown *already included* in `completion_tokens`, so adding it on top double-counts.
 
 ### 7.5 Cost-optimized routing and unit economics
 
@@ -1345,6 +1474,10 @@ engineer's job includes being able to produce that second number on demand, not 
 ---
 
 ## 8. Authentication and authorization
+
+> **In plain words.** Provider keys live in one locked place that only the gateway can read. Each team gets its own gateway key, and a policy says which models each team may use.
+>
+> **Real-world example.** A leaked provider key used to mean checking 12 apps for copies. Now it is one rotation in the secrets manager. The finance team may use the model approved for financial data; the marketing team's request for it is refused before it uses any quota.
 
 ### 8.1 API key management
 
@@ -1429,6 +1562,10 @@ is every provider call in the organization at once.
 
 ## 9. Observability
 
+> **In plain words.** Every call gets a log line with who, which model, how long, how many tokens, what it cost, and whether a backup was used. The prompt text itself is not logged unless a team opts in, because it may contain personal data.
+>
+> **Real-world example.** Latency jumps at 10:15. The dashboard shows time-to-first-token for one provider went from 600 ms to 4 s, while the 400-error rate is flat. So it is a provider problem, not an app bug, and the on-call engineer knows which one within a minute.
+
 ### 9.1 What to log, and the PII line
 
 Every request through the gateway should produce a structured log record and an OTEL span with, at
@@ -1508,6 +1645,10 @@ async def instrumented_chat(request: ChatRequest, executor: ChainExecutor, chain
             raise
 ```
 
+Two notes on the attribute names: `gen_ai.fallback_depth` and `tenant.id` are this gateway's own
+custom attributes, not part of the OTEL convention; and the GenAI conventions are still evolving (newer
+versions rename `gen_ai.system` to `gen_ai.provider.name`), so pin the semconv version you emit.
+
 ### 9.4 Error rate per provider, and the metric that actually predicts incidents
 
 Track error rate segmented by `(provider, model, error_class)` — a rising 429 rate is a capacity/quota
@@ -1520,6 +1661,10 @@ reason and get ignored.
 ---
 
 ## 10. Streaming through the gateway
+
+> **In plain words.** Streaming sends the answer word by word so users see text right away. The gateway must pass each piece on immediately and still count tokens and cost at the very end.
+>
+> **Real-world example.** A user asks a question in a mobile app. The first words arrive after 0.5 s instead of waiting 8 s for the whole answer. If the user closes the app after 3 s, the tokens already generated were still billed, so the gateway still records their cost.
 
 ### 10.1 SSE end-to-end
 
@@ -1596,6 +1741,10 @@ delivered."
 ---
 
 ## 11. Caching
+
+> **In plain words.** A cache stores answers so a repeated question doesn't cost another model call. Exact-match caching is safe; "similar question" caching can return the wrong answer and must be used with care.
+>
+> **Real-world example.** A classification endpoint sees the same 2,000 product titles again and again at temperature 0; an exact cache serves repeats in 5 ms for $0. But "cancel my subscription" and "how do I NOT cancel my subscription" look similar to an embedding model and must never share an answer.
 
 ### 11.1 Exact-match caching
 
@@ -1677,6 +1826,10 @@ is actually earning the discount.
 
 ## 12. Configuration management
 
+> **In plain words.** Apps ask for a nickname like "default" or "fast", not a real model name. The platform team decides in config which real, dated model each nickname points to.
+>
+> **Real-world example.** "default" points to a pinned snapshot. To upgrade, the team runs the eval suite on the new model, then changes one line of config. All 30 apps that call "default" move over without a single app deploy.
+
 ### 12.1 Model aliases and version pinning
 
 Every routing decision in §4 resolves an **alias**, never a raw provider model string, specifically so
@@ -1733,6 +1886,10 @@ the code review of an application PR nobody on the platform team would even see.
 ---
 
 ## 13. The SDK side — client experience
+
+> **In plain words.** The SDK is the small library apps use to call the gateway. It should be easy to use and should only retry the connection to the gateway; the gateway handles provider failures.
+>
+> **Real-world example.** A developer writes `client.chat(messages)` and gets a typed answer back. If both the SDK and the gateway retried 3 times at every layer, one failing request could turn into dozens of provider calls; keeping the SDK's retries small prevents that.
 
 ### 13.1 A typed client wrapping the gateway
 
@@ -1802,6 +1959,10 @@ matching §3's adapter error taxonomy) should be specific enough to act on witho
 
 ## 14. Production deployment
 
+> **In plain words.** The gateway must be more reliable than any provider behind it, because if it is down, everything is down. So it runs as many identical copies with shared state, careful health checks and safe deploys.
+>
+> **Real-world example.** 20 gateway copies sit behind a load balancer. Rate-limit counters and circuit-breaker state live in Redis, so if one copy sees a provider fail, all 20 stop calling it. A bad release goes to the "green" copies first and is rolled back before most traffic hits it.
+
 ### 14.1 Stateless design and horizontal scaling
 
 The gateway process itself must hold no per-request state that survives past that request's response —
@@ -1866,10 +2027,14 @@ cost stated, rather than defaulted into by whatever the first regional deploymen
 
 ## 15. Comparison with existing solutions — build vs buy
 
+> **In plain words.** You don't have to build a gateway from scratch. Open-source and commercial tools exist; the question is whether they fit your rules on data, routing and cost tracking.
+>
+> **Real-world example.** A 200-person startup with no strict data-residency rules can run an open-source proxy in a day. A bank that must keep prompts inside one region and bill 40 internal teams separately may keep the open-source adapters but build its own policy and cost ledger.
+
 | Solution | What it is | Where it's strong | Where it falls short of a custom platform gateway |
 |---|---|---|---|
 | **LiteLLM** | Open-source Python library / proxy server providing a unified OpenAI-compatible interface across 100+ providers | Broadest provider coverage available anywhere, drop-in OpenAI SDK compatibility, active community, self-hostable proxy mode with built-in rate limiting and budgets | Policy/RBAC and cost-attribution features are less mature than a purpose-built internal platform's; deep customization (bespoke content-based routing, org-specific compliance rules) means forking or extending, at which point you own a fork of someone else's abstraction rather than your own |
-| **Portkey** | Commercial gateway-as-a-service, with a hosted control plane, extensive caching/routing/observability features | Polished UI, fast to adopt, strong out-of-box observability and guardrails | Data governance implications of a third party proxying every prompt (even with content-logging opt-outs, request metadata transits their infrastructure); vendor lock-in on routing/config surface; ongoing per-request pricing on top of underlying model cost |
+| **Portkey** | Commercial gateway-as-a-service, with a hosted control plane, extensive caching/routing/observability features (its core gateway is also available as open source) | Polished UI, fast to adopt, strong out-of-box observability and guardrails | Data governance implications of a third party proxying every prompt when using the hosted service (even with content-logging opt-outs, request metadata transits their infrastructure); vendor lock-in on routing/config surface; ongoing platform pricing on top of underlying model cost |
 | **Helicone** | Primarily an observability/logging layer for LLM calls, with lighter gateway features (caching, rate limiting) added over time | Best-in-class request/response logging and cost dashboards with minimal integration effort (often a base-URL swap) | Not a full gateway — routing, fallback, and RBAC are thinner than LiteLLM's or Portkey's; better thought of as complementary to a gateway than a replacement for one |
 | **Custom gateway** (this chapter) | Purpose-built internal service | Exact fit to internal policy, compliance, and cost-attribution requirements; no third-party in the request path; full control over the routing/fallback logic that matters most to your specific traffic mix | Ongoing engineering and on-call cost (§1.3); reinventing genuinely solved problems (provider adapters, SSE parsing) unless scoped carefully |
 
@@ -1890,11 +2055,15 @@ differentiated requirements live.
 
 ## 16. Interview questions
 
+> **In plain words.** For each question, first say the idea in one plain sentence, then give one number, then name one trade-off. The "Weak" and "Strong" answers below show what interviewers listen for.
+>
+> **Real-world example.** "Why a gateway?" → "One front door for all model calls: 6 apps and 4 providers become 10 integrations instead of 24. The cost is an extra hop and a new single point of failure, so the gateway must be more reliable than any provider."
+
 **1. Why build a model gateway instead of letting each application call providers directly?**
 *Weak:* "So we don't repeat code." *Strong:* names the N×M-to-N+M reduction in §1.1, and lists which
 downstream capabilities (auth, rate limiting, cost control, observability, RBAC) are consequences of
 having one interception point rather than independent features — and is honest about the cost side
-(§1.3): a gateway is a new SPO F and a new latency hop, and its own reliability bar must exceed any
+(§1.3): a gateway is a new SPOF (single point of failure) and a new latency hop, and its own reliability bar must exceed any
 single provider's.
 
 **2. Walk through the full request lifecycle, start to finish.** *Weak:* "the app calls the gateway,
@@ -1954,7 +2123,7 @@ provider's real quota even when every individual tenant is compliant (§6.5).
 **11. How do you calculate the true cost of a request when the provider offers prompt caching?**
 *Weak:* multiplies total tokens by one input rate. *Strong:* separates billable (non-cached) input,
 cached input at its discounted rate, and output at its own (usually higher) rate — and flags reasoning
-tokens as a fourth, often-invisible-in-content category some models bill separately (§7.1, §7.4).
+tokens as a fourth, often-invisible-in-content category billed at the output rate (§7.1, §7.4).
 
 **12. A team says the gateway's cost dashboard shows higher spend after they enabled prompt caching.
 What's the likely bug?** *Weak:* "caching must not be working." *Strong:* the cost calculation is
@@ -2154,3 +2323,153 @@ breaker state change, and the successful secondary call as one coherent span tre
 *Time:* ~1.5 days.
 *Unblocks:* `11-token-accounting-and-cost.md` and `12-serving-latency-and-caching.md`'s planned labs,
 which assume a working gateway to instrument further.
+
+---
+
+## 18. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of problem teams hit when running a model gateway: what users or finance saw, why it happened, the numbers, and the fix.
+>
+> **Real-world example.** A team is "under quota" but gets 429s → Case 2. Everyone waits a minute when a provider hangs → Case 3.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent. They are not any specific company's postmortem. Prices are
+illustrative round numbers, not current list prices.
+
+**Quick index:** caching turned on but cost dashboard doesn't move → Case 1; 429s while every tenant
+is under quota → Case 2; 60-second hangs during a provider brownout → Case 3; a small outage becomes a
+retry storm → Case 4; semantic cache gives opposite answers → Case 5; ledger total lower than the
+provider invoice → Case 6; JSON extraction breaks with no deploy → Case 7.
+
+### Case 1 — Prompt caching "saves nothing"
+
+**Setup.** A support bot sends 50,000 requests a day. Each has 6,000 input tokens, of which 5,000 are
+the same system prompt and help-center text, and 300 output tokens. Illustrative prices: $3 per
+million input tokens, $0.30 per million cached input tokens, $15 per million output tokens.
+
+**Symptom.** The team turns on provider prompt caching. The provider reports a 90% cache hit rate on
+the 5,000-token prefix, but the gateway's cost dashboard still shows $1,125 a day.
+
+**Measurement.** Before caching: 300M input tokens × $3/M = $900, plus 15M output tokens × $15/M =
+$225, total $1,125/day. With caching, 50,000 × 0.9 × 5,000 = 225M tokens are cached. Real cost:
+75M uncached × $3/M = $225, plus 225M cached × $0.30/M = $67.50, plus $225 output = $517.50/day. The
+gateway's `Usage` had no `cached_input_tokens` field, so it priced all 300M input tokens at the full
+rate.
+
+**Fix.** Add `cached_input_tokens` to `Usage` and `cached_input_per_1k` to the pricing table (§2.2,
+§7.1), and normalize each provider's usage fields so "input" means the same thing everywhere (§3.3).
+Dashboard drops from $1,125 to $517.50/day, a 54% saving that was real all along.
+
+**Lesson.** Cost math must track every token category the provider bills differently (§7.4).
+
+### Case 2 — 429s while every tenant is "under quota"
+
+**Setup.** 12 internal tenants share one model deployment with an upstream allocation of 2,000,000
+TPM. The platform team gave each tenant 250,000 TPM in the gateway, 3,000,000 in total, assuming they
+would never all be busy at once.
+
+**Symptom.** At the Monday 9:00 peak, apps see provider 429s. Every tenant's gateway dashboard says
+they are at about 70% of their quota.
+
+**Diagnosis.** 12 × 250,000 × 0.70 = 2,100,000 TPM of demand against 2,000,000 TPM upstream. About
+100,000 / 2,100,000 ≈ 4.8% of token volume is refused by the provider. The gateway only checked
+per-tenant buckets, never the shared upstream one (§6.5).
+
+**Fix.** Add a shared `(provider, model)` bucket sized to the real allocation, checked in addition to
+the per-tenant bucket, and route overflow to a second deployment. Provider 429s drop to near zero;
+the requests that are still over capacity get a clear gateway error that names the scope that is full.
+
+**Lesson.** Per-tenant limits that add up to more than the upstream allocation are a promise the
+gateway can't keep. Model the shared ceiling explicitly.
+
+### Case 3 — Everyone waits 60 seconds when a provider hangs
+
+**Setup.** A chat product with a 20 s latency target. Fallback chain of 3 providers. Each hop used
+the same `total_timeout_s = 60` and there was no first-token timeout.
+
+**Symptom.** During a primary-provider brownout, the provider accepts requests but sends nothing. p99
+latency goes from 6 s to 64 s. Users give up before the backup ever answers.
+
+**Diagnosis.** Each request waits the full 60 s on the stuck primary before the chain moves to the
+backup, which then takes about 4 s: 60 + 4 = 64 s. The circuit breaker only counts completed
+failures, so it trips slowly because each failure takes a minute to happen.
+
+**Fix.** Add `first_token_timeout_s = 10` and give the whole chain one budget divided across hops
+(§5.4). Worst case to reach the backup is now 10 s, so brownout p99 is about 10 + 4 = 14 s, inside
+the 20 s target. The faster failures also trip the breaker sooner, so most requests skip the
+primary entirely.
+
+**Lesson.** A provider that hangs is worse than one that fails fast. Time out on the first token, and
+budget the whole chain, not each hop.
+
+### Case 4 — A small outage becomes a retry storm
+
+**Setup.** The SDK makes up to 3 attempts. The gateway tries up to 3 providers, and retries each one up
+to 3 times on 429 or timeout.
+
+**Symptom.** A short rate-limit event at the primary provider turns into a 10-minute outage across
+all providers, with provider traffic many times higher than normal.
+
+**Diagnosis.** One logical request can become 3 (SDK) × 3 (hops) × 3 (retries per hop) = 27 provider
+calls. At 1,000 logical requests per second, that is up to 27,000 calls per second hitting providers
+that are already overloaded. The retries themselves keep the 429s going.
+
+**Fix.** The SDK retries only the connection to the gateway, not provider errors the gateway already
+handled (§13.2). The gateway allows 2 attempts per hop and respects `Retry-After`. Worst case drops
+from 27 to 1 × 3 × 2 = 6 calls per logical request, and the event ends when the provider recovers.
+
+**Lesson.** Retries multiply across layers. Decide which single layer owns provider retries.
+
+### Case 5 — The semantic cache answers the opposite question
+
+**Setup.** A subscription service puts a semantic cache in front of its support bot with
+`similarity_threshold = 0.97`. Hit rate is 12%. To save more money, someone lowers it to 0.90 and the
+hit rate rises to 31%.
+
+**Symptom.** A user asks "how do I keep my subscription and not cancel it?" and gets step-by-step
+cancellation instructions.
+
+**Measurement.** Reviewers sample 500 cache hits at 0.90: 20 (4%) are answers to a different
+question. At 0.97, the same review finds 2 in 500 (0.4%).
+
+**Fix.** Restore 0.97, allow the semantic cache only for FAQ-style intents that were evaluated, and
+exclude account actions (cancel, refund, delete) entirely (§11.2). Hit rate goes back to 12%.
+
+**Lesson.** "Similar embedding" is not "same meaning". Tune the threshold on real queries and measure
+wrong answers, not just hit rate.
+
+### Case 6 — The cost ledger is 13% lower than the invoice
+
+**Setup.** A mobile assistant streams 100,000 answers a day. Each has about 2,000 input tokens and 800
+output tokens when completed. Illustrative prices: $2.50/M input, $10/M output. 18% of users close
+the app mid-answer, after about 400 output tokens on average.
+
+**Symptom.** The monthly provider invoice is higher than the gateway ledger by a steady 13%.
+
+**Diagnosis.** The gateway recorded cost only after `[DONE]`. A completed stream costs 2,000 ×
+$2.50/M + 800 × $10/M = $0.013; a disconnected one still costs 2,000 × $2.50/M + 400 × $10/M = $0.009.
+Real daily cost: 82,000 × $0.013 + 18,000 × $0.009 = $1,066 + $162 = $1,228. The ledger saw only the
+$1,066, a gap of $162 / $1,228 ≈ 13.2%.
+
+**Fix.** Settle and record in a `finally` block using whatever usage the provider reported (§10.3),
+and cancel the upstream request when the client disconnects so the provider stops generating. The
+ledger now matches the invoice within rounding.
+
+**Lesson.** Tokens generated are billed whether or not anyone reads them. Settle on every exit path.
+
+### Case 7 — JSON extraction breaks with no deploy
+
+**Setup.** An invoice-extraction service makes 200,000 calls a day through the alias `extract`, which
+pointed to a floating model name rather than a dated snapshot.
+
+**Symptom.** One morning, the share of responses that fail JSON validation rises from 0.5% to 4%, with
+no code or config change on the team's side.
+
+**Measurement.** Failures go from 200,000 × 0.005 = 1,000 to 200,000 × 0.04 = 8,000 a day. Traces show
+the same alias and prompt, but the `gen_ai.response.model` value changed overnight: the provider had
+moved the floating name to newer weights.
+
+**Fix.** Pin `extract` to a dated snapshot (§12.1), run the eval suite before any alias change, and
+alert when the response model differs from the pinned one. Failures return to about 1,000 a day.
+
+**Lesson.** Floating model names are fine for experiments, not for anything with a quality contract.
