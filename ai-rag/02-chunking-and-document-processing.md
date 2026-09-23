@@ -34,6 +34,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Thesis, restated as an engineering claim](#1-thesis-restated-as-an-engineering-claim)
 2. [The ingestion pipeline, stage by stage](#2-the-ingestion-pipeline-stage-by-stage)
 3. [Parsing — the stage that decides your ceiling](#3-parsing--the-stage-that-decides-your-ceiling)
@@ -50,6 +51,79 @@
 14. [Mental models — the compressed set](#14-mental-models--the-compressed-set)
 15. [Lab exercises](#15-lab-exercises)
 16. [Interview questions and system design prompts](#16-interview-questions-and-system-design-prompts)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**What this chapter is about.** Before a RAG system can search your documents, it has to turn files
+(PDFs, web pages, Word files, spreadsheets) into clean text, cut that text into small pieces called
+**chunks**, and store each chunk with its embedding and some labels (**metadata**). Search then
+returns chunks, not whole documents. If this step is done badly, nothing later can fix it: a
+sentence that was lost while reading the PDF can never be found.
+
+**A real-world example.** An HR policy PDF, 40 pages, two columns, with a table of leave days.
+
+- **Parsing** (reading the file): a cheap PDF reader mixes the two columns line by line, producing
+  "Employees are entitled to 25 | The company reserves the" — nonsense. A better parser keeps the
+  columns and the table rows intact.
+- **Normalization** (cleaning): remove page numbers, repeated headers and footers; keep the
+  headings.
+- **Chunking** (cutting): cut at headings, so "Parental leave" is one chunk and "Sick leave" is
+  another. Cutting every 500 characters instead would split "Parental leave: 16 weeks" from "…paid
+  at 100% of salary", and a question about parental pay finds only half the answer.
+- **Metadata**: store `department=HR`, `country=DE`, `updated=2026-03-01` next to each chunk, so a
+  German employee only gets German rules (filtering) and the answer can cite the page (citation).
+
+**What this chapter covers, in one line each:**
+
+| Section | In plain words |
+|---|---|
+| §1 | Each step can only lose information, never add it back. Bad parsing sets a ceiling on quality. |
+| §2 | The steps of the pipeline and what to save after each one. |
+| §3 | Reading files correctly — PDFs, tables, HTML, spreadsheets, code. Usually the cheapest quality win. |
+| §4 | Cleaning text without destroying meaning; keeping track of where each piece came from. |
+| §5 | Chunk size: small chunks are precise but lose context; big chunks keep context but blur the match. |
+| §6 | Ways to cut: fixed size, by paragraphs/headings, by meaning, or with an LLM — and which to use. |
+| §7 | Search with small chunks, but give the LLM the bigger surrounding section. |
+| §8 | Labels stored with each chunk: needed for filters, permissions and citations. |
+| §9 | Giving each chunk a stable ID so that re-processing a changed document updates only what changed. |
+| §10 | Removing duplicate chunks (the same footer on 1,000 pages). |
+| §11 | Measuring whether one chunking method is actually better than another. |
+| §12 | What it costs. |
+| §16 | Interview questions. |
+
+### Symbols and terms used in this chapter
+
+| Symbol / term | What it means | Typical value | Simple example |
+|---|---|---|---|
+| document | one original file or page | — | `leave-policy-2026.pdf` |
+| chunk | a small piece of a document that gets its own embedding | 200 – 1,000 tokens | the "Parental leave" section |
+| token | a piece of a word used for counting; ~4 characters of English | — | 512 tokens ≈ 380 words ≈ ¾ of a page |
+| chunk size | how long each chunk is, measured in tokens | 256 – 1,024 | "chunks of 512 tokens" |
+| overlap / `f` | share of each chunk repeated at the start of the next one, so sentences at the cut aren't lost | 0 – 20% | `f = 0.2` → the last 100 of 500 tokens repeat in the next chunk |
+| `1/(1−f)` | how many more chunks overlap creates | — | `f = 0.2` → `1/0.8 = 1.25` → 25% more chunks, embedding cost and storage |
+| `k` / top-k | how many chunks retrieval returns for one question | 3 – 20 | top-5 chunks go to the LLM |
+| token budget | how many tokens of retrieved text you can give the LLM | 2K – 20K | 5 chunks × 800 tokens = 4,000 tokens |
+| parsing | turning a file into text (and tables, headings) | — | PDF → text in the right reading order |
+| normalization | cleaning the text: whitespace, headers/footers, encoding | — | remove "Page 12 of 40" from every page |
+| offsets | the start/end position of a chunk in the original document | — | characters 10,240–12,880 → lets you highlight the source |
+| metadata / payload | labels stored with a chunk, not embedded in its text | — | `tenant_id`, `doc_id`, `section`, `updated_at` |
+| structure-aware splitting | cutting at headings, paragraphs, list items | — | one chunk per H2 section |
+| semantic chunking | cutting where the topic changes, detected with embeddings | — | a new chunk starts when the text moves from "pay" to "benefits" |
+| parent-child / small-to-big | search small chunks, send their bigger parent section to the LLM | child 200 tok, parent 1,500 tok | find the sentence, read the whole section |
+| contextual retrieval | prepending a short LLM-written summary ("This is from ACME's 2025 annual report, section Revenue") to each chunk before embedding | — | fixes chunks that mean nothing alone |
+| BM25 | classic keyword search scoring (the "lexical" branch) | — | finds exact codes like `ERR-4012` that embeddings blur |
+| content hash | a fingerprint of the chunk text; same text → same hash | SHA-256 | skip re-embedding chunks whose text didn't change |
+| idempotent | running the same step twice gives the same result, no duplicates | — | re-ingesting a document doesn't create a second copy |
+| MinHash / Jaccard | a way to find *near*-duplicate texts by comparing overlapping word sets | similarity 0 – 1 | two versions of the same footer, 0.95 similar |
+| golden set | your own list of real questions with the correct answer marked | 50 – 500 | "How many sick days?" → leave policy §2 |
+| recall@k | share of questions whose correct answer appears in the top `k` | 0 – 1 | 45 of 50 found in top 5 → 0.9 |
+| recall ceiling / `⊇` | "can be at most": each step can only keep or lose information | — | parsed ⊇ cleaned ⊇ chunked: nothing lost in parsing can be found later |
+| `O(corpus)` | cost grows with the size of the whole collection | — | changing chunk size = re-chunk + re-embed everything |
+
+If a section gets too technical, read this table and the one-line summary above, and come back to
+the details when you need them.
 
 ---
 

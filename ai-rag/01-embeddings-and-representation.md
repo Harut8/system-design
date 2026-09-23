@@ -29,6 +29,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Thesis, restated as an engineering claim](#1-thesis-restated-as-an-engineering-claim)
 2. [What an embedding actually is](#2-what-an-embedding-actually-is)
 3. [Symmetric vs asymmetric embedding — the most-skipped detail](#3-symmetric-vs-asymmetric-embedding--the-most-skipped-detail)
@@ -46,6 +47,73 @@
 15. [Mental models — the compressed set](#15-mental-models--the-compressed-set)
 16. [Lab exercises](#16-lab-exercises)
 17. [Interview questions and system design prompts](#17-interview-questions-and-system-design-prompts)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**What an embedding is.** An embedding model reads a piece of text and outputs a fixed-length list
+of numbers, for example 768 of them. Texts with similar meaning get similar lists of numbers. That
+lets a computer find "texts that mean the same thing" by comparing numbers, even when the words
+are different.
+
+**A real-world example.** A company's HR assistant has thousands of policy paragraphs. An employee
+asks *"Can I take time off when my child is born?"*. The best paragraph is titled *"Parental
+leave"* and never uses the words "time off" or "child is born". Keyword search misses it. With
+embeddings, both the question and the paragraph become vectors that point in almost the same
+direction, so the paragraph is found.
+
+**What this chapter covers, in one line each:**
+
+| Section | In plain words |
+|---|---|
+| §1 | Choosing an embedding model is like choosing a database schema: changing it later means re-processing *everything*. |
+| §2 | How "closeness" between two vectors is measured, and why vectors must be normalized (scaled to length 1). |
+| §3 | Questions and documents are different kinds of text; many models need to be told which one they're reading. Forgetting that silently hurts quality. |
+| §4–5 | Which models exist in 2026, and why a public leaderboard doesn't tell you which one is best *for your data* — test on your own questions. |
+| §6 | Shorter vectors (fewer numbers) are cheaper; some models are trained so you can cut the vector short and keep most of the quality. |
+| §7 | Storing each number with less precision (int8, 1-bit) saves up to 32× memory. |
+| §8 | Every model has a maximum input length; text past it is often cut off without any error. |
+| §9 | A chunk like *"revenue grew 3%"* means nothing on its own (which company? which year?) — and how to fix that. |
+| §10 | When fine-tuning a model on your own data is worth it (usually: last). |
+| §11 | Multiple languages, images and PDFs. |
+| §12 | Tracking which model produced each vector, and switching models safely. |
+| §13 | What it all costs. |
+| §17 | Interview questions. |
+
+### Symbols and terms used in this chapter
+
+| Symbol / term | What it means | Typical value | Simple example |
+|---|---|---|---|
+| embedding / vector | the list of numbers a model produces for one text | — | `[0.021, -0.113, 0.087, …]` (768 numbers) |
+| `d` | dimensions: how many numbers are in the vector | 384 – 3072 | `text-embedding-3-small` → `d = 1536` |
+| `ℝ^d` | "the space of all lists of `d` real numbers" — where the vectors live | — | like a map with `d` directions instead of 2 |
+| `f: text → ℝ^d` | the embedding model, written as a function: text in, vector out | — | `f("reset my password") = [0.02, …]` |
+| `N` | number of texts (chunks) in your collection | 10K – 1B | 2 million support-ticket chunks |
+| token | a piece of a word the model counts in; ~¾ of an English word | 1 token ≈ 4 characters | "unbelievable" ≈ 3 tokens |
+| context length | the most tokens a model can read at once | 512 – 128K | a 512-token model can't see page 2 of a long document |
+| cosine similarity | how much two vectors point in the same direction: 1 = same, 0 = unrelated | −1 to 1 | "dog" vs "puppy" ≈ 0.8; "dog" vs "invoice" ≈ 0.1 |
+| dot product | sum of the element-wise products; equals cosine when vectors have length 1 | — | cheaper to compute than cosine |
+| normalization (L2) | scaling a vector so its length is exactly 1 | — | like converting all arrows to the same length so only their direction matters |
+| `τ` (tau), temperature | a training setting that controls how sharply the model separates close vs far pairs | 0.01 – 0.1 | you only need it if you train models |
+| InfoNCE / contrastive loss | the training rule: pull matching pairs together, push non-matching apart | — | "question + its correct answer" pulled together |
+| symmetric / asymmetric | same text type on both sides (sentence ↔ sentence) vs different (short question ↔ long document) | — | search is asymmetric; duplicate detection is symmetric |
+| `input_type` | the API flag that tells the model "this is a query" or "this is a document" | `query` / `document` | Cohere, Voyage have it; forgetting it lowers quality silently |
+| MTEB | a public benchmark / leaderboard of embedding models | — | useful for a shortlist, not for the final choice |
+| golden set | your own list of real questions with the correct answers marked | 50 – 500 questions | "What's the refund window?" → policy §4.2 |
+| `recall@k` | share of the correct answers found in the top `k` results | 0 – 1 | correct doc is in the top 10 for 42 of 50 questions → 0.84 |
+| MRR | mean reciprocal rank: 1 if the right answer is 1st, ½ if 2nd, ⅓ if 3rd… averaged | 0 – 1 | rewards putting the right answer *near the top* |
+| nDCG | a ranking score that gives more credit to relevant results higher up | 0 – 1 | used when several answers are partly relevant |
+| bootstrap CI | a range around a measured number showing how much it could move by chance | ± a few points | "recall 0.84 ± 0.06" on 50 questions |
+| MRL (Matryoshka) | a model trained so the first 256 (or 512…) numbers of a vector are useful on their own | — | keep 256 of 3072 numbers → 12× smaller |
+| quantization (int8 / binary) | storing each number with 1 byte / 1 bit instead of 4 bytes | 4× / 32× smaller | 1024-dim vector: 4,096 B → 1,024 B → 128 B |
+| rescoring | re-checking the top candidates with full-precision vectors after a rough search | — | thumbnails first, full-size photos for the finalists |
+| anisotropy / hubness | quirks of high-dimensional vectors: all vectors crowd in one direction / a few vectors show up as "nearest" for too many queries | — | why a fixed "similarity > 0.8" threshold is unreliable |
+| fine-tuning | further training a model on your own examples | hundreds – thousands of pairs | teaching a model that "PTO" and "annual leave" mean the same |
+| `O(corpus)` | cost grows with the size of your whole collection | — | switching models = re-embedding all 2M chunks |
+
+If a section gets too technical, read this table and the one-line summary above, and come back to
+the details when you need them.
 
 ---
 

@@ -85,6 +85,39 @@ Imagine an online music service with **10 million songs**. Each song has been tu
 | Filter | "only results where tenant = X" | "nearest pharmacy that is *open now*" |
 | Tombstone | a deleted item still sitting in the index, marked dead | a closed shop still printed on the map |
 
+### Symbols and letters used in this chapter
+
+Formulas in this chapter use short letters. Here is what each one means, with a typical value, so a
+formula like `N × d × 4 bytes` reads as "number of vectors × numbers per vector × 4 bytes".
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `N` | number of vectors (chunks) stored in the index | 100K – 1B | 10 million song vectors → `N = 10,000,000` |
+| `d` | dimensions: how many numbers are in one vector | 384, 768, 1024, 1536, 3072 | a 768-dim model turns every text into 768 numbers |
+| `k` | how many results you ask for | 5 – 100 | "give me the 10 most similar" → `k = 10` |
+| `q` | the query vector (the user's question turned into numbers) | — | "how do I reset my password?" → one vector |
+| `x` | one stored vector (one chunk) | — | one paragraph from a help article |
+| `Q` | number of test queries used for measuring | 200 – 1,000 | you test the index with 500 real questions |
+| `M` | HNSW: max links per item in the graph | 16 (8 – 64) | each song "knows" 16 similar songs |
+| `ef_construction` | HNSW: how carefully links are chosen while building | 64 – 400 | how many candidates you consider before picking a new song's 16 neighbours |
+| `ef_search` (`ef`) | HNSW: how many candidates are kept while searching | ≥ `k`, often 40 – 400 | how many routes the GPS compares |
+| `nlist` | IVF: number of buckets (clusters) | ≈ `√N` to `16·√N` | 16,384 aisles in a giant supermarket |
+| `nprobe` | IVF: how many buckets are searched per query | 1 – 5% of `nlist` | you walk through 64 of those aisles |
+| `m` (lowercase, PQ) | product quantization: how many pieces each vector is cut into (= bytes per vector) | `d/16` – `d/4` | a 768-dim vector cut into 96 pieces → 96 bytes |
+| `oversample` | how many extra candidates to re-check with full precision | 1.5 – 8 | 4× with `k = 10` → re-check 40, return 10 |
+| `t` | fraction of items in the index that are deleted (tombstones) | 0 – 0.4 | 30% of chunks deleted → `t = 0.3` |
+| `h` | cache hit ratio: share of reads served from RAM | 0.9 – 1.0 | 0.99 → 1 read in 100 goes to disk |
+| `s` (selectivity) | share of the data that matches a filter | 0.0001 – 1 | a customer owns 0.5% of all chunks → `s = 0.005` |
+| `θ` (theta) | angle between two vectors; smaller = more similar | 0° – 90° | 40° = fairly similar, 80° = barely related |
+| `G_k`, `A_k` | true top-k (from brute force) and what the index returned | — | `G` = the answer key, `A` = the student's answers |
+| `recall@k` | share of the true top-k that the index returned | target 0.95 – 0.99 | 9 of 10 correct → 0.9 |
+| `SE`, CI | standard error / confidence interval of a measured number | ±0.01 – 0.02 | "recall 0.95 ± 0.017" — differences smaller than that are noise |
+| p50 / p99 | latency that 50% / 99% of queries are faster than | ms | p99 = 20 ms → only 1 query in 100 is slower than 20 ms |
+| QPS | queries per second | 10 – 10,000 | 200 users each searching once every 2 s → ~100 QPS |
+| fp32 / fp16 / int8 / 1-bit | bytes used for each number: 4 / 2 / 1 / 1/8 | — | a 768-dim vector: 3,072 / 1,536 / 768 / 96 bytes |
+| `O(...)` | "grows roughly like"; `O(N)` = double the data, double the work | — | brute force is `O(N)`; HNSW is ~`O(log N)` |
+| `√N`, `log N` | square root / logarithm of `N` | — | `√10,000,000 ≈ 3,162`; `log₁₆(10M) ≈ 6` |
+
 If a section below gets too technical, read its **In plain words** box and the example, and skip
 the rest until you need it.
 
