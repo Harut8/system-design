@@ -1224,164 +1224,334 @@ the twenty minutes it takes to find out.
 
 ## 8. Updates, deletes, and index drift
 
-Every benchmark you will read measures a freshly built index. Yours will be six months old.
+Benchmarks measure a freshly built index. Yours will have been through months of inserts, updates
+and deletes. This section covers what those do to a graph index, mechanically, and what each store
+does about it.
 
-### 8.1 Deletion is not deletion
+> **Background in the databases track:** tombstones and compaction in LSM trees —
+> [`../databases/13-lsm-trees-and-compaction.md`](../databases/13-lsm-trees-and-compaction.md)
+> ("Delete Operations: Tombstones", §4 "Compaction Strategies"). Postgres MVCC and dead tuples — §4.2.1 of
+> [`../databases/05-transactions-and-concurrency.md`](../databases/05-transactions-and-concurrency.md).
+> Why re-embedding with `UPDATE` bloats a pgvector table — `01` §12.7.6. Those mechanisms are not
+> repeated here; this section is about what they do to *vector* indexes.
 
-You cannot cheaply remove a node from an HNSW graph. Removing it would orphan the edges that route
-*through* it, and repairing that means re-running neighbor selection for every node that pointed at
-it. So every implementation soft-deletes: the node stays in the graph, marked dead, and is filtered
-out of results.
+### 8.1 Deletion is not deletion — why a graph can't just remove a node
 
-Three consequences, in increasing order of how much they surprise people:
+Compare with a B-tree: deleting a key removes one entry from one leaf page; nothing else points at
+that entry, so nothing else breaks. An HNSW node is different in three concrete ways:
 
-1. **Deleted vectors still cost memory.** Delete 30% of your corpus and the index does not shrink.
-2. **Deleted vectors still cost traversal.** The search still walks through them; they are still
-   distance computations.
-3. **Deleted vectors consume your `ef_search` budget.** They occupy slots in the dynamic candidate
-   list before being filtered out. At 30% tombstones, an `ef_search` of 100 is doing the work of
-   about 70. **Recall degrades over time with no configuration change and no deploy** — which makes
-   it a genuinely hard incident to diagnose, because the usual first question ("what changed?") has
-   the answer "nothing."
+1. **Other nodes route through it.** On layer 0 each node has up to `2·M` = 32 out-edges (M = 16), so
+   on average ~32 other nodes have an edge *into* it. Remove it and each of those loses a route. If
+   the node was one of the few "bridge" nodes between two clusters (exactly the long edges the
+   §2.3.4 heuristic works to keep), a whole region becomes unreachable from the entry point.
+2. **The graph doesn't know who points at a node.** HNSW stores only out-edges. Finding the in-edges
+   of node X means scanning every adjacency list — `O(N × M)` — unless the implementation keeps a
+   reverse index, which costs another ~`M × 4` bytes per vector.
+3. **Repair is expensive.** Each affected in-neighbour must re-run neighbour selection — roughly an
+   `ef_construction` search each. Deleting one node costs about as much as ~30 inserts.
 
-pgvector surfaces this in its FAQ as one of the causes of fewer-than-expected results ("dead tuples")
-alongside `ef_search` and filtering. In Postgres the mechanism is familiar — `VACUUM` reclaims dead
-tuples — and the operational advice is the standard one: watch `n_dead_tup`, and be aware that a
-heavily updated vector table needs more aggressive autovacuum settings than its row count suggests,
-because each dead tuple is large.
+So every implementation **soft-deletes**: mark the node dead, keep it in the graph so it can still
+route, drop it from results. Consequences:
 
-### 8.2 The segment/compaction model, and why it's everywhere
+| Effect | Mechanism | Size of the effect |
+|---|---|---|
+| Memory doesn't shrink | dead node's vector + edges stay | delete 30% → index size unchanged |
+| Latency doesn't drop | traversal still computes distances to dead nodes | same work, fewer useful results |
+| **Recall drops** | dead nodes occupy slots in the `ef` beam `W` (§2.3.2), then get discarded | effective beam ≈ `ef × (1 − t)` at tombstone fraction `t`; `t = 0.3`, `ef = 100` → ~70 live candidates |
+| Results can under-return | if the beam is mostly dead nodes, fewer than `k` live ones survive | pgvector FAQ lists "dead tuples" as a cause of fewer results |
 
-Most dedicated stores solve this the way LSM trees solve it
-(`../databases/13-lsm-trees-and-compaction.md` is the reference and the analogy is nearly exact):
+The recall drop is the dangerous one: it happens with **no deploy and no config change**, so "what
+changed?" gets the answer "nothing" (§17 Case 3).
+
+**Updates are delete + insert.** Changing a chunk's text means a new embedding: the old node is
+tombstoned and a new node inserted. In Postgres, *any* `UPDATE` of the row (even of a metadata
+column) creates a new tuple version under MVCC; with a 3–6 KB vector per row, dead tuples add up
+fast.
+
+### 8.1.1 What each store does about tombstones, and what to monitor
+
+**pgvector.** The HNSW index lives in ordinary Postgres pages. Deleted/updated rows become dead
+tuples; `VACUUM` removes their index entries **and repairs the graph around them**, which is slow on
+large HNSW indexes. pgvector's docs suggest `REINDEX INDEX CONCURRENTLY` before vacuuming a heavily
+churned HNSW index, because rebuilding is faster than repairing.
+
+```sql
+-- How dead is the table?
+SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_autovacuum
+FROM pg_stat_user_tables WHERE relname = 'chunks';
+
+-- Vacuum vector tables sooner than the 20% default: each dead tuple is large.
+ALTER TABLE chunks SET (autovacuum_vacuum_scale_factor = 0.02,
+                        autovacuum_vacuum_cost_limit   = 2000);
+
+-- After heavy churn: rebuild instead of a long graph-repairing VACUUM.
+REINDEX INDEX CONCURRENTLY chunks_embedding_idx;
+```
+
+**Qdrant.** Data is split into segments. The optimizer rewrites a segment when its deleted fraction
+passes `deleted_threshold` (default 0.2, and only above `vacuum_min_vector_number`). Watch
+`segments_count`, `points_count` and `indexed_vectors_count` from the collection info API;
+`indexed_vectors_count` far below `points_count` means data is waiting to be indexed and is being
+brute-forced.
+
+**Elasticsearch / OpenSearch (Lucene).** Deletes set a bit in the segment's live-docs bitmap; the
+vector graph for that segment keeps the node until a segment merge rewrites it. `_cat/segments`
+shows `docs.deleted` per segment.
+
+**hnswlib / FAISS (libraries).** hnswlib has `mark_deleted(id)` and, with
+`allow_replace_deleted=True`, reuses dead slots for new inserts. FAISS HNSW doesn't support removal
+at all; you rebuild.
+
+**Alert on these three numbers** (they're the only early warning for this class of regression):
+
+| Metric | Example threshold | Action |
+|---|---|---|
+| Tombstone / dead-tuple fraction | > 15–20% | vacuum / compact / rebuild |
+| Corpus growth since last `ef_search` sweep | > 50% | re-run the §3.2 sweep |
+| Segment count (segment-based stores) | > 2× steady state | check that compaction is keeping up |
+
+### 8.2 The segment model — how most dedicated stores handle writes
+
+Qdrant, Milvus, Weaviate, Lucene (Elasticsearch/OpenSearch) and LanceDB all use a variant of the
+LSM pattern (`../databases/13-lsm-trees-and-compaction.md` §1):
 
 ```
-    writes → in-memory buffer → sealed immutable segment (own HNSW graph)
-                                          │
-                                          ▼
-                               background compaction:
-                          merge segments, drop tombstones, rebuild graph
+upsert ──► WAL (durable) ──► mutable/growing segment      (small, searched by BRUTE FORCE)
+                                   │ when size > threshold
+                                   ▼
+                             sealed segment + its own HNSW graph   (immutable)
+                                   │ background
+                                   ▼
+                     compaction/merge: combine segments, drop tombstones, build a new graph
 ```
 
-Queries fan out across segments and merge results. This makes writes cheap and deletes eventually
-free, at the cost of:
+Query path: search **every** segment (growing ones by brute force, sealed ones by HNSW), take the
+top-k of each, merge.
 
-- **Query latency proportional to segment count.** More segments, more graphs to traverse. Your p99
-  is partly a function of how far behind compaction is.
-- **Compaction competing with queries** for CPU and IO. The classic 3am latency spike.
-- **Recall varying with segment structure**, because per-segment top-k then merge is not identical to
-  global top-k. Usually a small effect; occasionally not.
+| Consequence | Why | Concrete number |
+|---|---|---|
+| Writes are cheap | appending to a small segment, no graph insert | ingest 10–100× faster than inserting into one big HNSW |
+| New data is searchable quickly | growing segment is scanned exactly | e.g. Qdrant: segments under `indexing_threshold` (in KB) are not HNSW-indexed |
+| Latency grows with segment count | one graph search per segment | 20 segments ≈ 20 × (log-cost search) + merge |
+| Compaction competes with queries | builds graphs on the same CPUs and disks | p99 spikes during merges ("the 3am spike") |
+| Per-segment top-k ≠ global top-k | each segment's ANN misses different vectors | usually small; measurable with §3 |
 
-The operational ask is modest and almost always skipped: **monitor segment count and tombstone ratio
-as first-class metrics**, and alert on them. They are leading indicators for a class of quality
-regression that has no other early signal. `../sre-observability/12-alerting.md` for how to set the
-thresholds without generating noise.
+### 8.3 Freshness — when is a new vector searchable?
 
-### 8.3 Freshness versus recall
+| Store | Default behaviour | What it costs | Visible after |
+|---|---|---|---|
+| **pgvector** | synchronous: the row is inserted into the HNSW graph inside the transaction | each insert pays an `ef_construction` search → slow bulk loads (build the index *after* bulk load, §4.4) | commit |
+| **Qdrant** | WAL + segment; `wait=true` returns after the change is applied | new points in unindexed segments are brute-forced until the optimizer builds the graph | the upsert call returns (`wait=true`) |
+| **Elasticsearch / OpenSearch** | near-real-time: new docs become searchable at the next *refresh* | each refresh creates a small segment; many small segments → merges | `refresh_interval` (default 1 s) |
+| **Milvus** | growing segment searchable; sealed segments indexed in the background | consistency level (Strong / Bounded / Session / Eventually) chosen per query | depends on consistency level |
+| **turbopuffer** | WAL on object storage, group-committed | ~1 write batch per namespace per second | ~hundreds of ms after commit |
 
-New vectors are not searchable until they are indexed. Every store makes a different choice about
-what happens in between, and the choice is usually configurable and usually left at a default nobody
-chose deliberately:
+The product question behind this table: if the UI says "your document is ready" when the upload
+finishes, you have promised read-your-writes. Either wait for the store's visibility guarantee
+before showing "ready" (e.g. `wait=true`, `refresh=wait_for`, Milvus `Strong`), or show "indexing…"
+until it's visible. `15-ingestion-pipelines-and-freshness.md` defines the staleness SLO.
 
-- **Index immediately on insert** — searchable at once, expensive writes, and bulk loads crawl.
-- **Buffer, then bulk-index at a threshold** — fast writes, and a window where new documents are
-  invisible or served by a linear scan of the buffer.
-- **Index asynchronously** — fast writes, eventual searchability, and a read-your-writes problem
-  that surfaces as "I just uploaded that document and search can't find it."
+### 8.4 The rebuild path — shadow index and swap
 
-That last one is a product decision disguised as a configuration flag. If your product says "your
-document is ready" the moment upload completes, you have promised read-your-writes and need to
-either index synchronously or scan the buffer. Decide it deliberately and write the decision down;
-`15-ingestion-pipelines-and-freshness.md` is where the staleness SLO gets defined.
+Given §8.1–8.3, periodic full rebuild is normal operation. The mechanics per store:
 
-### 8.4 The rebuild path is not optional
+| Store | Build new | Swap atomically |
+|---|---|---|
+| pgvector | `CREATE INDEX CONCURRENTLY` / `REINDEX INDEX CONCURRENTLY` | automatic when the concurrent build finishes |
+| pgvector (new model/dims) | new column or table (`01` §12.7) | rename in one transaction, or switch the view |
+| Qdrant | create collection `chunks_v2` | `update_collection_aliases`: move alias `chunks` from v1 to v2 |
+| Elasticsearch / OpenSearch | reindex into `chunks_v2` | `_aliases` API: remove v1 + add v2 in one call |
+| Milvus | new collection | `alter_alias` |
 
-Given §8.1–8.3, periodic full rebuild is part of operating an index, not an admission of failure.
-The pattern is the same shadow-index-and-swap from `01` §12 and `02` §9:
+Before the swap:
 
-1. Build the new index alongside the old, from the persisted intermediate artifacts (`02` §2 —
-   this is why you kept them).
-2. Run the §3 recall harness against **both**. This is the whole reason the harness exists: it turns
-   "the rebuild looks fine" into a number.
-3. Run the golden set (`02` §11) against both, so you catch quality regressions that recall misses.
-4. Swap atomically. Keep the old index until you've watched the new one under real traffic.
+1. Run the §3 recall harness against **both** indexes — this is what turns "the rebuild looks fine"
+   into a number.
+2. Run the golden set (`02` §11) against both, to catch relevance regressions recall can't see.
+3. Swap, and keep the old index until the new one has served real traffic without regression.
 
-Rebuild cadence is set by §4.4's build wall-clock and by how fast tombstones accumulate. Measure
-both and you can state the cadence instead of guessing it.
+Cadence comes from data: build wall-clock (§4.4) and the tombstone accumulation rate (Lab 7). E.g.
+2% of chunks change per week and recall falls below target at 20% tombstones → rebuild at least
+every ~10 weeks, or monthly for margin.
 
 ---
 
 ## 9. Where the bytes live: RAM, SSD, object storage
 
-Three architectures. This choice moves cost by an order of magnitude and p99 by two, and it is
-usually made implicitly by picking a product.
+### 9.0 Why HNSW wants RAM when a B-tree is happy on disk
+
+A Postgres B-tree over a billion rows works fine on disk. An HNSW index over 10M vectors becomes
+unusable the moment it stops fitting in memory. The reason is the **access pattern**, and the
+arithmetic is short.
+
+> **Background in the databases track:** latency of each storage tier —
+> [`../databases/00-os-and-hardware-internals.md`](../databases/00-os-and-hardware-internals.md)
+> §2 "The Numbers Every Database Engineer Should Know"; B-tree fan-out and height —
+> [`../databases/06-indexing-internals.md`](../databases/06-indexing-internals.md) §2 "Fan-out and
+> Tree Height Calculation"; buffer pool —
+> [`../databases/01-storage-engine-fundamentals.md`](../databases/01-storage-engine-fundamentals.md)
+> §5; page faults and why mmap hurts databases — `../databases/00-os-and-hardware-internals.md`
+> §5, §10–11.
+
+**A B-tree lookup touches ~3–4 pages, and the top of the tree is always cached.**
+
+```
+8 KB page, ~16-byte entries  → fan-out ≈ 500
+height for 1B keys           = log_500(10⁹) ≈ 3.3 → 4 levels
+levels 1–2 (1 + 500 pages)   = ~4 MB  → always in the buffer pool
+level 3 (250K pages)         = ~2 GB  → usually cached
+⇒ a point lookup costs ~1 random disk read ≈ 0.1 ms on NVMe
+```
+
+Keys also have a **total order**: neighbouring keys live on the same or adjacent pages, so a range
+scan reads pages sequentially.
+
+**An HNSW query touches thousands of unrelated locations.**
+
+```
+distance computations per query (§2.3.2)  ≈ 2,000–4,000
+each one reads a different vector: 768 × 4 B = 3 KB ≈ one 4 KB page
+node IDs are assigned in insertion order, so graph neighbours are scattered across the file
+⇒ ~3,000 random page reads per query
+```
+
+There's no way to lay vectors out so that nearby vectors share pages: points in 768 dimensions have
+no 1-D order that preserves nearness. (Space-filling curves and KD-/R-trees stop working above
+~10–20 dimensions; that's the curse of dimensionality in storage terms.)
+
+**Put the two access patterns on each storage tier** (latencies from `databases/00` §2):
+
+| Tier | Random 4 KB read | HNSW: 3,000 reads **serial** | HNSW: ~150 rounds of parallel neighbour reads | B-tree: ~1 uncached read |
+|---|---:|---:|---:|---:|
+| DRAM | ~0.1 µs per cache line (~1 µs per 3 KB vector) | **~1–3 ms** | — | µs |
+| Local NVMe | ~10–100 µs | 30–300 ms | ~2–15 ms | ~0.1 ms |
+| Network block storage (EBS-like) | ~0.5–1 ms | 1.5–3 s | 75–150 ms | ~1 ms |
+| HDD | ~10 ms | 30 s | 1.5 s | ~10 ms |
+
+Why "rounds": each hop depends on the previous one. You can fetch the ~32 neighbours of the current
+node in parallel, but you can't know the *next* node to expand until those distances are computed.
+So the best case is ~one I/O round-trip per expanded node, and HNSW expands ~100–200 nodes at layer 0.
+
+**IOPS is the other wall.** 3,000 reads/query × 200 QPS = 600,000 random reads/s — a whole
+high-end NVMe drive's rated IOPS, for one index. A B-tree at 200 QPS needs ~200 IOPS.
+
+**Conclusion:** a graph index needs its hot part in RAM. Either everything is in RAM (tier 1), or you
+use a graph *designed* for disk that cuts reads from ~3,000 to ~30–60 (§9.0.2), or you use
+clustering (IVF) whose cells can be read sequentially.
+
+### 9.0.1 When a RAM index outgrows RAM — the page-cache cliff
+
+pgvector stores HNSW in normal 8 KB Postgres pages, and Qdrant/Milvus can `mmap` vectors and graphs
+from disk. Both look fine while the index fits in `shared_buffers` + OS page cache, then fall off a
+cliff. Expected latency with cache hit ratio `h`, 3,000 accesses, 0.1 ms per miss (NVMe):
+
+```
+latency ≈ 3,000 × [ h × ~1 µs  +  (1 − h) × 100 µs ]   (serial worst case; parallel reads ≈ ÷5–10)
+h = 1.00 →   3 ms
+h = 0.99 →   6 ms
+h = 0.90 →  33 ms
+h = 0.50 → 150 ms
+```
+
+A 10% miss rate is a 10× slowdown. That's why "our index is 110% of RAM" performs far worse than
+"10% slower".
+
+Check it in Postgres:
+
+```sql
+-- Index size vs memory
+SELECT pg_size_pretty(pg_relation_size('chunks_embedding_idx'));
+SHOW shared_buffers;
+
+-- Cache hit ratio of the vector index (want > 0.99)
+SELECT idx_blks_hit::float / nullif(idx_blks_hit + idx_blks_read, 0) AS hit_ratio
+FROM pg_statio_user_indexes WHERE indexrelname = 'chunks_embedding_idx';
+
+-- Warm the index into cache after a restart/failover (pg_prewarm extension)
+SELECT pg_prewarm('chunks_embedding_idx');
+```
+
+Remember that the HNSW index competes with your OLTP tables for the same buffer pool (§10.2).
+
+### 9.0.2 How disk-resident designs get the reads down
+
+The fixes all attack one of the three numbers above: reads per query, bytes per read, or rounds.
+
+| Technique | Used by | What it changes | Result |
+|---|---|---|---|
+| Compressed vectors (PQ/BQ) in RAM for navigation | DiskANN, pgvectorscale, Qdrant/Weaviate with quantization | distance to decide the next hop computed from RAM, no I/O | reads only for the final candidates |
+| Vector + adjacency list in the same 4 KB sector | DiskANN | one read gives both the node's full vector and its neighbours | 1 read per hop instead of 2+ |
+| Fewer hops (α-pruned Vamana graph, §2.4) | DiskANN | ~30–60 hops instead of ~150 expansions | ~30–60 reads per query |
+| Beam width `W` parallel reads | DiskANN | issues `W` reads per round | ~10–20 rounds × ~0.1 ms ≈ 2–5 ms |
+| Clustered layout (IVF) | LanceDB, turbopuffer, Milvus IVF | a cell is contiguous on disk → **sequential** read | `nprobe` sequential reads instead of thousands of random ones |
+| Rescore only the top `k × oversample` | all quantized setups (§6.4) | full vectors read for ~40–100 candidates | 40–100 reads, parallel |
+
+IVF on disk example: `nprobe = 32` cells × 610 vectors × 96 B PQ codes ≈ 1.9 MB of **sequential**
+reads per query — ~1 ms on NVMe, and fine even from object storage in a few large range requests.
+That's why object-storage-native stores use clustering rather than a pure graph.
 
 ### 9.1 The three shapes
 
 | | **All in RAM** | **SSD-resident (DiskANN family)** | **Object storage + cache** |
 |---|---|---|---|
-| Query p50 | ~1–10 ms | ~5–30 ms | ~10–20 ms warm, ~1 s cold |
-| Cost driver | RAM $/GB-month | NVMe $/GB-month | S3 $/GB-month (~1–2 orders cheaper) |
-| Cold start | index load time | mmap, fast | first query pays object-storage reads |
+| What's in RAM | vectors + graph | PQ/BQ codes (e.g. 32–100 B/vector) | cache of recently used namespaces |
+| What's on disk | snapshot/WAL only | full vectors + graph, 1 hop ≈ 1 read | NVMe cache; source of truth in S3/GCS |
+| Reads per query | 0 disk reads | ~30–60 random NVMe reads | warm: like SSD; cold: tens–hundreds of object GETs (~10–100 ms each, parallel) |
+| Query p50 (order of magnitude) | ~1–10 ms | ~5–30 ms | ~10–20 ms warm, ~0.5–1 s cold |
+| Cost driver | RAM $/GB-month | NVMe $/GB-month | S3 $/GB-month + requests |
 | Scales to | RAM you can buy | disk you can buy | effectively unbounded |
 | Best for | one hot corpus, latency-critical | large single corpus, cost-sensitive | many namespaces, spiky/sparse access |
-| Worst for | large corpora | very high QPS | latency-critical uniform traffic |
+| Worst for | large corpora | very high QPS (IOPS-bound) | latency-critical uniform traffic |
+| Examples | pgvector (fits in cache), Qdrant/Redis default, Weaviate | pgvectorscale StreamingDiskANN, Milvus `DISKANN`, Qdrant `on_disk` + quantization | turbopuffer, LanceDB on S3, Pinecone serverless |
 
-**The SSD family** (DiskANN/Vamana and descendants) is not "HNSW on disk" — it is a graph designed
-so that traversal touches few enough pages to make SSD viable, with a compressed in-memory
-representation guiding the search and full vectors read from disk only when needed. That is §6.1's
-two-stage structure again, with the storage hierarchy as the second stage. pgvectorscale's
-StreamingDiskANN brings this shape into Postgres.
-
-**The object-storage family** is the genuinely new architecture of the last few years, and it exists
-because of a workload observation: many RAG systems are not one big corpus with uniform traffic, they
-are *thousands of small per-tenant corpora with wildly uneven access*. Keeping 10,000 tenant indexes
-resident in RAM when 200 are active at any moment is paying for 98% idle capacity.
-
-turbopuffer's published architecture is a clean illustration of the tradeoffs, and its numbers show
-the shape well: data lives on object storage, is cached on NVMe after first access, and queries route
-to the node holding the cache. Its stated figures — *first query to a namespace p50 = 874 ms for 1M
-documents; subsequent cached queries p50 = 14 ms for 1M documents* — make the cold/warm cliff
-explicit rather than hiding it. Writes go through a WAL on object storage: *p50 = 165 ms for 500 kB*,
-*~10,000+ vectors/sec*, with *one WAL entry per namespace per second* (concurrent writes group-commit,
-so a write can wait up to a second).
-
-Those are vendor figures for one system, quoted with conditions. What is durable is the *shape*: a
-~60× cold/warm ratio, writes measured in hundreds of milliseconds, and a per-namespace commit
-cadence. Any object-storage-native design will have that shape; the constants will differ.
+**Object storage** is the newest shape and exists because many RAG systems are thousands of small
+per-tenant corpora with uneven access: keeping 10,000 tenant indexes in RAM when 200 are active is
+paying for 98% idle memory. turbopuffer's published figures show the shape: *first query to a
+namespace p50 = 874 ms for 1M documents; subsequent cached queries p50 = 14 ms*; writes via a WAL on
+object storage at *p50 = 165 ms for 500 kB*, *one WAL entry per namespace per second*. That's a
+~60× cold/warm ratio, and any design built on object storage will have a ratio of that kind.
 
 ### 9.2 Cold start is a product decision
 
-The cold/warm cliff is the defining property of tier three and it must be designed around, not
-discovered in production. The options are the usual cache-warming ones and they are all *product*
-choices:
+The cold/warm cliff must be designed around, not discovered in production:
 
-- **Pre-flight/warm queries** on a signal that predicts real traffic — user opens the app, session
-  starts, a scheduled job fires. turbopuffer explicitly supports this pattern.
-- **Pinning** the namespaces you know are hot.
-- **Accepting it** and telling the user, for genuinely cold-path workloads (a quarterly report over
-  an archive) where a one-second first query is fine.
+- **Pre-warm** on a signal that predicts traffic (session start, app open, scheduled job). Postgres:
+  `pg_prewarm`; object stores: a cheap warm-up query (turbopuffer supports this pattern).
+- **Pin** namespaces you know are hot.
+- **Accept it** for genuinely cold workloads (a quarterly report over an archive).
 
-The mistake is measuring p50 on a warm cache in a benchmark, shipping, and then discovering that your
-actual traffic pattern — one query per tenant per hour — means *every* query is cold. Your benchmark
-measured a case that never occurs. Sample your real inter-arrival times per namespace before
-believing any warm number.
+The classic mistake: benchmark p50 on a warm cache, ship, and discover that one query per tenant
+per hour means *every* query is cold (§17 Case 7). Measure inter-arrival times per namespace from
+real logs before trusting a warm number:
 
-### 9.3 The cost inversion
+```
+cold_fraction ≈ P(time since the namespace's previous query > cache TTL)
+blended_p50   ≈ quantile of the mix, e.g. 30% cold × 800 ms + 70% warm × 15 ms → p50 still warm,
+                but p75+ is cold
+```
 
-At 100M × 768-dim fp32, ~330 GB (§5.2):
+### 9.3 The cost inversion — with prices
 
-- **RAM:** roughly the memory of a large instance, priced accordingly, continuously.
-- **NVMe:** perhaps an order of magnitude cheaper per GB-month, with a latency penalty measured in
-  milliseconds.
-- **Object storage:** roughly two orders of magnitude cheaper per GB-month than RAM, plus request
-  costs, plus a cache tier sized to the *working set* rather than the corpus.
+Example: 100M × 768-dim fp32, ~330 GB (§5.2). Approximate cloud list prices (check current pricing
+for your region and provider):
 
-The inversion that decides the architecture: **if your working set is a small fraction of your
-corpus, tier three is dramatically cheaper; if it is most of your corpus, tier one is dramatically
-faster and the cost gap narrows.** So the number to measure before choosing is not corpus size — it
-is *what fraction of your namespaces are touched in a five-minute window*. That is a query against
-your access logs and it should precede the architecture decision, not follow it.
+| Tier | ~$/GB-month | 330 GB/month, storage only | Notes |
+|---|---:|---:|---|
+| RAM (memory-optimized instances) | ~$4–6 | **~$1,300–2,000** | plus replicas; paid continuously |
+| Local/attached NVMe or SSD block storage | ~$0.08–0.30 | ~$25–100 | plus the compute to serve it |
+| Object storage (S3-class) | ~$0.02–0.03 | **~$7–10** | plus per-request costs + NVMe cache sized to the *working set* |
+
+RAM is ~100–200× more expensive per GB than object storage. The decision rule:
+
+- **Working set ≪ corpus** (most namespaces idle): object storage + cache is dramatically cheaper.
+- **Working set ≈ corpus** (uniform traffic over one corpus): the cache must hold everything anyway,
+  so RAM or SSD-resident wins on latency and the cost gap narrows.
+
+The number to measure first is not corpus size but **what fraction of namespaces (or of the
+corpus) is touched in a 5–15 minute window**. That's one query against access logs, and it decides
+the architecture.
 
 ---
 
