@@ -4,7 +4,7 @@
 > **Prerequisites:** [`20-langchain-architecture-and-internals.md`](20-langchain-architecture-and-internals.md)
 > (§8's claim that a tool's usefulness to a model is exactly as good as its type hints and
 > docstring is this chapter's §3 taken to its production conclusion — schema quality is not a
-> nicety here, it is the majority of your tool-selection-accuracy budget),
+> nicety here, it is one of the biggest levers on tool-selection accuracy),
 > [`21-langgraph-deep-dive.md`](21-langgraph-deep-dive.md) (the `ToolNode`, checkpointing, and
 > interrupt-for-approval machinery this chapter's §11.2 assumes as the durable substrate a
 > confirmation gate suspends into), [`22-agent-orchestration-patterns.md`](22-agent-orchestration-patterns.md)
@@ -53,6 +53,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [What tool calling is](#1-what-tool-calling-is)
 2. [The tool calling protocol](#2-the-tool-calling-protocol)
 3. [Tool definition and schemas](#3-tool-definition-and-schemas)
@@ -71,10 +72,102 @@
 16. [Anti-patterns](#16-anti-patterns)
 17. [Interview questions](#17-interview-questions)
 18. [Lab exercises](#18-lab-exercises)
+19. [Real-world cases — incidents with numbers](#19-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A chatbot that only writes text can say something wrong, but it can't *do*
+anything wrong. Once you give it tools (issue a refund, create an order, send an email), its
+mistakes become real actions: money moves, records change, emails go out. The model only
+*suggests* a call; your code runs it. This chapter is about the code that sits between the
+suggestion and the action, and makes it safe.
+
+**A real-world example.** An online store runs a support bot that handles about 10,000 refund
+conversations a day. It has one tool: `issue_refund(order_id, amount)`. (All numbers here are
+illustrative.)
+
+1. **The call itself.** The customer says "my blender arrived broken, order O-5512". The model
+   answers with a structured request, not text: `issue_refund(order_id="O-5512", amount=49.99)`.
+   Your code reads it, runs the refund, and sends the result back so the model can reply "Done,
+   $49.99 is on its way" (§1–§2).
+2. **Wrong order, no check.** Without an ownership check, a customer who types someone else's
+   order number gets their refund. With an **authorization** check (§6), the code asks "does this
+   logged-in customer own O-5512?" and refuses if not. The model never decides this.
+3. **Too much money, no rule.** The model proposes `amount=499.90` (a misread decimal point). A
+   **business rule** (§7.3) says "support bots may refund at most $50 without a manager", so the
+   call is stopped and the model is told why.
+4. **The network blip.** 0.4% of refund calls time out: 40 a day. The payment system often did
+   process them; only the reply was lost. Retrying blindly pays some customers twice. With an
+   **idempotency key** (§8), the retry carries the same key, and the payment system returns the
+   first result instead of paying again.
+5. **Two actions at once.** The model asks for two refunds in one turn. The code runs them in
+   parallel (§10), but reports each result separately, so one failure doesn't hide the other
+   success.
+6. **After the fact.** Every attempt, including the refused ones, goes into an **audit log** (§6.5)
+   and a trace (§13). A month later, "who refunded O-5512, and who tried to?" is one query.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Tool / function calling | the model outputs "call this function with these arguments" instead of text | a waiter writing an order ticket; the kitchen does the cooking |
+| Tool schema | the name, description and argument types of a tool, shown to the model | the menu, with what each dish contains |
+| `tool_call` | one request from the model: tool name + arguments + an ID | one order ticket |
+| Tool result | what your code sends back after running the tool | the kitchen's "dish ready" or "out of stock" note |
+| Registry | the one list of all tools, who owns them, who may use them | the company's list of approved suppliers |
+| Authorization | code checking whether *this* user may do *this* action on *this* item | the bank checking your ID before handing over cash |
+| Business rule | a policy limit, like "max $50 refund" | "cashiers can void up to $50; above that, call the manager" |
+| Idempotency key | a unique ID per action so repeats have no extra effect | a cheque number: the bank won't cash the same cheque twice |
+| Circuit breaker | stop calling a service that keeps failing, for a while | a fuse that trips instead of letting wires overheat |
+| Preview / confirm | first show what would happen, then do it only after approval | a quote from the builder before they start work |
+| Token forwarding | calling other systems with the *user's* own permissions | a courier who carries your signed letter, not a master key |
+| Audit log | a record of every attempted action that is never edited | CCTV footage plus the visitor sign-in book |
+| Dead-letter queue | a list of actions whose outcome is unknown, for a human to resolve | the "problem parcels" shelf at the post office |
+| Prompt injection | text in a document that tries to give the model orders | a forged note slipped into the waiter's order pad |
+
+### Symbols and parameters used in this chapter
+
+This chapter has little math. These are the parameters, knobs and metrics that appear in its code
+and text.
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `tool_call_id` / `tool_use_id` | ID linking a tool result to the call it answers | provider-generated string | the result for call `call_7` must carry `call_7` |
+| `tool_choice` | how strongly the model is pushed to use a tool: auto / any (required) / a named tool / none | `auto` | force `create_purchase_order` for structured extraction |
+| `strict` | OpenAI: decode so arguments exactly match the schema | `true` for write tools | no missing or extra keys possible |
+| `parallel_tool_calls` / `disable_parallel_tool_use` | OpenAI / Anthropic switch for allowing several calls per turn | parallel on by default | turn off when call B needs call A's result |
+| `max_attempts` | how many times a failed call is tried in total | 3 | try, wait 0.5 s, try, wait 1 s, try, give up |
+| `base_delay` | first wait before a retry; doubles each time (exponential backoff) | 0.5 s | waits of 0.5 s, then 1 s |
+| jitter | small random extra wait so retries don't all hit at once | 0 – 0.1 s | 0.5 s becomes 0.53 s |
+| validation retry cap | how many times the model may fix bad arguments | 2 | after 2 bad tries, stop and tell the user |
+| `failure_threshold` | circuit breaker: failures in a row before it "opens" | 5 | 5 timeouts in a row → stop calling for a while |
+| `reset_timeout_s` | circuit breaker: how long it stays open before one test call | 30 s | after 30 s, try one call to see if the service is back |
+| `max_concurrency` | most tool calls running at once | 5 | 8 calls requested → 5 run, 3 wait |
+| `per_call_timeout` / `batch_deadline` | time limit per call / for the whole parallel batch | 10 s / 15 s | one slow call can't hold the turn for a minute |
+| `rate_per_second`, `burst` | token-bucket limit for calls to an outside API | 10 / 20 | up to 20 calls at once, then 10 per second |
+| idempotency key | SHA-256 hash of (task ID, tool, arguments): 64 hex characters | — | same refund retried → same key → paid once |
+| status-check backoff | waits between "did it go through?" checks: `2^attempt` s | 1, 2, 4, 8, 16 s | 5 checks over 31 s, then escalate to a human |
+| preview token TTL | how long an approved preview stays valid; used once | 10 min | approve at 14:00, must execute by 14:10 |
+| poll interval | how often to check a long-running job | 10 – 15 s | report job estimated at 120 s → ~10 checks |
+| `n` | number of tool-calling rounds in one task | 1 – 10 | look up order, check policy, refund → `n = 3` |
+| `base_prompt_tokens` | tokens in the system prompt + tool schemas + user message | 1,000 – 5,000 | 20 tool schemas can take a few thousand tokens |
+| `avg_tool_result_tokens` | average size of one tool result | 100 – 5,000 | an order record ≈ 300 tokens |
+| `O(n)`, `O(n²)` | "grows like n" / "grows like n squared" | — | total input tokens grow roughly with `n²` because history is resent each round |
+| `max_tokens` (result truncation) | cap on how big a tool result may be before it enters context | ~2,000 | a 50 KB JSON is cut to the fields the model needs |
+| p50 / p95 / p99 | latency that 50% / 95% / 99% of calls are faster than | ms – s | p99 = 3 s → 1 call in 100 takes longer than 3 s |
+| tool-selection accuracy | share of test requests where the model picked the right tool | aim ≥ 0.9 | 276 right out of 300 → 0.92 |
+| tool calls per task | average calls to finish one task | 2 – 5 | rising from 2.1 to 3.4 hints the schema got worse |
+| 4xx / 5xx | HTTP error classes: caller's mistake / server's failure | — | 404 "no such order" vs 503 "service down" |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. What tool calling is
+
+> **In plain words.** The model can't press buttons. It can only write a note saying "please call this function with these values". Your program reads the note, decides whether to allow it, runs it, and tells the model what happened.
+>
+> **Real-world example.** A user asks a travel bot "what's the weather in Boston?". The model returns `get_weather(city="Boston")`. Your code calls the weather API, gets "12°C, rain", and sends that back. The model then writes "It's 12°C and raining in Boston." Two model calls, one tool run, all in your code.
 
 Before function calling existed as an API primitive, getting an LLM to "do something" meant asking
 it to produce text in a format your application parsed with regex or a hopeful `json.loads` call,
@@ -83,8 +176,9 @@ had a name — ReAct-style text parsing — and it worked, badly, at a cost that
 creative the model felt that day. Tool calling (OpenAI calls it function calling; Anthropic calls
 it tool use; the underlying mechanism is the same) replaced "hope the text parses" with a real
 protocol: the model is given a set of tool schemas alongside the prompt, and instead of free text
-it can emit a structured object — a tool name and a set of arguments — that the *inference API
-itself* guarantees is syntactically well-formed against the schema you supplied.
+it can emit a structured object — a tool name and a set of arguments — that is shaped by the
+schema you supplied, and that the *inference API itself* can guarantee is well-formed against that
+schema when you turn on its strict / constrained-decoding mode (§2.1).
 
 That guarantee is the entire value proposition, and it is worth being precise about what it does
 and does not cover. The API guarantees the tool call is *syntactically* valid: the named tool
@@ -117,7 +211,7 @@ probability distribution instead of code you wrote and can read.
 
 ### 1.2 The protocol-level mechanics
 
-At the wire level, every tool-calling provider implements the same four-message dance:
+At the wire level, every tool-calling provider implements the same five-step exchange:
 
 ```
 1. Application → Model:   user message + list of available tool schemas
@@ -140,7 +234,7 @@ own, and every section from §6 onward is about what has to happen inside that b
 let step 3 run.**
 
 ```python
-# The four-message dance, made concrete and minimal.
+# The five-step exchange, made concrete and minimal.
 from openai import OpenAI
 
 client = OpenAI()
@@ -199,6 +293,10 @@ document told it to. None of that is in the wire protocol. All of it is in this 
 ---
 
 ## 2. The tool calling protocol
+
+> **In plain words.** OpenAI and Anthropic do the same thing with slightly different message shapes. OpenAI gives you the arguments as a JSON string and has a special `tool` role; Anthropic gives you a ready-made dictionary and sends results back inside a `user` message. Convert both into one internal format right away.
+>
+> **Real-world example.** A team supports both providers. Without a shared format they have 14 places in the code with `if provider == "openai"`. With one `NormalizedToolCall` type made at the edge, they have 2 small converter functions and nothing else changes.
 
 The two dominant providers — OpenAI and Anthropic — implement materially the same idea with
 different wire formats, different defaults, and different rough edges. If you are building anything
@@ -337,10 +435,9 @@ single turn when the calls are independent — "get the weather in Boston and in
 produces two `get_weather` calls in one assistant message rather than two separate round trips.
 OpenAI exposes `parallel_tool_calls: false` to force strictly sequential, one-at-a-time calls (useful
 when tool B's arguments causally depend on tool A's result and you'd rather the model literally
-cannot try to guess both at once). Anthropic's models decide this natively based on task structure
-and don't expose an equivalent kill switch as a top-level parameter as of this writing — you control
-it by how you phrase tool descriptions and, if truly necessary, by disallowing tools that are safe
-to combine. §10 covers the execution-side implications of this in full; the protocol-level point
+cannot try to guess both at once). Anthropic's equivalent is not a top-level parameter: it is a
+flag inside `tool_choice` — `{"type": "auto", "disable_parallel_tool_use": true}` — which limits
+the model to at most one tool call per turn (with `any` or `tool`, exactly one). §10 covers the execution-side implications of this in full; the protocol-level point
 here is just: **check `len(tool_calls) > 1` in your dispatcher unconditionally.** Code that
 assumes exactly one tool call per turn works in every demo and breaks the first time a model
 decides two independent lookups can be batched.
@@ -385,6 +482,10 @@ of raw SDKs.
 ---
 
 ## 3. Tool definition and schemas
+
+> **In plain words.** The model knows only what the schema tells it: the tool's name, its description, and each argument's type and description. So write the description like instructions to a new colleague: when to use this tool, when not to, and what each value must look like.
+>
+> **Real-world example.** A `status` field described only as "string" gets values like `"in_review"` that don't exist. Changing it to `enum: ["pending", "approved", "rejected"]` makes those invalid values impossible to produce.
 
 The schema is the entire interface between the model's reasoning and your code. It is not
 documentation for humans that happens to also be machine-readable — for the model, it is the
@@ -501,9 +602,9 @@ degrades well before the schema stops being syntactically valid, though, for a r
 nothing to do with schema validity: extracting five correctly-typed, correctly-nested fields from a
 conversational description requires the model to hold five separate constraints in its generation
 context simultaneously, and error compounds per field the way retrieval error compounds per hop
-(`04` §13's point, restated one level up the stack). The practical ceiling, from measured behavior
-across current frontier models, is roughly two levels of nesting with fewer than ten total leaf
-fields before you should be flattening the schema, splitting the tool into two calls, or — the
+(`04` §13's point, restated one level up the stack). A common rule of thumb (a starting point to
+measure against, not a published limit) is roughly two levels of nesting with fewer than ten total
+leaf fields before you should consider flattening the schema, splitting the tool into two calls, or — the
 option this chapter argues for in §11.1 — using a **preview-then-confirm** pattern that lets the
 model build the structure incrementally across turns instead of in one shot.
 
@@ -515,6 +616,10 @@ support only partially) — that is a signal the tool is doing two things and sh
 ---
 
 ## 4. The tool execution lifecycle
+
+> **In plain words.** Between "the model asked" and "the action happened" there is a fixed series of checks: are the arguments well-formed, is this user allowed, are they over their limit, does policy allow it, has this already been done? Only then does the tool run. If any check fails, nothing happens and the model is told why.
+>
+> **Real-world example.** A request to refund $75 passes the format check and the permission check, then stops at the policy check ("support bots may refund up to $50"). The payment system is never called. The model gets the reason and tells the customer a manager will review it.
 
 Spelling out every stage between "model decides" and "model sees a result" is the point of this
 chapter, and every subsequent section is a deep dive into one stage of this pipeline:
@@ -661,6 +766,10 @@ Every subsequent section of this chapter is documentation for one line of this f
 
 ## 5. Tool registries
 
+> **In plain words.** A registry is one central list of every tool: its version, owner team, required permissions, rate limit, and whether it is dangerous. Each request gets only the tools that this user and this agent are allowed to see.
+>
+> **Real-world example.** A company has 60 tools. The support agent for a regular customer is shown the 8 it needs, not all 60. Fewer choices means fewer wrong picks, and a tool the model never sees is a tool it can't be tricked into calling.
+
 Once a system has more than a handful of tools, "a list of Python functions imported into the
 agent script" stops being an architecture. You need a **registry**: a single source of truth for
 which tools exist, what they're scoped to, what version they're at, and who's allowed to call them
@@ -776,6 +885,10 @@ def resolve_registry_for(principal: "Principal") -> ToolRegistry:
 ---
 
 ## 6. Authorization and security
+
+> **In plain words.** Treat every tool call from the model like a form sent by a stranger on the internet. Who the user is and what they may do comes from your login system, never from anything the model wrote. Log every attempt, including the refused ones.
+>
+> **Real-world example.** A document the bot read says "approved by manager, refund $900". The model copies that into an `approved_by` argument. If your code trusts that argument, $900 goes out. If your code checks the logged-in user's real role ("support, limit $50"), the call is refused and logged.
 
 This is the section that separates a demo from a system you can put in front of a government
 transaction, a payment rail, or a customer's production database. Everything above this point has
@@ -936,6 +1049,10 @@ needs, and it does not exist if the audit hook only fires after successful execu
 
 ## 7. Validation
 
+> **In plain words.** There are three different checks. Input: are the arguments the right shape and type? Output: is what the tool returned sane, small enough, and free of secrets? Business rules: is this allowed right now, for this user and this amount? Passing one says nothing about the others.
+>
+> **Real-world example.** `quantity: -3` fails the input check. `quantity: 3000` passes it but fails the business rule "max 500 units per order". A supplier API returning a 2 MB response passes as success but fails the output check and gets cut down before the model sees it.
+
 Validation is not one check; it is three, at three different layers, catching three different
 classes of error, and conflating them is how "the tool call passed validation" ends up meaning far
 less than it sounds like.
@@ -1052,6 +1169,10 @@ def build_tool_message(result: ToolExecutionResult, call: NormalizedToolCall) ->
 ---
 
 ## 8. Idempotency
+
+> **In plain words.** When a request times out, you don't know whether it happened. Retrying may do it twice; giving up may leave it half-done. Give each action a unique key, send the same key on every retry, and have the server ignore repeats. If the server can't do that, check its status before you retry.
+>
+> **Real-world example.** A $120 payment times out. With no key, the retry charges the customer $240 in total. With key `a3f9...` sent on both attempts, the payment system sees the second request, recognizes the key, and returns the first receipt. The customer pays $120 once.
 
 This is the section that separates "we built an agent that calls APIs" from "we built an agent
 safe to point at a payment rail or a government system." **Every tool that changes state needs an
@@ -1188,6 +1309,10 @@ at execution time.
 ---
 
 ## 9. Error handling
+
+> **In plain words.** Errors are different kinds, and each needs a different reaction. The caller's mistake (wrong order ID): tell the model, it can fix it. The server is down: retry a little later or stop, and don't ask the model to change arguments. Timeout: you don't know what happened, so check before acting again. Always send the model a short structured error, not a stack trace.
+>
+> **Real-world example.** A shipping API is down and every call waits 30 s before timing out. Ten calls cost 5 minutes. With a circuit breaker that opens after 5 failures, the next calls fail in milliseconds with "shipping service unavailable", and the bot tells the user right away.
 
 Tool execution fails in more distinct ways than a normal RPC call, because the caller is a model
 that has to *understand* the failure well enough to decide what to do next, not just a process that
@@ -1332,6 +1457,10 @@ trackable item.
 
 ## 10. Parallel tool calling
 
+> **In plain words.** The model can ask for several tools at once. Run independent ones side by side to save time, but run two calls that change the same thing (the same stock item, the same order) one after the other. Report each call's result on its own.
+>
+> **Real-world example.** "What's the weather in Boston and Seattle?" → two calls run together: about 1 s instead of 2 s. "Remove 2 of SKU-7 and remove 3 of SKU-7" → run in order, otherwise both may read stock = 10 and one write overwrites the other, leaving 8 or 7 instead of 5.
+
 Modern models frequently emit several tool calls in one turn when the calls are independent. How
 you execute that batch is a real design decision, not a detail.
 
@@ -1443,6 +1572,10 @@ async def execute_batch_with_deadline(calls, ctx, per_call_timeout=10.0, batch_d
 
 ## 11. Complex tool patterns
 
+> **In plain words.** Some actions need more than one step. Search first, let the user pick, then act on the exact ID. For risky actions, show a preview and wait for a yes before doing it. For slow jobs, start the job, check on it now and then, and fetch the result when it's done.
+>
+> **Real-world example.** A purchasing bot previews an order: "3 laptops, $4,197 including tax". The manager clicks approve. The create call carries a one-time token valid for 10 minutes, tied to exactly that preview, so the price can't change between approval and purchase, and the order can't be placed twice.
+
 Real tool-calling systems need more than "call a function, get a result" for the cases that matter
 most operationally: multi-step workflows, human approval before an irreversible action, and
 operations that don't complete within a single request/response cycle.
@@ -1501,7 +1634,7 @@ def create_purchase_order(preview_token: str) -> dict:
     return po_service.commit_from_preview(preview_token)
 ```
 
-`preview_token` is the load-bearing detail: it binds the eventual `create` call to the *exact*
+`preview_token` is the key detail: it binds the eventual `create` call to the *exact*
 previewed state (amounts, line items, computed tax) so that nothing can drift between what a human
 approved and what actually executes, and its single-use, time-boxed nature gives you idempotency
 (§8) as a side effect of the same mechanism — a replayed `create_purchase_order` call with an
@@ -1549,6 +1682,10 @@ about — "showed the user a live log tail; here are the last 20 lines and the e
 ---
 
 ## 12. Enterprise integration patterns
+
+> **In plain words.** Tools usually wrap existing company systems: REST or GraphQL APIs, databases, queues, files, and old SOAP services. Keep all the messy connection details (login, retries, strange error codes, rate limits) in a normal client class, and keep the tool itself a thin wrapper. Never let the model write raw SQL or GraphQL.
+>
+> **Real-world example.** A CRM allows 10 requests per second per API key. One busy agent loop sends 50 per second, and the CRM blocks the key for an hour, for every team. A shared limiter (10/s, bursts up to 20) in front of the CRM prevents that.
 
 This is where tool calling stops being an LLM-API topic and becomes systems integration — the same
 discipline you'd apply building any service that calls REST APIs, GraphQL endpoints, databases,
@@ -1704,6 +1841,10 @@ get the refresh race condition wrong.
 
 ## 13. Observability for tool calls
 
+> **In plain words.** Record every tool call as a trace span: which tool, which user, how long it took, what happened, how many retries. Use the same trace ID in the audit log so engineers and auditors can look at the same event.
+>
+> **Real-world example.** The support bot got slower: median task time went from 4 s to 9 s. The per-tool latency chart shows `lookup_order` p95 rising from 300 ms to 5 s after the order service was upgraded. The problem is found in minutes, not days.
+
 Every tool invocation should produce a trace span with a consistent schema, following
 `../sre-observability/26-llm-and-ai-observability.md` §9's tool-use-and-agent-traces convention,
 so tool call behavior is queryable across the whole fleet of agents rather than debuggable only by
@@ -1769,6 +1910,10 @@ identifier, which turns every serious incident review into manual timestamp corr
 ---
 
 ## 14. Testing tool-calling agents
+
+> **In plain words.** Test three things separately: each tool on its own (no model), the whole check-and-run pipeline with fake model answers, and a small labeled test set against the real model to catch bad schema changes. Test the "must be refused" cases as carefully as the "must work" ones.
+>
+> **Real-world example.** A test replays a saved model answer with a missing field, then a fixed answer. It checks that the pipeline rejected the first, accepted the second, and called the refund backend exactly once. It runs in under a second with no API key.
 
 Tool-calling systems have three genuinely different things that need testing, and conflating them
 into one "test the agent" effort is how authorization bugs and schema regressions both ship
@@ -1854,6 +1999,10 @@ sense of security about the boundary that actually protects the system.
 
 ## 15. The cost of tool calling
 
+> **In plain words.** Every round, the whole conversation so far (including all previous tool results) is sent to the model again. So cost grows faster than the number of rounds. Fewer rounds, parallel calls, smaller tool results and prompt caching all help.
+>
+> **Real-world example.** With a 1,500-token base prompt and 2,000-token tool results, a 3-round task sends 10,650 input tokens in total; a 6-round task sends 39,750: twice the rounds, about 3.7× the tokens (illustrative, computed with §15.1's formula). Cutting results to 400 tokens brings the 6-round task down to 15,750.
+
 Every tool-calling round trip has a real, measurable token cost, and it compounds in a way that
 plain-generation costs don't, because the entire conversation history — including every prior tool
 call and every prior tool result — is resent as input on every subsequent turn.
@@ -1877,8 +2026,11 @@ def estimate_task_token_cost(num_rounds: int, avg_tool_result_tokens: int, base_
 ```
 
 This is why an agent that needed 3 tool calls in the first architecture iteration and needs 8 after
-a schema regression (§13.2's leading indicator) doesn't cost "roughly 2.7x more" — it can easily
-cost 5-8x more, because every one of those extra rounds resends everything before it.
+a schema regression (§13.2's leading indicator) doesn't cost "roughly 2.7x more" — it can cost
+roughly 3-8x more, because every one of those extra rounds resends everything before it. The
+multiplier is higher when tool results are large compared with the base prompt: with a 1,500-token
+base prompt and 2,000-token results, this function gives 10,650 tokens for 3 rounds and 69,400 for
+8 (about 6.5x); with a 3,000-token base prompt and 300-token results, 10,050 vs 33,800 (about 3.4x).
 
 ### 15.2 Minimizing rounds
 
@@ -1916,8 +2068,8 @@ direction.
 
 ## 16. Anti-patterns
 
-**Too many tools.** Beyond roughly 15-20 tools in a single model's active tool list, selection
-accuracy degrades measurably regardless of provider, because the model has to discriminate against
+**Too many tools.** As a model's active tool list grows (teams often report trouble somewhere past
+a couple of dozen tools, but measure your own), selection accuracy tends to degrade, because the model has to discriminate against
 an increasingly crowded, increasingly similar-looking candidate set on every decision. Fix with
 dynamic, per-request scoping (§5.3) — resolve the tool list to what this task plausibly needs, not
 the entire catalog every agent could theoretically touch.
@@ -1962,6 +2114,10 @@ validation failure mode) sits undetected until a customer notices.
 ---
 
 ## 17. Interview questions
+
+> **In plain words.** Interviewers mostly want to hear one idea: the model only proposes a call, and your code decides whether it runs. Answer each question with that idea, one concrete example with a number, and one trade-off.
+>
+> **Real-world example.** "The payment API timed out, what now?" A strong short answer: "I don't know if it went through. Check status or retry with the same idempotency key; if I can't check, mark it unresolved and send it to a human. Never guess."
 
 **1. "What's the actual mechanism behind tool calling — what does the model return, and what
 executes it?"**
@@ -2090,7 +2246,9 @@ does hit a live model, gated in CI, specifically to catch schema-quality regress
 Weak: "each tool call costs some tokens." Strong: explains the compounding effect (§15.1) — every
 turn resends the accumulated conversation, so total input tokens across an n-round task grow closer
 to quadratically than linearly in the number of rounds, which is why a schema regression that
-silently doubles the average number of tool-calling rounds can 5-8x the cost of a task, not 2x.
+silently doubles the average number of tool-calling rounds can raise the cost of a task by up to
+roughly 4x, not 2x (the exact factor depends on how large tool results are compared with the base
+prompt).
 
 **18. "When would you consolidate several narrow tools into one broader tool, and when is that a
 mistake?"**
@@ -2271,3 +2429,147 @@ comparison.
 a check that tool-selection/task-success accuracy didn't regress as the price of the savings.
 *Time:* ~1 day plus API cost.
 *Unblocks:* `11-token-accounting-and-cost.md`'s per-tenant attribution labs.
+
+---
+
+## 19. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a common kind of tool-calling failure: what people saw, why it happened in simple terms, the numbers, and the fix.
+>
+> **Real-world example.** Customers charged twice → Case 1; bot picks the wrong tool more often → Case 2; users see records they shouldn't → Case 3; agent hangs for minutes → Case 4; token bill jumps → Case 5; stock counts drift → Case 6; duplicate government filings → Case 7.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent. They are not any specific company's postmortem.
+
+**Quick index:** double charges → Case 1 · lower tool-selection accuracy after adding tools → Case 2 ·
+cross-user data access → Case 3 · tasks stuck for minutes when a dependency is down → Case 4 ·
+cost per task tripled → Case 5 · inventory drift → Case 6 · duplicate filings after timeouts → Case 7.
+
+### Case 1 — Refunds paid twice after timeouts
+
+**Setup.** E-commerce support bot, 12,000 refunds a day through `issue_refund`, retry wrapper with
+`max_attempts=3`. The payment provider supports idempotency keys and the team sends one.
+
+**Symptom.** Finance finds about 29 double refunds a day, averaging $38 each: roughly $1,100 a day.
+
+**Measurement/Diagnosis.** 0.4% of refund calls time out: `12,000 × 0.004 = 48` a day. Payment logs
+show about 60% of those had actually succeeded (`48 × 0.6 ≈ 29`). Every retry carried a *different*
+idempotency key: `generate_idempotency_key()` was called inside the retry loop, and the key included
+a timestamp (§8.3's most common bug).
+
+**Fix.** Generate the key once, before the first attempt, from `(task_id, tool, args)` only; store
+it in the checkpointed task state (§8.5). Double refunds: 29/day → 0 over the next 30 days.
+
+**Lesson.** Sending an idempotency key is not enough. It must be the *same* key on every retry.
+
+### Case 2 — The catalog grew, accuracy dropped
+
+**Setup.** An internal IT helpdesk agent started with 12 tools. Over six months teams added their own
+tools until every request was sent all 46.
+
+**Symptom.** More "the bot did the wrong thing" tickets; average tool calls per resolved task went
+from 2.1 to 3.4.
+
+**Measurement/Diagnosis.** On a fixed 300-request labeled eval (§14.4), tool-selection accuracy was
+94% (282/300) with 12 tools and 81% (243/300) with 46. Most errors were between near-duplicates:
+`reset_password` vs `unlock_account`, `create_ticket` vs `escalate_ticket`.
+
+**Fix.** Per-request tool scoping from the registry (§5.3): each request gets about 8 tools chosen by
+the user's role and the detected intent; descriptions rewritten to name their nearest confusable
+neighbour (§3.1). Accuracy: 81% → 95% (285/300); calls per task back to 2.2.
+
+**Lesson.** Every added tool is a new way to be wrong. Measure selection accuracy before and after
+adding tools.
+
+### Case 3 — A shared service account widened everyone's access
+
+**Setup.** A sales assistant with a `crm_lookup_contact` tool. The tool used one service-account
+token with read access to all regions.
+
+**Symptom.** A sales rep in one region asked the bot about a competitor account and got contact
+details they could not open in the CRM itself.
+
+**Measurement/Diagnosis.** Joining two weeks of audit records (§6.5) against the CRM's own
+permission table: 1,340 of 52,000 lookups (2.6%) returned contacts the user was not allowed to see
+directly. Nothing was "hacked"; the tool was simply more powerful than the user.
+
+**Fix.** OAuth token forwarding (§6.3): the tool calls the CRM with the user's own token. The CRM
+now refuses those 2.6% itself. Out-of-scope lookups in the next audit: 0. A negative test (§14.5)
+now checks that a user without access gets a refusal.
+
+**Lesson.** Developers usually test with broad accounts, so this bug is invisible in testing. Test
+with the least-privileged real role.
+
+### Case 4 — One dead dependency froze the agent
+
+**Setup.** An order-status agent calls a shipping-carrier API with a 30 s timeout. No circuit breaker.
+
+**Symptom.** During a 40-minute carrier outage, users waited up to 5 minutes for an answer, then got
+a generic error.
+
+**Measurement/Diagnosis.** The agent loop allowed 10 tool calls per task. Each failed after the full
+timeout: `10 × 30 s = 300 s` per task. Worker pool saturation then slowed unrelated requests too.
+
+**Fix.** A per-host circuit breaker (§9.4, `failure_threshold=5`, `reset_timeout_s=30`) and a
+structured `{"error": "server_error", "retryable": false}` message telling the model to answer
+without tracking data. After the first 5 timeouts, later calls fail in milliseconds. In the next
+outage, p99 task time stayed under 4 s and the bot said "tracking is temporarily unavailable".
+
+**Lesson.** Retrying a dead service costs time on every call. Fail fast and tell the user.
+
+### Case 5 — A description edit tripled the token bill
+
+**Setup.** A research assistant: 50,000 tasks a day, 1,500-token base prompt, ~2,000-token tool
+results. Illustrative price: $2.50 per million input tokens.
+
+**Symptom.** Daily input cost rose from about $1,330 to about $4,970 with no traffic change.
+
+**Measurement/Diagnosis.** A "cleanup" of a tool description removed the line saying which fields
+the search tool returns, so the model started calling a second lookup to get them. Rounds per task
+went from 3 to 6. Using §15.1's formula: `3 rounds → 10,650` input tokens, `6 rounds → 39,750`
+(3.7×), because each round resends all earlier results. `50,000 × 10,650 × $2.50/1M ≈ $1,331`;
+`50,000 × 39,750 × $2.50/1M ≈ $4,969`.
+
+**Fix.** Restored the description, added "tool calls per task" as a CI-gated metric (§13.2), and cut
+tool results to the fields the model uses (~400 tokens, §7.2). Even at 6 rounds that gives 15,750
+tokens per task (~$1,969/day); back at 3 rounds it is lower still.
+
+**Lesson.** Twice the rounds costs more than twice the money. Watch calls-per-task as closely as
+success rate.
+
+### Case 6 — Parallel updates lost inventory changes
+
+**Setup.** A warehouse assistant lets staff say things like "move 2 units of SKU-7 to bin A and 3 to
+bin B". The model emits two `update_inventory` calls in one turn; the dispatcher runs every batch in
+parallel.
+
+**Symptom.** Stock counts slowly drift from physical counts.
+
+**Measurement/Diagnosis.** 1,800 batched updates a day; 4% of batches contain two calls on the same
+SKU (`1,800 × 0.04 = 72`). Both calls read the same starting count and each wrote its own result, so
+one change was lost each time: about 72 lost updates a day.
+
+**Fix.** Declare `update_inventory` in `CONFLICTING_RESOURCE_EXTRACTORS` (§10.1) so same-SKU calls
+run one after the other; the inventory service also added a version check on writes. Lost updates:
+72/day → 0.
+
+**Lesson.** "Independent" in the model's mind is not "independent" in your database.
+
+### Case 7 — A timeout reported as "failed" led to duplicate filings
+
+**Setup.** A tax-filing assistant submits to a legacy SOAP service with no idempotency-key support.
+20,000 filings a month.
+
+**Symptom.** Some taxpayers had two filings for the same year and had to contact the agency.
+
+**Measurement/Diagnosis.** 0.2% of submits timed out (`20,000 × 0.002 = 40` a month). The service's
+own records showed 70% of those (`28`) had gone through. The bot told users "submission failed,
+please try again", and 18 of those 28 users resubmitted.
+
+**Fix.** The status-check pattern (§8.4): on timeout, query by `(taxpayer_id, tax_year,
+filing_type)` with waits of 1, 2, 4, 8, 16 s (31 s total). Filings still unknown after that go to
+the dead-letter queue (§9.5) and the user is told "unresolved, a person will confirm". In the next
+month, of 40 timeouts, 38 were settled by the status check and 2 went to the queue; duplicate
+filings: 18 → 0.
+
+**Lesson.** "Timed out" does not mean "failed". Check, and if you can't, say "unknown" honestly.
