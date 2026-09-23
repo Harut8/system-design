@@ -10,6 +10,7 @@ Prerequisites: familiarity with distributed system fundamentals from the `README
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [TCP Fundamentals](#1-tcp-fundamentals)
 2. [UDP and When to Use It](#2-udp-and-when-to-use-it)
 3. [HTTP/1.1 vs HTTP/2 vs HTTP/3](#3-http11-vs-http2-vs-http3)
@@ -24,10 +25,93 @@ Prerequisites: familiarity with distributed system fundamentals from the `README
 12. [Capacity Planning and Performance Math](#12-capacity-planning-and-performance-math)
 13. [Failure Modes and Debugging](#13-failure-modes-and-debugging)
 14. [Interview Patterns](#14-interview-patterns)
+15. [Real-world cases — incidents with numbers](#15-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** Every call between two computers pays a toll in round trips. Opening a
+connection, proving identity with TLS and warming up TCP's speed can cost several round trips
+before any useful data arrives. On a phone far from the server, each round trip can be 100 ms or
+more. This chapter explains where those round trips come from, which protocol (TCP, UDP, HTTP/1.1,
+HTTP/2, HTTP/3, gRPC, WebSocket, DNS, TLS) removes which ones, and what breaks when you get it wrong.
+
+**A real-world example.** A shopping app user in Berlin opens a product page. The API lives in
+Virginia, so one round trip (RTT) is about 100 ms. The response is 200 KB. All numbers below are
+illustrative and assume no packet loss unless stated.
+
+- **Fresh connection, TCP + TLS 1.2:** TCP handshake 1 RTT, TLS 1.2 2 RTT, then the request
+  1 RTT → the first byte arrives at 4 RTT = 400 ms. TCP slow start sends 14.6 KB, then 29.2,
+  58.4, 116.8 KB (219 KB total), so 200 KB needs 4 flights → the last byte arrives at about
+  7 RTT = **700 ms**.
+- **Switch to TLS 1.3 (§9):** one fewer RTT → about **600 ms**.
+- **Reuse a warm connection (§10):** no handshakes and the window is already large → about
+  1 RTT = **100 ms** plus server time.
+- **HTTP/3 with 0-RTT resumption (§3.3):** the request rides in the first packet → first byte at
+  1 RTT, last byte at about 4 RTT = **400 ms** even on a brand-new connection.
+- **Lossy mobile network (§3.2):** the page loads 30 images over one HTTP/2 connection. A single
+  lost packet pauses all 30 for about one RTT. With HTTP/3 only the image that lost the packet waits.
+- **Behind the API (§4, §10):** the product service calls pricing and stock over gRPC on pooled
+  connections, passes along its remaining time budget (deadline), and uses an L7 or client-side
+  load balancer so every pricing pod gets traffic.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| RTT (round-trip time) | time for a packet to go there and a reply to come back | asking a question across a room and hearing the answer |
+| TCP | reliable, ordered byte stream between two machines | a phone call: you dial, both confirm, then talk in order |
+| UDP | single packets, no delivery guarantee | posting postcards: fast, but some may never arrive |
+| Handshake | setup messages exchanged before real data | "Hello?" "Hello, I hear you." "Great, here's why I called." |
+| Slow start | TCP begins slowly and doubles its speed each RTT | a new employee gets small tasks first, bigger ones as trust grows |
+| Congestion control | TCP slows down when the network looks overloaded | easing off the gas when traffic ahead brakes |
+| Head-of-line (HOL) blocking | one stuck item holds up everything behind it | one slow shopper at the only open checkout lane |
+| Multiplexing | many requests share one connection at the same time | many conversations over one phone line, each tagged with a name |
+| QUIC / HTTP/3 | a newer transport over UDP with independent streams and built-in TLS | several separate lanes instead of one: a crash in one lane does not stop the others |
+| TLS / mTLS | encryption plus identity check; mTLS checks both sides | showing ID at the door; mTLS: the door also shows you its badge |
+| gRPC + protobuf | typed remote function calls with compact binary messages | a pre-printed form both sides agreed on, instead of a free-form letter |
+| WebSocket / SSE | a connection that stays open so the server can push messages | an open phone line vs. calling back every minute to ask "anything new?" |
+| DNS + TTL | name-to-address lookup, cached for TTL seconds | a phone book entry you trust for a fixed time before checking again |
+| Connection pool | a set of already-open connections that requests borrow and return | a taxi rank: cars wait ready instead of being built for each ride |
+| TIME_WAIT | a closed connection's slot kept reserved for a while | a parking space coned off for a minute after a car leaves |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| RTT | round-trip time | 0.1–1 ms same datacenter, 60–100 ms across the US, 100–300 ms mobile | Berlin to Virginia ≈ 100 ms |
+| one-way latency | time in one direction, about RTT / 2 | half the RTT | 30 ms one-way → 60 ms RTT |
+| MSS | max TCP payload per packet | 1,460 bytes on Ethernet | 1 MB ≈ 685 packets |
+| cwnd | congestion window: data TCP may have "in the air" unacknowledged | starts at 10 × MSS | grows 14.6 → 29.2 → 58.4 KB per RTT in slow start |
+| IW | initial congestion window | 10 segments ≈ 14.6 KB | first flight of a new connection |
+| ssthresh | size at which slow start stops doubling | set after the first loss | above it, cwnd grows slowly |
+| BDP | bandwidth-delay product = bandwidth × RTT: how much data must be in flight to fill the link | 100 Mbps × 60 ms = 750 KB; 1 Gbps × 60 ms = 7.5 MB | a 64 KB window on a 60 ms path caps at 64 KB × 8 / 0.06 s ≈ 8.7 Mbps |
+| p (loss rate) | fraction of packets lost | 0.01–0.1% wired, 1–2% bad mobile | 1% loss hurts Cubic much more than BBR (§1.2) |
+| MSL / TIME_WAIT | max segment lifetime; how long a closed socket is kept | Linux: 60 s TIME_WAIT | 10,000 closes/s × 60 s = 600,000 sockets |
+| ephemeral ports | local ports for outgoing connections | Linux 32768–60999 = 28,232 | ≈ 470 new connections/s to one IP:port before running out |
+| `tcp_keepalive_time` / `_intvl` / `_probes` | idle time before probing, gap between probes, probes before giving up | Linux defaults 7200 s / 75 s / 9 | 7200 + 75 × 9 = 7875 s ≈ 2.2 h to notice a dead peer |
+| `TCP_NODELAY` | turn off Nagle's batching of small writes | on for RPC | avoids ~40 ms delayed-ACK stalls |
+| RPS / λ | requests per second | 1,000–100,000 | API gateway at 50,000 RPS |
+| in flight (L = λ × W) | requests being served at once = rate × latency (Little's law) | — | 50,000 RPS × 0.02 s = 1,000 in flight |
+| max concurrent streams | HTTP/2 requests allowed at once on one connection | 100–250 (nginx 128) | 1,000 in flight / 100 = 10 connections |
+| Mbps vs MB/s | megabits vs megabytes per second (× 8) | — | 50 MB/s = 400 Mbps |
+| TTL (DNS) | seconds a DNS answer may be cached | 30–300 s, 3600 s for static | TTL 60 s → most clients move within ~1 min |
+| `MaxIdleConnsPerHost` | Go HTTP client: idle connections kept per backend | default 2 | raise to ~100 for a busy backend |
+| pool_size | database pool size, HikariCP rule: cores × 2 + spindles | 4-core SSD box → 9 | 10 connections often beat 100 |
+| deadline | absolute time by which a call must finish, passed downstream | 50 ms in-region, ~500 ms cross-region | 500 ms budget, 100 ms used → 400 ms passed on |
+| TTFT / ITL | LLM time to first token / time between tokens | 200 ms / 30 ms | 500 tokens → 200 + 500 × 30 = 15.2 s |
+| p50 / p99 | latency that 50% / 99% of requests beat | — | p99 = 190 ms → 1 in 100 requests is slower |
+| gRPC codes 4 / 8 / 14 | DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / UNAVAILABLE | — | 14 is usually safe to retry |
+| HTTP 502 / 503 / 504 | bad upstream response / overloaded / upstream too slow | — | proxy timeout hit → 504 |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. TCP Fundamentals
+
+> **In plain words.** TCP turns an unreliable network into a reliable, ordered stream of bytes. The price: a handshake before any data moves, a slow start before it moves fast, and some leftover state after it closes. Most TCP advice boils down to "open connections rarely and reuse them".
+>
+> **Real-world example.** A checkout service in Frankfurt calls a payment API in Virginia (RTT about 90 ms). A fresh TCP + TLS 1.3 connection costs 2 RTT = 180 ms before the request is even sent. A pooled connection skips that, so the call takes about 1 RTT = 90 ms plus server time.
 
 ### 1.1 The Three-Way Handshake
 
@@ -37,9 +121,9 @@ Every TCP connection begins with a three-way handshake. This is not a detail you
 CLIENT                                    SERVER
   |                                          |
   |  ──── SYN (seq=x) ──────────────────>    |
-  |                                          |  (1 RTT)
+  |                                          |  (1/2 RTT)
   |  <──── SYN-ACK (seq=y, ack=x+1) ────    |
-  |                                          |  (1 RTT)
+  |                                          |  (1/2 RTT)
   |  ──── ACK (ack=y+1) + [data] ───────>   |
   |                                          |
   |  Connection established.                 |
@@ -50,8 +134,10 @@ Total latency for first byte:
   - TLS 1.3 handshake:  + 1 RTT  (or 0 for resumption)
   - HTTP request:        + 1 RTT
   ────────────────────────────────────────────
-  First byte arrives:     3 RTT minimum (no TLS resumption)
-                          2 RTT minimum (with TLS resumption)
+  First byte arrives:     3 RTT minimum (TLS 1.3 full handshake; 4 RTT with TLS 1.2)
+                          2 RTT minimum (TLS 1.3 0-RTT resumption: request rides
+                                         in the first TLS flight; plain PSK
+                                         resumption without early data is still 1 RTT)
 ```
 
 **Why this matters in system design**: if your service is in us-east and the database is in us-west (~30ms one-way latency), each new TCP connection costs ~60ms just for the handshake. Add TLS and you are at ~120ms before any data moves. This is why connection pooling (§10) is not optional for any serious system.
@@ -64,16 +150,18 @@ TCP's congestion control algorithm determines how fast data actually flows. The 
 - Uses a cubic function to grow the congestion window after a loss event
 - Loss-based: it only backs off when packets are dropped
 - Problem: in high-bandwidth, high-latency links (long fat networks), Cubic is too conservative. It takes a long time to fill the pipe after a loss event
-- Problem: in datacenter networks with shallow buffers, Cubic causes buffer bloat by filling switch queues
+- Problem: because it only reacts to loss, Cubic keeps pushing until a queue overflows. With deep buffers this fills queues and adds delay (bufferbloat); with shallow datacenter switch buffers it causes frequent drops
 
 **BBR (Bottleneck Bandwidth and Round-trip propagation time)**:
 - Developed by Google, deployed on YouTube, Google Cloud, and most Google services
 - Model-based: measures the actual bottleneck bandwidth and minimum RTT, then paces packets to match
 - Does not wait for packet loss to reduce rate -- it actively probes and adjusts
-- Dramatically better performance on WAN links (2-25x improvement over Cubic for lossy links)
+- Much better on lossy WAN links: Google's BBR paper (Cardwell et al., ACM Queue 2016) reports 2-25x higher throughput than Cubic on its B4 inter-datacenter WAN
 
 ```
-Cubic vs BBR behavior on a 100 Mbps link with 1% packet loss:
+Cubic vs BBR behavior on a 100 Mbps link with 1% random packet loss
+(illustrative, ~30-50 ms RTT; the Mathis estimate for loss-based TCP,
+MSS/RTT × 1.22/sqrt(p), gives ~2.8-4.7 Mbps here):
 
 Cubic:
   Throughput: ~3-5 Mbps  (loss causes aggressive backoff)
@@ -88,7 +176,7 @@ BBR:
 
 ### 1.3 TCP Slow Start
 
-Every new TCP connection starts with a small congestion window (typically 10 segments = ~14KB) and doubles it each RTT until it hits a threshold or detects loss. This means:
+Every new TCP connection starts with a small congestion window (typically 10 segments × 1,460 bytes = ~14.6KB, per RFC 6928) and roughly doubles it each RTT until it hits the slow-start threshold (`ssthresh`) or detects loss. This means:
 
 ```
 RTT 0:  sends 14 KB
@@ -99,17 +187,18 @@ RTT 4:  sends 224 KB
 ...
 
 Time to send a 1 MB response on a fresh connection (30ms RTT):
-  ~7 RTTs = ~210ms just for slow start to ramp up
+  14 + 28 + 56 + 112 + 224 + 448 = 882 KB after 6 rounds, so 7 rounds
+  ~7 RTTs = ~210ms just for slow start to ramp up (plus the handshakes)
 
 Time to send the same 1 MB on a warm, pooled connection:
   ~30ms   (congestion window already large)
 ```
 
-**Design implication**: slow start is the reason why small, frequent requests suffer more from new connections than large bulk transfers. For microservice architectures with many small RPCs, connection reuse is critical.
+**Design implication**: for small, frequent requests the fixed cost of a new connection (handshake RTTs, then a small first window) can be larger than the request itself. For microservice architectures with many small RPCs, connection reuse is critical. Note that Linux also shrinks the window of a connection that sat idle for longer than one retransmission timeout (`net.ipv4.tcp_slow_start_after_idle=1` by default), so a pooled connection that was idle can partly slow-start again; long-lived RPC services often set it to 0.
 
 ### 1.4 TIME_WAIT and Socket Exhaustion
 
-When a TCP connection closes, the side that initiates the close enters `TIME_WAIT` state for 2 * MSL (Maximum Segment Lifetime, typically 60 seconds on Linux). During this time, the (source IP, source port, dest IP, dest port) tuple is occupied and cannot be reused.
+When a TCP connection closes, the side that initiates the close enters `TIME_WAIT`. The RFC says to wait 2 × MSL (Maximum Segment Lifetime; RFC 793 suggests MSL = 2 minutes). Linux hardcodes TIME_WAIT at 60 seconds. During this time, the (source IP, source port, dest IP, dest port) tuple is occupied and cannot be reused.
 
 ```
 Connection close sequence:
@@ -125,17 +214,22 @@ ACTIVE CLOSER                    PASSIVE CLOSER
   |  ...                               |
   |  CLOSED                            |
 
-Problem: a server handling 10,000 short-lived connections/second
+Problem: a client or proxy opening 10,000 short-lived connections/second
+  to ONE backend (same dest IP:port), and closing them first,
   accumulates 10,000 × 60 = 600,000 TIME_WAIT sockets
-  Linux default ephemeral port range: 32768-60999 = ~28,000 ports
+  Linux default ephemeral port range: 32768-60999 = 28,232 ports
+  Sustainable rate to one dest IP:port: 28,232 / 60s ≈ 470 new conns/s
 
-  Result: EADDRINUSE errors, connection failures
+  Result: EADDRNOTAVAIL / "cannot assign requested address", connection failures
+
+  (A server that closes first also piles up TIME_WAIT sockets, but they share
+  its listening port, so they cost memory, not ephemeral ports.)
 ```
 
 **Mitigations**:
 1. **Connection pooling** (§10) -- reuse connections instead of creating/destroying them
-2. `SO_REUSEADDR` / `SO_REUSEPORT` -- allow binding to TIME_WAIT sockets
-3. `tcp_tw_reuse=1` -- allow reuse of TIME_WAIT sockets for new outbound connections (safe for clients)
+2. `SO_REUSEADDR` -- lets a restarted server re-bind its listening port while old connections are in TIME_WAIT (it does not fix outbound port exhaustion; `SO_REUSEPORT` is for several sockets sharing one listening port)
+3. `net.ipv4.tcp_tw_reuse=1` -- allow reuse of TIME_WAIT sockets for new outbound connections (needs TCP timestamps; safe for clients). Do not look for `tcp_tw_recycle`: it broke clients behind NAT and was removed in Linux 4.12
 4. Increase ephemeral port range: `net.ipv4.ip_local_port_range = 1024 65535`
 5. Use long-lived connections (HTTP/2 multiplexing, gRPC channels)
 
@@ -143,20 +237,22 @@ Problem: a server handling 10,000 short-lived connections/second
 
 ### 1.5 Nagle's Algorithm and TCP_NODELAY
 
-Nagle's algorithm batches small writes into larger TCP segments to reduce the number of packets. This introduces latency (up to 200ms delay) for small messages.
+Nagle's algorithm batches small writes into larger TCP segments to reduce the number of packets. The rule: a small segment may be sent only if no earlier data is still unacknowledged. On its own that costs at most one RTT, but combined with the receiver's **delayed ACK** (the receiver waits up to ~40ms on Linux, up to 200ms on some other stacks, before acknowledging) a write-write-read pattern can stall for the whole delayed-ACK timer.
 
 ```
 Without TCP_NODELAY (Nagle enabled):
-  write(4 bytes)  → buffer, wait for ACK or more data
+  write(4 bytes)  → nothing unacked, sent immediately
+  write(4 bytes)  → first write still unacked: buffer
   write(4 bytes)  → buffer, still waiting
-  write(4 bytes)  → buffer, ACK arrives, send all 12 bytes
-  Latency: 200ms+ for the first 4 bytes
+  Receiver delays its ACK (waiting for a response to piggyback on),
+  so the last 8 bytes leave only when the ACK arrives:
+  Latency: up to the delayed-ACK timer (~40ms Linux, up to 200ms elsewhere)
 
 With TCP_NODELAY (Nagle disabled):
   write(4 bytes)  → send immediately
   write(4 bytes)  → send immediately
   write(4 bytes)  → send immediately
-  Latency: ~RTT for each write
+  Latency: each write leaves at once (one-way network delay only)
 ```
 
 **Rule**: for RPC-style communication (gRPC, Redis, database wire protocols), always set `TCP_NODELAY`. For bulk data transfer (file uploads, backups), leave Nagle enabled. gRPC sets `TCP_NODELAY` by default.
@@ -171,7 +267,7 @@ Default:
   tcp_keepalive_intvl = 75s    (75s between probes)
   tcp_keepalive_probes = 9     (9 failed probes to declare dead)
 
-  Time to detect dead peer: 7200 + (75 × 9) = 7875 seconds = ~2 hours
+  Time to detect dead peer: 7200 + (75 × 9) = 7875 seconds = ~2.2 hours
 
 Production setting:
   tcp_keepalive_time  = 60s
@@ -186,6 +282,10 @@ Application-level keep-alive (gRPC PING frames, WebSocket pings, HTTP/2 PING) is
 ---
 
 ## 2. UDP and When to Use It
+
+> **In plain words.** UDP just sends packets. No handshake, no retries, no ordering. That is a feature when old data is useless (a voice sample from 200 ms ago) and a bug when every byte matters (a bank transfer).
+>
+> **Real-world example.** A video call sends 50 audio packets per second. If 1 packet is lost, re-sending it would arrive too late to play, so the app skips it and you hear a 20 ms glitch instead of a 300 ms freeze.
 
 ### 2.1 UDP Basics
 
@@ -214,7 +314,7 @@ UDP:  No congestion control (sends at whatever rate you choose)
 | Health checks / heartbeats | Lightweight, no connection setup cost | SWIM protocol gossip |
 | QUIC / HTTP/3 | Builds reliability and multiplexing on top of UDP in userspace | Google, Cloudflare |
 | Metrics collection | Losing one metric sample is acceptable, throughput matters | StatsD over UDP |
-| Service discovery (mDNS, SSDP) | Multicast to discover peers | Consul, Kubernetes |
+| Service discovery (mDNS, SSDP) | Multicast to discover peers on a local network | Bonjour/Avahi (mDNS), UPnP (SSDP) |
 
 ### 2.3 When Not to Use UDP
 
@@ -229,9 +329,13 @@ UDP:  No congestion control (sends at whatever rate you choose)
 
 ## 3. HTTP/1.1 vs HTTP/2 vs HTTP/3
 
+> **In plain words.** HTTP/1.1 sends one request at a time per connection. HTTP/2 sends many at once over one TCP connection, but one lost packet still pauses all of them. HTTP/3 moves to QUIC over UDP, so a lost packet only pauses the one request it belonged to.
+>
+> **Real-world example.** A shopping app loads 30 product images on a phone with 2% packet loss. On HTTP/2 each lost packet freezes all 30 downloads for about one round trip. On HTTP/3 only the one image with the lost packet waits.
+
 ### 3.1 HTTP/1.1 — Sequential and Wasteful
 
-HTTP/1.1 is a text-based protocol with one request-response pair per TCP connection at a time. To achieve concurrency, browsers open 6-8 parallel TCP connections per origin.
+HTTP/1.1 is a text-based protocol with one request-response pair per TCP connection at a time (pipelining exists in the spec but is disabled in practice). To achieve concurrency, browsers open up to 6 parallel TCP connections per origin.
 
 ```
 HTTP/1.1 with persistent connections (Connection: keep-alive):
@@ -242,7 +346,7 @@ Connection 2:  [req2] ──> [res2] [req4] ──> [res4] [req6] ──> [res6]
 
 Problems:
 1. Head-of-line (HOL) blocking: req3 cannot start until res1 finishes
-2. TCP connection overhead: 6-8 handshakes, 6-8 slow-start ramps
+2. TCP connection overhead: up to 6 handshakes, 6 slow-start ramps
 3. Redundant headers: Cookie, User-Agent, Accept sent on every request (~800 bytes)
 4. No server push: server cannot send resources proactively
 ```
@@ -277,7 +381,9 @@ Key features:
   2. Multiplexing:       multiple streams on one connection
   3. HPACK compression:  header table compresses repeated headers
   4. Server push:        server can push resources before client asks
-  5. Stream priority:    client can prioritize streams (deprecated in H2, replaced in H3)
+                         (rarely helped in practice; Chrome removed it in 2022)
+  5. Stream priority:    the original H2 priority tree was deprecated by RFC 9113;
+                         RFC 9218 "Extensible Priorities" replaces it for H2 and H3
   6. Flow control:       per-stream and per-connection flow control
 ```
 
@@ -312,8 +418,8 @@ pkt5 (Stream 3) arrived, TCP cannot deliver them to the
 application until pkt3 is retransmitted and received.
 
 All streams are blocked by one lost packet on one stream.
-This is worse than HTTP/1.1 with 6 connections, where only
-1 of 6 connections would be blocked.
+On lossy links this can be worse than HTTP/1.1 with 6
+connections, where only 1 of 6 connections would be blocked.
 ```
 
 This is the fundamental problem that HTTP/3 and QUIC solve.
@@ -347,17 +453,24 @@ QUIC architecture:
 
 Key advantages:
 1. No HOL blocking:     each stream is independently sequenced
-2. 0-RTT handshake:     TLS 1.3 integrated, can send data in first packet
+2. Fast handshake:      TLS 1.3 integrated: 1 RTT for a new connection,
+                         0-RTT (data in the first packet) when resuming
 3. Connection migration: connection ID survives Wi-Fi→cellular handoff
 4. Userspace control:    congestion control and loss recovery in application
 ```
 
 **Handshake comparison**:
 ```
-HTTP/1.1 + TLS 1.2:  3 RTT  (TCP SYN + TLS + HTTP)
-HTTP/2 + TLS 1.3:    2 RTT  (TCP SYN + TLS/HTTP combined)
-HTTP/3 (QUIC):        1 RTT  (QUIC combines transport + crypto)
-HTTP/3 0-RTT:         0 RTT  (resumption, sends data immediately)
+Setup round trips BEFORE the first request can be sent
+(add 1 more RTT to get the first response byte back):
+
+TCP + TLS 1.2 (typical HTTP/1.1):  3 RTT  (TCP 1 + TLS 2)
+TCP + TLS 1.3 (typical HTTP/2):    2 RTT  (TCP 1 + TLS 1)
+HTTP/3 (QUIC):                     1 RTT  (QUIC combines transport + crypto)
+HTTP/3 0-RTT:                      0 RTT  (resumption, sends data immediately)
+
+The TLS version, not the HTTP version, decides the TLS cost:
+HTTP/1.1 over TLS 1.3 is also 2 RTT.
 ```
 
 ### 3.4 Comparison Matrix
@@ -368,9 +481,9 @@ HTTP/3 0-RTT:         0 RTT  (resumption, sends data immediately)
 | Multiplexing | No (1 req/conn) | Yes (streams) | Yes (independent streams) |
 | HOL blocking | Per-connection | TCP-level (all streams) | None (per-stream only) |
 | Header compression | None | HPACK | QPACK |
-| Handshake latency | 3 RTT | 2 RTT | 1 RTT (0 with resumption) |
+| Handshake latency (setup before request) | 2-3 RTT (TCP + TLS 1.3/1.2) | 2-3 RTT (TCP + TLS 1.3/1.2) | 1 RTT (0 with resumption) |
 | Connection migration | No | No | Yes (connection ID) |
-| Server push | No | Yes | Yes (rarely used) |
+| Server push | No | In spec; removed from major browsers | In spec; rarely implemented |
 | Encryption | Optional (TLS) | Effectively required | Always (built-in TLS 1.3) |
 | Deployment complexity | Low | Medium | High (UDP, middlebox issues) |
 
@@ -389,9 +502,13 @@ HTTP/3 0-RTT:         0 RTT  (resumption, sends data immediately)
 
 ## 4. gRPC and Protocol Buffers
 
+> **In plain words.** gRPC lets one service call a function on another service as if it were local. Messages are defined in a `.proto` schema and sent as compact binary over HTTP/2. It adds streaming, deadlines and generated client code.
+>
+> **Real-world example.** A ride-hailing dispatcher asks a pricing service for a fare 5,000 times per second. With gRPC the request is a typed `GetFare(trip)` call of about 100 bytes, and if the caller only has 150 ms left, the pricing service knows that too and gives up in time.
+
 ### 4.1 What gRPC Is
 
-gRPC is a high-performance RPC framework built on HTTP/2, using Protocol Buffers (protobuf) as its interface definition language and serialization format. It is the standard for service-to-service communication in modern distributed systems and is the dominant protocol for ML model serving.
+gRPC is a high-performance RPC framework built on HTTP/2, using Protocol Buffers (protobuf) as its interface definition language and serialization format. It is one of the most common choices for service-to-service communication and is widely supported by ML model servers.
 
 ```
 gRPC architecture:
@@ -459,13 +576,14 @@ JSON (human-readable, text):
     {"item_id": "p_042", "score": 0.89, "reason": "content_based"}
   ]
 }
-Size: ~220 bytes
+Size: ~170 bytes (compact, no whitespace)
 
 Protobuf (binary, schema-driven):
 [binary encoding of the same data]
-Size: ~65 bytes  (70% smaller)
+Size: ~77 bytes  (~55% smaller; strings dominate here, so savings are
+                  modest. Number-heavy payloads shrink much more.)
 
-Serialization speed:
+Serialization speed (illustrative; depends heavily on language and library):
   JSON:     ~500 ns to serialize, ~800 ns to deserialize
   Protobuf: ~100 ns to serialize, ~150 ns to deserialize
   (5-6x faster)
@@ -509,7 +627,7 @@ Serialization speed:
 
 ### 4.4 Why ML Serving Uses gRPC
 
-gRPC dominates ML model serving (TensorFlow Serving, Triton Inference Server, TorchServe, vLLM) for specific technical reasons:
+Many ML model servers expose a gRPC API (TensorFlow Serving, Triton Inference Server, TorchServe), usually next to an HTTP/REST one. LLM servers such as vLLM mainly expose an OpenAI-compatible HTTP API with SSE streaming. Internally, gRPC is popular for specific technical reasons:
 
 ```
 ML inference request/response characteristics:
@@ -520,9 +638,12 @@ ML inference request/response characteristics:
 
 Why gRPC wins:
   1. Binary serialization: a 768-dim float32 embedding is 3,072 bytes in protobuf
-                           vs ~6,000 bytes in JSON (each float becomes a string)
+                           vs ~6,000-8,000 bytes in JSON with floats rounded to
+                           ~6 digits, ~17,000 at full precision (each float
+                           becomes a string)
   2. Streaming:           token-by-token LLM generation maps to server streaming
-  3. Code generation:     type-safe tensor shapes catch errors at compile time
+  3. Code generation:     typed messages catch field/type mistakes at compile time
+                           (tensor shapes are still checked at runtime)
   4. HTTP/2 multiplexing: one connection handles thousands of concurrent inferences
   5. Deadlines:           built-in deadline propagation across service chains
   6. Load balancing:      works with service mesh (Envoy, Istio) at L7
@@ -615,6 +736,10 @@ No proxy in the path → lower latency.
 
 ## 5. REST Design Principles
 
+> **In plain words.** REST is a style for HTTP APIs: resources have URLs, you act on them with GET/PUT/POST/DELETE, and every request carries everything the server needs. The most useful idea for distributed systems is idempotency: retrying a request must not do the work twice.
+>
+> **Real-world example.** A customer taps "Pay 49.99 EUR" and the network drops before the reply. The app retries with the same idempotency key, and the server returns the stored first result instead of charging the card a second time.
+
 ### 5.1 REST Is a Constraint Set, Not a Protocol
 
 REST (Representational State Transfer) is an architectural style defined by six constraints. Most "REST APIs" violate most of them. What people call REST is usually "JSON over HTTP with resource-oriented URLs."
@@ -638,7 +763,7 @@ GET    /users/123        → Idempotent, Safe (no side effects)
 HEAD   /users/123        → Idempotent, Safe
 PUT    /users/123        → Idempotent (replaces entire resource)
 DELETE /users/123        → Idempotent (deleting twice = same as once)
-PATCH  /users/123        → NOT idempotent (increment counter twice ≠ once)
+PATCH  /users/123        → NOT guaranteed idempotent ("set name" is, "increment counter" is not)
 POST   /users            → NOT idempotent (creates new resource each time)
 ```
 
@@ -691,7 +816,8 @@ Implementation:
 
 Recommendation for system design interviews: URL versioning.
 It is the most explicit, easiest to route at the load balancer/API gateway,
-and what Google, Stripe, and AWS use.
+and common in large public APIs (Stripe, for example, uses /v1 paths plus
+a date-based version header).
 ```
 
 ### 5.4 Pagination Patterns
@@ -749,7 +875,7 @@ HATEOAS (Hypermedia as the Engine of Application State) means responses include 
 ### 5.6 Rate Limiting and API Design
 
 ```
-Standard rate limiting headers:
+Common rate limiting headers (X-RateLimit-* is a convention, not a standard; Retry-After is standard):
 
 HTTP/1.1 429 Too Many Requests
 X-RateLimit-Limit:     100        (max requests per window)
@@ -778,6 +904,10 @@ Algorithms:
 ---
 
 ## 6. WebSocket
+
+> **In plain words.** WebSocket turns one HTTP connection into a two-way pipe that stays open. Either side can send a message at any time, with no polling. The hard parts are keeping millions of open connections alive and routing a message to the server that holds the right user.
+>
+> **Real-world example.** A chat app has 2 million online users spread over 40 gateway servers (50,000 connections each). When Alice (server 7) messages Bob (server 31), server 7 publishes to a pub/sub channel and server 31 pushes it down Bob's socket.
 
 ### 6.1 What WebSocket Solves
 
@@ -812,7 +942,7 @@ WebSocket (correct solution):
   Client → Server: {"type": "typing", "user": "alice"}
   Server → Client: {"type": "presence", "user": "bob", "status": "online"}
   
-  Either side sends at any time. No polling. Sub-millisecond latency.
+  Either side sends at any time. No polling. Latency ≈ one network trip.
 ```
 
 ### 6.2 The WebSocket Handshake
@@ -894,6 +1024,7 @@ Application-level heartbeat (more common in practice):
   Server sends: {"type": "pong", "ts": 1710532800}
   
   Advantages over protocol-level ping:
+  - Browser JavaScript cannot send protocol-level PING frames at all
   - Works through intermediaries that may not forward WebSocket pings
   - Can include application data (last seen event ID for gap detection)
   - Measurable latency (compare timestamps)
@@ -916,6 +1047,10 @@ Application-level heartbeat (more common in practice):
 ---
 
 ## 7. GraphQL
+
+> **In plain words.** GraphQL lets the client ask for exactly the fields it needs in one request. It saves round trips for the client but moves the work to the server, which can easily end up running one database query per item.
+>
+> **Real-world example.** A mobile home screen shows 10 friends and each friend's latest order. With REST that is 1 + 10 = 11 calls from the phone; with GraphQL it is 1. Without batching, the server now runs the 1 + 10 = 11 SQL queries itself; with DataLoader it runs 2 (one for friends, one `WHERE user_id IN (...)` for orders).
 
 ### 7.1 What GraphQL Solves
 
@@ -1018,13 +1153,16 @@ DataLoader pattern:
 
 4. Persisted queries:
    Client sends a hash, server looks up the pre-approved query
-   Prevents arbitrary query injection
-   Used by: GitHub GraphQL API, Shopify
+   Prevents arbitrary query injection (common for first-party mobile/web clients)
 ```
 
 ---
 
 ## 8. DNS Resolution
+
+> **In plain words.** DNS turns a name like `api.example.com` into an IP address. Answers are cached at several layers for a time called the TTL. Short TTLs mean fast failover but more lookups; long TTLs mean the opposite. Caches that ignore the TTL are a classic outage cause.
+>
+> **Real-world example.** A bank moves its API to a standby region. The DNS record has TTL 60 s, so most clients switch within about a minute, but a service whose connection pool never reconnects keeps sending traffic to the dead region until someone restarts it.
 
 ### 8.1 How DNS Resolution Works
 
@@ -1037,7 +1175,7 @@ Application calls getaddrinfo("api.example.com")
   │
   ▼
 ┌──────────────────────────────┐
-│ 1. Application/Library Cache │  (glibc nscd, Go net.Resolver cache)
+│ 1. Application/Library Cache │  (JVM InetAddress cache, nscd; Go has none)
 │    TTL: varies               │  Hit? → return immediately
 └──────────────┬───────────────┘
                │ miss
@@ -1080,7 +1218,8 @@ DNS record with TTL:
 What TTL means in practice:
   - Resolver caches the record for up to 300 seconds
   - After TTL expires, next query triggers a fresh lookup
-  - Clients may cache beyond TTL (Java's InetAddress caches forever by default!)
+  - Clients may cache beyond TTL (the JVM ignores the record TTL and uses its own
+    setting: 30s by default, forever if a security manager is installed)
 
 TTL tradeoffs:
   Low TTL (30-60s):
@@ -1126,7 +1265,7 @@ GeoDNS / Latency-based routing:
   api.example.com → 10.0.2.1  (resolver in EU → EU datacenter)
 
   Routes users to nearest datacenter based on resolver location.
-  Used by every major CDN and global service.
+  Widely used by CDNs and global services (many also use anycast).
 
 Health-checked DNS failover:
   Primary:   api.example.com → 10.0.1.1  (health check every 10s)
@@ -1141,7 +1280,8 @@ Health-checked DNS failover:
 
 ```
 1. Java DNS caching (the classic trap):
-   Default: InetAddress caches DNS results FOREVER (TTL = -1)
+   The JVM ignores DNS TTLs. Default: 30 seconds, but FOREVER (TTL = -1)
+   when a security manager is installed (older app servers did this)
    Fix: -Dsun.net.inetaddr.ttl=30 (cache for 30 seconds)
    Or: networkaddress.cache.ttl=30 in java.security
 
@@ -1152,7 +1292,8 @@ Health-checked DNS failover:
    Connection pool still sends traffic to 10.0.1.1 (stale connections!)
    
    Fix: set max connection lifetime in pool (e.g., 5 minutes)
-   Fix: periodic re-resolution in the pool (Go's net.Resolver does this)
+   Fix: re-resolve and rebalance (e.g., gRPC's DNS resolver re-resolves when
+        connections fail; plain HTTP pools usually do not)
 
 3. Kubernetes DNS resolution at scale:
    Pod DNS queries go to CoreDNS (cluster service)
@@ -1160,7 +1301,7 @@ Health-checked DNS failover:
    
    Fix: NodeLocal DNSCache (DaemonSet that caches on each node)
    Fix: Use headless services with client-side resolution
-   Fix: Set ndots:1 in pod DNS config (reduces search domain expansion)
+   Fix: Lower ndots (default 5 in Kubernetes) in pod DNS config (reduces search domain expansion)
 
 4. /etc/resolv.conf search domains:
    search default.svc.cluster.local svc.cluster.local cluster.local
@@ -1178,6 +1319,10 @@ Health-checked DNS failover:
 ---
 
 ## 9. TLS and mTLS
+
+> **In plain words.** TLS encrypts the connection and proves the server is who it claims to be. TLS 1.2 needs 2 round trips to set up, TLS 1.3 needs 1. mTLS makes the client prove its identity too, which is how services in a zero-trust network know who is calling.
+>
+> **Real-world example.** A payments service only accepts calls from the checkout service. With mTLS, checkout presents a certificate that names it; a compromised analytics pod without that certificate is rejected during the handshake, before it can send a single request.
 
 ### 9.1 TLS 1.3 Handshake
 
@@ -1224,7 +1369,7 @@ CLIENT                                          SERVER
   |  Only safe for idempotent requests.            |
 ```
 
-**0-RTT replay risk**: an attacker can capture and replay the 0-RTT data. This is safe for GET requests but dangerous for POST requests (could replay a payment). gRPC does not use 0-RTT by default for this reason.
+**0-RTT replay risk**: an attacker can capture and replay the 0-RTT data. This is safe for GET requests but dangerous for POST requests (could replay a payment). Most servers and RPC stacks leave 0-RTT disabled by default for this reason.
 
 ### 9.2 mTLS (Mutual TLS)
 
@@ -1253,7 +1398,7 @@ No service can impersonate another.
 Use cases:
   - Zero-trust networking (SPIFFE/SPIRE)
   - Kubernetes service mesh (Istio, Linkerd)
-  - API authentication (Stripe, Plaid)
+  - B2B API authentication (for example, some banking and payment APIs)
   - Database connections (PostgreSQL ssl_cert)
 ```
 
@@ -1287,7 +1432,7 @@ Short-lived certificates (best practice):
   - Validity: 1-24 hours
   - Rotation: automated, every validity period
   - Revocation: unnecessary (cert expires before revocation propagates)
-  - Used by: SPIFFE/SPIRE, Google BeyondCorp, Netflix
+  - Used by: SPIFFE/SPIRE-based meshes (SPIRE's default X.509 SVID lifetime is 1 hour)
 ```
 
 ### 9.4 Certificate Pinning
@@ -1322,6 +1467,10 @@ Pinning levels:
 
 ## 10. Connection Pooling
 
+> **In plain words.** A connection pool keeps a set of already-open connections and lends them out. You pay for the handshake once instead of on every request. The pool must be sized right, and it must throw away connections that are dead or point to an old address.
+>
+> **Real-world example.** An order service does 1,000 database queries per second, each taking 5 ms. That is only 1,000 × 0.005 = 5 queries in flight on average, so a pool of about 10–20 connections is plenty, instead of opening 1,000 new connections per second.
+
 ### 10.1 Why Connection Pooling Exists
 
 Opening a new connection for every request is prohibitively expensive:
@@ -1334,13 +1483,17 @@ TLS:  1 RTT (TLS 1.3) or 2 RTT (TLS 1.2) ~1-2ms datacenter, ~30-60ms cross-regio
 Auth: 1 RTT (database auth, token exchange) ~1-5ms
 TCP slow start: 7+ RTTs to reach full throughput
 
-Total for first useful byte: 3-5 RTTs = 3-15ms datacenter, 100-250ms cross-region
+Total for first useful byte: 3-5 RTTs = ~3-10ms datacenter (RTT ~1ms plus
+  auth work), ~90-150ms cross-region (RTT ~30ms)
 
-vs. reusing a pooled connection: 0 RTTs, immediate data transfer
+vs. reusing a pooled connection: 0 extra RTTs, immediate data transfer
 
 At 10,000 requests/second with 2ms connection overhead:
-  New connections: 10,000 × 2ms = 20 seconds of CPU time per second (impossible)
-  Pooled:          10,000 × 0ms = negligible overhead
+  New connections: 10,000 × 2ms = 20 s of extra waiting per second, i.e.
+                   every request is 2ms slower and ~20 requests sit in
+                   handshakes at any moment; plus 10,000 × 60s = 600,000
+                   TIME_WAIT sockets and TLS handshake CPU on both sides
+  Pooled:          no handshakes, no TIME_WAIT churn
 ```
 
 ### 10.2 HTTP Connection Pooling
@@ -1372,9 +1525,12 @@ Key parameters:
 
 Common misconfiguration:
   Go's default MaxIdleConnsPerHost = 2
-  If your service calls one backend at 1000 RPS:
-    → only 2 connections reused, 998 create new connections per second
-    → TIME_WAIT socket exhaustion within minutes
+  If your service calls one backend at 1000 RPS with ~20 requests in flight:
+    → only 2 idle connections are kept; the other ~18 are closed after
+      each burst and reopened, which can mean hundreds of new
+      connections per second
+    → TIME_WAIT socket buildup and, above ~470 new conns/s to one
+      IP:port, ephemeral port exhaustion
 
 Fix: set MaxIdleConnsPerHost = 100 (or match your concurrency)
 ```
@@ -1456,7 +1612,9 @@ Best practices:
   - Do NOT create a new channel per RPC (defeats connection reuse)
   - Set keepalive parameters to detect dead connections
   - Use round_robin LB policy for backend with multiple replicas
-  - Set max concurrent streams per connection (default: 100 in most impls)
+    (the default policy, pick_first, sends everything to one backend)
+  - Know the server's max concurrent streams per connection (defaults
+    differ: HTTP/2 recommends at least 100; nginx uses 128)
 ```
 
 ### 10.5 Connection Pool Failure Modes
@@ -1491,6 +1649,10 @@ Best practices:
 ---
 
 ## 11. Protocol Selection for ML/AI Systems
+
+> **In plain words.** An ML request usually crosses several hops: browser to gateway, gateway to feature store, feature store to model server. Each hop gets the protocol that fits it: JSON/REST where humans and browsers are involved, gRPC/binary inside, and streaming (SSE or gRPC streams) for LLM tokens.
+>
+> **Real-world example.** A support chatbot streams a 500-token answer. The first token arrives after 200 ms and the rest at 30 ms each, so the full answer takes 200 + 500 × 30 = 15,200 ms. With streaming the user starts reading at 0.2 s instead of staring at a spinner for 15 s.
 
 ### 11.1 ML Inference Pipeline Protocol Map
 
@@ -1539,8 +1701,8 @@ Option 1: gRPC server streaming (internal)
   Without streaming: user waits 15.2s for complete response
 
 Option 2: Server-Sent Events (client-facing)
-  GET /v1/chat/completions (OpenAI-compatible)
-  Accept: text/event-stream
+  POST /v1/chat/completions (OpenAI-compatible, body has "stream": true)
+  Response Content-Type: text/event-stream
   
   data: {"choices": [{"delta": {"content": "Hello"}}]}
   data: {"choices": [{"delta": {"content": " world"}}]}
@@ -1561,7 +1723,7 @@ Online store requirements:
   - Throughput: 100K+ reads/second
   - Payload: feature vectors (10-1000 floats)
 
-Protocol comparison for feature serving:
+Protocol comparison for feature serving (illustrative numbers):
 
 | Protocol | p50 latency | Payload size (100 floats) | Throughput |
 |----------|-------------|---------------------------|------------|
@@ -1580,6 +1742,10 @@ Recommendation:
 
 ## 12. Capacity Planning and Performance Math
 
+> **In plain words.** A few formulas cover most networking capacity questions: requests in flight = requests per second × latency; bandwidth = requests per second × bytes per request × 8 bits; and a single TCP connection can carry at most window size ÷ RTT.
+>
+> **Real-world example.** An e-commerce API gets 50,000 requests/s at 20 ms each, so 50,000 × 0.02 = 1,000 requests are in flight at any moment. With HTTP/2 and 100 streams per connection, 1,000 ÷ 100 = 10 connections are enough.
+
 ### 12.1 Connection Math
 
 ```
@@ -1590,18 +1756,20 @@ HTTP/1.1 (one request per connection at a time):
   Connections needed: 50,000 × 0.020 = 1,000 concurrent connections
   With connection reuse (keep-alive): ~1,000 pooled connections
   Without connection reuse: 50,000 new connections/second
-    → 50,000 × 60s = 3,000,000 TIME_WAIT sockets per minute
-    → System fails within seconds
+    → 50,000 × 60s = 3,000,000 TIME_WAIT sockets at steady state
+    → To one backend IP:port, the 28,232 ephemeral ports run out
+      in under a second
 
 HTTP/2 (multiplexed, ~100 streams per connection):
-  Connections needed: 50,000 / 100 = 500 connections
-  In practice: 10-50 connections (each handles 1,000-5,000 streams)
+  Streams limit concurrency, not rate: 1,000 in flight / 100 = 10 connections
+  In practice: 10-50 connections (20-100 in-flight streams each,
+  1,000-5,000 requests/second each)
   Much better resource utilization
 
 gRPC (HTTP/2 with long-lived channels):
   Connections: 1 per backend server (multiplexed)
   With 10 backend servers: 10 connections total
-  Each handles 5,000 concurrent RPCs
+  Each handles 5,000 RPC/s, ~100 in flight at a time
 ```
 
 ### 12.2 Bandwidth Math
@@ -1626,7 +1794,7 @@ For a 768-dim float32 embedding vector:
   Protobuf: 768 × 4 bytes = 3,072 bytes (packed repeated float)
   
   At 50,000 inferences/second:
-    JSON:     300 MB/s = 2.4 Gbps (saturates a 10G NIC on a single service)
+    JSON:     300 MB/s = 2.4 Gbps (about a quarter of a 10G NIC for one service)
     Protobuf: 150 MB/s = 1.2 Gbps (half the bandwidth)
 ```
 
@@ -1648,11 +1816,18 @@ Response serialize |  0ms  |  2ms  | JSON/proto  | Client-facing
 Network (client)   | 10ms  | 50ms  | HTTPS       | CDN edge → origin
 ───────────────────┼───────┼───────┼─────────────┼──────────────────
 Total              | 30ms  |190ms  |             | Under 200ms budget
+
+Note: adding p99s is a rough, usually pessimistic budget, not the true p99 of
+the sum. Real p99 must be measured end to end.
 ```
 
 ---
 
 ## 13. Failure Modes and Debugging
+
+> **In plain words.** Most network errors have a small set of causes, and each error name points to one of them: nobody listening (refused), packets silently dropped (timeout), someone slammed the door (reset). Knowing which layer produced the error tells you where to look.
+>
+> **Real-world example.** An IoT backend sees `ECONNRESET` on 3% of device uploads. The load balancer drops connections idle for more than 350 s, and devices upload every 10 minutes on a reused connection. Sending a keep-alive ping every 60 s brings the errors to near zero.
 
 ### 13.1 TCP/Network Failure Modes
 
@@ -1694,8 +1869,9 @@ Total              | 30ms  |190ms  |             | Under 200ms budget
 ```
 7. HTTP 502 Bad Gateway:
    Proxy/LB cannot reach the upstream server.
-   Cause: upstream crashed, upstream too slow (proxy timeout < upstream response time).
-   Debug: check upstream health, increase proxy timeout, check upstream logs.
+   Cause: upstream crashed, refused or reset the connection, or returned an invalid
+          response (e.g., upstream keep-alive timeout shorter than the proxy's).
+   Debug: check upstream health and logs, align keep-alive/idle timeouts.
 
 8. HTTP 503 Service Unavailable:
    Server is overloaded or in maintenance.
@@ -1756,6 +1932,10 @@ gRPC:
 ---
 
 ## 14. Interview Patterns
+
+> **In plain words.** Interviewers rarely want packet diagrams. They want you to pick a protocol for each hop and justify it with one number and one trade-off. A good answer names the client, the traffic pattern, the payload and the failure you are protecting against.
+>
+> **Real-world example.** "Mobile app to our API: HTTPS/JSON, because browsers and phones speak it and we can debug it with curl. Service to service: gRPC, because we make 20,000 calls/s with deadlines. The catch: gRPC needs L7 or client-side load balancing, or new pods get no traffic."
 
 ### 14.1 Pattern: "Why did you choose gRPC / REST / WebSocket here?"
 
@@ -1865,12 +2045,121 @@ Key points:
 | LLM token streaming | TCP+TLS | SSE or gRPC stream | JSON/Proto | Progressive rendering |
 | Chat / collaboration | TCP+TLS | WebSocket | JSON | Full-duplex, low latency |
 | IoT telemetry | TCP/UDP | MQTT or gRPC | Proto/CBOR | Lightweight, constrained devices |
-| Video streaming | UDP | QUIC/WebRTC | Binary | Real-time, loss tolerant |
+| Real-time video (calls) | UDP | WebRTC (RTP/SRTP) | Binary | Real-time, loss tolerant (video-on-demand usually uses HLS/DASH over HTTP) |
 | DNS | UDP | DNS protocol | Binary | Single packet, stateless |
 | Metrics collection | UDP | StatsD | Text | Fire-and-forget, loss acceptable |
 | Database replication | TCP+mTLS | gRPC stream | Protobuf | Ordered, reliable log shipping |
 | CDN edge → client | UDP (QUIC) | HTTP/3 | Varies | 0-RTT, no HOL blocking |
 | Feature store reads | TCP | gRPC or Redis | Proto/RESP | Sub-10ms p99 |
+
+---
+
+## 15. Real-world cases — incidents with numbers
+
+> **In plain words.** Six short incident stories. Each one shows a symptom you might see in
+> production, the numbers that pointed to the cause, the fix, and what changed afterwards.
+>
+> **Real-world example.** "Payments fail every few minutes with `cannot assign requested address`"
+> turns out to be 2,000 new connections per second to one backend, which uses up 28,232 ports in
+> about 14 seconds (Case 1).
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+**Quick index:** outbound connect errors under load → Case 1 · new pods get no traffic → Case 2 ·
+mobile latency worse on bad networks despite HTTP/2 → Case 3 · small messages take ~40 ms → Case 4 ·
+errors continue long after a DNS failover → Case 5 · cross-region copy far slower than the link →
+Case 6.
+
+### Case 1 — Payments proxy runs out of ports
+
+- **Setup.** A Go payments proxy forwards 3,000 requests/s to one fraud-check backend (one
+  virtual IP and port). Each call takes about 20 ms, so about 3,000 × 0.02 = 60 calls are in flight.
+  The HTTP client uses Go's default `MaxIdleConnsPerHost = 2`.
+- **Symptom.** During a sale, bursts of `dial tcp: connect: cannot assign requested address`
+  errors; payment success rate drops from 99.9% to 93%.
+- **Measurement/Diagnosis.** `ss -s` shows about 28,000 sockets in TIME_WAIT, all to the same
+  destination. Only 2 connections stay idle in the pool, so most of the ~60 in-flight connections
+  are closed after use: about 2,000 new connections/s. Steady state would need 2,000 × 60 s =
+  120,000 TIME_WAIT slots, but only 28,232 ephemeral ports exist, so they run out after
+  28,232 / 2,000 ≈ 14 s.
+- **Fix.** Set `MaxIdleConnsPerHost = 200` and `MaxConnsPerHost = 300`. New connections drop from
+  ~2,000/s to under 5/s; TIME_WAIT count drops from ~28,000 to a few hundred; connect errors go
+  to zero.
+- **Lesson.** Port exhaustion is a pool-sizing bug, not a kernel-tuning problem. Size the idle
+  pool to the number of requests in flight (rate × latency).
+
+### Case 2 — New dispatch pods receive zero gRPC traffic
+
+- **Setup.** A ride-hailing dispatch service calls an ETA service over gRPC through a TCP (L4)
+  load balancer. The ETA service autoscales from 3 to 6 pods at the evening peak.
+- **Symptom.** p99 ETA latency climbs from 40 ms to 900 ms even after scaling out.
+- **Measurement/Diagnosis.** The 3 old pods run at 90% CPU; the 3 new pods at 2%. Each dispatch
+  client holds one long-lived HTTP/2 connection opened before the scale-out, and every RPC is
+  multiplexed over it. The L4 balancer only balances connections, so new pods never get any.
+- **Fix.** Switch to client-side `round_robin` over a headless service (one subchannel per pod),
+  and set a server `MaxConnectionAge` of 5 minutes so clients reconnect and see new pods. CPU
+  evens out to about 90% × 3 / 6 = 45% per pod; p99 returns to about 45 ms.
+- **Lesson.** gRPC needs L7 or client-side load balancing (§4.6). Scaling out does nothing if
+  traffic is pinned to old connections.
+
+### Case 3 — Video platform's mobile API is slow on bad networks
+
+- **Setup.** A video platform's mobile app loads its home screen (about 40 packets of API
+  responses and thumbnails) over one HTTP/2 connection. In some markets, cellular loss is about 2%
+  and RTT about 150 ms.
+- **Symptom.** p95 home-screen load is 1.9 s in those markets vs 0.7 s on Wi-Fi.
+- **Measurement/Diagnosis.** With 2% loss and 40 packets, the chance that at least one packet is
+  lost is 1 − 0.98^40 ≈ 55%. Each loss stalls every stream on the connection for at least one RTT
+  (150 ms), longer if the retransmission timer fires. Packet traces show all streams waiting on
+  one retransmitted packet (§3.2).
+- **Fix.** Enable HTTP/3 at the CDN edge, with fallback to HTTP/2 when UDP is blocked. A loss now
+  stalls only the stream that lost the packet, and 0-RTT resumption saves the setup RTT on
+  returning users. p95 drops from 1.9 s to about 1.3 s (illustrative).
+- **Lesson.** HTTP/2 fixes HOL blocking at the HTTP layer but not at the TCP layer. On lossy
+  networks, QUIC's independent streams matter.
+
+### Case 4 — Chat messages take 40 ms instead of 1 ms
+
+- **Setup.** A chat backend sends each message to an internal fan-out service over a custom TCP
+  protocol: one small `write()` for the header, a second for the body, then waits for a reply.
+- **Symptom.** p50 publish latency is about 41 ms inside one datacenter where RTT is 0.3 ms.
+- **Measurement/Diagnosis.** `tcpdump` shows the header leave at once, the body wait about 40 ms,
+  and the receiver's ACK arriving right before the body. Nagle holds the body until the header is
+  acknowledged, and the receiver's delayed-ACK timer (~40 ms on Linux) holds the ACK (§1.5).
+- **Fix.** Set `TCP_NODELAY` and send header and body in one write. p50 drops from ~41 ms to
+  ~1 ms.
+- **Lesson.** A latency that clusters at 40 ms (or 200 ms) on a fast network is a Nagle/delayed-ACK
+  fingerprint.
+
+### Case 5 — Bank ledger writes fail for 22 minutes after a failover
+
+- **Setup.** A bank's ledger service writes to a database behind `db-primary.internal`, DNS TTL
+  60 s. The pool keeps connections open forever.
+- **Symptom.** After a planned failover, 100% of writes fail with "database is read-only" for
+  22 minutes until an engineer restarts the pods.
+- **Measurement/Diagnosis.** DNS switched correctly within 60 s, but the pool's 40 connections
+  were still open to the old primary, now a read-only replica. Nothing forced a reconnect, so the
+  new DNS answer was never used (§8.4, §10.5).
+- **Fix.** Set max connection lifetime to 5 minutes, drop TTL to 30 s, and evict all pooled
+  connections on a "read-only" error. In the next failover test, writes recover in about 45 s.
+- **Lesson.** A DNS TTL only matters if clients look the name up again. Connection lifetime must
+  be shorter than the failover time you promise.
+
+### Case 6 — Cross-region backup copies at a tenth of the link speed
+
+- **Setup.** An IoT telemetry platform copies 500 GB of nightly data from Europe to the US over a
+  1 Gbps link with 80 ms RTT. The copy tool sets a fixed 1 MB socket buffer.
+- **Symptom.** The copy runs at about 100 Mbps and takes about 11 hours, spilling into the
+  morning peak.
+- **Measurement/Diagnosis.** Bandwidth-delay product = 1 Gbps × 0.08 s = 10 MB must be in flight
+  to fill the link. One connection can carry at most window / RTT = 1 MB × 8 / 0.08 s = 100 Mbps.
+  At 100 Mbps, 500 GB takes 500 × 8 / 0.1 s ≈ 11.1 hours.
+- **Fix.** Remove the fixed buffer (setting `SO_RCVBUF` turns off Linux auto-tuning), raise
+  `net.ipv4.tcp_rmem`/`tcp_wmem` maximums to 16 MB, and use BBR since the path has some loss.
+  Throughput rises to about 940 Mbps; the copy takes 500 × 8 / 0.94 s ≈ 1.2 hours.
+- **Lesson.** On long paths, the window, not the link, is often the limit. Compute the BDP before
+  buying more bandwidth.
 
 ---
 
