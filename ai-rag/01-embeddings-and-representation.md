@@ -47,6 +47,7 @@
 15. [Mental models — the compressed set](#15-mental-models--the-compressed-set)
 16. [Lab exercises](#16-lab-exercises)
 17. [Interview questions and system design prompts](#17-interview-questions-and-system-design-prompts)
+18. [Real-world cases — incidents with numbers](#18-real-world-cases--incidents-with-numbers)
 
 ---
 
@@ -80,6 +81,7 @@ direction, so the paragraph is found.
 | §12 | Tracking which model produced each vector, and switching models safely. |
 | §13 | What it all costs. |
 | §17 | Interview questions. |
+| §18 | Real-world cases: what broke, the numbers, and the fix. |
 
 ### Symbols and terms used in this chapter
 
@@ -111,13 +113,26 @@ direction, so the paragraph is found.
 | anisotropy / hubness | quirks of high-dimensional vectors: all vectors crowd in one direction / a few vectors show up as "nearest" for too many queries | — | why a fixed "similarity > 0.8" threshold is unreliable |
 | fine-tuning | further training a model on your own examples | hundreds – thousands of pairs | teaching a model that "PTO" and "annual leave" mean the same |
 | `O(corpus)` | cost grows with the size of your whole collection | — | switching models = re-embedding all 2M chunks |
+| `a`, `p`, `nᵢ`, `sim`, `L` | in the training formula (§2.1): anchor (e.g. a question), its positive match, the negatives, the similarity function, and the loss the training tries to shrink | — | `a` = "reset password?", `p` = the reset guide, `nᵢ` = billing pages |
+| `‖v‖` | the length (L2 norm) of vector `v` | 1 after normalization | a vector sliced from 1024 to 256 numbers may have `‖v‖ ≈ 0.5` until you rescale it |
+| `k` (top-k) / `k` (prefix) | number of results returned; in §6 also the number of dimensions you keep | top-10 / 256 | "return the 10 best chunks"; "keep the first 256 numbers" |
+| `bytes_per_dim` | bytes used to store one number | 4 (float32), 2 (float16), 1 (int8), 1/8 (binary) | 1024 × 4 = 4,096 bytes per vector |
+| Hamming distance | number of bits that differ between two binary vectors | 0 – `d` | `1011` vs `1001` → 1 |
+| `rescore_multiplier` | how many extra candidates the rough search returns for re-checking | 4 | top-10 wanted → re-check 40 |
+| IoU | overlap between the text you retrieved and the text that actually answers (intersection over union) | 0 – 1 | retrieve 2,048 tokens, 300 of them are the answer → low IoU |
+| MaxSim | late-interaction score: for each query token take its best-matching document token, then add them up | — | used by ColBERT (§9.4) |
+| `m`, `ef_construction`, `ef_search` | HNSW index settings: links per node, build-time search width, query-time search width | 16, 200, 100 | higher `ef_search` = more accurate, slower |
+| price per 1M tokens | what an embedding API charges | $0.02 – $0.13 (OpenAI) | 500M tokens on `3-small` = $10 |
 
-If a section gets too technical, read this table and the one-line summary above, and come back to
-the details when you need them.
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Thesis, restated as an engineering claim
+
+> **In plain words.** The embedding model decides which texts count as "similar". Two different models put the same text in completely different places, so their vectors can't be mixed (Voyage's 4-series is the one documented exception, §4.1). Switching models later means re-processing every document you have.
+>
+> **Real-world example.** A support desk has 2 million chunks of about 300 tokens each (600M tokens). Re-embedding them with `text-embedding-3-large` at $0.13 per 1M tokens costs $78. The money is small; the days of backfill, re-testing and risk of a bad switch are not.
 
 Every retrieval system is built on top of a similarity judgment, and the embedding model is the
 thing that makes that judgment. Change the model and you change what counts as "close." Two
@@ -151,6 +166,10 @@ can defend," not "how to pick a vector database plugin."
 ---
 
 ## 2. What an embedding actually is
+
+> **In plain words.** An embedding is a list of numbers. Texts with similar meaning get lists that point in a similar direction, and we measure closeness by that direction (cosine similarity). If every vector is scaled to length 1, the three common ways of measuring closeness give the same ranking. If some vectors are not scaled, the ranking breaks without any error.
+>
+> **Real-world example.** In the numpy example below, 20 of 200 vectors are made 5× longer by a bug. Their meaning didn't change, but dot product now pushes them up the result list, so users see results that are only there because their vectors are "louder".
 
 An embedding is a point in `ℝ^d` produced by a function `f: text → ℝ^d` that was trained so that
 semantically related inputs land close together and unrelated inputs land far apart, under some
@@ -298,6 +317,10 @@ you invented, not one anisotropy or hubness gave you permission to invent.
 
 ## 3. Symmetric vs asymmetric embedding — the most-skipped detail
 
+> **In plain words.** A question ("what's the refund window?") and a document ("Refunds are accepted within 30 days...") are different kinds of text. Many models want to be told which one they are reading. If you forget, or pass the wrong setting, you still get a vector back and nothing errors; results are just worse.
+>
+> **Real-world example.** Illustrative: an HR bot on Cohere embeds user questions with `input_type="search_document"`. On a 50-question test set, the right answer is in the top 10 for 38 questions (recall@10 = 0.76) instead of 42 (0.84) with the correct `search_query` setting. No log line ever shows it.
+
 A query and a document are not the same kind of text. "What was ACME's Q2 revenue growth?" is
 nine words framed as a question. The chunk that answers it is a declarative sentence sitting
 inside a filing. If you embed both with the exact same forward pass and no signal about which
@@ -400,6 +423,10 @@ need for `08`.
 
 ## 4. The 2026 model landscape
 
+> **In plain words.** There are many embedding models. They differ in how much text they can read at once, how long their vectors are, whether they handle images, whether you can download and retrain them, and price.
+>
+> **Real-world example.** Embedding a 100M-token corpus costs $2 on OpenAI's `text-embedding-3-small` ($0.02 per 1M tokens) and $13 on `text-embedding-3-large` ($0.13 per 1M). A 12,000-token contract fits in Cohere `embed-v4.0` (128K tokens) but not in EmbeddingGemma (2,048).
+
 The table below is built from vendor documentation checked 2026-08-08 (fact sheet §1). Prices are
 included only where the fact sheet has a verified number; everything else is left blank rather
 than guessed.
@@ -411,7 +438,7 @@ than guessed.
 | `voyage-4-lite` | 32,000 | 256 / 512 / 1024 (default) / 2048 | text | float, int8, uint8, binary, ubinary | enterprise service | no | — |
 | `voyage-4-nano` | 32,000 | 256 / 512 / 1024 (default) / 2048 | text | float, int8, uint8, binary, ubinary | fully (open weights) | **yes**, on Hugging Face | — |
 | `embed-v4.0` (Cohere) | **128,000** | 256 / 512 / 1024 / 1536 (default) | text, images, mixed text+image (PDF) | float, int8, uint8, binary, ubinary, base64 | enterprise service | no | — |
-| `gemini-embedding-001` | 8,192 (shared across modalities where applicable) | 3072 default, manual-normalize on truncation | text (+ `task_type` for retrieval roles) | — | no | no | unverified, see §13 |
+| `gemini-embedding-001` | 2,048 | 3072 default, manual-normalize on truncation | text (+ `task_type` for retrieval roles) | — | no | no | unverified, see §13 |
 | `gemini-embedding-2` | **8,192, shared across text/image/audio/video/PDF**, 258 visual tokens/PDF page | 3072 default; recommended truncations 768/1536/3072, **auto-renormalizes** | text, image, audio, video, PDF — one shared space | — | no | no | unverified, see §13 |
 | `text-embedding-3-small` (OpenAI) | 8,192 | 1536 default, `dimensions` param truncates | text | — | **no** | no | **$0.02** |
 | `text-embedding-3-large` (OpenAI) | 8,192 | 3072 default, `dimensions` param truncates | text | — | **no** | no | **$0.13** |
@@ -467,6 +494,10 @@ on this fact sheet.
 ---
 
 ## 5. Why leaderboards mislead, and what to do instead
+
+> **In plain words.** Public leaderboards test models on general public data that many models have already seen during training. A high score there doesn't mean the model is best for your documents. Use the leaderboard to pick 3–5 candidates, then test them on 50 of your own real questions.
+>
+> **Real-world example.** In the worked example below, `voyage-4` finds 84.7% of answers and `embed-v4.0` 83.1% on a 50-question legal test set. Their 95% ranges overlap ([0.801, 0.889] vs [0.782, 0.874]), so it's a tie on quality, and the choice comes down to cost and speed.
 
 ### 5.1 The numbers, dated and labeled as secondary
 
@@ -573,7 +604,7 @@ API embedding is fine).
 
 | Constraint | Filter |
 |---|---|
-| Context ≥ 12k tokens | Eliminates EmbeddingGemma (2,048), Gemini (8,192) |
+| Context ≥ 12k tokens | Eliminates EmbeddingGemma (2,048), Gemini (2,048 / 8,192) |
 | English text only | Multimodal not required, but not disqualifying |
 | Budget ≤ $500/mo at ~200k docs | Eliminates models with high per-token cost at scale (check §13) |
 | Fine-tuning optionality | Eliminates OpenAI (cannot fine-tune); keeps Voyage (enterprise), Cohere, open-weight |
@@ -582,8 +613,9 @@ Surviving shortlist from §4's table:
 1. `voyage-4` (32k context, 1024d default, closed API, enterprise fine-tuning)
 2. `embed-v4.0` (Cohere, 128k context, 1536d default, closed API)
 3. `Qwen3-Embedding-8B` (32k context, 4096d, open-weight, self-hostable)
-4. `text-embedding-3-large` (OpenAI, 8,192 context — tight but sufficient, no fine-tuning — kept
-   as a strong baseline because it's cheap and widely benchmarked)
+4. `text-embedding-3-large` (OpenAI, 8,192 context, no fine-tuning — it fails both the 12k-context
+   and the fine-tuning filters, so it is kept only as a baseline: it is cheap, widely benchmarked,
+   and fine for this eval because chunks, not whole documents, are what gets embedded)
 
 Four candidates is a comfortable shortlist. More than five wastes evaluation time; fewer than
 three risks missing something.
@@ -659,6 +691,8 @@ class EvalCandidate:
     dimensions: int
     price_per_m_tokens: float
 
+# price_per_m_tokens: OpenAI's $0.13 is its list price (§4); the Voyage and Cohere figures are
+# illustrative placeholders — check the vendors' current pricing pages before relying on them.
 candidates = [
     EvalCandidate("voyage-4",    voyage_embed,   "document",        "query",           1024, 0.06),
     EvalCandidate("embed-v4.0",  cohere_embed,   "search_document", "search_query",    1536, 0.10),
@@ -705,7 +739,7 @@ def evaluate_candidate(candidate: EvalCandidate, corpus_chunks, golden_set, k=20
 ```
 
 **Critical detail on `input_type`:** §3 showed that using the wrong input_type silently degrades
-recall by 5–15 points. The `EvalCandidate` struct carries the correct input_type for each model
+recall (by how much is corpus-specific — lab 2 in §16 measures it on yours). The `EvalCandidate` struct carries the correct input_type for each model
 because the evaluation is worthless if you get this wrong — and it's the #1 mistake teams make
 when comparing models. Voyage wants `"document"` / `"query"`. Cohere wants `"search_document"` /
 `"search_query"`. OpenAI has no input_type. Qwen uses instruction prefixes. Get it from the
@@ -819,8 +853,10 @@ oai-3-large            $52.00        $0.39       $4.72           no
 ```
 
 At this corpus size, embedding cost is trivial for all API models — the decision is dominated by
-recall quality and operational considerations, not price. At 10× the corpus (4B tokens), the
-cost picture changes and self-hosting Qwen becomes the clear economic winner.
+recall quality and operational considerations, not price. Even at 10× the corpus (4B tokens), the
+one-time embed on `voyage-4` at the illustrative $0.06/1M is $240 — still small next to a GPU
+server. Self-hosting Qwen wins on cost only at much larger volumes, frequent full re-embeds, or
+when data can't leave your network.
 
 **The decision matrix:**
 
@@ -978,8 +1014,8 @@ change.
 terminology. A new user population asks differently from the early adopters. Your golden set,
 built from early query traffic, no longer represents actual usage.
 
-**3. Model deprecation.** Vendors deprecate models (§12). OpenAI deprecated `ada-002` in favour
-of `text-embedding-3-small`. Voyage deprecated the `01/02` series. When your model gets a
+**3. Model deprecation.** Vendors deprecate models (§12). OpenAI now lists `ada-002` as a legacy
+model, superseded by `text-embedding-3-small`. Voyage deprecated the `01/02` series. When your model gets a
 deprecation notice, that's a forced migration — the eval harness should already be running
 against the replacement candidate.
 
@@ -1040,6 +1076,10 @@ def monthly_full_eval(model, corpus_chunks, golden_set, previous_runs: list[Eval
 
 ## 6. Dimensionality and Matryoshka Representation Learning
 
+> **In plain words.** Shorter vectors take less memory and search faster. Some models are trained so that the first part of the vector (say, the first 256 of 2048 numbers) works well on its own. After you cut a vector short, you must rescale it back to length 1.
+>
+> **Real-world example.** 10 million vectors at 2048 numbers × 4 bytes take 81.92 GB. Keeping only the first 256 numbers takes 10.24 GB, 8× less. Your own test set tells you how much accuracy that costs.
+
 ### 6.1 What MRL actually trains
 
 Matryoshka Representation Learning (arXiv 2205.13147, submitted May 2022, last revised Feb 2024)
@@ -1069,7 +1109,7 @@ vector), but one throws away information optimized for a different objective, an
 optimized for exactly the operation you're about to perform on it.
 
 MRL is now widely adopted: OpenAI's `text-embedding-3-*` family, Gemini `embedding-001` and
-`embedding-2`, Voyage's 3/3.5/4 series, Cohere `embed-v4`, Qwen3-Embedding, EmbeddingGemma, and
+`embedding-2`, Voyage's `voyage-3-large`/3.5/4 series, Cohere `embed-v4`, Qwen3-Embedding, EmbeddingGemma, and
 (outside the vendors covered above) `nomic-embed-text-v1.5`, `mxbai-embed-large-v1`, and `jina-v3`.
 If you're picking among 2026-era models, assume MRL support is the norm, not the exception, and
 check for it explicitly only when it isn't advertised.
@@ -1105,8 +1145,8 @@ def truncate_and_renormalize(embedding: np.ndarray, k: int) -> np.ndarray:
     """MRL truncation. Assumes `embedding` is already L2-normalized at full
     dimension (true for every model in §4). Do this manually for any model
     that does not state it auto-renormalizes truncated output (e.g.
-    gemini-embedding-001, OpenAI's `dimensions` param per their own docs,
-    EmbeddingGemma per its docs). Safe to call even where the vendor already
+    gemini-embedding-001, EmbeddingGemma per its docs, and any OpenAI vector
+    you slice yourself instead of using the `dimensions` param). Safe to call even where the vendor already
     renormalizes — renormalizing an already-unit vector is a no-op.
     """
     truncated = embedding[..., :k]
@@ -1165,6 +1205,10 @@ your own system without measuring it.
 ---
 
 ## 7. Quantization
+
+> **In plain words.** Store each number more roughly: 1 byte instead of 4 (int8, 4× smaller) or 1 bit (binary, 32× smaller). Do a fast rough search first, then re-check the best few dozen candidates with the precise numbers. This keeps most of the accuracy.
+>
+> **Real-world example.** A 1024-number vector is 4,096 bytes as float32 and 128 bytes as binary. In the Hugging Face test, binary alone kept ~92.5% of the search quality and binary plus re-checking kept ~96%. On a 41M-text index, memory went from 200 GB to 5.2 GB.
 
 This section draws on the richest verified material on the fact sheet: the Hugging Face blog
 *"Binary and Scalar Embedding Quantization"* (March 2024), MTEB retrieval subset, 15 benchmarks,
@@ -1348,12 +1392,16 @@ to build; the vendor gives you the representations, not the retrieval architectu
 
 ## 8. Context length, truncation, and what the model actually sees
 
+> **In plain words.** Every model has a maximum input length. By default, most APIs quietly cut off whatever doesn't fit and embed only the beginning. In an ingestion pipeline, turn that into an error, or count tokens yourself before sending.
+>
+> **Real-world example.** A 12,000-token contract sent to a model with an 8,192-token limit loses its last 3,808 tokens (32%). A question about a clause in that last part can never find this document, and nothing in the logs says why.
+
 This is the silent-failure section. Every vendor on this fact sheet handles over-length input
 differently, and the defaults are not uniformly safe.
 
 | Vendor | Default behavior on over-length input | How to force a loud failure instead |
 |---|---|---|
-| Gemini (both `-001` and `-2`) | **Silently truncates** inputs exceeding the 8,192-token limit — the doc states this outright | No documented flag on the fact sheet to force an error; you must count tokens yourself before the call |
+| Gemini (both `-001` and `-2`) | **Silently truncates** inputs exceeding the input limit (2,048 tokens for `-001`, 8,192 for `-2`) — the doc states this outright | No documented flag on the fact sheet to force an error; you must count tokens yourself before the call |
 | Voyage AI | `truncation=True` by default — silently truncates | Set `truncation=False` to get an error on over-length input instead of a silently truncated embedding |
 | Cohere | `truncate` defaults to `END` — silently drops the tail | Set `truncate=NONE` to force an error on over-length input |
 | OpenAI | Max input 8,192 tokens (`text-embedding-3-*`), `cl100k_base` encoding | Not on the fact sheet — count tokens client-side with `tiktoken` before sending |
@@ -1405,6 +1453,10 @@ actual risk is much narrower and much rarer than that framing suggests.
 ---
 
 ## 9. The representation limit: a chunk that means nothing alone
+
+> **In plain words.** A chunk like "revenue grew by 3%" doesn't say which company or which year, so a question about "ACME in Q2 2023" can't match it. No better model can fix missing information. The fixes add the missing context: an LLM-written note in front of the chunk, embedding the whole document first (late chunking), or matching word by word (late interaction).
+>
+> **Real-world example.** Anthropic reported that adding a short context note to every chunk cut the share of failed top-20 searches from 5.7% to 3.7%, and to 1.9% when combined with keyword search and reranking, on their own test set.
 
 ### 9.1 The core failure
 
@@ -1538,6 +1590,10 @@ rows in §9.2's table) is `04-retrieval-hybrid-and-reranking.md`'s job.
 
 ## 10. Domain adaptation: when to fine-tune and when not to
 
+> **In plain words.** Fine-tuning means training the model further on your own examples. It is expensive and hard to undo: every document must be re-embedded with the new model. Try cheaper fixes first: correct query/document settings, better chunks, keyword search next to vector search, and a reranker.
+>
+> **Real-world example.** An HR bot misses questions that say "PTO" when the policy says "annual leave". Adding keyword search and a context note mentioning "PTO" often closes that gap in an afternoon. Fine-tune only if your test set still shows a gap after those.
+
 ### 10.1 The decision boundary, in order
 
 Fine-tuning an embedder is the most expensive and least reversible lever in this entire chapter —
@@ -1631,6 +1687,10 @@ selection generally.
 
 ## 11. Multilingual and multimodal
 
+> **In plain words.** Multilingual models put the same meaning in different languages close together, so a French question can find an English document. Multimodal models put images, PDFs and text in one space, so a text question can find a chart without reading the text out of it first. Both have limits you must test.
+>
+> **Real-world example.** `gemini-embedding-2` charges 258 tokens per PDF page from an 8,192-token budget, so at most 31 pages fit (31 × 258 = 7,998), before any text. A 40-page PDF silently loses at least its last 9 pages.
+
 ### 11.1 Cross-lingual retrieval, and where it breaks
 
 A multilingual embedding model is trained so that semantically equivalent text in different
@@ -1677,6 +1737,10 @@ the pushdown and filtered-search theory this leans on is
 ---
 
 ## 12. Drift, versioning, and migration
+
+> **In plain words.** Record on every vector which model (and settings) produced it. To switch models, build a second index next to the old one, test both on the same questions, switch only if the new one is clearly better, and keep the old one around for a quick rollback.
+>
+> **Real-world example.** Re-embedding a 500M-token corpus on `text-embedding-3-small` costs $10. The expensive mistake isn't the bill; it's searching half-old, half-new vectors with one query, which quietly returns nonsense for the unmigrated half.
 
 This is the operational heart of the chapter — the section that turns §1's abstract "it's a schema
 decision" into something you actually run in production.
@@ -2105,7 +2169,8 @@ CREATE TABLE document_embeddings (
 CREATE INDEX idx_active_embeddings ON document_embeddings
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 200)
-    WHERE version_id = (SELECT id FROM embedding_versions WHERE is_active = true);
+    WHERE version_id = 2;  -- the active version's id, written as a literal:
+                           -- PostgreSQL does not allow subqueries in an index predicate
 ```
 
 **The partial index is the key insight.** Instead of building a global HNSW index over all
@@ -2263,11 +2328,12 @@ row to `embedding_versions`, create one partial index, done. No new columns, no 
 cleanest DDL for ongoing multi-model coexistence.
 
 **When it hurts:**
-- The `::vector(d)` cast in every query and index definition is easy to get wrong — use the wrong
-  dimension and pgvector silently truncates or pads with zeros depending on direction.
-- No compile-time dimension safety: the untyped column accepts any length, so a pipeline bug that
-  produces 768-dim vectors for a 1024-dim model inserts successfully and silently degrades
-  retrieval (the partial index silently ignores rows that don't cast cleanly).
+- The `::vector(d)` cast in every query and index definition is easy to get wrong — cast to the
+  wrong dimension and pgvector raises an "expected N dimensions" error, so the query or index
+  build fails until every cast matches.
+- No compile-time dimension safety: the untyped column accepts any length. A pipeline bug that
+  produces 768-dim vectors for a 1024-dim model is caught only when the partial index's cast runs
+  (an insert error for that `model_id`), and not at all for a `model_id` that has no index yet.
 - Expression indexes can't use all pgvector optimizations available to natively-typed columns.
 
 ---
@@ -2361,8 +2427,9 @@ Vectors at 768 dimensions and above (~3 KB) exceed PostgreSQL's ~2 KB inline thr
 to the TOAST relation — a separate physical table with **its own autovacuum schedule**. An UPDATE
 that changes a TOASTed vector writes new TOAST chunks AND dead TOAST chunks, and the TOAST
 table's bloat is invisible to `pg_stat_user_tables` (you need `pg_stat_all_tables` filtered to the
-TOAST relation's OID). A re-embed job that UPDATEs 500K vectors can silently double a 400 GB
-table overnight and leave autovacuum chewing through the TOAST relation for days.
+TOAST relation's OID). A re-embed job that UPDATEs every vector in a table leaves a dead copy of
+each one behind, so the table's heap and TOAST storage can roughly double before vacuum catches
+up — and autovacuum can spend days working through a large TOAST relation.
 
 **INSERT-only patterns (Options B/C/D) avoid this entirely.** New embeddings are INSERTs into rows
 that never existed before — no dead tuples, no TOAST churn, no vacuum pressure. Old embeddings
@@ -2376,7 +2443,7 @@ If you must use Option A (UPDATE-based re-embedding), mitigate the bloat:
 -- Aggressive autovacuum on the embedding table during re-embed.
 ALTER TABLE documents SET (
     autovacuum_vacuum_scale_factor = 0.01,   -- vacuum at 1% dead tuples (default 20%)
-    autovacuum_vacuum_cost_delay = 2,        -- less throttling during vacuum
+    autovacuum_vacuum_cost_delay = 0,        -- no throttling (default is 2 ms on PG 12+)
     autovacuum_analyze_scale_factor = 0.01
 );
 
@@ -2668,7 +2735,7 @@ migration_log:
     started: "2026-02-01"
     completed: "2026-03-15"
     reason: "asymmetric embedding support, MRL truncation for storage reduction"
-    re_embed_cost: "$42.00"
+    re_embed_cost: "$126.00"            # 2.1B tokens × the illustrative $0.06/1M used in §5.4
     corpus_tokens: 2_100_000_000
     recall_delta: "+4.2% recall@20 (p<0.05, bootstrap CI on 50-query golden set)"
 ```
@@ -2688,6 +2755,10 @@ problem in its own right —
 ---
 
 ## 13. Cost model for the representation layer
+
+> **In plain words.** You pay three ways: once to embed the documents, a little for every question, and every month to keep the vectors in memory or on disk. At large scale the monthly storage bill is the biggest, which is why shorter and rougher vectors (§6, §7) matter for cost.
+>
+> **Real-world example.** 100,000 questions a month × 30 tokens = 3M tokens, which costs $0.06 on `text-embedding-3-small`. On the other hand, moving a 41M-text index from 200 GB to 5.2 GB of RAM saves about $740 a month at $3.8 per GB-month.
 
 Symbolic formulas first, verified prices plugged in only where the fact sheet has them.
 
@@ -3022,6 +3093,10 @@ this from a one-off calculation into something you can re-run after every ingest
 
 ## 17. Interview questions and system design prompts
 
+> **In plain words.** Interviewers want a simple explanation first, then one number, then one trade-off. Formulas only if asked.
+>
+> **Real-world example.** "What does binary quantization give you?" → "Each number becomes 1 bit, so vectors are 32× smaller; you keep about 92–96% of quality if you re-check the top candidates with full vectors; the cost is a second, precise pass."
+
 This section maps the chapter's content to the questions you'll actually face — in system design
 rounds, ML-focused interviews, and architecture reviews. Each question below names the sections it
 draws from and gives the answer structure an interviewer expects, not just the facts.
@@ -3224,8 +3299,8 @@ Key moves:
 **"We have 100M documents and queries in 12 languages. Design the retrieval layer."**
 
 Key moves:
-- Multilingual embedding model is required (§11.1). Qwen3-Embedding ranks #1 on MTEB
-  multilingual; Gemini `embedding-2` and Cohere `embed-v4` also support it.
+- Multilingual embedding model is required (§11.1). Qwen3-Embedding-8B ranked #1 on the MTEB
+  multilingual board as of June 2025 (rankings change often — §5.1); Gemini `embedding-2` and Cohere `embed-v4` also support it.
 - 100M documents at 1024 dims × 4 bytes = 400 GB float32. MRL to 256 dims = 100 GB. Binary
   quantization on top = ~3 GB in memory + int8 on disk for rescore. This is the §7.6 stacking
   argument — without it, the index doesn't fit in RAM.
@@ -3292,6 +3367,154 @@ the truncation sweep (Lab 3) and the quantization benchmark (Lab 4) before commi
 the "knee" where recall drops faster than savings justify is different for every corpus.
 Storage cost dominates at scale because it's a monthly recurring charge, not a one-time bill
 (§13.1) — this is the economic argument that justifies the engineering effort.
+
+---
+
+## 18. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of problem teams hit with embeddings in production: what users saw, why it happened in simple terms, the numbers, and the fix.
+>
+> **Real-world example.** Quick index: quality dropped after a refactor → Case 1; long documents can't be found → Case 2; vectors made shorter and results got worse → Case 3; quality crashed halfway through a model switch → Case 4; memory bill too high, or binary vectors won't insert → Case 5; about to switch to the "#1" model → Case 6; the end of long PDFs is never found → Case 7.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent. They are not any specific company's post-mortem, and you
+can recompute every number.
+
+### Case 1 — The refactor that changed `input_type`
+
+**Setup.** An HR assistant over 40,000 policy chunks, embedded with Cohere `embed-v4.0`. The team
+has a 120-question golden set. A refactor replaced two embedding helpers with one shared `embed()`
+function that hard-codes `input_type="search_document"`.
+
+**Symptom.** No errors. Over two weeks, the share of answers users mark as unhelpful rises from 6%
+to 11%.
+
+**Measurement/Diagnosis.** Golden-set recall@10 fell from 0.88 (106 of 120 questions) to 0.79 (95
+of 120). The request logs show the same `input_type` on the query path and the ingestion path (§3).
+Documents were embedded correctly; only queries were wrong.
+
+**Fix.** Pass `input_type="search_query"` on the query path. No re-embedding needed, because the
+document side was right. Recall@10 back to 0.88 the same day. A unit test now asserts that query
+and document calls use different settings (§14, anti-pattern 2).
+
+**Lesson.** The `input_type` pair is part of the schema. Test it like one.
+
+### Case 2 — Bigger chunks, silently cut off
+
+**Setup.** Contract search over 18,000 contracts, self-hosted EmbeddingGemma (2,048-token limit)
+through a library that truncates long input without an error. To "keep clauses together", someone
+raised the chunker's maximum from 1,500 to 6,000 tokens. Result: 240,000 chunks.
+
+**Symptom.** Lawyers report that questions about late clauses (termination, liability caps) "never
+find anything", while short-section questions work fine.
+
+**Measurement/Diagnosis.** A token audit (lab 6) finds 31,200 of 240,000 chunks (13%) over 2,048
+tokens. Those chunks average 5,400 tokens, so on average 3,352 tokens (62%) of each one are never
+seen by the model (§8). On the 150-question golden set, recall@10 is 0.81 (122/150); on the 30
+questions whose answer sits in an over-long chunk, it's 0.37 (11/30).
+
+**Fix.** Chunk maximum back to 1,800 tokens, plus a pre-embed check that rejects anything over
+2,048 tokens instead of sending it. The 30-question subset goes from 11/30 to 25/30 (0.83); overall
+from 122/150 to 136/150 (0.81 → 0.91).
+
+**Lesson.** A chunk-size change must be checked against the model's input limit. Make over-length
+input an error, not a silent cut.
+
+### Case 3 — Shorter vectors, forgot to rescale
+
+**Setup.** Product search over 5 million products with `gemini-embedding-001` (3,072 dimensions).
+To save memory the team slices each vector to its first 768 numbers in their own code:
+5M × 3,072 × 4 bytes = 61.44 GB becomes 5M × 768 × 4 bytes = 15.36 GB. The index uses inner
+product.
+
+**Symptom.** Search quality visibly drops: recall@10 falls from 0.86 at full size to 0.71, while a
+quick offline test predicted about 0.84 at 768 dimensions.
+
+**Measurement/Diagnosis.** The lengths (`‖v‖`) of the stored vectors vary widely instead of all
+being 1.0. `gemini-embedding-001` doesn't rescale truncated output (§6.2), so inner product rewards
+products whose vectors happen to be longer — the §2.2 bug.
+
+**Fix.** Rescale every stored 768-number vector to length 1 (no API calls needed; it's a
+division) and rescale the query the same way. Recall@10 goes to 0.84, with the same 15.36 GB.
+
+**Lesson.** After cutting a vector short, rescale it. Assert `‖v‖ ≈ 1` at insert time.
+
+### Case 4 — One column, two models
+
+**Setup.** A support desk with 2 million chunks (about 350 tokens each) migrates from `ada-002` to
+`text-embedding-3-small`. Both output 1,536 numbers, so the backfill writes new vectors into the
+same column and nothing complains. Queries switch to the new model on day one.
+
+**Symptom.** Three days in, agents say search "went random" for older tickets.
+
+**Measurement/Diagnosis.** 1.1 million chunks (55%) have new vectors, 0.9 million (45%) still have
+old ones (§12.2). Golden-set recall@10 is 0.57, down from 0.83 before the migration. The numbers fit:
+new-vector chunks are found at about 0.87, old-vector chunks at about 0.20 (close to chance),
+and 0.55 × 0.87 + 0.45 × 0.20 ≈ 0.57.
+
+**Fix.** Move to a version-tagged table (§12.7.3 Option C), query the old and new versions
+separately until the backfill finishes, then switch. Re-embed cost: 2M × 350 = 700M tokens × $0.02
+per 1M = $14. After cutover, recall@10 is 0.87.
+
+**Lesson.** Same vector length does not mean same space. Tag every vector with its model version,
+and never search a mixed set with one query vector.
+
+### Case 5 — Binary vectors: one insert bug and one quality dip
+
+**Setup.** A 30-million-chunk index at 1,024 dimensions in float32 needs 30M × 4,096 bytes =
+122.88 GB of RAM. The team switches to binary vectors: 30M × 128 bytes = 3.84 GB.
+
+**Symptom.** First, every insert fails: the binary column was declared with length 1,024. After that
+is fixed, recall@10 drops from 0.90 to 0.83.
+
+**Measurement/Diagnosis.** 1,024 bits pack into 128 bytes, not 1,024 (§7.2). The quality dip is
+expected for binary search without a re-check: 0.83 / 0.90 = 92% retention, in line with the
+~92.5% from §7.1.
+
+**Fix.** Declare the packed length as 128 bytes. Add rescoring (§7.3): take the top 40 (4 × 10)
+from the binary search and re-check them against int8 vectors on disk (30M × 1,024 bytes =
+30.72 GB). Recall@10 goes to 0.87 (97% retention). RAM at the §7.5 basis of $3.8 per GB-month:
+$466.94 → $14.59, saving about $452 a month.
+
+**Lesson.** Binary quantization needs two things: the right packed length, and a re-check stage.
+
+### Case 6 — Switching to the "#1" model
+
+**Setup.** A bank's internal knowledge base (1.5B tokens) plans a quarter-long migration because a
+new model ranks far above theirs on MTEB. Current model: an API at $0.02 per 1M tokens. Candidate:
+$0.13 per 1M.
+
+**Symptom.** None yet. The risk is spending a quarter and $195 per full re-embed (1.5B × $0.13 /
+1M) instead of $30 (1.5B × $0.02 / 1M) for no real gain.
+
+**Measurement/Diagnosis.** On a 60-question golden set from real staff questions, the candidate
+scores recall@10 0.80 [0.70, 0.88] and the current model 0.78 [0.68, 0.87]. The ranges overlap
+heavily: on this data it's a tie (§5.2, §5.6 mistake 3).
+
+**Fix.** Keep the current model. Spend the effort on contextual retrieval (§9.2) instead:
+recall@10 goes from 0.78 to 0.86 on the same golden set, with no model change.
+
+**Lesson.** A leaderboard gap is not your gap. Measure on your own questions with a confidence
+interval before paying for a migration.
+
+### Case 7 — The last pages of long PDFs
+
+**Setup.** Insurance policy PDFs, 45 pages on average, embedded whole with `gemini-embedding-2`
+(258 tokens per page, 8,192-token shared budget, silent truncation — §4.1, §8).
+
+**Symptom.** Questions about exclusions, which usually sit near the end of a policy, almost never
+find the right policy.
+
+**Measurement/Diagnosis.** 45 × 258 = 11,610 tokens, over the 8,192 budget. At most 31 pages fit
+(31 × 258 = 7,998), so pages 32–45 (14 pages, 31% of each document) are never seen. Recall@10 on
+exclusion questions: 0.22.
+
+**Fix.** Embed each PDF in 10-page windows: 10 × 258 = 2,580 tokens, leaving 5,612 for text.
+A 45-page policy becomes 5 vectors instead of 1 (5× the vectors to store). Recall@10 on exclusion
+questions goes to 0.85.
+
+**Lesson.** For multimodal input, count page tokens before you send. The budget is shared and runs
+out silently.
 
 ---
 
