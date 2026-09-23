@@ -83,6 +83,10 @@ Kafka is the right answer when you need one or more of: durable event storage wi
 
 ## 2. Core Architecture
 
+> **In plain words.** Kafka is a group of servers (brokers). Each topic is split into partitions, and each partition is copied to a few brokers. One copy is the leader and takes all writes; the others follow and stay ready to take over.
+>
+> **Real-world example.** A ride-hailing app has a `trip-events` topic with 6 partitions and 3 copies each on 3 brokers. That is 18 partition copies, 6 per broker. If broker 2 dies, the 2 partitions it led get new leaders on brokers 0 and 1 within seconds, and no acknowledged trip event is lost.
+
 ### 2.1 Brokers, Topics, Partitions
 
 A Kafka **cluster** is a set of servers called **brokers**. Each broker holds some subset of the data. The unit of data organization is the **topic** -- a named feed of messages (think: "user-clicks", "order-events", "page-views"). Each topic is divided into one or more **partitions**, and each partition is an ordered, immutable sequence of records.
@@ -110,7 +114,7 @@ Cluster (3 brokers, topic "user-events" with 6 partitions, RF=3)
 Key rules:
 - A partition lives on exactly one broker (as leader) and is replicated to (replication factor - 1) other brokers as followers.
 - All client reads and writes go to the partition leader. (Kafka 2.4+ allows follower reads for latency-sensitive geo-distributed consumers, but this is not the default.)
-- The **replication factor** (RF) determines how many copies of each partition exist. RF=3 means the cluster survives two broker failures for any partition.
+- The **replication factor** (RF) determines how many copies of each partition exist. RF=3 means acknowledged data survives two broker failures for any partition, but with the usual `min.insync.replicas=2` the partition stops accepting `acks=all` writes once two of its three replicas are down (see §9.4).
 
 ### 2.2 Physical Layout: Segments, Logs, and Indexes
 
@@ -188,6 +192,10 @@ Benefits of KRaft:
 
 ## 3. Producers
 
+> **In plain words.** A producer is the client that writes events. It picks a partition (usually by hashing the key), groups events into batches, compresses them, and waits for the brokers to confirm. Its settings decide the trade between speed and safety.
+>
+> **Real-world example.** A payments service sends 5,000 events/s. With `linger.ms=10` each partition gets one batch every 10 ms at most, so ~50 events share each send window instead of 5,000 separate requests per second. With `acks=all` and idempotence, a network hiccup that causes a retry does not create a duplicate charge event.
+
 ### 3.1 Producer Architecture
 
 A Kafka producer serializes a record (key + value + headers), determines the target partition, batches records destined for the same partition, optionally compresses the batch, and sends it to the partition leader.
@@ -211,7 +219,8 @@ PRODUCER INTERNALS:
 
   Key configs:
     batch.size       = 16384 (bytes per batch, default 16 KB)
-    linger.ms        = 0     (how long to wait for more records)
+    linger.ms        = 0     (how long to wait for more records;
+                              Java client default became 5 in Kafka 4.0)
     buffer.memory    = 33554432 (total memory for unsent batches)
     max.in.flight.requests.per.connection = 5
 ```
@@ -265,7 +274,7 @@ producer.flush()              # Block until all messages are delivered
 Kafka producers batch records destined for the same partition to amortize network overhead. Two parameters control batching:
 
 - **`batch.size`** (bytes): Maximum size of a batch. When the accumulated records for a partition reach this size, the batch is sent immediately.
-- **`linger.ms`** (milliseconds): How long to wait for additional records before sending a non-full batch. Default is 0, meaning "send immediately."
+- **`linger.ms`** (milliseconds): How long to wait for additional records before sending a non-full batch. The Java client default was 0 ("send immediately") until Kafka 4.0, which raised it to 5 ms; librdkafka-based clients (such as `confluent_kafka`) default to 5 ms.
 
 ```
 BATCHING TRADEOFF:
@@ -299,7 +308,7 @@ Kafka supports four compression codecs, applied at the batch level:
 | Codec | CPU Cost | Compression Ratio | Speed | Best For |
 |-------|----------|-------------------|-------|----------|
 | none | 0 | 1:1 | N/A | Low-CPU environments |
-| snappy | Low | ~1.5-2x | Fast | General purpose, default choice |
+| snappy | Low | ~1.5-2x | Fast | General purpose |
 | lz4 | Low | ~2-3x | Very fast | High throughput, recommended |
 | zstd | Medium | ~3-5x | Medium | Best ratio, bandwidth-constrained |
 
@@ -333,8 +342,11 @@ acks=all (a.k.a. acks=-1, full ISR acknowledgment):
   Data survives any single broker failure (with RF >= 3, min.insync.replicas=2).
   Use case: financial transactions, event sourcing, anything you cannot lose.
 
-  CRITICAL: acks=all with min.insync.replicas=1 is equivalent to acks=1.
+  CRITICAL: acks=all with min.insync.replicas=1 can silently degrade to acks=1
+  (if the ISR shrinks to just the leader, the leader alone acks the write).
   Always pair acks=all with min.insync.replicas=2 (and RF=3).
+
+  Default: the Java producer's acks default changed from 1 to all in Kafka 3.0.
 ```
 
 ### 3.6 Idempotent Producers
@@ -357,11 +369,15 @@ IDEMPOTENT PRODUCER DEDUP:
   Result: exactly one copy of seq=1 in the log.
 ```
 
-Enabling idempotence requires `max.in.flight.requests.per.connection <= 5` (default is 5, so no change needed) and `acks=all`. Since Kafka 3.0, idempotence is enabled by default.
+Enabling idempotence requires `max.in.flight.requests.per.connection <= 5` (default is 5, so no change needed), `retries > 0`, and `acks=all`. Since Kafka 3.0, the Java producer enables idempotence by default (unless you set a conflicting config such as `acks=1`). librdkafka-based clients (such as `confluent_kafka`, used in this chapter's Python examples) still default to `enable.idempotence=false`, so set it explicitly.
 
 ---
 
 ## 4. Consumers
+
+> **In plain words.** A consumer reads events and remembers its place (the offset). Consumers in the same group split the partitions between them, so each event is handled once per group. Different groups each get every event.
+>
+> **Real-world example.** An e-commerce `order-events` topic has 12 partitions. The billing group runs 4 instances (3 partitions each). The search-indexing group runs 12 instances (1 each). Both groups see all orders and track their own offsets, so a slow search indexer never delays billing.
 
 ### 4.1 Consumer Groups and Partition Assignment
 
@@ -417,13 +433,15 @@ Topic "user-events" with 6 partitions, Consumer Group "analytics-pipeline":
 
 When consumers join or leave a group, a **rebalance** occurs and partitions are reassigned. The assignment strategy determines the algorithm:
 
-**Range Assignor** (default): Assigns partitions to consumers in order. Consumer 0 gets the first N/M partitions, consumer 1 gets the next N/M, etc. Can cause slight imbalance if partitions don't divide evenly.
+**Range Assignor** (first in the Java consumer's default list, which since Kafka 3.0 is `[RangeAssignor, CooperativeStickyAssignor]`): Assigns partitions to consumers in order. Consumer 0 gets the first N/M partitions, consumer 1 gets the next N/M, etc. Can cause slight imbalance if partitions don't divide evenly.
 
 **Round-Robin Assignor**: Distributes partitions round-robin across consumers. More balanced than range, but does not consider which consumer previously owned a partition.
 
 **Sticky Assignor**: Like round-robin, but tries to preserve previous assignments during rebalance. This minimizes partition movement, reducing the cost of rebalancing (state that a consumer built for a partition does not need to be rebuilt).
 
 **Cooperative Sticky Assignor** (recommended): Like sticky, but uses **incremental cooperative rebalancing** -- only the partitions that need to move are revoked, while all other partitions continue being consumed. This is a major operational improvement over eager rebalancing.
+
+**New consumer group protocol (KIP-848)**: generally available in Kafka 4.0 (opt in with `group.protocol=consumer`). The broker-side group coordinator computes assignments and updates each consumer incrementally, so there is no group-wide "stop the world" sync barrier at all.
 
 ### 4.3 Offset Management
 
@@ -464,14 +482,14 @@ try:
             log_processing_failure(order, result.error)
 
 finally:
-    consumer.close()   # Triggers final offset commit and clean group leave
+    consumer.close()   # Clean group leave (commits offsets only if auto commit is on)
 ```
 
 **Auto commit vs manual commit**:
 
 | Mode | Config | Guarantee | Risk |
 |------|--------|-----------|------|
-| Auto commit | `enable.auto.commit=true` | At-most-once (can lose messages) | Offset committed before processing finishes. If consumer crashes mid-processing, message is lost. |
+| Auto commit | `enable.auto.commit=true` | At-least-once in a simple poll-then-process loop; can lose messages if processing is handed off to other threads | The Java consumer commits the offsets of records returned by the *previous* `poll()`. If you process asynchronously, an offset can be committed before processing finishes, and a crash then loses that message. You also cannot control exactly when commits happen. |
 | Manual commit (sync) | `enable.auto.commit=false`, call `commit()` after processing | At-least-once (can duplicate) | If consumer crashes after processing but before commit, message is reprocessed on restart. |
 | Manual commit + idempotent processing | Same + dedup in your application | Effectively exactly-once | Requires application-level idempotency |
 
@@ -545,6 +563,10 @@ Monitoring consumer lag (see Section 12 for PromQL queries) is non-negotiable. I
 ---
 
 ## 5. Partition Key Design -- The Most Important Decision
+
+> **In plain words.** The key decides which partition an event goes to. Events with the same key stay in order; events with different keys may be processed in any order. A bad key puts most traffic on one partition while others sit idle.
+>
+> **Real-world example.** A chat app keys messages by `conversation_id`, so messages in one chat never arrive out of order. If it keyed by `country` instead, one country with 40% of users would put 40% of traffic on one of 32 partitions, about 13x the fair share of ~3%.
 
 ### 5.1 Why This Is the Most Important Kafka Decision
 
@@ -632,11 +654,15 @@ You **cannot reduce** the number of partitions in a topic without recreating it 
 - **Over-provision partitions** at topic creation. Start with more than you think you need.
 - **Formula for minimum partitions**: `max(target_throughput / per_partition_throughput, target_consumer_parallelism)`. For example, if you need 100 MB/s throughput and each partition handles ~10 MB/s, you need at least 10 partitions.
 - **Common defaults**: 6-12 partitions for moderate topics, 30-100 for high-throughput topics, up to 500+ for extreme scale.
-- **Diminishing returns**: Each partition adds memory overhead on the broker (~10 KB for leadership metadata) and increases rebalance time. More than a few thousand partitions per broker degrades performance.
+- **Diminishing returns**: Each partition adds memory and file-handle overhead on the broker and increases rebalance and failover time. More than a few thousand partitions per broker degrades performance.
 
 ---
 
 ## 6. Exactly-Once Semantics
+
+> **In plain words.** Networks fail, so events get retried and may be processed twice. Kafka can make "read, process, write back to Kafka" all-or-nothing using transactions. Once you write to an outside database, you still need your own duplicate check.
+>
+> **Real-world example.** A bank ledger consumer crashes after writing a $100 transfer to Postgres but before committing the offset. On restart it sees the event again. Because the ledger table has a unique `event_id`, the second insert is rejected and the account is charged $100, not $200.
 
 ### 6.1 The "Exactly-Once" Confusion
 
@@ -757,6 +783,10 @@ COMMON INTERVIEW ANSWER:
 
 ## 7. Kafka Streams and ksqlDB
 
+> **In plain words.** Kafka Streams is a library you put inside your own app to transform and aggregate topics. It keeps running totals in a local store and backs them up to a Kafka topic, so a crashed instance can rebuild them. ksqlDB lets you write the same logic in SQL.
+>
+> **Real-world example.** A video platform counts views per video in 1-minute windows. 8 app instances each own 4 of 32 partitions and keep counts in RocksDB. When one instance dies, another replays the backup (changelog) topic and continues counting.
+
 ### 7.1 Kafka Streams: Lightweight Stream Processing
 
 Kafka Streams is a client library (not a cluster) for building stream processing applications. Unlike Flink or Spark Streaming, it runs as a regular JVM application -- no separate infrastructure to deploy and operate.
@@ -820,7 +850,7 @@ BACKED BY THE SAME TOPIC:
 
 ### 7.3 Windowed Aggregations
 
-Kafka Streams supports three window types for aggregating events over time:
+Kafka Streams supports four window types for aggregating events over time:
 
 ```
 WINDOW TYPES:
@@ -917,6 +947,10 @@ ksqlDB is useful in interviews as a quick explanation for "how do we compute rea
 
 ## 8. Kafka Connect
 
+> **In plain words.** Connect is a ready-made way to move data between Kafka and other systems without writing code. Source connectors pull data in (for example, database changes); sink connectors push data out (to search, S3, caches).
+>
+> **Real-world example.** A shop uses Debezium to stream every change to its `products` table into Kafka. A sink connector writes those changes to Elasticsearch, so a price update shows up in search within a second or two instead of waiting for a nightly batch job.
+
 ### 8.1 Source and Sink Connectors
 
 Kafka Connect is a framework for moving data between Kafka and external systems without writing custom code. It runs as a distributed cluster of **workers** that execute **connectors** (plugins).
@@ -1002,11 +1036,15 @@ SCHEMA REGISTRY FLOW:
 
 ## 9. Performance Tuning and Internals
 
+> **In plain words.** Kafka is fast because it only appends to the end of files, lets the operating system cache recent data in RAM, and sends file data straight to the network. Most tuning is about batch sizes, partition count, and replication.
+>
+> **Real-world example.** An IoT platform ingests 200 MB/s of sensor data. At ~40 MB/s per partition that needs at least 5 partitions; they choose 24 for growth and consumer parallelism. Consumers that read the last few minutes hit the page cache and cause almost no disk reads.
+
 ### 9.1 Why Kafka Is Fast: Sequential I/O and the Page Cache
 
 Kafka achieves high throughput despite writing everything to disk because it exploits two OS-level optimizations:
 
-**Sequential I/O**: Kafka always appends to the end of a log file. Sequential writes to a modern SSD achieve 300-600 MB/s; sequential writes to spinning disk achieve 50-100 MB/s. Random writes achieve 0.1-1 MB/s. Kafka's append-only design turns disk I/O from a bottleneck into an advantage.
+**Sequential I/O**: Kafka always appends to the end of a log file. Sequential writes to a modern SSD achieve 300-600 MB/s; sequential writes to spinning disk achieve 50-100 MB/s. Small random writes on spinning disk achieve only about 0.1-1 MB/s. Kafka's append-only design turns disk I/O from a bottleneck into an advantage.
 
 **OS page cache**: Kafka deliberately does not maintain its own in-memory cache. Instead, it relies on the Linux page cache. When Kafka writes a message to the log file, the OS caches that page in memory. When a consumer reads the message shortly after (the common case -- tailing the log), the read is served from the page cache with no disk I/O at all.
 
@@ -1046,8 +1084,11 @@ ZERO-COPY WITH sendfile() (2 copies, 2 context switches):
          (copy 1)            (DMA from page cache to NIC)   (copy 2)
 
   Bypasses user space entirely.
-  CPU never touches the data.
-  Reduces CPU usage by 50-70% for consumer-fetch workloads.
+  CPU never copies the data.
+  Noticeably reduces CPU for consumer-fetch workloads.
+
+  Caveat: with TLS enabled, the broker must encrypt data in user space,
+  so zero-copy does not apply to encrypted connections.
 ```
 
 This is why Kafka consumers can read at sustained 100+ MB/s per broker with minimal CPU impact: the data flows from disk (or page cache) directly to the network card without passing through the JVM.
@@ -1064,7 +1105,7 @@ PARTITION COUNT FORMULA:
   Where:
     T_p = target producer throughput (e.g., 200 MB/s)
     t_p = throughput achievable per partition by a producer (~30-50 MB/s)
-    T_c = target consumer throughput (e.g., 100 MB/s)
+    T_c = target consumer throughput (e.g., 200 MB/s)
     t_c = throughput achievable per partition by a consumer (~50-100 MB/s)
 
   Example:
@@ -1097,7 +1138,8 @@ REPLICATION FACTOR TRADEOFFS:
          Use: dev/test only. NEVER in production for data you care about.
 
   RF=2:  Survives 1 broker failure. But with min.insync.replicas=2,
-         a single replica failure makes the partition read-only.
+         a single replica failure makes the partition reject acks=all writes
+         (reads still work).
          Rarely used in practice.
 
   RF=3:  The standard production setting. Survives 1 broker failure
@@ -1117,6 +1159,10 @@ STORAGE IMPACT:
 ---
 
 ## 10. Common Interview Patterns
+
+> **In plain words.** These are the shapes Kafka takes in real designs: an event log you can replay, a feature pipeline for ML, change capture to keep caches fresh, notification fan-out, log shipping, and dead-letter topics. Learn to draw each in 30 seconds.
+>
+> **Real-world example.** In a "design a notification system" interview, one `order-shipped` event feeds 4 consumer groups (push, email, SMS, analytics). Adding a Slack channel next quarter is just a fifth consumer group, with no change to the order service.
 
 ### 10.1 Event Sourcing Backbone
 
@@ -1144,9 +1190,14 @@ EVENT SOURCING WITH KAFKA:
     - Can add new consumers (new views) at any time
     - Time-travel debugging: replay events up to a point in time
 
-  Kafka requirement: log compaction or infinite retention
-    log.cleanup.policy=compact (keeps latest value per key)
-    OR retention.ms=-1 (keep forever, disk cost scales linearly)
+  Kafka requirement: infinite retention for the event log
+    retention.ms=-1 (keep forever, disk cost scales linearly;
+    tiered storage can move old segments to object storage)
+
+  Careful with compaction: cleanup.policy=compact keeps only the LATEST
+  record per key. Keyed by order_id, compaction would eventually drop
+  "created", "paid" and "shipped" and keep only "delivered". Use compacted
+  topics for current-state snapshots, not for the full event history.
 ```
 
 ### 10.2 Real-Time Feature Pipeline
@@ -1299,6 +1350,10 @@ DEAD LETTER QUEUE PATTERN:
 
 ## 11. Capacity Planning
 
+> **In plain words.** Size Kafka with simple multiplication: events per second times event size gives MB/s; times seconds per day and retention days gives storage; times the copy count gives disk. Then add headroom.
+>
+> **Real-world example.** 50,000 events/s x 500 bytes = 25 MB/s. Per day that is 2.16 TB; with 3 copies and 7 days it is ~45 TB, or ~18 TB after 2.5x lz4 compression. On 6 brokers that is ~3 TB each.
+
 ### 11.1 Back-of-Envelope Math
 
 This is the kind of calculation interviewers expect you to walk through.
@@ -1318,10 +1373,10 @@ STEP 2: WITH REPLICATION (RF=3)
   (Each message is written to 3 brokers)
 
 STEP 3: STORAGE
-  Daily volume:  25 MB/s * 86,400 s/day = 2,160 GB/day = ~2.1 TB/day
-  With RF=3:     2.1 TB * 3 = 6.3 TB/day across the cluster
-  7-day retention: 6.3 * 7 = 44.1 TB total cluster storage
-  With compression (lz4, ~2.5x): 44.1 / 2.5 = ~17.6 TB compressed
+  Daily volume:  25 MB/s * 86,400 s/day = 2,160 GB/day = ~2.16 TB/day
+  With RF=3:     2.16 TB * 3 = 6.48 TB/day across the cluster
+  7-day retention: 6.48 * 7 = ~45.4 TB total cluster storage
+  With compression (lz4, ~2.5x): 45.4 / 2.5 = ~18.1 TB compressed
 
 STEP 4: PARTITION COUNT
   Target throughput: 25 MB/sec
@@ -1342,7 +1397,7 @@ STEP 5: BROKER COUNT
   But for fault tolerance with RF=3: minimum 3 brokers.
   For headroom and partition distribution: 5-6 brokers.
 
-  Storage per broker: 17.6 TB / 6 = ~3 TB per broker.
+  Storage per broker: 18.1 TB / 6 = ~3 TB per broker.
   Each broker needs ~3 TB NVMe + 64 GB RAM (for page cache).
 
 SUMMARY:
@@ -1372,7 +1427,7 @@ RETENTION SIZING:
   ├─────────────┼────────────┼──────────────┼─────────────────┤
   │ 1,000       │ 500 B      │ 43 GB        │ 362 GB          │
   │ 10,000      │ 500 B      │ 432 GB       │ 3.6 TB          │
-  │ 50,000      │ 500 B      │ 2.1 TB       │ 17.6 TB         │
+  │ 50,000      │ 500 B      │ 2.2 TB       │ 18.1 TB         │
   │ 100,000     │ 1 KB       │ 8.6 TB       │ 72 TB           │
   │ 1,000,000   │ 200 B      │ 17.3 TB      │ 145 TB          │
   └─────────────┴────────────┴──────────────┴─────────────────┘
@@ -1384,6 +1439,10 @@ RETENTION SIZING:
 ---
 
 ## 12. Failure Modes and Operational Concerns
+
+> **In plain words.** Things that go wrong: a broker dies, a copy falls behind, consumers keep kicking each other out of the group, or consumers fall so far behind that old data is deleted before they read it. Most are visible early in a few metrics.
+>
+> **Real-world example.** A consumer takes 6 minutes to process one batch of 500 records, longer than `max.poll.interval.ms=300000` (5 minutes). It is removed from the group, rejoins, gets the same batch, and times out again. With 300 events/s arriving and almost nothing committed, lag grows by about 1.08 million events per hour. Cutting `max.poll.records` to 50 brings a batch down to ~36 s and the loop stops.
 
 ### 12.1 Broker Failure and Partition Leader Election
 
@@ -1401,12 +1460,13 @@ LEADER ELECTION ON BROKER FAILURE:
   Step 2: Controller removes Broker2 from ISR for all its partitions.
           ISR=[Broker0, Broker1]
   Step 3: Controller elects new leader from remaining ISR.
-          New leader = Broker0 (first in ISR order).
+          New leader = Broker0 (e.g., first eligible replica in ISR).
   Step 4: Controller updates metadata. Clients refresh.
   Step 5: Producers and consumers reconnect to Broker0 for Partition 5.
 
-  Failover time: typically 1-5 seconds with KRaft.
-  (With ZooKeeper: 5-30 seconds in pathological cases.)
+  Failover time: usually seconds with KRaft. A clean shutdown moves
+  leaders first; a hard crash is detected after broker.session.timeout.ms
+  (default 9 s). (With ZooKeeper: longer in pathological cases.)
 
   During failover, produce requests for this partition return errors.
   Well-configured producers (retries > 0, retry.backoff.ms) handle this
@@ -1427,8 +1487,9 @@ ISR SHRINK:
   With min.insync.replicas=2: partition is still writable.
 
   If Broker1 ALSO falls behind: ISR=[Broker0]
-  With min.insync.replicas=2: partition becomes READ-ONLY.
-  Producers receive NotEnoughReplicasException.
+  With min.insync.replicas=2: partition rejects acks=all writes
+  (reads still work; acks=0/1 writes are still accepted).
+  acks=all producers receive NotEnoughReplicasException.
 
   This is correct behavior! Better to reject writes than lose them.
 
@@ -1473,7 +1534,7 @@ PREVENTION:
   1. Use cooperative rebalancing (reduces scope of each rebalance)
   2. Tune heartbeat and session timeouts:
      session.timeout.ms=30000     (how long before coordinator considers consumer dead)
-     heartbeat.interval.ms=10000  (must be < session.timeout.ms / 3)
+     heartbeat.interval.ms=10000  (keep <= session.timeout.ms / 3)
      max.poll.interval.ms=300000  (how long between poll() calls before being kicked)
   3. Ensure consumer processing time < max.poll.interval.ms
   4. Pin consumer group membership with static group membership:
@@ -1546,6 +1607,10 @@ KRaft mitigates this by integrating consensus into Kafka itself. The controller 
 
 ## 13. Kafka vs Alternatives -- Decision Matrix
 
+> **In plain words.** Kafka is not always the answer. Use it when you need replay, many independent readers, per-key order, or very high volume. For a simple job queue, a managed queue like SQS is less work.
+>
+> **Real-world example.** A startup sending 200 welcome emails per minute uses SQS: no brokers to run and no partitions to plan. A clickstream of 300,000 events/s read by 5 teams uses Kafka, because each team replays the same data at its own pace.
+
 ### 13.1 Comparison Table
 
 ```
@@ -1561,8 +1626,9 @@ KRaft mitigates this by integrating consensus into Kafka itself. The controller 
 │              │ partition  │ (FIFO)     │ effort     │ partition  │            │
 │              │            │            │ (FIFO opt) │            │            │
 ├──────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
-│ Throughput   │ Millions   │ Tens of    │ Thousands  │ Millions   │ Hundreds   │
-│ (msgs/sec)   │ per sec    │ thousands  │ per sec    │ per sec    │ of thous.  │
+│ Throughput   │ Millions   │ Tens of    │ Very high  │ Millions   │ Hundreds   │
+│ (msgs/sec)   │ per sec    │ thousands  │ (std);FIFO │ per sec    │ of thous.  │
+│              │            │            │ much lower │            │            │
 ├──────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
 │ Replay       │ Yes        │ No (msgs   │ No (msgs   │ Yes        │ Yes (but   │
 │              │ (offset    │ deleted    │ deleted    │ (cursor    │ limited by │
@@ -1580,7 +1646,7 @@ KRaft mitigates this by integrating consensus into Kafka itself. The controller 
 │              │ actional)  │ least-once)│ least-once)│ actional)  │            │
 ├──────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
 │ Ops          │ High       │ Medium     │ Zero       │ High       │ Low        │
-│ complexity   │ (KRaft     │            │ (managed)  │ (ZK + BK)  │            │
+│ complexity   │ (KRaft     │            │ (managed)  │ (meta + BK)│            │
 │              │ helps)     │            │            │            │            │
 ├──────────────┼────────────┼────────────┼────────────┼────────────┼────────────┤
 │ Best for     │ Event      │ Task       │ Simple     │ Multi-     │ Lightweight│
@@ -1657,7 +1723,9 @@ Kafka advantages:
   - Simpler architecture (fewer moving parts without BK)
   - Better tooling and monitoring
   - More engineers know it (hiring, onboarding)
-  - KRaft removes ZK dependency; Pulsar still needs ZK + BK
+  - KRaft removes ZK dependency; Pulsar still needs a metadata store
+    (traditionally ZooKeeper) plus BookKeeper
+  - Kafka now also has tiered storage (KIP-405, production-ready in 3.9)
 ```
 
 ---
@@ -1704,6 +1772,10 @@ BROKER CONFIGURATION (production defaults):
 ```
 
 ## Appendix B: Interview Answer Template
+
+> **In plain words.** When you add Kafka to a design, say five things: why Kafka, the topic and key, the delivery guarantee, how it survives failures, and a rough size. This template gives you the sentences.
+>
+> **Real-world example.** "Orders go to `order-events`, keyed by `order_id`, 24 partitions. acks=all, RF=3, min ISR 2. Consumers commit after an idempotent upsert. 25 MB/s, 7 days, ~18 TB compressed on 6 brokers."
 
 When Kafka appears in your system design answer, use this structure:
 

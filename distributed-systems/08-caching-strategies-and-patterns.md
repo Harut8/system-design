@@ -8,6 +8,7 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Mental Models](#1-mental-models)
 2. [Caching Strategies — The Big Five](#2-caching-strategies--the-big-five)
 3. [Cache Invalidation](#3-cache-invalidation)
@@ -20,6 +21,7 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 10. [Capacity Planning](#10-capacity-planning)
 11. [Failure Modes and Resilience](#11-failure-modes-and-resilience)
 12. [Monitoring](#12-monitoring)
+13. [Real-world cases — incidents with numbers](#13-real-world-cases--incidents-with-numbers)
 
 ---
 
@@ -101,11 +103,13 @@ class CacheAside:
         self.default_ttl = default_ttl
 
     def get(self, key: str) -> Optional[Any]:
-        """Read-through with cache-aside pattern."""
+        """Cache-aside read: the application loads the DB on a miss."""
         # Step 1: Check cache
         cached = self.cache.get(key)
         if cached is not None:
             return json.loads(cached)
+        if self.cache.exists(f"neg:{key}"):
+            return None  # Known-missing key: negative-cache hit, skip the DB
 
         # Step 2: Cache miss — fetch from source
         value = self._fetch_from_db(key)
@@ -172,7 +176,7 @@ WRITE-THROUGH:
                    4. return success
 ```
 
-**Pros**: Cache is always consistent with the database (no stale reads after writes). Simplifies read path since the cache is guaranteed to be fresh. Combined with read-through, gives you a complete caching abstraction.
+**Pros**: Cache is consistent with the database after each successful write (a writer reads its own writes). This is not strict consistency: concurrent writers, a failed second step, or a write that bypasses the cache can still leave the two out of sync. Simplifies the read path since the cache is usually fresh. Combined with read-through, gives you a complete caching abstraction.
 
 **Cons**: Write latency increases -- every write must wait for both cache and DB. Caches data that may never be read (wasted memory). If the cache and DB write are not atomic, partial failures create inconsistency. Not suitable for write-heavy workloads.
 
@@ -239,8 +243,8 @@ REFRESH-AHEAD:
 │ Read-Through     │ Miss: high │ Low      │ Eventual  │ Low (app)    │ Simple read  │
 │                  │ Hit: low   │          │           │ High (cache) │ patterns     │
 ├──────────────────┼────────────┼──────────┼───────────┼──────────────┼──────────────┤
-│ Write-Through    │ Hit: low   │ High     │ Strong    │ Medium       │ Read-after-  │
-│                  │            │ (2x)     │           │              │ write needs  │
+│ Write-Through    │ Hit: low   │ High     │ Read-your-│ Medium       │ Read-after-  │
+│                  │            │ (2x)     │ writes*   │              │ write needs  │
 ├──────────────────┼────────────┼──────────┼───────────┼──────────────┼──────────────┤
 │ Write-Behind     │ Hit: low   │ Very low │ Eventual  │ High         │ Write-heavy  │
 │                  │            │          │ (weak)    │              │ workloads    │
@@ -249,6 +253,8 @@ REFRESH-AHEAD:
 │                  │ (no miss)  │          │           │              │ predictable  │
 └──────────────────┴────────────┴──────────┴───────────┴──────────────┴──────────────┘
 ```
+
+\* Write-through gives read-your-writes on the happy path, not linearizability: races between concurrent writers and partial failures (DB write OK, cache write failed) can still leave stale entries, so keep a TTL.
 
 **Decision matrix**: Start with cache-aside (it is the default). Add write-through if you need read-after-write consistency. Use write-behind only for write-heavy workloads where you can tolerate data loss. Add refresh-ahead for known hot keys. In practice, most production systems use cache-aside with TTL-based invalidation and event-driven invalidation for critical paths.
 
@@ -480,43 +486,40 @@ class MutexCache:
             return fetch_fn(key)
 ```
 
-**Tradeoff**: Serializes requests for the same key. If the lock holder is slow or crashes, waiting requests are delayed. The lock TTL must be tuned carefully -- too short and the lock expires before the fetch completes; too long and a crashed lock holder blocks everyone.
+**Tradeoff**: Serializes requests for the same key. If the lock holder is slow or crashes, waiting requests are delayed. The lock TTL must be tuned carefully -- too short and the lock expires before the fetch completes; too long and a crashed lock holder blocks everyone. The sample deletes the lock unconditionally; in production store a random token as the lock value and delete only if it still matches (a small Lua script), so a slow holder never deletes someone else's lock.
 
 ### 4.3 Solution 2: Probabilistic Early Expiration (PER)
 
 Instead of all entries expiring at exactly the same time, each access independently decides whether to refresh the entry early, with the probability increasing as the TTL approaches. This spreads out the refresh load.
+
+The standard algorithm is **XFetch** from "Optimal Probabilistic Cache Stampede Prevention" (Vattani, Chierichetti, Lowenstein, VLDB 2015). Store two extra numbers with each entry: `delta` (how long the last recomputation took) and `expiry`. On every read, recompute early if:
+
+```
+now - delta * beta * ln(rand()) >= expiry        rand() uniform in (0, 1]
+```
+
+Because `ln(rand())` is negative, `-delta * beta * ln(rand())` is a random "look-ahead" with average `delta * beta`. With `remaining = expiry - now`, the chance that one request triggers a refresh is `exp(-remaining / (delta * beta))`: essentially zero far from expiry, rising exponentially as expiry approaches. `beta = 1` is the paper's default; `beta > 1` refreshes earlier.
 
 ```python
 import math
 import random
 import time
 
-def should_refresh_early(
-    stored_at: float,
-    ttl: float,
-    beta: float = 1.0  # Tuning parameter: higher = more aggressive refresh
-) -> bool:
+def should_refresh_early(expiry: float, delta: float, beta: float = 1.0) -> bool:
     """
-    Probabilistic Early Recomputation (PER) algorithm.
-    Based on "Optimal Probabilistic Cache Stampede Prevention" (Vattani et al.)
-    
-    Returns True if this request should trigger an early refresh.
-    Probability increases exponentially as expiry approaches.
+    XFetch (Vattani et al., VLDB 2015).
+    expiry: absolute time the entry expires (seconds since epoch)
+    delta:  how long the last recomputation took (seconds)
+    beta:   >1 refreshes earlier, <1 later; 1.0 is the default
     """
     now = time.time()
-    expiry = stored_at + ttl
-    remaining = expiry - now
-
-    if remaining <= 0:
-        return True  # Already expired
-
-    # XFetch algorithm: P(refresh) = beta * ln(random()) * -compute_time
-    # Simplified: probability increases as remaining time decreases
-    threshold = remaining / ttl
-    return random.random() > threshold ** beta
+    # 1.0 - random.random() is in (0, 1], so log() never sees 0
+    return now - delta * beta * math.log(1.0 - random.random()) >= expiry
 ```
 
-**Tradeoff**: No locks, no coordination. But multiple requests may still refresh simultaneously (though far fewer than without PER). Works best for high-traffic keys where the probabilistic spread is effective.
+**Worked example** (checked with python): a hot key gets 1,000 reads/s, recomputing it takes `delta = 0.2 s`, `beta = 1`. Per request, refresh probability is `e^-10 ≈ 0.00005` at 2 s before expiry, `e^-5 ≈ 0.007` at 1 s, and `e^-1 ≈ 0.37` at 0.2 s. The first early refresh typically fires about `delta * ln(rate * delta) = 0.2 * ln(200) ≈ 1.06 s` before expiry, and a simulation averages about 2.7 recomputations per expiry cycle. Without PER, all reads in the 0.2 s after expiry miss: about 1,000 x 0.2 = 200 identical DB queries.
+
+**Tradeoff**: No locks, no coordination. But multiple requests may still refresh simultaneously (a few, instead of hundreds). Works best for high-traffic keys where the probabilistic spread is effective; a key read once a minute rarely gets an early refresh.
 
 ### 4.4 Solution 3: Request Coalescing (Singleflight)
 
@@ -599,12 +602,16 @@ class SingleFlight:
 
     async def do(self, key: str, fn: Callable[[], Awaitable[Any]]) -> Any:
         async with self._lock:
-            if key in self._in_flight:
-                # Another coroutine is already fetching — wait for its result
-                return await self._in_flight[key]
+            future = self._in_flight.get(key)
+            is_leader = future is None
+            if is_leader:
+                future = asyncio.get_running_loop().create_future()
+                self._in_flight[key] = future
 
-            future = asyncio.get_event_loop().create_future()
-            self._in_flight[key] = future
+        if not is_leader:
+            # Another coroutine is already fetching — wait for its result
+            # (outside the lock, so other keys are not blocked meanwhile)
+            return await future
 
         try:
             result = await fn()
@@ -628,15 +635,15 @@ async def get_user(user_id: int):
     if cached:
         return json.loads(cached)
 
-    # Even if 10,000 concurrent requests call this for the same user_id,
-    # only ONE database query executes
+    # Even if 10,000 concurrent requests in THIS process call this for the
+    # same user_id, only ONE database query executes (per process)
     result = await flight.do(key, lambda: db.fetch_user(user_id))
 
     await redis.setex(key, 300, json.dumps(result))
     return result
 ```
 
-**Singleflight is the recommended production solution**. It is simple, deterministic (no probabilistic behavior), and reduces N concurrent requests to exactly 1 database query. Combined with a short mutex as a fallback, it handles every thundering herd scenario.
+**Singleflight is the recommended first defense**. It is simple, deterministic (no probabilistic behavior), and reduces N concurrent requests to 1 database query **per process**. Note the scope: with 50 app servers, a hot-key expiry can still send up to 50 queries to the database. Combine it with a distributed lock (§4.2), early refresh (§4.3), or stale-while-revalidate (§3.5) when that fan-in is still too much.
 
 ---
 

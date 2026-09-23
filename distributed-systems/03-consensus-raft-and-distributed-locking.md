@@ -8,6 +8,7 @@ Prerequisites: familiarity with distributed system models from the `README.md` r
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why Consensus Exists](#1-why-consensus-exists)
 2. [Raft Fundamentals](#2-raft-fundamentals)
 3. [Raft Leader Election](#3-raft-leader-election)

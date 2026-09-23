@@ -61,7 +61,7 @@ There is no configuration that achieves both instant detection and zero false po
 
 ### Real-World Consequences of Getting It Wrong
 
-**Split-brain from aggressive detection.** A network partition isolates the leader from two of five nodes in a Raft cluster. If the three reachable nodes detect the leader as failed before the partition heals, they elect a new leader. If the old leader has not yet noticed the partition (asymmetric reachability), two leaders now accept writes. Raft's term-based fencing prevents permanent divergence, but client writes to the stale leader are lost.
+**Split-brain from aggressive detection.** A network partition cuts a five-node Raft cluster into the leader plus one follower on one side and three followers on the other. If the three followers detect the leader as failed before the partition heals, they elect a new leader. If the old leader has not yet noticed the partition (asymmetric reachability), two nodes now believe they are leader. The old leader cannot commit anything (it reaches only 2 of 5 nodes, not a majority), and Raft's term numbers prevent permanent divergence, but clients talking to the old leader see their writes hang and then fail, and any reads it serves locally without a lease or read-index check can be stale.
 
 **Cascading failure from false positives.** A Cassandra cluster under heavy compaction load experiences heartbeat delays. Gossip marks nodes as down, triggering streaming of data to remaining nodes, which increases their load, which delays their heartbeats, which triggers more evictions. The cluster death-spirals from a self-inflicted wound.
 
@@ -105,11 +105,11 @@ The protocol has three knobs: heartbeat interval (`T_hb`), timeout multiplier (`
 
 ### Direct Heartbeating vs Gossip-Disseminated Heartbeats
 
-**Direct heartbeating** means every node sends heartbeats directly to every other node (or to a designated monitor). Message complexity is $O(N^2)$ per interval for all-to-all, or $O(N)$ if heartbeats go to a central coordinator. Cassandra originally used this approach with a designated seed node.
+**Direct heartbeating** means every node sends heartbeats directly to every other node (or to a designated monitor). Message complexity is $O(N^2)$ per interval for all-to-all, or $O(N)$ if heartbeats go to a central coordinator.
 
 **Gossip-disseminated heartbeats** piggyback liveness information on gossip protocol messages. Each node maintains a heartbeat counter that it increments periodically. During gossip exchanges, nodes share their view of every other node's heartbeat counter. If node A sees that node C's heartbeat counter has not advanced in `T_timeout`, it suspects C. This reduces per-node message overhead to $O(1)$ gossip exchanges per interval (each exchange carries $O(N)$ state), achieving $O(\log N)$ dissemination time with high probability.
 
-Cassandra uses gossip-disseminated heartbeats in production: each node increments its own heartbeat generation counter and gossips it. Other nodes update their view of that counter during anti-entropy rounds and use the phi accrual detector on the arrival times of gossip updates carrying that counter.
+Cassandra uses gossip-disseminated heartbeats in production: each node's heartbeat state has a *generation* (set when the process starts, so it changes on restart) and a *version* that the node increments about once per second and gossips. Other nodes update their view of that state during gossip rounds and feed the arrival times of fresh heartbeat updates into the phi accrual detector.
 
 ### Heartbeat Message Design
 
@@ -144,7 +144,7 @@ The solution is to jitter heartbeat timing:
 next_heartbeat_time = last_heartbeat_time + T_hb + random(0, T_hb * jitter_fraction)
 ```
 
-Where `jitter_fraction` is typically 0.1 to 0.5. Cassandra uses a `QUARANTINE_DELAY` after startup and randomizes gossip rounds within a configurable window. etcd's Raft implementation randomizes election timeouts between `[T_election, 2 * T_election]` for the same reason.
+Where `jitter_fraction` is typically 0.1 to 0.5. Gossip systems such as Cassandra also pick a random peer each round, which spreads load across the cluster. etcd's Raft implementation randomizes election timeouts between `[T_election, 2 * T_election)` for a related reason: so followers do not all start elections at the same instant.
 
 An alternative is **phase-based staggering**: assign each node a fixed offset based on its node ID:
 
@@ -246,8 +246,8 @@ Adaptive timeouts can be too adaptive. If the algorithm tracks a period of unusu
 
 ```
 Steady state: intervals = [1000, 1001, 999, 1002, 1000, 998, ...]
-  mean = 1000, stddev = 1.5
-  timeout = 1000 + 4*1.5 = 1006ms    <-- DANGEROUSLY TIGHT
+  mean = 1000, stddev ≈ 1.3
+  timeout = 1000 + 4*1.3 ≈ 1005ms    <-- DANGEROUSLY TIGHT
 
 Next interval: 1050ms (normal jitter from a context switch)
   Result: FALSE POSITIVE
