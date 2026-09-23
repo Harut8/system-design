@@ -8,6 +8,7 @@ Prerequisites: Distributed filesystems (HDFS/S3) from `14-distributed-filesystem
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Batch Processing Fundamentals](#1-batch-processing-fundamentals)
 2. [MapReduce: The Original Distributed Batch Framework](#2-mapreduce-the-original-distributed-batch-framework)
 3. [MapReduce Limitations and the Road to Spark](#3-mapreduce-limitations-and-the-road-to-spark)
@@ -24,6 +25,78 @@ Prerequisites: Distributed filesystems (HDFS/S3) from `14-distributed-filesystem
 14. [Data Skew and Performance Tuning](#14-data-skew-and-performance-tuning)
 15. [Batch vs Stream: Lambda and Kappa Architectures](#15-batch-vs-stream-lambda-and-kappa-architectures)
 16. [Production Patterns and Anti-Patterns](#16-production-patterns-and-anti-patterns)
+17. [Interview Questions](#17-interview-questions)
+18. [Real-world cases — incidents with numbers](#18-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** Some jobs have to read terabytes of data that are already sitting in storage: yesterday's orders, a year of logs, all customer profiles. One machine would take days. So we split the data into thousands of pieces and let hundreds of machines work at once. The hard parts are moving data between machines (the "shuffle"), keeping every machine equally busy, surviving machines that die halfway, and not running out of memory. MapReduce was the first popular framework for this. Spark is the one most teams use today.
+
+**A real-world example.** An e-commerce company runs a nightly job: "revenue per product per region for yesterday." Numbers are illustrative but consistent.
+
+- Input: 2 TB of order events in Parquet on S3. Also a 5 MB `regions` table and a 40 GB `products` table.
+- Cluster: 20 nodes, each 16 cores and 64 GB RAM. 3 executors per node × 5 cores = 15 cores per node, so 300 tasks run at once. Each executor gets 17 GB heap + 2 GB overhead (§14).
+- **Reading (§4, §6):** Spark cuts 2 TB into 128 MB splits → 16,384 read tasks → about 55 "waves" of 300 tasks. It reads only the 4 columns the query uses, not all 40.
+- **Joins (§7):** `regions` is 5 MB, under the 10 MB broadcast threshold, so Spark copies it to every executor. The 2 TB side never crosses the network for that join. `products` is 40 GB, so that join needs a shuffle.
+- **Shuffle sizing (§9, §13):** about 400 GB is shuffled. With the default 200 shuffle partitions, each task gets ~2 GB, which does not fit in its share of memory, so tasks spill to disk and crawl. Setting 3,200 partitions gives ~128 MB each (about 11 waves), and AQE merges any that turn out tiny.
+- **Skew (§14):** 15% of orders have `product_id = 0` ("unknown"). That is 60 GB landing in one partition. 3,199 tasks finish in ~1 minute; one runs for over an hour. Fix: handle the `0` rows separately (they match no product anyway), or let AQE skew join split that partition into ~64 MB pieces (60 GB / 64 MB = 960 tasks).
+- **Stragglers (§16):** one node has a failing disk and runs tasks 5× slower than the median. Speculative execution starts a copy of those tasks elsewhere; the first copy to finish wins.
+- **Failures (§12):** an executor dies at 80%. Its shuffle files are served by the external shuffle service, so Spark reruns only that executor's unfinished tasks, not the whole job.
+- **Re-runs (§16):** the job overwrites the `date=…` partition, so running it twice never doubles revenue.
+
+Before these fixes the job took about 7 hours and missed the 06:00 deadline. After: about 1.5 hours (illustrative).
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Batch job | process a complete, fixed pile of data, then stop | doing the monthly accounts once all receipts are in |
+| Partition | one slice of the dataset, processed by one task | one stack of exam papers given to one grader |
+| Map | work on each record alone, tag it with a key | each polling station counting its own ballots |
+| Shuffle | move all records with the same key to the same machine | sorting mail into bags by destination city |
+| Reduce | combine all records of one key | the city post office delivering its bag |
+| Narrow dependency | output piece needs only one input piece; no data moves | each cook finishing their own dish |
+| Wide dependency | output piece needs data from many input pieces; needs a shuffle | regrouping all dishes by table before serving |
+| Stage | a chain of narrow steps between two shuffles | one leg of a relay race |
+| Driver / executor | the planner process / the worker processes | head chef / line cooks |
+| Lineage | the recipe of how each piece was made, used to rebuild lost pieces | keeping the recipe instead of a spare cake |
+| Broadcast join | send a copy of the small table to every worker | giving every cashier a printed price list |
+| Data skew | a few keys have far more data than the rest | one checkout lane with a 40-item cart queue |
+| Salting | split a hot key into N sub-keys, then combine | opening 10 lanes just for the huge queue |
+| Spill | writing partial results to local disk when memory is full | putting papers on the floor when the desk is full |
+| AQE | Spark re-plans mid-job using real data sizes | a GPS rerouting after seeing actual traffic |
+| Speculative execution | run a backup copy of a slow task | sending a second courier when the first is stuck |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `M` | number of map tasks (input splits) | 100 – 100,000 | 2 TB / 128 MB = 16,384 |
+| `R` | number of reduce tasks / shuffle partitions | 200 – 10,000 | 3,200 for a 400 GB shuffle |
+| `M × R` | number of shuffle blocks to fetch | up to millions | 1,000 × 200 = 200,000 |
+| `hash(key) % R` | which reduce partition a key goes to | — | `hash("user42") % 200 = 17` |
+| `spark.sql.shuffle.partitions` | shuffle partitions for DataFrame/SQL | 200 (default) | 400 GB / 200 = 2 GB per task (too big) |
+| `spark.sql.files.maxPartitionBytes` | max bytes per input split when reading files | 128 MB | 2 TB → 16,384 splits |
+| `spark.sql.adaptive.enabled` | turn AQE on | true since Spark 3.2 | merges 200 tiny partitions into 16 |
+| `advisoryPartitionSizeInBytes` | AQE's target size per shuffle partition | 64 MB | 1 GB shuffle → ~16 partitions |
+| `skewedPartitionFactor` / `...ThresholdInBytes` | AQE calls a join partition skewed if > factor × median AND > threshold | 5 / 256 MB | 60 GB partition vs 128 MB median → skewed |
+| `spark.sql.autoBroadcastJoinThreshold` | max table size for automatic broadcast join | 10 MB | 5 MB `regions` table is broadcast |
+| `spark.executor.memory` | JVM heap per executor | 1 GB default; 4–16+ GB in practice | 17 GB |
+| `spark.executor.memoryOverhead` | extra off-heap memory per container | max(10% of heap, 384 MB) | 17 GB heap → ~2 GB |
+| `spark.executor.cores` | tasks one executor runs at once | 4 – 5 | 3 executors × 5 cores = 15 per node |
+| Reserved memory | fixed memory Spark keeps for itself | 300 MB | 8 GB heap → 7,892 MB usable |
+| `spark.memory.fraction` | share of usable heap for Spark's execution + storage | 0.6 | 0.6 × 7,892 MB ≈ 4.7 GB |
+| `spark.memory.storageFraction` | part of that pool protected for cached data | 0.5 | ≈ 2.4 GB of 4.7 GB |
+| Waves | rounds of tasks needed = tasks / task slots | 1 – 100 | 16,384 / 300 ≈ 55 |
+| `spark.speculation`, multiplier, quantile | backup copies for slow tasks; "slow" = multiplier × median after quantile of tasks finish | off; 1.5 and 0.75 (≤ 3.5), 3 and 0.9 (4.0) | task at 5× median gets a copy |
+| `mapreduce.task.io.sort.mb` | MapReduce map-side sort buffer | 100 MB | spills to disk when full |
+| `spark.shuffle.sort.bypassMergeThreshold` | at or below this many partitions, skip sorting in shuffle write | 200 | 150 partitions → bypass writer |
+| HDFS replication | copies of each block | 3 | 1 on writer's node, 2 on another rack |
+| Salt count `N` | sub-keys a hot key is split into | 10 – 100 | `bot_account` → `0_bot…` … `9_bot…` |
+| Shuffle spill (disk) | bytes written to disk because memory ran out (Spark UI) | 0 is ideal | 30 GB spill → add memory or partitions |
+| Task duration max / median | how uneven tasks are; a sign of skew | < 3× is healthy | 45 min / 8 s → severe skew |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
@@ -1668,8 +1741,13 @@ In practice, most production systems use a hybrid:
    Avoid: APPEND mode without deduplication (re-run = duplicates).
 
    df.write.mode("overwrite") \
+     .option("partitionOverwriteMode", "dynamic") \
      .partitionBy("date") \
      .parquet("s3://output/")
+
+   Careful: the default spark.sql.sources.partitionOverwriteMode is
+   "static", which deletes EVERY existing partition under the path, not
+   just the dates present in df. "dynamic" replaces only those dates.
 
    With Iceberg: MERGE INTO for upsert semantics.
    MERGE INTO target USING source ON target.id = source.id

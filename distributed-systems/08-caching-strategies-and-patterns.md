@@ -1770,6 +1770,62 @@ ALERT PRIORITY MATRIX:
 
 ---
 
+## 13. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent.
+
+**Quick index:** DB spikes every TTL period → Case 1 · cache restarted empty, DB overwhelmed → Case 2 · hit rate collapses during a nightly job → Case 3 · DB flooded by requests for IDs that don't exist → Case 4 · old prices shown for up to an hour → Case 5 · one Redis shard at 100% CPU, others idle → Case 6
+
+### Case 1: Flash-sale stampede on one product key
+
+- **Setup.** E-commerce checkout. The flash-sale product's details are cached with cache-aside, TTL 60 s. The key gets 8,000 reads/s; rebuilding it (a join of inventory and pricing) takes 300 ms.
+- **Symptom.** Every 60 seconds, database CPU jumps to 100% and product-page p99 goes from 40 ms to 4 s, then recovers.
+- **Measurement/Diagnosis.** The spikes line up exactly with the key's expiry. In the 300 ms rebuild window, 8,000 x 0.3 = 2,400 requests miss and all run the same query. The DB pool has 200 connections, so 2,200 requests queue.
+- **Fix.** Singleflight in each of the 30 app servers (§4.4): at most 30 queries per expiry instead of 2,400. Plus XFetch (§4.3) with `delta = 0.3 s`, `beta = 1`: the first early refresh fires on average about `0.3 x ln(8,000 x 0.3) ≈ 2.3 s` before expiry, so in most cycles the key never actually expires. After: 2–3 rebuild queries per minute; p99 back to ~40 ms.
+- **Lesson.** Hot key + expiry = stampede. Coalesce per process and refresh early; per-process singleflight alone still leaves one query per server.
+
+### Case 2: Cold cache after a Redis restart
+
+- **Setup.** Chat app. 40,000 profile reads/s, hit rate 97%, so the DB sees 40,000 x 0.03 = 1,200 queries/s. The DB tops out at about 6,000 queries/s. Redis runs without persistence (§6.3) and no replica.
+- **Symptom.** Redis is OOM-killed and restarts empty. Error rate jumps to over 80% for 25 minutes.
+- **Measurement/Diagnosis.** Hit rate drops to 0%, so DB demand is 40,000 queries/s -- about 6.7x its capacity. Most queries time out *before* they can fill the cache, so the cache refills very slowly and the outage keeps itself going.
+- **Fix.** Add a replica with automatic failover (a restart becomes a ~15–30 s failover to a warm copy); set `maxmemory` below the container limit with `allkeys-lru` so Redis evicts instead of being killed; add request coalescing, and admission control in front of the DB (cap at 5,000 queries/s and let the rest fail fast so admitted queries finish and fill the cache). After a similar event in a test: hit rate back above 90% in ~3 minutes instead of 25.
+- **Lesson.** Plan for an empty cache. The miss path must survive 100% misses, or at least shed load so the cache can refill.
+
+### Case 3: Nightly scan wipes the LRU cache
+
+- **Setup.** Video platform. A Redis cache holds 2 million video-metadata entries for 25,000 reads/s at 96% hit rate (DB: 1,000 queries/s). Policy: `allkeys-lru`.
+- **Symptom.** Every night at 02:00 the hit rate falls to 60% and DB load rises to 25,000 x 0.40 = 10,000 queries/s for an hour.
+- **Measurement/Diagnosis.** `evicted_keys` jumps from ~0 to tens of thousands per second at 02:00. A new analytics job reads all 30 million videos once through the same cache-aside code path. With LRU, each one-time read looks "recent" and pushes out a popular item (§5.1).
+- **Fix.** The job reads from a DB replica and bypasses the cache; the policy changes to `allkeys-lfu`, so items read once cannot beat items read thousands of times. After: hit rate stays at 95–96% during the job.
+- **Lesson.** Scans kill LRU. Keep batch traffic out of the serving cache, or use a frequency-aware policy (LFU, TinyLFU).
+
+### Case 4: Random-ID scraper causes cache penetration
+
+- **Setup.** Public API `GET /users/{id}`. Normal traffic 5,000 req/s at 97% hit rate: 150 DB queries/s. 50 million valid IDs.
+- **Symptom.** DB CPU at 100%, while the cache looks healthy.
+- **Measurement/Diagnosis.** A scraper sends 20,000 req/s for random IDs that don't exist. None are ever cached, so the DB now serves 150 + 20,000 = 20,150 queries/s. Negative caching (§11.2) doesn't help: each random ID is asked only once.
+- **Fix.** Validate the ID format first, then check a Bloom filter of all 50 million valid IDs. At a 1% false-positive rate it needs about 9.6 bits per ID: ~479 million bits ≈ 60 MB, with 7 hash functions. After: only ~1% of bogus requests pass the filter, so the extra DB load drops from 20,000 to ~200 queries/s. Add rate limiting per client as well.
+- **Lesson.** A cache only helps for keys that exist. For "does not exist" traffic, answer before the DB: validation, Bloom filter, rate limits.
+
+### Case 5: Stale prices from a read-replica race
+
+- **Setup.** E-commerce catalog. Writes go to the primary DB, then the app deletes `price:{id}` from the cache. Cache misses read from a DB replica that lags up to 300 ms. TTL: 1 hour.
+- **Symptom.** A few customers see an old price for up to an hour after a price change; support tickets follow.
+- **Measurement/Diagnosis.** Sampling cache vs. primary shows about 60 stale prices per day out of 50,000 price changes (0.12%). Sequence: writer updates the primary and deletes the key; a reader misses, reads the *replica* (still old), and writes the old price back into the cache for a full hour.
+- **Fix.** Delete the key a second time about 1 s after the write (longer than the replica lag, "delayed double delete"), and read from the primary on a cache miss for prices. Lower the TTL to 10 minutes as the upper bound on any staleness left. For stronger protection, use versioned keys (§3.3) or leases (§3.4). After: stale prices drop from ~60/day to ~1/day, and never last longer than 10 minutes.
+- **Lesson.** Cache-aside plus replicas has a race window. The TTL is your worst-case staleness, so pick it on purpose.
+
+### Case 6: One hot key melts one Redis shard
+
+- **Setup.** Live-sports app on a 6-shard Redis Cluster. During a final, the key `match:final:score` gets 150,000 reads/s. All reads go to the one shard that owns its hash slot.
+- **Symptom.** That shard's CPU is at 100% and its p99 is 40 ms; the other five shards sit at ~15% CPU and ~1 ms.
+- **Measurement/Diagnosis.** `redis-cli --hotkeys` (works when an LFU policy is set) shows one key taking most of the shard's commands. Adding shards does not help: one key always lives in one slot.
+- **Fix.** Put an in-process L1 cache (§7.4) with a 1-second TTL in front of Redis on the 60 app servers. Redis now sees at most ~60 reads/s for that key (one per server per second) instead of 150,000. The score may be up to 1 s old, which is fine for this screen. After: shard CPU back to ~15%.
+- **Lesson.** Sharding spreads *keys*, not *load on one key*. Hot keys need local caching or key replication (§11.3).
+
+---
+
 ## Summary: The Interview Caching Checklist
 
 When caching comes up in a system design interview, walk through these items:

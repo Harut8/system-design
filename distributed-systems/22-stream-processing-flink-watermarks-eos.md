@@ -8,6 +8,7 @@ Prerequisites: Kafka fundamentals from `07-kafka-and-event-streaming.md`, cachin
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Stream Processing Fundamentals](#1-stream-processing-fundamentals)
 2. [Apache Flink Architecture](#2-apache-flink-architecture)
 3. [Windowing Deep Dive](#3-windowing-deep-dive)
@@ -23,6 +24,74 @@ Prerequisites: Kafka fundamentals from `07-kafka-and-event-streaming.md`, cachin
 13. [Capacity Planning for Streaming Pipelines](#13-capacity-planning-for-streaming-pipelines)
 14. [Failure Walkthroughs](#14-failure-walkthroughs)
 15. [Interview Patterns](#15-interview-patterns)
+16. [Real-world cases — incidents with numbers](#16-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** Many products need numbers that are always up to date: "how many payments did this card make in the last 5 minutes?", "what did this user click in this session?". The events that feed those numbers never stop, arrive out of order, and sometimes arrive minutes late. The machines computing the numbers crash now and then. This chapter is about computing correct running totals over a never-ending stream: when to decide "this 5-minute bucket is done" (watermarks), how to survive a crash without losing or double-counting anything (checkpoints), and how to avoid writing duplicate results to other systems (exactly-once sinks).
+
+**A real-world example.** A bank's fraud team wants the feature `payments_per_card_last_5m`. Payments arrive through Kafka at 20,000 per second. A Flink job counts them per card in 5-minute windows and writes alerts to a Kafka topic that the fraud service reads.
+
+1. **Late events.** A bus ticket gate loses its network link. It stores 12 card taps made between 12:00 and 12:04 and uploads them at 12:06. If the job counts by *arrival time* (processing time), those 12 taps land in the 12:05-12:10 bucket: the 12:00 bucket is too low, the 12:05 bucket too high, and a fraud rule fires on the wrong window. Counting by *event time* (the time printed on the event) puts them in the right bucket.
+2. **When is a bucket done?** The job cannot wait forever. A **watermark** with a 10-second delay says "I have probably seen everything up to (latest time seen - 10 s)". The 12:00-12:05 bucket closes at about 12:05:10 and its count is sent out.
+3. **Stragglers.** A payment stamped 12:04:58 arrives at 12:05:40. With **allowed lateness** of 1 minute, the bucket is still kept, so its count is corrected and re-sent. The ticket gate's taps arriving at 12:06, after the 1-minute grace, go to a **side output** and are fixed by a nightly batch job instead of being silently dropped.
+4. **Crash.** A worker dies at 12:07:30. The last **checkpoint** (taken every 60 s) is from 12:07:00. Flink restores every counter to its 12:07:00 value and rewinds Kafka to the 12:07:00 positions, then re-reads 30 s x 20,000/s = 600,000 payments. Without checkpoints, the job would either lose all counts or skip those 600,000 payments.
+5. **Duplicate alerts.** Re-reading 600,000 payments also re-produces the alerts they caused. The Kafka sink uses **two-phase commit**: alerts are written inside a Kafka transaction that is committed only when a checkpoint completes, so the fraud service (reading with `read_committed`) sees each alert once. The price: an alert becomes visible up to one checkpoint interval (about 60 s) later.
+6. **Big state.** 60M active cards x ~400 bytes of counters = 24 GB. Spread over 4 workers that is 6 GB each, too much for comfortable Java-heap storage, so the job keeps state in **RocksDB** on local SSD. Only changed files are uploaded at each checkpoint: ~2% of 24 GB = 480 MB, ~2.4 s at 200 MB/s.
+7. **New code version.** To deploy a new fraud rule without losing 24 GB of counters, the team stops the job with a **savepoint** and starts the new version from it.
+
+| Term | Plain meaning | Everyday analogy |
+|:---|:---|:---|
+| Stream (unbounded data) | Events that keep coming and never "finish" | A river, not a lake |
+| Event time | When the thing actually happened (timestamp in the event) | The date on a letter |
+| Processing time | When the computer handled it | The day the letter reached your desk |
+| Window | A bucket of events grouped by time (e.g. 5 minutes) | A shift at a factory: count what was made from 9:00 to 9:05 |
+| Watermark | "I think all events up to time W have arrived" | A teacher collecting tests: "time is up, handing in now" |
+| Allowed lateness | Extra grace period to accept stragglers and correct a result | Accepting a homework a day late and re-grading |
+| Side output | Where events go that are too late even for the grace period | The "late mail" tray handled separately |
+| Keyed state | Per-key memory the job keeps (count per card) | A tally sheet per customer |
+| State backend (RocksDB) | Where that memory lives: Java heap or an embedded on-disk database | Notes in your head vs a filing cabinet |
+| Checkpoint | A consistent snapshot of all state + input positions, taken automatically | A video game autosave |
+| Checkpoint barrier | A marker in the stream that says "snapshot everything before this line" | A "cut here" line on a conveyor belt |
+| Exactly-once | After failures, results look as if each event was counted once | A cashier who recounts after a mistake but never charges twice |
+| Two-phase commit sink | Write output as "pending", publish it only after the snapshot succeeds | Writing a cheque but only mailing it after the books balance |
+| Savepoint | A manual, portable snapshot used for upgrades and moves | Saving your game before switching to a new console |
+| Backpressure | A slow step makes earlier steps slow down instead of dropping data | A traffic jam backing up the on-ramp |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|:---|:---|:---|:---|
+| `t` | Event time of one event | a timestamp | Card tapped at 12:04:58 |
+| `W` | Watermark: "all events with time <= W should have arrived" | trails max event time | Max seen 14:03:30, delay 10 s → W = 14:03:20 |
+| `max_allowed_delay` / `forBoundedOutOfOrderness` | How far the watermark trails the newest event time seen | 5-30 s server, minutes for mobile | 10 s |
+| `autoWatermarkInterval` | How often Flink computes a new watermark | 200 ms (default) | 5 new watermarks per second |
+| `withIdleness` | After this much silence a partition is ignored for the watermark | 1-5 min | Night-time partition stops holding everyone back |
+| allowed lateness | How long a fired window stays open for late events | 0 (default); 1-10 min | Late tap at 12:05:40 still counted |
+| size / slide / gap | Window length / how often a sliding window starts / inactivity that ends a session | 1 h / 15 min / 30 min | size/slide = 4 windows per event |
+| panes | Windows alive at once per key (size / slide) | 1 to hundreds | 30 d / 1 h = 720 |
+| `p` (parallelism) | Number of parallel copies of an operator | 4-200 | p = 48 for 48 Kafka partitions |
+| max parallelism / key groups | Fixed number of state shards; upper limit for `p` | 128 minimum | 128 key groups over 4 subtasks = 32 each |
+| slots | Work places per TaskManager | 1-8 | 12 TMs x 4 slots = 48 |
+| `n` (checkpoint ID) | Sequence number of a checkpoint / barrier | increasing | Barrier 42 |
+| checkpoint interval | Time between automatic checkpoints | 60-300 s | Crash 30 s after a checkpoint → replay 30 s |
+| min-pause / timeout / num-retained | Gap between checkpoints / abort after / how many to keep | 30 s / 10 min / 1-3 | |
+| churn | Share of state that changes between checkpoints | 1-5% | 2% of 128 GB = 2.56 GB uploaded |
+| upload bandwidth | Speed of writing checkpoints to S3 | 100 MB/s per TM | 2.56 GB / 500 MB/s ≈ 5 s |
+| `num_keys x state_per_key x windows` | State size estimate | GB to TB | 500M x 64 B x 4 = 128 GB |
+| T0, T1, T2 | Sink transactions, one per checkpoint | | T1 committed when checkpoint n completes |
+| `transaction.timeout.ms` / `transaction.max.timeout.ms` | Kafka producer transaction timeout / broker's upper limit for it | 15 min-1 h / 15 min default | Outage longer than the timeout loses pending output |
+| `isolation.level` | Whether a Kafka consumer sees uncommitted data | set `read_committed` | Default `read_uncommitted` sees aborted data |
+| consumer lag | Newest offset minus the offset being read | < 1 checkpoint interval of data | 60 s x 100K/s = 6M records |
+| `busyTimeMsPerSecond` | ms per second an operator is busy | 1000 = saturated | 950 → nearly full |
+| `outPoolUsage` / `inPoolUsage` | How full output / input network buffers are | 0-1 | High in, low out = this operator is the bottleneck |
+| buffer size | One network buffer between operators | 32 KB | Credits count free buffers |
+| heartbeat timeout | Time before a silent TaskManager is declared dead | 50 s (default) | Adds up to 50 s to recovery |
+| HLL error | Standard error of a HyperLogLog distinct count | ~0.8% with 12 KB | 1,000,000 ± ~8,000 |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 

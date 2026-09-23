@@ -1033,6 +1033,181 @@ Step 4: Add redundancy where serial dependencies remain.
 
 ---
 
+## 11. Interview Questions — Reliability Math, SLOs and Error Budgets
+
+> **In plain words.** Interviewers want to see that you can turn "reliable" into numbers and use them to make decisions. Answer in three steps: the definition, one worked number, one trade-off.
+>
+> **Real-world example.** "Is 99.9% good enough for checkout?" → "That is 43 minutes of failure per 30 days, or 1 failed checkout in 1,000. If each failed checkout costs revenue and trust, compare that loss with the cost of multi-AZ plus automatic rollback, which is what 99.95% – 99.99% usually needs."
+
+### Conceptual questions
+
+**Q1. What is the difference between an SLI, an SLO and an SLA?**
+*Sections: §4, §5, §10*
+
+An SLI is a measurement: good events divided by total events (e.g., requests answered successfully in under 300 ms / all requests). An SLO is an internal target for that SLI over a window (99.9% over a rolling 30 days). An SLA is an external contract, usually with service credits if missed. The SLA should be looser than the SLO (e.g., SLO 99.95%, SLA 99.9%), so the team gets warned and reacts long before money is owed.
+
+**Q2. Convert 99.9% and 99.99% into downtime. Why do different sources give different numbers?**
+*Sections: §3, §6*
+
+99.9% of a 30-day window = 0.001 x 43,200 min = 43.2 min. Of an average month (365.25 / 12 = 30.44 days) it is 43.8 min, and of a 365-day year 8.76 hours. 99.99% is 10x less: 4.32 min per 30 days, about 52.6 min per year. The differences come only from the window length. A strong answer states the window.
+
+**Q3. Why does MTTR usually matter more than MTBF?**
+*Sections: §2*
+
+A = MTBF / (MTBF + MTTR). With MTBF 200 h and MTTR 1 h, A = 99.50%. To reach 99.9% you can either raise MTBF to about 1,000 h (remove most causes of failure) or cut MTTR to 12 minutes (automatic detection plus rollback). Recovery speed is under your control for every failure type; prevention has to be done one failure type at a time.
+
+**Q4. Five services at 99.9% each sit on the request path. What is the end-to-end availability, and what do you do about it?**
+*Sections: §3, §10*
+
+0.999^5 = 99.50%. Serial availability multiplies, so each hard dependency lowers the total. Fixes: make dependencies soft (cache, default response, "recommendations unavailable"), move work off the request path (queue it), and add redundancy to the weakest remaining links. Redundancy helps only if copies fail independently.
+
+**Q5. Explain burn rate and the multi-window, multi-burn-rate alert.**
+*Sections: §5*
+
+Burn rate = observed error rate / (1 - SLO). 1x uses exactly the whole budget over the window; 14.4x uses 2% of a 30-day budget in 1 hour (14.4 x 1 / 720). The Google SRE Workbook recommends: page at 14.4x over 1 h (confirmed over 5 min), page at 6x over 6 h (30 min), ticket at 1x over 3 days (6 h). The long window proves enough budget was spent to matter; the short window proves it is still happening, so the alert clears quickly after a fix.
+
+**Q6. Two replicas at 99.9% give 99.9999%. When is that wrong?**
+*Sections: §7, §8*
+
+When failures are correlated: same software version, same config push, same rack, same AZ, same certificate. If a shared cause makes the second replica fail 95% of the time the first does, both-down probability is 0.001 x 0.95 = 0.00095, so about 99.9%, not 99.9999%. Mitigate with staged rollouts, separate failure domains and config canaries.
+
+**Q7. What should happen when the error budget is exhausted?**
+*Sections: §6*
+
+A written policy decides in advance: freeze risky launches, allow only fixes and reliability work until the rolling window recovers, and root-cause the incidents that used the budget. If the budget is never used, the SLO is probably too loose, or the team could ship faster.
+
+**Q8. Why must a quorum system use an odd number of replicas, and where do you place them?**
+*Sections: §8*
+
+Quorum = floor(n/2) + 1. n = 4 needs 3 and tolerates 1 failure, the same as n = 3, so the 4th node adds cost but no tolerance. Placement matters: 2+1 across two regions dies with the region holding 2. Surviving any single region outage needs 3 regions (1+1+1 or 2+2+1).
+
+### System design prompts
+
+**Prompt A. Define SLOs and alerting for a payments API that handles 50M requests per 30 days.**
+
+A structured answer:
+
+1. **User journeys**: "authorize a card payment" and "check payment status". Different criticality.
+2. **SLIs**: availability = non-5xx, non-timeout responses / valid requests (exclude health checks and 4xx caused by bad input), measured at the load balancer. Latency = share of authorizations under 500 ms.
+3. **SLOs**: authorization 99.95% availability over a rolling 30 days; 99% of requests under 500 ms. Budget: 0.05% x 50M = 25,000 failed requests, or 21.6 minutes of full outage.
+4. **Alerts**: page if error rate > 14.4 x 0.05% = 0.72% over 1 h and 5 min; page if > 6 x 0.05% = 0.3% over 6 h and 30 min; ticket if > 0.05% over 3 days and 6 h.
+5. **Architecture to match**: multi-AZ active-active, automatic failover tested regularly, canary deploys with automatic rollback, idempotency keys so client retries are safe.
+6. **Policy**: below 25% budget left, only fixes ship; SLA to merchants set looser, e.g. 99.9%.
+
+What interviewers listen for: the window stated with the number; excluding bad denominators; computed alert thresholds rather than "alert on errors"; an SLA looser than the SLO; failover that is tested.
+
+**Prompt B. A ride-hailing dispatch path needs 99.95%. The chain is gateway 99.95%, matching 99.99%, pricing 99.99%, trip DB 99.95%. What do you change?**
+
+Serial product = 0.9995 x 0.9999 x 0.9999 x 0.9995 ≈ 99.88%, short of target. Steps: (1) make pricing soft: show a cached fare estimate if pricing is down; (2) give the trip DB a synchronous standby with tested automatic failover; (3) run the gateway in multiple AZs; (4) re-multiply and keep going until the product clears 99.95% with room to spare. What interviewers listen for: you multiply before you design, you remove dependencies before adding replicas, and you notice that any single component at exactly 99.95% leaves no budget for the others.
+
+### Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| 99.9% of 30 days in minutes? | 43.2 min | §3, §6 |
+| 99.99% per year? | about 52.6 min | §3 |
+| Availability from MTBF and MTTR? | MTBF / (MTBF + MTTR) | §2 |
+| Three serial deps at 99.99%? | 0.9999^3 ≈ 99.97% | §3 |
+| Two independent 99.9% copies in parallel? | 1 - 0.001^2 = 99.9999% | §3 |
+| Burn rate at 1.44% errors on a 99.9% SLO? | 14.4x; budget gone in about 2.1 days | §5 |
+| Budget used by 14.4x for 1 hour (30-day SLO)? | 2% | §5 |
+| Why a short window in the alert? | confirms the problem is still happening; alert resets fast | §5 |
+| Quorum for 5 replicas? | 3; tolerates 2 failures | §8 |
+| Chance of no failure in a month with MTBF 730 h? | e^(-720/730) ≈ 37% | §2 |
+| Active-passive: primary 99.9%, failover works 95%? | 1 - 0.001 x 0.05 = 99.995% | §8 |
+| Why not average latency? | one slow request in 100 hides in the mean; use p99 | §4 |
+
+### Debugging prompts
+
+**D1. "A page fired at 3 a.m.: 1-hour error rate 1.6%, 5-minute error rate 0.05%. The on-call engineer found nothing wrong."** The problem ended before the page. A correct multi-window rule needs *both* windows above 1.44%, so it should not have fired. The alert is checking only the long window. Add the short-window condition.
+
+**D2. "We used 60% of our monthly budget and no alert fired."** A slow burn: for example 0.2% errors (2x) for 9 days = 2 x 9 / 30 = 60%. Page-level rules (14.4x, 6x) never trigger at 2x. Add the 1x / 3-day ticket rule, and check the budget dashboard weekly.
+
+**D3. "The SLO dashboard shows 99.97%, but support is flooded with 'checkout failed' tickets."** The SLI does not see the failures: it is measured at the server (misses LB errors, DNS, TLS, client timeouts), or the denominator includes health checks and synthetic traffic, or failures return 200 with an error body. Move measurement to the load balancer or client, fix the good/bad definition, and exclude probes.
+
+**D4. "We added a second replica and availability did not improve."** The replicas share a failure cause: same config push, same AZ, or failover that does not actually work. Look at past incidents: if both went down together, the redundancy was not independent.
+
+### Common mistakes
+
+- Quoting nines without the window ("99.9%" of what period, of what requests?).
+- Adding availabilities instead of multiplying them.
+- Assuming redundant copies fail independently.
+- Alerting on a raw error threshold (pages on every blip) instead of burn rate.
+- Setting the SLO to current performance, leaving no budget to ship.
+- Counting health checks in the SLI denominator.
+- Using average latency as an SLI.
+- Setting the SLA equal to or tighter than the SLO.
+
+---
+
+## 12. Real-world cases — incidents with numbers
+
+> **In plain words.** Short stories of reliability math going wrong in practice, each with the numbers that exposed the problem and the fix.
+>
+> **Real-world example.** A team believed they had 99.9997% availability; one region outage showed the real figure was about 99.99%, because the math skipped the region that held the majority of replicas (Case 5).
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent. All budgets use a 30-day window (43,200 minutes).
+
+Quick index: too many hard dependencies → Case 1 · pages on every blip → Case 2 · budget gone, no page → Case 3 · both replicas down together → Case 4 · region outage kills quorum → Case 5 · outages found by customers → Case 6 · dashboard green, users unhappy → Case 7.
+
+### Case 1: The e-commerce product page with 12 hard dependencies
+
+- **Setup**: a product page calls 12 services in series, each at 99.9%. SLO: 99.5% (216 min of failure allowed per 30 days).
+- **Symptom**: the page misses its SLO every month although no single service misses its own.
+- **Measurement/Diagnosis**: 0.999^12 = 98.81%, about 516 minutes of expected failure per 30 days, 2.4x the budget. Seven of the 12 calls (recommendations, reviews, loyalty points, ads, A/B config and two analytics calls) are not needed to show the page.
+- **Fix**: those 7 became soft dependencies with timeouts and fallbacks: 0.999^5 = 99.50%, about 216 minutes, right at the limit. The two weakest remaining services got a second, independent replica (99.99% each): 0.999^3 x 0.9999^2 = 99.68%, about 138 minutes, 64% of budget.
+- **Lesson**: count hard dependencies before adding servers. Removing a dependency beats making it more reliable.
+
+### Case 2: The chat app that paged on every blip
+
+- **Setup**: 99.9% SLO. Alert: "5-minute error rate above 0.1%".
+- **Symptom**: about 30 pages a week; most cleared by themselves; the on-call team started ignoring pages.
+- **Measurement/Diagnosis**: a typical blip was 1% errors for 5 minutes: burn rate 10x for 5 minutes = 10 x 5 / 43,200 = 0.12% of the budget. About 129 such blips a month used about 15% of budget: real, but never urgent.
+- **Fix**: replaced with the multi-window rules (14.4x over 1 h + 5 min, 6x over 6 h + 30 min, 1x over 3 d + 6 h as a ticket). Pages fell to the few incidents that actually threatened the budget; blips show up in the weekly budget review instead.
+- **Lesson**: page on budget spent, not on a raw threshold.
+
+### Case 3: The bank API's slow burn
+
+- **Setup**: 99.9% SLO, only the two page-level burn-rate rules (14.4x and 6x) configured.
+- **Symptom**: at the monthly review, 100% of the budget was gone, and no alert had fired.
+- **Measurement/Diagnosis**: a new client library retried incorrectly and caused a steady 0.3% error rate: burn rate 3x. 30 / 3 = 10 days to use the whole budget. 3x is far below both paging thresholds.
+- **Fix**: added the 1x / 3-day ticket rule. At 3x, the 3-day average passes 0.1% after about 1 day, when 10% of the budget is spent (3 x 1 / 30), instead of being noticed after 100%.
+- **Lesson**: fast-burn pages and slow-burn tickets are both needed.
+
+### Case 4: The "six nines" replica pair and a config push
+
+- **Setup**: two active-active API replicas, 99.9% each; the design doc claimed 1 - 0.001^2 = 99.9999% (about 2.6 seconds of downtime per 30 days).
+- **Symptom**: two outages of 25 minutes each in one month.
+- **Measurement/Diagnosis**: both outages were a bad config pushed to both replicas at the same moment. 50 minutes down = 1 - 50 / 43,200 = 99.88%, below even a single replica's 99.9%.
+- **Fix**: config rollouts now go to one replica first, wait 10 minutes and check error rate, then continue; a bad config is rolled back automatically. The next bad push hit one replica, and the other kept serving.
+- **Lesson**: redundancy math assumes independent failures. Shared changes make failures dependent.
+
+### Case 5: The bank ledger with a 2+1 quorum across two regions
+
+- **Setup**: Raft ledger, 3 replicas: 2 in Region A, 1 in Region B. The design review computed 99.9997%.
+- **Symptom**: a 50-minute outage of Region A stopped all ledger writes for 50 minutes.
+- **Measurement/Diagnosis**: with Region A down, 1 of 3 replicas is left; a quorum needs 2. The Region A outage alone takes the system down, so availability is bounded by Region A's 99.99% (about 99.990% overall when all cases are counted, §8). The 50-minute outage alone was more than 10x the 4.32-minute budget of a 99.99% SLO.
+- **Fix**: moved to 1+1+1 across three regions. Losing any one region leaves 2 of 3, still a quorum. Same per-replica and per-region numbers now give about 99.9996%.
+- **Lesson**: place replicas so that no single failure domain holds a majority.
+
+### Case 6: The video platform that learned about outages from its users
+
+- **Setup**: 99.9% SLO (43.2 min per 30 days). About 4 incidents a month.
+- **Symptom**: SLO missed every month; incidents were found through user reports.
+- **Measurement/Diagnosis**: average detection 40 minutes, then 12 minutes to fix and verify. 4 x (40 + 12) = 208 minutes of downtime = 99.52%, 4.8x the budget. Detection was 77% of the downtime.
+- **Fix**: synthetic playback probes every 30 s from 3 regions plus burn-rate alerts cut detection to about 3 minutes: 4 x (3 + 12) = 60 minutes (99.86%). Automatic rollback then cut repair to 5 minutes: 4 x (3 + 5) = 32 minutes, 99.93%, 74% of the budget.
+- **Lesson**: measure MTTD separately. It is often the largest piece of MTTR.
+
+### Case 7: The IoT telemetry SLI that counted health checks
+
+- **Setup**: SLO 99.6%. The SLI counted every request at the service, including load-balancer health checks.
+- **Symptom**: the dashboard showed 99.65% (SLO met), but device makers reported lost data.
+- **Measurement/Diagnosis**: of 10M requests a day, 3M were health checks (always successful) and 7M real device uploads, of which 99.5% succeeded. Measured SLI = (6.965M + 3M) / 10M = 99.65%. Real user SLI = 99.5%, below the 99.6% SLO.
+- **Fix**: health checks and synthetic probes excluded from the denominator. The dashboard showed the miss, and the team fixed the upload timeout that caused most failures.
+- **Lesson**: define "total events" as real user requests only.
+
+---
+
 ## Key Takeaways
 
 1. **Availability is multiplicative across serial dependencies.** In a microservices architecture, this is the dominant factor. Five services at three nines give you only two-and-a-half nines.

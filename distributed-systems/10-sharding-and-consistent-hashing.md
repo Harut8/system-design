@@ -8,6 +8,7 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why Partition Data](#1-why-partition-data)
 2. [Partitioning Strategies](#2-partitioning-strategies)
 3. [Consistent Hashing -- The Core Algorithm](#3-consistent-hashing--the-core-algorithm)
@@ -22,10 +23,93 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 12. [Capacity Planning Math](#12-capacity-planning-math)
 13. [Failure Walkthroughs](#13-failure-walkthroughs)
 14. [Interview Patterns](#14-interview-patterns)
+15. [Real-world cases — incidents with numbers](#15-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** One database server can only hold so much data and answer so many requests per
+second. When you outgrow it, you split the data across many servers. Each server holds one slice,
+called a **shard** or **partition**. Now every request must find the right server, the slices must
+stay about the same size and busyness, and adding or removing a server must not force you to move
+all the data. This chapter is about how to split data, how to find it again, and how to change the
+split safely.
+
+**A real-world example.** An e-commerce site keeps shopping carts in a cache of 10 servers. There
+are 40 million carts and 50,000 cart reads per second. The cache answers 95% of reads; the other
+5% (2,500/s) go to the database, which can handle about 10,000 reads/s. Black Friday is coming, so
+the team adds an 11th cache server. (Illustrative numbers, computed below.)
+
+- **Naive split, `hash(cart_id) % 10`** (§2.2). Changing to `% 11` sends about 10/11 = 91% of carts
+  (about 36.4 million) to a different server. Those servers don't have them yet, so the hit rate
+  falls from 95% to about 8.6%. Database reads jump from 2,500/s to about 45,700/s, far above the
+  10,000/s it can take. The site slows to a crawl on the busiest day of the year.
+- **Consistent hashing** (§3). Only about 1/11 = 9% of carts (about 3.6 million) move to the new
+  server. The hit rate dips to about 86%, database reads rise to about 6,800/s for a while, and the
+  site stays up.
+- **Virtual nodes** (§4). With one position per server on the ring, the busiest server can easily
+  get 2–3x its fair share. Giving each server 256 positions brings that down to about +10%.
+- **Hot keys** (§6.4). A flash-sale product page is read 20,000 times a second. That one key lives on
+  one server, however well the rest is spread. Fixes: cache it locally, add read replicas, or salt
+  the key.
+- **Routing** (§7). The app needs to know which server has cart 12345: a smart client, a proxy, or
+  "ask any node and it forwards".
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Shard / partition | one slice of the data, stored on one server (plus its copies) | one drawer of a big filing cabinet |
+| Partition key | the field used to decide which slice a record goes to | the first letter of the surname on a file |
+| Range partitioning | each shard owns a sorted range of keys (A–F, G–L…) | encyclopedia volumes A–C, D–F… |
+| Hash partitioning | scramble the key with a hash, then pick a shard from the number | dealing cards at random into piles |
+| `hash % N` (modular hashing) | shard = hash of the key modulo the number of servers | seat = ticket number mod number of tables; add a table and almost everyone moves |
+| Consistent hashing | servers and keys sit on a circle; each key goes to the next server clockwise | houses on a ring road, each served by the next fire station clockwise |
+| Virtual node (vnode) / token | one server placed at many points on the circle | one pizza chain with many small branches spread around town |
+| Hash slot (Redis) | a fixed set of 16,384 buckets; servers own groups of buckets | fixed mailbox numbers; you only change who empties which boxes |
+| Rebalancing | moving shards between servers to even out load | redistributing boxes when a new worker joins the warehouse |
+| Hot partition / hot key | one shard or key gets far more traffic than the rest | one checkout lane with a celebrity in it |
+| Key salting | split one hot key into several keys with a suffix | opening 10 queues for the celebrity instead of 1 |
+| Scatter-gather | ask every shard, then merge the answers | calling every branch to ask who has a product in stock |
+| Local vs global secondary index | an index per shard vs one index split by the indexed value | each branch's own stock list vs one central catalogue by product |
+| Replication factor (RF) | how many copies of each shard exist | keeping 3 copies of a key, at home, at work, with a friend |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| K | total number of keys | millions to billions | 40M carts |
+| N | number of physical nodes (servers) or buckets | 3 – 1,000 | 10 cache servers |
+| V | virtual nodes (tokens) per physical node | 8 – 256 | Cassandra `num_tokens` = 16 (4.0+) |
+| P | total points on the ring = N × V (§5.5) | thousands | 100 nodes × 256 = 25,600 |
+| M | Maglev lookup table size (a prime) | 65,537 | backend lookup is `table[hash % M]` |
+| `hash(key) % N` | modular hashing: remainder after dividing by N | — | 7,842,391 % 3 = 1 → node 1 |
+| K/N, K/(N+1) | keys moved when one node joins a consistent-hash cluster | ~1/N of keys | 1M keys, 100 → 101 nodes: ~9,901 move |
+| N/(N+1) | share of keys moved by modular hashing when one node is added | ~all | 100 → 101 nodes: 99% move |
+| 1/sqrt(V) | relative spread of node load with V random vnodes | 6% at V=256 | busiest node ~+10% over average |
+| 2^128, 2^64 | size of the hash space (ring positions) | — | Murmur3 tokens in Cassandra are 64-bit |
+| slot = CRC16(key) % 16384 | Redis Cluster slot for a key | 0 – 16,383 | "mykey" → slot 14,687 |
+| RF | replication factor, copies per partition | 3 (Redis Cluster often 2) | each partition on 3 nodes |
+| W, R | replicas that must confirm a write / answer a read | 2 and 2 for RF=3 | W + R > RF → reads overlap the latest write |
+| QUORUM | floor(RF/2) + 1 replicas | 2 of 3 | Cassandra `QUORUM` |
+| h, weight w | rendezvous: per-(key, node) hash score and node weight | — | pick the node with the highest score |
+| T, P, C (Kafka sizing, §6.1) | target throughput, per-partition producer and consumer throughput | MB/s | partitions ≥ max(T/P, T/C) |
+| RCU / WCU | DynamoDB read / write capacity units | 3,000 / 1,000 per partition | limits before a split |
+| Range / partition size | data per partition before a split | 512 MB (CockroachDB), 10 GB (DynamoDB, HBase) | a 600 MB range splits in two |
+| QPS | queries (requests) per second | 1K – millions | 500,000 reads/s total |
+| hotspot_factor | busiest partition QPS ÷ average partition QPS | aim < 5x | 50,000 / 83 ≈ 600x = danger |
+| C, nprobe (§11.2) | number of IVF clusters; clusters searched per query | 1,000; 20 | search 20 of 1,000 partitions |
+| MTBF | mean time between failures of one part | ~2M hours (SSD rating) | 800 drives → one failure per ~2,500 h |
+| p99 | 99% of requests finish faster than this | ms | p99 < 5 ms for feature reads |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Why Partition Data
+
+> **In plain words.** One machine has limits on disk, memory, and requests per second. When your data or traffic passes those limits, you split the data across many machines. Copies (replication) help with reads and failures; splitting (sharding) is what helps with writes and total size.
+>
+> **Real-world example.** A chat app stores 200 TB of messages and takes 10 million writes per second. No single server can hold or write that much, so messages are split by conversation across 100 servers (about 2 TB of unique data each), and each slice is copied 3 times.
 
 ### 1.1 Vertical Scaling Hits a Wall
 
@@ -113,6 +197,10 @@ The distinction matters. In an ML feature store, the data (feature values) is pa
 ---
 
 ## 2. Partitioning Strategies
+
+> **In plain words.** There are three ways to decide where a record lives: by sorted ranges (A–F on server 1), by a scrambled hash of the key, or by looking it up in a table. Ranges are good for "give me everything between X and Y" but can get hot spots. Hashing spreads load evenly but loses order. A lookup table is flexible but must itself stay fast and available.
+>
+> **Real-world example.** An IoT platform keyed by timestamp puts all of today's sensor writes on one range shard. Hashing by `device_id` instead spreads 1 million devices evenly over 20 shards (about 50,000 each), but "all readings from 9:00 to 10:00" now has to ask all 20 shards.
 
 There are three fundamental strategies for deciding which partition owns which key. Every production system uses one of these, or a hybrid.
 
@@ -228,6 +316,10 @@ In practice, directory-based partitioning is used when the partition mapping is 
 ---
 
 ## 3. Consistent Hashing -- The Core Algorithm
+
+> **In plain words.** Picture the hash values as a clock face. Each server sits at some point on it; each key goes to the first server clockwise from it. When you add a server, it only takes keys from its one neighbour, so only about 1/N of the keys move instead of almost all of them.
+>
+> **Real-world example.** A cache of 100 servers holds 1 million keys. Adding server 101 with `hash % N` moves about 990,000 keys; with consistent hashing about 9,900 keys (1%) move.
 
 Consistent hashing was introduced by Karger et al. (1997) to solve the exact problem that modular hashing creates: how to distribute keys across a changing set of nodes with minimal disruption when nodes are added or removed.
 
@@ -425,6 +517,10 @@ Result: only 2 of 10 keys moved (20%, close to 1/N = 25% for N=4)
 
 ## 4. Virtual Nodes (Vnodes)
 
+> **In plain words.** With only one spot per server on the circle, the gaps between servers are random, so one server may get three times more keys than another. Placing each server at many spots (virtual nodes) averages this out. Bigger servers can get more spots.
+>
+> **Real-world example.** A 10-node cluster with 1 spot per node: the busiest node typically carries about 3x the average load. With 256 spots per node, the busiest is only about 10% above average (simulated in §4.3).
+
 ### 4.1 The Load Imbalance Problem
 
 With only 3 physical nodes on the ring, the arcs are unlikely to be equal. One node might own 50% of the key space while another owns 10%. With one random point per node, the arc lengths are roughly exponentially distributed: the standard deviation of a node's share is about as large as the average share itself (~100%), and the biggest node typically owns about ln(N) times its fair share. With N=3, the imbalance is severe.
@@ -548,6 +644,10 @@ With random token placement, V=128-256 per physical node is a common balance poi
 ---
 
 ## 5. Consistent Hashing Variants
+
+> **In plain words.** There are several other ways to get the "only move a few keys" property. Jump hash needs no table but only lets you add or remove the last server. Rendezvous hashing scores every server for each key and picks the highest. Maglev builds a fixed lookup table for very fast load balancers.
+>
+> **Real-world example.** A video platform's 20 edge caches use rendezvous hashing: each request computes 20 scores (cheap), and when one cache dies only its roughly 5% of videos move to other caches.
 
 The original consistent hashing algorithm (Karger et al.) is not the only option. Several variants optimize for specific use cases.
 
@@ -688,6 +788,10 @@ K = total key count, N = node count
 
 ## 6. Partition Assignment and Rebalancing
 
+> **In plain words.** Some systems fix the number of partitions up front and just move whole partitions between servers (Kafka, Redis). Others split partitions automatically as they grow (DynamoDB, CockroachDB). Moving a partition safely means copy, catch up, switch over, then delete the old copy.
+>
+> **Real-world example.** A Kafka topic created with 12 partitions on 3 brokers (4 each) can grow to 4 brokers (3 each) by moving 3 partitions. It can never use more than 12 consumers in one group, so pick the count for future growth.
+
 ### 6.1 Static vs Dynamic Partitioning
 
 **Static (fixed) partitioning**: The number of partitions is determined at creation time and does not change. Each partition is small enough that rebalancing means moving entire partitions between nodes, not splitting them.
@@ -816,6 +920,10 @@ Only salt keys that are actually hot.
 ---
 
 ## 7. Routing: How Clients Find the Right Partition
+
+> **In plain words.** Once data is split, every request needs to reach the right server. Either the client knows the map, a proxy in the middle knows it, or any server accepts the request and forwards it. Maps go out of date, so servers must be able to say "not me, try over there".
+>
+> **Real-world example.** A Redis Cluster client caches which of 16,384 slots each server owns. After slot 5,000 moves, the old server replies `MOVED 5000 10.0.0.2:6379` once, and the client updates its map. That costs one extra round trip, about 0.5 ms, instead of an error.
 
 Once data is partitioned, every request must be routed to the correct partition. There are three fundamental approaches, and every system uses one or a combination.
 
@@ -982,6 +1090,10 @@ This pattern is common across distributed systems. Cassandra uses a similar appr
 
 ## 8. Replication + Partitioning Interaction
 
+> **In plain words.** Each partition is kept on several servers (usually 3). One copy is often the leader that takes writes. Copies must sit on different machines, and ideally in different racks or data centres, so one failure never takes out all of them.
+>
+> **Real-world example.** A bank ledger with RF=3 across 3 availability zones: if a whole zone goes dark, every partition still has 2 copies, which is enough for a write quorum of 2.
+
 In production, every partition is replicated. This section covers how replication and partitioning interact.
 
 ### 8.1 Each Partition Is a Replication Group
@@ -1087,6 +1199,10 @@ CockroachDB uses zone configurations to specify diversity constraints (e.g., "re
 
 ## 9. Secondary Indexes on Partitioned Data
 
+> **In plain words.** If data is split by user ID, a question like "all users in NYC" has no single home. You either ask every shard (cheap writes, expensive reads) or keep a separate index split by city (cheap reads, but every write must update two places).
+>
+> **Real-world example.** A ride-hailing app has 1,000 shards keyed by `rider_id`. "Riders in city X" with local indexes means 1,000 requests per query. A global index by city means 1 request per query, but a rider changing city costs 3 writes (data, old city, new city).
+
 When data is partitioned by a primary key, queries on other fields (secondary indexes) become complicated. There are two fundamental approaches.
 
 ### 9.1 Local (Document-Partitioned) Indexes
@@ -1179,6 +1295,10 @@ In interviews, state this trade-off explicitly. If your system is read-heavy on 
 ---
 
 ## 10. Real-World Systems Deep Dives
+
+> **In plain words.** How five real databases actually split data: DynamoDB and Cassandra hash, Redis uses 16,384 fixed slots, Kafka uses fixed partitions per topic, and CockroachDB uses sorted ranges that split themselves. Knowing one concrete number for each helps a lot in interviews.
+>
+> **Real-world example.** Redis Cluster: `CRC16("mykey") % 16384 = 14687`, so with 3 masters the key lives on the third master (slots 10,923–16,383).
 
 ### 10.1 DynamoDB
 
@@ -1348,6 +1468,10 @@ Query: SELECT * FROM users WHERE user_id = 600000
 
 ## 11. Partitioning for ML/AI Systems
 
+> **In plain words.** ML systems use the same ideas. Feature stores split by user or item ID. Vector search splits by cluster of similar vectors and searches only the closest few clusters. Model serving routes by model name, and training splits the dataset across workers.
+>
+> **Real-world example.** A recommender with 100 million items spreads them over 50 retrieval servers of 2 million each. It asks all 50 for their top 200 in parallel (about 5 ms), then merges 10,000 candidates.
+
 This section bridges the general partitioning theory to the specific needs of ML/AI systems. These patterns appear directly in the solutions for feature stores, recommendation systems, embedding search, model serving, and parallel training.
 
 ### 11.1 Feature Store Online Serving
@@ -1480,6 +1604,10 @@ Query: "Find 200 candidate items for user U42"
 ---
 
 ## 12. Capacity Planning Math
+
+> **In plain words.** Multiply items by size by copies to get storage. Divide by what one server holds to get server count. Then check requests per second per server, and check the busiest key, not just the average.
+>
+> **Real-world example.** 1 billion items x 2 KB x 3 copies = 6 TB. At 1 TB per node that is 6 nodes. 500,000 reads/s over 6,000 partitions is about 83 reads/s each, but one viral key at 10% of traffic is 50,000 reads/s on one partition.
 
 Concrete formulas for partition sizing and throughput estimation. These are the numbers you should be able to produce in an interview whiteboard session.
 
@@ -1619,6 +1747,10 @@ Partition strategy: Redis Cluster (hash partitioning)
 ---
 
 ## 13. Failure Walkthroughs
+
+> **In plain words.** Step-by-step stories of what happens when a node dies, the network splits, too much data moves at once, or one key gets extremely hot. The common thread: detect, fail over, re-copy, and throttle recovery so it doesn't cause the next outage.
+>
+> **Real-world example.** A 5-node cluster loses Node 3: 4 partitions need a new leader (a few seconds of write pauses), and 6 partitions need a new third copy (about 10 s per 1 GB at 100 MB/s).
 
 Understanding how partitioned systems behave under failure is critical for interviews. Walk through each scenario step by step.
 
@@ -1810,6 +1942,10 @@ MITIGATION:
 
 ## 14. Interview Patterns
 
+> **In plain words.** In an interview, start from the most common query and pick the partition key that makes it hit one shard. Then check for hot keys, low cardinality, secondary queries, and size the cluster with real numbers.
+>
+> **Real-world example.** "Design the orders table for an e-commerce site": partition by `user_id` so "my orders" is one shard; 500M orders x 1 KB x 3 = 1.5 TB; add a global index on `order_id` for support lookups; cache flash-sale products separately.
+
 ### 14.1 The Partition Key Decision Framework
 
 When an interviewer asks "how would you partition this data?", use this structured approach:
@@ -1937,6 +2073,67 @@ TEMPLATE ANSWER:
 │                          │                        │ co-located                │
 └──────────────────────────┴────────────────────────┴───────────────────────────┘
 ```
+
+---
+
+## 15. Real-world cases — incidents with numbers
+
+> **In plain words.** Six short incident stories. Each shows a symptom you might see on a dashboard, how the numbers point to the cause, and what fixed it. They reuse the ideas from §2–§13.
+>
+> **Real-world example.** "Cache hit rate fell from 95% to 9% right after we added a node" is almost always modular hashing (Case 1).
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+**Quick index:** hit rate collapses after adding a node → Case 1 · one node at 100% CPU while others idle → Case 2 · write throttling on "today" → Case 3 · latency spike across the cluster during expansion → Case 4 · one hot product takes down a cache node → Case 5 · "find by email" query times out → Case 6.
+
+### Case 1: Adding one cache node wipes out the cache
+
+- **Setup.** E-commerce session cache: 10 memcached servers, 40M sessions, 50,000 reads/s, 95% hit rate. The client used `hash(session_id) % N`. The database handles about 10,000 reads/s.
+- **Symptom.** Minutes after adding server 11, login latency went from 20 ms to 3 s and the database hit 100% CPU.
+- **Measurement.** Hit rate fell to about 9%. Going from `% 10` to `% 11` moves 10/11 = 91% of keys (36.4M sessions). Misses went from 2,500/s to about 45,700/s.
+- **Fix.** Switched the client to Ketama-style consistent hashing with 160 points per server. The next expansion (11 → 12) moved about 1/12 = 8% of keys; hit rate dipped to about 87% and database reads peaked at about 6,500/s.
+- **Lesson.** Never use `% N` for anything that resizes. Check the client library's hashing mode before the first resize, not after.
+
+### Case 2: One Cassandra node twice as busy as the rest
+
+- **Setup.** 6-node cluster built by hand with `num_tokens: 1` and randomly chosen tokens.
+- **Symptom.** One node at 90% disk and CPU; another at 25%.
+- **Measurement.** `nodetool status` showed ownership of 31%, 24%, 18%, 13%, 9%, 5%. The fair share is 16.7%, so the biggest node carried 1.9x its share and the smallest 0.3x. That is normal for 1 token per node (§4.1).
+- **Fix.** Built a new datacenter with `num_tokens: 16` and the token allocator on, then moved traffic to it. Ownership spread became 16–18% per node. Peak node CPU dropped from 90% to about 55%.
+- **Lesson.** Random single tokens give random load. Use vnodes or deliberate token allocation from day one; changing tokens later means moving data.
+
+### Case 3: Time-series writes all land on one partition
+
+- **Setup.** IoT telemetry table in a key-value store, partition key = date (`2026-09-23`), 1M devices each writing once every 10 s = 100,000 writes/s.
+- **Symptom.** Constant write throttling. Total provisioned capacity was 5x the load.
+- **Measurement.** Per-partition metrics showed 100% of today's writes on one partition. A single partition in this system allowed about 1,000 writes/s, so 99% of writes were throttled.
+- **Fix.** Changed the key to `device_id` with a timestamp sort key. 100,000 writes/s spread over about 200 partitions gives about 500 writes/s each, 50% of the limit. Throttling dropped to near zero.
+- **Lesson.** A date or a counter as the partition key makes a moving hot spot. Put the time in the sort key, not the partition key.
+
+### Case 4: Cluster expansion causes a latency incident
+
+- **Setup.** 50-node store, 10,000 partitions of 5 GB (50 TB). The team added 10 nodes at once with no streaming limit (§13.3).
+- **Symptom.** p99 read latency jumped from 8 ms to 900 ms; two nodes were marked dead by the failure detector, which started even more data movement.
+- **Measurement.** About 8.3 TB had to move. New nodes' NICs were at 10 Gbps for over 10 minutes, and source disks were at 95% utilisation from streaming reads.
+- **Fix.** Paused, then added nodes 2 at a time with streaming capped at 200 Mbps per node and failure-detector sensitivity lowered during moves. Expansion took about 12 hours instead of 20 minutes, but p99 stayed under 15 ms.
+- **Lesson.** Rebalancing is production traffic too. Throttle it, add capacity in small steps, and add it before you need it.
+
+### Case 5: A flash-sale product overloads one cache node
+
+- **Setup.** Product cache on Redis Cluster, 12 masters, 600,000 reads/s total (about 50,000 per master). One product goes viral at 180,000 reads/s.
+- **Symptom.** One master at 100% CPU; timeouts on unrelated products stored on the same master.
+- **Measurement.** hotspot_factor = 230,000 / 50,000 = 4.6x for that master. Retries (up to 3) pushed attempted reads on it past 400,000/s.
+- **Fix.** Added a 1-second in-process cache for the top 100 keys on each of the 60 app servers. Each server now fetches the hot key about once per second, so Redis sees about 60 reads/s for it instead of 180,000. The master dropped back to about 50,000 reads/s.
+- **Lesson.** Hashing cannot split one key. Detect hot keys and serve them from a local cache, replicas, or salted copies (§6.4).
+
+### Case 6: "Find account by email" scans every shard
+
+- **Setup.** Bank customer table, 256 shards keyed by `customer_id`. Login looks users up by email using per-shard (local) indexes.
+- **Symptom.** Login p99 of 1.2 s; timeouts whenever any one shard was slow.
+- **Measurement.** Each login fanned out to 256 shards. With each shard's p99 at 20 ms, the chance that at least one of 256 is slower than its p99 is 1 − 0.99^256 ≈ 92%, so almost every login waited on a slow shard.
+- **Fix.** Added a global lookup table `email → customer_id`, partitioned by email. Login now does 2 single-shard reads. p99 fell to about 15 ms; each email change costs one extra write.
+- **Lesson.** If a secondary lookup is on a hot path, give it its own partitioned index (§9.2). Scatter-gather to hundreds of shards turns tail latency into the common case.
 
 ---
 
