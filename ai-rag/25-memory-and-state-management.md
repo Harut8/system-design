@@ -18,20 +18,19 @@
 > without knowing which memory tier produced which fact in context, and §3–§5 here are the
 > instrumentation prerequisite for that), `16-multi-tenancy-and-isolation.md` (planned — §10's per-
 > tenant memory isolation is that chapter's subject matter applied one layer earlier, to the store
-> instead of the compute), `17-safety-guardrails-and-prompt-injection.md` (planned — a long-term memory
+> instead of the compute), [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md) (a long-term memory
 > store that persists an attacker-injected "fact" across sessions is a *persistent* prompt injection,
 > strictly worse than the single-turn kind that chapter otherwise assumes, and §7's fact-extraction
 > validation is the first line of defense against it).
 >
 > **THESIS:** Memory is not one system. It is three systems — conversation history, agent state, and
 > long-term memory — with different lifetimes, different consistency requirements, different storage
-> answers, and different failure modes, and the single most expensive mistake a team makes in
+> answers, and different failure modes, and one of the most expensive mistakes a team can make in
 > production is collapsing all three into one growing list of messages threaded through every LLM call
 > and calling the whole pile "memory." That mistake is not a style preference; it has a bill attached.
 > Every unnecessary token in context is billed, at every turn, for the rest of the conversation's life,
-> and past roughly a few thousand tokens of irrelevant history the model's attention measurably degrades
-> on the part that matters — the "lost in the middle" effect is not folklore, it is a reproducible
-> retrieval curve. **The job of a memory system is not to remember everything. It is to forget
+> and as irrelevant history piles up, the model's accuracy on the part that matters measurably drops —
+> the "lost in the middle" effect is not folklore, it is a reproducible retrieval curve. **The job of a memory system is not to remember everything. It is to forget
 > correctly** — to decide, at every turn, which of everything that has ever happened is worth the
 > tokens to re-state, and to make that decision cheaply, deterministically where possible, and legibly
 > enough that a human debugging a bad response can tell *why* the model didn't know something it
@@ -47,6 +46,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The three kinds of memory](#1-the-three-kinds-of-memory)
 2. [Why you can't just dump everything into the prompt](#2-why-you-cant-just-dump-everything-into-the-prompt)
 3. [Conversation history management: buffers, windows, and summarization](#3-conversation-history-management-buffers-windows-and-summarization)
@@ -64,10 +64,100 @@
 15. [Anti-patterns](#15-anti-patterns)
 16. [Interview questions, with weak and strong answers](#16-interview-questions-with-weak-and-strong-answers)
 17. [Lab exercises](#17-lab-exercises)
+18. [Real-world cases — incidents with numbers](#18-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A chat model has no memory of its own. Every call starts from zero, so your code has
+to decide what to send it each time. If you send the whole conversation every turn, the bill grows
+fast, the request eventually gets too big, and the model gets worse at spotting the one detail that
+matters. If you send too little, the assistant "forgets" things the user already told it. This chapter
+is about sending the right small set of things on every turn.
+
+**A real-world example: an online shop's support assistant.** Numbers are illustrative but computed.
+
+1. **Turn 3.** A customer writes: "My order is 8842-B. Please keep answers short."
+2. **The naive way.** Each turn adds about 150 tokens, and the app re-sends the whole conversation
+   every time. By turn 80 a single request carries 80 × 150 = **12,000 tokens**. Over the whole
+   conversation the app pays for 150 × (1 + 2 + … + 80) = **486,000 tokens**, about **$1.46** at
+   $3 per million input tokens. At 10,000 such conversations a day, that is **$14,580 a day**. And the
+   order number now sits in the middle of a long wall of text, so the model sometimes asks for it again.
+3. **Conversation history (§3–§4).** Keep only the newest ~3,000 tokens word for word, and fold older
+   turns into a ~500-token running summary. The same 80-turn conversation now costs **241,500 tokens
+   (about $0.72)**, or **$7,245 a day** for 10,000 conversations (the small cost of the summary calls
+   is not included).
+4. **Structured facts (§3.5, §7.2).** Summaries blur exact values ("the customer asked about an
+   order"), so the order number 8842-B is pulled out right away and saved as a field, not left in prose.
+5. **Agent state (§5–§6).** The customer asks for a refund. The workflow needs a manager's approval.
+   Whether approval is pending is a typed field, `task_status = "awaiting_approval"`, saved after every
+   step. If the server restarts, the task resumes exactly where it stopped.
+6. **Long-term memory (§7, §9).** A week later the customer opens a new chat. The assistant looks up
+   their 5 most relevant saved facts (about 100 tokens), including "prefers short answers", instead of
+   loading every past conversation.
+7. **Isolation and deletion (§10).** Every lookup is filtered to this customer's id, so nobody else's
+   facts can leak in. If they ask "forget me", every store that holds their data is wiped.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Context window | the most text a model can read in one request | the size of a desk: only so many papers fit on it |
+| Token | a small piece of text the model counts and bills (~¾ of an English word) | a taxi meter tick |
+| Conversation history | the transcript of this chat | the minutes of the current meeting |
+| Agent state | the typed "where are we" record of one running task | a checklist clipped to a work order |
+| Long-term memory | facts about a user kept across chats | a doctor's patient file |
+| Sliding window | keep only the last N messages | a whiteboard where old notes are erased to make room |
+| Summary memory | squeeze old turns into a short running summary | "previously on…" at the start of a TV episode |
+| Trimming | cut messages to fit a token budget | packing a suitcase with a weight limit |
+| Reducer | a rule for merging two updates to the same field | two people adding items to one shared shopping list instead of replacing it |
+| Checkpoint | a saved copy of the state after each step | a save point in a video game |
+| Fact extraction | pull stable facts out of chat text into a structured record | a nurse copying "allergic to penicillin" into the chart |
+| Supersession | mark an old fact as replaced by a newer one | crossing out an old address and writing the new one |
+| Recency decay | older facts count less when ranking | milk with a "best before" date |
+| Tenant isolation | each user or company only sees its own memory | separate safe-deposit boxes in one bank |
+| Lost in the middle | models miss facts buried in the middle of long input | skimming a long email: you read the start and end |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `n`, `N`, `t` | number of turns in a conversation; `t` = the current turn | 10 – 200 | turn 80 of an 80-turn chat |
+| `tokens_per_turn` | tokens a single turn adds | 100 – 500 | 150 tokens ≈ a short question plus answer |
+| `price_per_million` | $ per 1 million input tokens | $0.15 – $15 | $3 → 486,000 tokens cost $1.46 |
+| `O(n)`, `O(n²)` | "grows like n" / "grows like n squared" | — | re-sending history is `O(n²)`: 2× the turns ≈ 4× the cost |
+| `window_size` | messages kept by a sliding window (§3.2) | 10 – 40 | 10 = the last 5 user/assistant pairs |
+| `max_tokens` | token budget for kept history (§3.3, §4) | 2,000 – 8,000 | 3,000 → the newest ~20 turns of 150 tokens |
+| `+ 4` | per-message formatting overhead added to token counts (§3.3) | 3 – 5 | a 10-token message counts as 14 |
+| `max_verbatim_messages` | recent messages kept word for word before folding into the summary (§3.4) | 6 – 20 | 8 = the last 4 exchanges |
+| `strategy`, `start_on`, `include_system` | `trim_messages` options: keep first or last; which message type the result must start on; keep the system message (§4.1) | `"last"`, `"human"`, `True` | never start the trimmed list with an orphan tool result |
+| `token_counter` | how `trim_messages` counts: a model's tokenizer, or `len` to count messages | model or `len` | `len` + `max_tokens=10` = keep 10 messages |
+| `thread_id` | the key a checkpoint is saved under | one per conversation or workflow | `"approval-workflow-4471"` |
+| `k`, `top_n` | candidates fetched from the index / facts actually kept after reranking (§9.1) | 15 – 20 / 5 – 8 | fetch 20, keep the best 5 |
+| `similarity` | how close a fact's meaning is to the query (0 to 1) | 0.6 – 0.9 | 0.86 = very related |
+| `learned_at`, `age_days` | when a fact was saved / how old it is in days | — | saved 240 days ago |
+| `half_life_days` | age at which the recency score halves (§9.2) | 30 – 365 by category | 90 → a 180-day-old fact scores 0.25 |
+| `recency_decay` | `0.5 ** (age_days / half_life_days)` | 0 – 1 | 30 days with half-life 90 → 0.79 |
+| `confidence` | how sure the extractor is that a fact is right (0 to 1) | ≥ 0.7 to store directly | 0.55 → sent to a review queue |
+| `0.6 / 0.25 / 0.15` | weights for similarity / recency / confidence in the composite score (§9.2) | tune per product | sim 0.8, recency 0.99, conf 0.7 → 0.83 |
+| `ttl_seconds` | how long Redis keeps a key before deleting it (§8.4) | 86,400 (1 day) | a crashed task's state disappears after 24 h |
+| `RETENTION_DAYS` | how long each fact category is kept without reinforcement (§10.3) | 30 – 365, or forever | goals: 30 days; preferences: forever |
+| `VECTOR(1536)` | an embedding column with 1,536 numbers per fact (§8.3) | 384 – 3,072 | one fact → one 1,536-number vector |
+| `total`, `*_reserved`, `safety_margin` | context budget: window size and fixed reservations (§12.2) | 128,000 / 2,000 / 4,000 / 1,000 | 128,000 − 7,000 = 121,000 tokens for content |
+| `priorities` weights | share of the content budget per category (§12.2) | sum to 1.0 | history 0.3 of 121,000 = 36,300 tokens |
+| `per_worker_tokens` | memory budget per worker agent (§11.5) | 1,000 – 3,000 | each of 8 workers gets 1,500 tokens of facts |
+| `threshold=0.92` | similarity above which two facts count as duplicates during compaction (§14.1) | 0.9 – 0.95 | "likes dark mode" vs "prefers dark mode" |
+| retrieval hit rate | share of retrieved facts the answer actually used (§14.5) | 0.3 – 0.8 | 2 of 5 used → 0.4 |
+| extraction yield / rejection | facts extracted per turn / share rejected by the confidence threshold (§14.5) | — | a sudden jump usually means a prompt regression |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. The three kinds of memory
+
+> **In plain words.** "Memory" is really three different things. The chat transcript, the checklist of the task running right now, and facts about the user that should last for months. They live for different times and need different storage.
+>
+> **Real-world example.** In a bank assistant, "what did I just ask?" comes from the transcript. "Is the $2,000 transfer approved yet?" is one field in the task's state. "This customer prefers email, not SMS" is a long-term fact read in next month's chat too.
 
 Start by refusing the word "memory" as a single concept, because production systems that treat it as
 one thing invariably build one data structure — usually a `list[Message]` — and try to make it serve
@@ -133,7 +223,7 @@ should inform every future interaction regardless of which session it happens in
   store for semantically retrievable facts and past interactions, a graph for relationships between
   entities (§7.4).
 
-### 1.4 Why the distinction is load-bearing, not academic
+### 1.4 Why the distinction matters in practice
 
 The three kinds differ on every axis that matters for system design:
 
@@ -181,6 +271,10 @@ once §3–§14 have added the mechanism behind each cell:
 ---
 
 ## 2. Why you can't just dump everything into the prompt
+
+> **In plain words.** Sending the whole chat every time fails in three ways. The request eventually becomes too big and is rejected. You pay again for every old message on every turn. And the model gets worse at noticing the detail that matters when it is buried in a long text.
+>
+> **Real-world example.** At 150 tokens per turn and $3 per million tokens, a 100-turn chat costs $2.27 if you re-send everything each turn. A 200-turn chat costs $9.05: twice the turns, about four times the cost (the table in §2.2).
 
 The naive default — every message ever exchanged, concatenated in order, sent on every call — is wrong
 for three independent reasons, and it is worth holding them separately because they call for different
@@ -258,13 +352,17 @@ Put together: naive full-history-every-turn is (a) going to fail outright once t
 degrading the quality of the specific answer you're generating *right now*, well before either of the
 first two failure modes bites. None of §3's countermeasures are premature optimization — by the time a
 production chat conversation reaches even 20–30 turns with tool calls interleaved, all three failure
-modes are already in effect, just not yet visibly enough to trigger an incident. The fix has to be
+modes can already be in effect, just not yet visibly enough to trigger an incident. The fix has to be
 designed in before the failure is visible, because the failure that becomes visible last (an outright
 context-length error) is the one that was quietly costing money and quality the whole time.
 
 ---
 
 ## 3. Conversation history management: buffers, windows, and summarization
+
+> **In plain words.** You have four basic choices: send everything, send the last few messages, send as many recent messages as fit a token budget, or summarize the old part and send the recent part word for word. Most real products combine the last two.
+>
+> **Real-world example.** A travel-booking chat keeps the newest 3,000 tokens as-is and a 500-token summary of everything older ("flying Paris to Rome on 12 May, window seat, budget under $300"). Turn 90 still knows the budget, without re-sending 90 turns.
 
 Every strategy below is a different answer to "which subset (or compressed form) of the transcript do
 we actually send this turn," and production systems typically combine two or three of them rather than
@@ -458,9 +556,13 @@ exactly*.
 
 ## 4. Message trimming strategies
 
+> **In plain words.** Trimming means cutting old messages so the rest fits a budget. It is free (no model call) but you must cut at the right places: never drop the system instructions, and never keep a tool's answer while dropping the request that asked for it.
+>
+> **Real-world example.** With a 3,000-token budget, one pasted 9,000-token log file would push out everything else if you count messages instead of tokens. `trim_messages(..., max_tokens=3000, start_on="human")` keeps the newest messages that fit and makes sure the list starts with a user message.
+
 Trimming and summarization solve the same problem with different tradeoffs: trimming is free (no LLM
-call) and lossy by deletion; summarization costs a call and is lossy by compression. LangGraph's
-`trim_messages` utility is the standard, batteries-included implementation of the trimming half, and is
+call) and lossy by deletion; summarization costs a call and is lossy by compression. LangChain's
+`trim_messages` utility (in `langchain_core`, used the same way inside LangGraph apps) is the standard, batteries-included implementation of the trimming half, and is
 worth knowing at the parameter level because interviewers use it as a concrete probe of whether you've
 actually shipped this.
 
@@ -478,7 +580,7 @@ trimmed = trim_messages(
     token_counter=model,             # delegate token counting to the model's own tokenizer
     max_tokens=3000,
     start_on="human",                # after trimming, the sequence must start on a HumanMessage
-    include_system=True,             # always keep the SystemMessage regardless of budget
+    include_system=True,             # always keep a leading SystemMessage (its tokens still count toward max_tokens)
 )
 ```
 
@@ -543,21 +645,21 @@ two situations `trim_messages`'s generic strategy doesn't know about:
 
 ```python
 def trim_preserving_tool_pairs(messages: list, max_tokens: int, count_fn) -> list:
-    # Walk backward, but if a ToolMessage is included, its originating
-    # AIMessage (matched by tool_call_id) must be included too, even if
-    # that pushes past the naive per-message budget.
-    kept, total, needed_call_ids = [], 0, set()
+    # Keep the newest messages that fit the budget (walking backward).
+    kept, total = [], 0
     for m in reversed(messages):
         c = count_fn(m)
-        must_keep = getattr(m, "tool_call_id", None) in needed_call_ids
-        if not must_keep and total + c > max_tokens:
-            continue if kept else None  # allow skipping non-required messages once budget is hit
+        if total + c > max_tokens:
             break
-        if getattr(m, "tool_calls", None):
-            needed_call_ids -= {tc["id"] for tc in m.tool_calls}
         kept.append(m)
         total += c
-    return list(reversed(kept))
+    kept.reverse()
+    # The cut may land between an AIMessage (with tool_calls) and its ToolMessages.
+    # Drop any leading ToolMessage whose originating AIMessage was cut off,
+    # so no tool result is sent without the call that produced it.
+    while kept and getattr(kept[0], "tool_call_id", None):
+        kept.pop(0)
+    return kept
 ```
 
 **Pinned messages survive any trim.** A user's explicit constraint ("never suggest solution X," "my
@@ -582,6 +684,10 @@ problem to be measured and tuned, not a constant to copy from a blog post.
 ---
 
 ## 5. Agent state in LangGraph: schemas, reducers, and checkpointing
+
+> **In plain words.** Agent state is a small typed record of "where is this task": status, current step, budget left. A reducer is the rule for combining two updates to the same field. A checkpoint saves the record after every step so a crash doesn't lose progress.
+>
+> **Real-world example.** Three research helpers run at the same time and each finds 4 facts. With `operator.add` as the reducer the shared list ends with all 12. With no reducer, LangGraph rejects the simultaneous writes with an error, and writes at different steps simply overwrite each other.
 
 This section assumes `21-langgraph-deep-dive.md` §2–§3 (state schema, node signature, reducers) and §5
 (checkpointing) as background and does not re-derive the mechanics — it focuses on the memory-specific
@@ -618,9 +724,10 @@ operationally distinct — a router reads `task_status`, never greps `messages` 
 concurrent writers"); LangGraph's answer is specifically the reducer, and it is worth restating why
 this matters for *memory* specifically, not just state in general: whenever two branches of a graph run
 concurrently and both need to contribute to the same piece of memory — two research sub-agents each
-finding facts to add to a shared `facts_learned: list[dict]` field — the default (last-writer-wins,
-`21-langgraph-deep-dive.md` §3.3) silently drops one branch's contribution the first time they complete
-in the same super-step. A reducer makes the merge explicit and correct:
+finding facts to add to a shared `facts_learned: list[dict]` field — without a reducer, LangGraph refuses the update: two writes to the same plain key in one super-step
+raise `InvalidUpdateError`. Writes that land in *different* super-steps are worse, because the default
+(last-writer-wins, `21-langgraph-deep-dive.md` §3.3) silently keeps only the later one. A reducer makes
+the merge explicit and correct:
 
 ```python
 import operator
@@ -652,11 +759,15 @@ model-calling node) so that what gets checkpointed is already the bounded, curat
 raw unbounded one:
 
 ```python
+from langchain_core.messages import RemoveMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
 def trim_history_node(state: AgentState) -> dict:
     trimmed = trim_messages(state["messages"], strategy="last",
                              token_counter=model, max_tokens=4000, start_on="human")
-    return {"messages": trimmed}   # combined with add_messages's replace-by-id semantics for a
-                                    # full-list replacement, use RemoveMessage (§5.4) instead
+    # Returning `trimmed` alone would NOT shrink state: add_messages merges by id (§5.4).
+    # Clear the list first, then write back the trimmed messages.
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)] + trimmed}
 ```
 
 ### 5.4 Removing messages correctly: `RemoveMessage`
@@ -696,6 +807,10 @@ memory is just fields of your graph's state."
 ---
 
 ## 6. Workflow state machines
+
+> **In plain words.** Some tasks take days and wait on people. Write them down as a small set of named stages and the allowed moves between them. Then "where are we?" is one field anyone can read, and the task can resume after any restart.
+>
+> **Real-world example.** An expense claim goes DRAFT → SUBMITTED → APPROVED → EXECUTING → COMPLETED. The manager clicks "approve" three days later; the app loads the saved state for `thread_id="expense-4471"` and continues from SUBMITTED, even though the original server was restarted twice meanwhile.
 
 Long-running agent workflows — a multi-day approval process, a document pipeline with several
 human-gated stages, an incident-response runbook — are naturally modeled as state machines, and doing
@@ -824,6 +939,10 @@ long-lived process" (loses all in-flight workflows on every restart, exactly `22
 
 ## 7. Long-term memory architectures
 
+> **In plain words.** Long-term memory keeps stable facts about a user across chats. Don't save whole transcripts. Pull out short, structured facts with a confidence score, save those, and look up only the relevant ones later.
+>
+> **Real-world example.** From "I'm vegetarian and I'm cooking for my parents on Saturday", a recipe assistant saves "diet: vegetarian" (useful for months) and does not save "cooking Saturday" (true for one week only). Next month it filters recipes with the saved fact, a few tokens instead of the old chat.
+
 ### 7.1 User profiles: the simplest durable structure
 
 The least sophisticated and most robust long-term memory primitive is a structured profile — a typed
@@ -876,9 +995,12 @@ is only relevant to the current task. Return an empty list if nothing durable wa
 
 Turn: {turn_text}"""
 
+class ExtractedFacts(BaseModel):     # with_structured_output needs one schema object, not a bare list
+    facts: list[ExtractedFact]
+
 def extract_facts(llm, turn_text: str, message_id: str) -> list[ExtractedFact]:
-    structured_llm = llm.with_structured_output(list[ExtractedFact])
-    return structured_llm.invoke(EXTRACTION_PROMPT.format(turn_text=turn_text))
+    structured_llm = llm.with_structured_output(ExtractedFacts)
+    return structured_llm.invoke(EXTRACTION_PROMPT.format(turn_text=turn_text)).facts
 ```
 
 The "would be useful in future, unrelated conversations" framing in the prompt is doing real work — it
@@ -952,7 +1074,7 @@ and a vector store are answering different questions (relational traversal vs se
 a sophisticated long-term memory system typically runs both, choosing which to query based on the
 question's shape (a "who/what depends on what" question routes to the graph; a "what do we know that's
 *like* this" question routes to the vector store) — the retrieval-router pattern from
-`05-query-understanding.md` (planned) applied to memory instead of documents.
+`05-query-understanding.md` §2 applied to memory instead of documents.
 
 ### 7.5 Session-spanning memory: the retrieval-at-session-start pattern
 
@@ -1044,6 +1166,10 @@ said previously, which is a different retrieval problem with a different (weaker
 
 ## 8. Memory storage backends: the decision matrix
 
+> **In plain words.** Pick storage by how the data is used. Postgres is the safe default for things that must last. Redis is for fast, short-lived task data that can expire. A vector store is for finding facts by meaning. An in-memory dict is for tests only.
+>
+> **Real-world example.** A support desk keeps active task state in Redis with a 24-hour expiry (read on every request in under a millisecond), facts and checkpoints in Postgres, and fact embeddings in a pgvector column in the same Postgres database.
+
 Each of the three memory kinds from §1 has different access patterns, and the storage backend decision
 should follow the access pattern, not familiarity or default tooling choice.
 
@@ -1060,13 +1186,14 @@ right choice for a single-process service, a local developer tool, or a low-traf
 horizontal scaling and concurrent-writer throughput are non-issues. `SqliteSaver`
 (`21-langgraph-deep-dive.md` §5.1) is the LangGraph-native version; the same tradeoffs apply to any
 hand-rolled memory store built on it. Do not reach for it once more than one process instance needs to
-read/write the same store — SQLite's file-locking model is not built for that.
+read/write the same store — SQLite allows only one writer at a time, and its file locking is not
+safe across machines (for example on a network file system).
 
 ### 8.3 PostgreSQL
 
 The default production answer for both agent state (checkpoints) and structured long-term memory
 (profiles, extracted facts as rows), and increasingly for vector memory too via `pgvector`
-(`03-indexing-and-vector-stores.md` §7 covers pgvector's tradeoffs against dedicated vector databases in
+(`03-indexing-and-vector-stores.md` §10 covers pgvector's tradeoffs against dedicated vector databases in
 depth — the summary that matters here: pgvector is the right default when you already run Postgres and
 memory volume per tenant is moderate; a dedicated vector store earns its keep past a scale or
 recall/latency requirement pgvector's HNSW implementation stops comfortably meeting). Postgres gives
@@ -1143,6 +1270,10 @@ document corpus.
 ---
 
 ## 9. Semantic memory and retrieval: memory as RAG
+
+> **In plain words.** Finding the right memories is the same job as finding the right documents: embed, search, rerank. Memory adds one twist: facts go stale. Rank by meaning plus freshness plus confidence, and mark old facts as replaced when a newer one contradicts them.
+>
+> **Real-world example.** "Uses React 16" (saved 240 days ago) and "just moved to React 19" (saved yesterday) both match "what framework do they use?". With a 90-day half-life the new fact scores 0.83 and the old one 0.69, so the new one wins; marking the old fact as replaced removes it entirely.
 
 ### 9.1 The core reframing
 
@@ -1258,7 +1389,11 @@ retrieval has to sort out fresh, and expensively, on every single query instead 
 
 ## 10. Memory in multi-tenant systems
 
-### 10.1 Isolation is the load-bearing requirement, not an afterthought
+> **In plain words.** Every memory lookup must be limited to the right owner: one user, one session, or one company. Enforce that in the database itself, not only in app code, because one forgotten filter leaks data. Also plan how long facts are kept and how to delete everything for a user.
+>
+> **Real-world example.** A 12,000-user HR assistant adds a new endpoint and forgets `WHERE user_id = ...`. With row-level security switched on in Postgres, that query still returns only the current user's rows. Without it, one employee could see another employee's saved facts.
+
+### 10.1 Isolation is the core requirement, not an afterthought
 
 Every memory query in a multi-tenant system must be scoped to the correct tenant boundary, and the
 boundary itself needs to be chosen deliberately: per-user (each individual's own preferences and
@@ -1303,7 +1438,10 @@ CREATE POLICY tenant_isolation ON user_facts
 
 ```python
 def with_tenant_context(conn, user_id: str):
-    conn.execute("SET app.current_user_id = %s", (user_id,))
+    # SET does not accept bind parameters in Postgres; set_config does.
+    # Note: RLS does not apply to the table owner unless you also run
+    # ALTER TABLE user_facts FORCE ROW LEVEL SECURITY; connect as a non-owner role.
+    conn.execute("SELECT set_config('app.current_user_id', %s, false)", (user_id,))
     # every subsequent query on this connection is transparently filtered by RLS,
     # even a query someone forgot to hand-write a WHERE user_id = ... clause for
 ```
@@ -1350,9 +1488,10 @@ def forget_user(user_id: str, postgres_conn, vector_store, redis_client, graph_s
     results["facts"] = postgres_conn.execute(
         "DELETE FROM user_facts WHERE user_id = %s", (user_id,)).rowcount
     results["vectors"] = vector_store.delete(filter={"user_id": user_id})
-    results["redis_keys"] = len(redis_client.keys(f"*:user:{user_id}:*"))
-    for key in redis_client.keys(f"*:user:{user_id}:*"):
-        redis_client.delete(key)
+    # SCAN, not KEYS (KEYS blocks Redis). Match both "...:user:<id>" and "...:user:<id>:...".
+    keys = set(redis_client.scan_iter(match=f"*:user:{user_id}")) | \
+           set(redis_client.scan_iter(match=f"*:user:{user_id}:*"))
+    results["redis_keys"] = redis_client.delete(*keys) if keys else 0
     results["graph_nodes"] = graph_store.delete_nodes(entity=f"user:{user_id}")
     return results
 ```
@@ -1366,6 +1505,10 @@ in the design doc and silently incomplete the first time it is actually executed
 ---
 
 ## 11. Memory in multi-agent systems
+
+> **In plain words.** When several agents work together, don't give each one everything. Give each agent the shared facts plus its own notes, pass short structured results between agents, and let each agent look up only the memories its own task needs.
+>
+> **Real-world example.** A supervisor with 8 worker agents: sharing a full 20,000-token history with each costs 160,000 tokens per round. Giving each worker a 1,500-token budget of relevant facts costs 12,000.
 
 ### 11.1 The cost problem specific to multi-agent memory
 
@@ -1462,6 +1605,10 @@ follow what the current unit of work needs, not an arbitrary even split.
 
 ## 12. The context window budget
 
+> **In plain words.** Each request has a fixed token budget. Instructions, chat history, retrieved documents, tool output and working notes all compete for it. Reserve room for the fixed parts and the answer, then split the rest based on what this turn needs.
+>
+> **Real-world example.** With a 128,000-token window, reserve 2,000 for instructions, 4,000 for the answer and 1,000 as a margin, leaving 121,000. A fact-lookup turn gives 65% of that (78,650 tokens) to retrieved documents; a follow-up in a long chat gives 55% to history instead.
+
 ### 12.1 The five categories competing for the same tokens
 
 Every production LLM call has, effectively, a fixed token budget (the context window, or a smaller
@@ -1531,6 +1678,10 @@ document losing its second half.
 
 ## 13. LangChain memory classes and why LangGraph replaced them
 
+> **In plain words.** LangChain used to ship ready-made "memory" classes, one per strategy. They didn't save themselves across restarts and didn't handle parallel updates. In LangGraph, memory is just fields in the graph's state, saved by the checkpointer.
+>
+> **Real-world example.** `ConversationSummaryBufferMemory(max_token_limit=2000)` becomes two state fields, `summary` and `messages`, plus one summarize node. A server restart no longer wipes it, because the checkpointer saves both fields after every step.
+
 ### 13.1 The classes, for the record
 
 LangChain's pre-LangGraph `Memory` module offered a family of classes, each a named, pre-built version
@@ -1590,12 +1741,17 @@ The migration is not class-for-class; it is a change of what memory *is*:
 
 Every legacy class becomes, in the new model, "a field of state, populated and maintained by an ordinary
 node, persisted for free by whichever checkpointer the graph is compiled with" — which is why LangChain's
-own migration guides do not offer a drop-in replacement class; there is no class to replace, because
+own migration guides point to LangGraph persistence rather than to a new replacement class; there is
+no class to replace, because
 memory is no longer a special kind of object, it is state, exactly as §5.1 argues.
 
 ---
 
 ## 14. Production patterns
+
+> **In plain words.** Once memory is live, it needs upkeep: merge duplicate facts on a schedule, delete by rule, upgrade old records when the format changes, test the fixed rules without a model, and track a few numbers so you notice when it gets worse.
+>
+> **Real-world example.** A nightly job finds "likes dark mode" and "prefers dark mode" (similarity 0.95, above the 0.92 threshold) for the same user and keeps only the higher-confidence one. A dashboard shows history tokens per turn so a trimming bug appears as a jump from 3,000 to 12,000.
 
 ### 14.1 Memory compaction
 
@@ -1780,6 +1936,10 @@ or a silently-forgotten system prompt in production traffic specifically shaped 
 
 ## 16. Interview questions, with weak and strong answers
 
+> **In plain words.** Interviewers want to hear that you separate the three kinds of memory, know why sending everything fails, and can name a concrete fix with a number. Start each answer with one plain sentence, then the mechanism, then one trade-off.
+>
+> **Real-world example.** "How do you handle a 100-turn chat?" A strong short answer: "Keep the newest ~3,000 tokens word for word, summarize the rest, and save exact values like order numbers as structured facts. That caps per-turn cost instead of letting it grow every turn."
+
 **1. What are the three kinds of memory in an agent system, and why does the distinction matter?**
 Weak: "Short-term and long-term memory." Strong: names conversation history, agent state, and
 long-term memory specifically, and grounds the distinction in different lifetimes, read/write ratios,
@@ -1813,15 +1973,16 @@ raw message count), `max_tokens`, `include_system` (never trim the system prompt
 
 **6. How would you trim history without breaking a tool call and its result apart?**
 Weak: "Trim by message count, it usually works out." Strong: explains that tool-call/tool-result pairs
-are structurally one unit tied by `tool_call_id`, that a generic trimmer isn't aware of this, and shows
-the pattern of tracking required call IDs while walking backward so a required `ToolMessage`'s
-originating `AIMessage` is never dropped independently (§4.4).
+are structurally one unit tied by `tool_call_id`, that a naive slice isn't aware of this, and shows
+the fix: after cutting, drop any leading `ToolMessage` whose originating `AIMessage` was cut, so a
+tool result is never sent without its call (§4.4).
 
 **7. What is a reducer, and how does it relate to memory specifically?**
 Weak: "It's how LangGraph merges state." Strong: explains the default overwrite-on-conflict behavior,
 why concurrent branches writing to the same un-reduced memory field (e.g. a shared `facts_learned` list)
-silently lose contributions, and that `add_messages` and `operator.add` are the two most common memory-
-relevant reducers, with the concrete failure mode being invisible in sequential testing (§5.2, and
+fail (LangGraph raises `InvalidUpdateError` for two writes in one super-step) or, across super-steps,
+silently overwrite each other, and that `add_messages` and `operator.add` are the two most common memory-
+relevant reducers, with the silent-overwrite case being invisible in sequential testing (§5.2, and
 `21-langgraph-deep-dive.md` §3.3).
 
 **8. Why does LangGraph's checkpointer persist conversation history, and is that enough on its own?**
@@ -1926,9 +2087,10 @@ rather than a blind byte cutoff when a category still overflows its slice (§12.
 
 **22. Two branches of a graph both try to append to a shared `facts_learned` list concurrently. What
 happens, and how do you fix it?**
-Weak: "LangGraph handles that automatically." Strong: states plainly that without a declared reducer the
-default is overwrite/last-writer-wins, so one branch's contribution is silently lost — invisible in
-sequential testing, real under production concurrency — and that the fix is `Annotated[list[dict],
+Weak: "LangGraph handles that automatically." Strong: states plainly that without a declared reducer,
+LangGraph rejects two writes to the same plain key in one super-step with `InvalidUpdateError`; if the
+writes land in different super-steps, the default overwrite (last-writer-wins) silently loses the
+earlier one — invisible in sequential testing — and that the fix is `Annotated[list[dict],
 operator.add]` (or a custom merge function for anything needing deduplication), naming this as
 specifically the concurrency contract memory-bearing state fields need (§5.2).
 
@@ -1957,7 +2119,8 @@ explain one design decision it would change in a system you're building. *Time:*
 *Goal:* make §5.2's concurrency hazard something you've seen fail, not just read about — a memory-
 specific variant of `21-langgraph-deep-dive.md` §17's Lab 2. *Steps:* build a graph with three
 concurrently-executing nodes each appending a fact to a shared `facts_learned` field with no reducer;
-run it enough times to observe non-deterministic data loss; fix it with `operator.add`; then
+observe LangGraph's `InvalidUpdateError` for same-super-step writes, then make one branch one step
+longer and observe the silent overwrite instead; fix both with `operator.add`; then
 deliberately engineer a duplicate-fact case and fix that with a dedup-aware custom reducer. *Artifact:*
 a script demonstrating broken, naively-fixed, and correctly-fixed behavior with printed state after
 each run. *Time:* ~1.5 hours.
@@ -2008,3 +2171,131 @@ memory without a batch job having touched the underlying row, and that writing i
 now-current version; then simulate reading a record from a *future* version your current code doesn't
 know about and confirm it fails loudly rather than silently corrupting data. *Artifact:* the migration
 chain, plus a test matrix of (stored version) x (expected behavior). *Time:* ~1.5 hours.
+
+---
+
+## 18. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of memory problem teams hit in production: what users saw, the numbers that explained it, and the fix with before/after numbers.
+>
+> **Real-world example.** Case 1 shows a chat bill 37× larger than the planning estimate, caused by re-sending history on every turn.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+**Quick index:** bill far above estimate → Case 1; "it forgot my order number" → Case 2; checkpoint
+storage and resume time keep growing → Case 3; users see someone else's facts → Case 4; assistant
+repeats an outdated fact → Case 5; deleted user still found in search → Case 6.
+
+### Case 1 — The chat bill is 37× the estimate
+
+**Setup.** A support chat handles 100,000 conversations a month. Each turn adds 150 tokens; input costs
+$3 per million tokens. The app re-sends the full history on every turn (§2.2). 95% of conversations
+last 30 turns; 5% last 200 turns.
+
+**Symptom.** Finance planned for about $1,700 a month. The actual input bill is about $65,000.
+
+**Measurement.** The plan used "average turns × tokens per turn": 38.5 × 150 tokens × 100,000 ×
+$3/M = $1,732.50. Real cost per conversation is 150 × (1 + 2 + … + n) tokens: $0.21 for a 30-turn chat,
+$9.05 for a 200-turn chat. Total: 95,000 × $0.209 + 5,000 × $9.045 = **$65,104**. The 5% of long chats
+produce **69%** of the bill.
+
+**Fix.** Cap history at 3,000 tokens (§3.3), with a summary for older turns (§3.4). A 200-turn chat
+now costs $1.71 instead of $9.05; the monthly total drops to **$26,100** (history only, summary calls
+not included), and long chats fall to 33% of the bill.
+
+**Lesson.** Re-sending history grows with the square of the turn count. Plan cost from the
+distribution of conversation lengths, not the average.
+
+### Case 2 — "It forgot my order number"
+
+**Setup.** A shop assistant uses summary memory (§3.4) with 8 messages kept word for word. Older turns
+are folded into a running summary.
+
+**Symptom.** In long chats, customers complain that the assistant asks for their order number again.
+
+**Diagnosis.** A sample of 400 conversations where the order number was given before the first fold:
+the summary kept the exact number in 248 (**62%**). The rest said things like "the customer asked about
+an order" (§3.5, point 1).
+
+**Fix.** Pull order numbers, emails and amounts out of each turn into structured state fields the
+moment they appear (§3.5, §7.2), and never pass them through the summary. On the same 400
+conversations the exact number was available in 396 (**99%**); the 4 misses were typos by the user.
+
+**Lesson.** Summaries are for the gist. Exact values go into fields.
+
+### Case 3 — Checkpoints that never stop growing
+
+**Setup.** A LangGraph chat app with a Postgres checkpointer. A "trim" node returns the last 20
+messages as a plain list (the bug §5.3–§5.4 describe). Messages average 1.2 KB when serialized.
+
+**Symptom.** Resuming old threads gets slower every week; the checkpoint table grows much faster than
+the number of users.
+
+**Measurement.** Because `add_messages` merges by id, returning a shorter list deletes nothing. A
+300-turn thread holds 600 messages, so its latest checkpoint is **720 KB**. Assuming one checkpoint per
+turn, that one thread wrote 1.2 KB × (2 + 4 + … + 600) ≈ **106 MB** of checkpoints over its life.
+
+**Fix.** Delete with `RemoveMessage` (§5.4), or clear with `REMOVE_ALL_MESSAGES` and write back the
+trimmed list (§5.3). Each checkpoint now holds at most 20 messages (**24 KB**), and the same thread's
+lifetime total is about **6.9 MB**. Add the "state size per thread" metric from §14.5 so a regression
+shows up on a dashboard.
+
+**Lesson.** A checkpointer saves whatever you give it. It does not bound growth for you.
+
+### Case 4 — One missing filter leaks other users' facts
+
+**Setup.** An HR assistant stores 1.2 million extracted facts for 12,000 employees (about 100 each) in
+a vector store. Isolation is done only in app code with `filter={"user_id": ...}` (§7.3).
+
+**Symptom.** An employee reports that the new "what do you remember about me?" page lists a salary
+detail that belongs to someone else.
+
+**Diagnosis.** The new endpoint called the search without the filter. One user's facts are 100 / 1.2M
+≈ 0.008% of the index, so a top-5 search across everyone almost always returns other people's facts.
+The logs show 3,100 calls in the 2 hours the endpoint was live; 3,087 (**99.6%**) returned at least one
+fact from another user.
+
+**Fix.** Move facts to Postgres with row-level security, set the user per connection with
+`set_config`, and connect as a non-owner role (§10.2). Make the filter a required argument in the
+vector-search wrapper, and add a CI test that searches as user A and asserts zero rows from user B.
+After the fix, the same missing-filter code returns only the caller's rows: **0** cross-user results
+in 10,000 test queries.
+
+**Lesson.** Isolation that depends on every caller remembering a filter will fail on the newest code
+path. Enforce it in the storage layer and test it.
+
+### Case 5 — The assistant keeps using an outdated fact
+
+**Setup.** A coding assistant ranks memories with §9.2's composite score but uses one global half-life
+of 3,650 days (ten years), which in practice means "no decay". There is no supersession check (§9.3).
+
+**Symptom.** A user who migrated to React 19 keeps getting React 16 advice.
+
+**Measurement.** For "what framework do they use?": the old fact (similarity 0.86, 240 days old,
+confidence 0.9) scores **0.890**; the new fact (similarity 0.80, 1 day old, confidence 0.7) scores
+**0.835**. The stale fact ranks first.
+
+**Fix.** Use a 90-day half-life for the "technical stack" category: the old fact drops to **0.690** and
+the new one rises to **0.833**. Also add the write-time contradiction check (§9.3), which marks the old
+fact `superseded_by` the new one, so it is not returned at all.
+
+**Lesson.** Similarity alone can't tell old from new. Mark replaced facts, and tune decay per category.
+
+### Case 6 — "Forget me" that didn't forget
+
+**Setup.** Facts live in Postgres, embeddings in a separate vector index, session state in Redis. The
+erasure job deleted Postgres rows only.
+
+**Symptom.** An audit runs a search on the vector index using the ids of users who asked to be
+deleted, and gets hits.
+
+**Measurement.** 2,400 erasure requests in a quarter; those users had on average 85 embeddings each, so
+about **204,000** vectors were still stored. Redis keys expired on their own after 24 hours, so they
+were not a gap.
+
+**Fix.** One `forget_user` function that deletes from every backend (§10.4) and returns a count per
+backend, plus a CI test that creates a user in all stores, deletes them, and asserts **0** rows,
+vectors and keys remain. A one-time cleanup job removed the 204,000 leftover vectors.
+
+**Lesson.** If memory is written to N stores, deletion must touch N stores, and a test must prove it.
