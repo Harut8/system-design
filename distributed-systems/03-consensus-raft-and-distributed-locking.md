@@ -1694,6 +1694,66 @@ Architecture:
 
 ---
 
+## 17. Real-world cases — incidents with numbers
+
+> **In plain words.** Consensus and locking bugs rarely look like "Raft is broken". They look like slow disks causing elections, a frozen worker writing late, or a cluster laid out so one outage removes the majority. Each case shows the symptom you would actually see, the number that gave it away, and the fix.
+>
+> **Real-world example.** Case 17.1: a Kubernetes control plane kept "losing" its etcd leader 30 times an hour; the cause was a 400 ms disk, not the network.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent. Case 17.6 is a public postmortem.
+
+Quick index: frequent leader elections → 17.1 · double processing despite a lock → 17.2 · a healthy leader keeps stepping down → 17.3 · whole cluster read-only after one region fails → 17.4 · lock service CPU at 95% when locks are released → 17.5 · cross-region failover after a short network blip → 17.6
+
+### 17.1 Slow disk, constant elections (Kubernetes control plane)
+
+- **Setup.** 3-member etcd for a 400-node Kubernetes cluster, on network-attached cloud disks. Defaults: heartbeat 100 ms, election timeout 1000 ms.
+- **Symptom.** `kubectl` calls time out with `etcdserver: request timed out`; deployments stall for a few seconds several times an hour.
+- **Measurement/Diagnosis.** `etcd_server_leader_changes_seen_total` rose by 30 in one hour. Network RTT between members was 0.6 ms, so the network was fine. `etcd_disk_wal_fsync_duration_seconds` p99 was 400 ms, against etcd's guidance of under 10 ms. Other workloads on the same disk caused stalls; when a stall on the leader passed 1000 ms, its heartbeats stopped and followers called an election (§3.4, §15.1).
+- **Fix.** Moved etcd to dedicated local SSDs. fsync p99: 400 ms → 3 ms. Leader changes: 30/hour → 0 in the following week. API server write p99: 1.8 s → 60 ms.
+- **Lesson.** In etcd, "leader lost" usually means "disk slow". Check fsync latency before touching timeouts; raising the election timeout only hides the problem and slows real failover.
+
+### 17.2 Double payouts behind a Redis lock (payments service)
+
+- **Setup.** A payouts worker takes a Redis lock `SET payout-batch <uuid> NX PX 10000` (10 s TTL), then pays each seller in the batch. Two workers run for redundancy. No fencing.
+- **Symptom.** Finance finds 312 sellers paid twice in one night.
+- **Measurement/Diagnosis.** JVM logs on worker A show a 14 s full GC pause mid-batch. A's lock expired at 10 s; worker B acquired it and started the same batch; A woke up and kept paying (§9.1). 312 duplicates × $40 average = $12,480 overpaid.
+- **Fix.** Moved the lock to etcd and used the lock key's `create_revision` as a fencing token. The payouts table stores `last_token` per batch and the write is `UPDATE ... WHERE batch_id = ? AND last_token <= ?` — a stale worker's write matches 0 rows. Each payout also carries an idempotency key per seller. GC tuning cut max pause 14 s → 200 ms. Duplicates: 312 → 0 over the next 90 nights.
+- **Lesson.** A lock only limits who *starts*. Only a check at the storage (fencing token or idempotency key) stops a stale holder from *finishing*.
+
+### 17.3 A flapping node keeps knocking out a healthy leader (dispatch service)
+
+- **Setup.** 5-member Raft cluster holding driver-assignment state for a ride-hailing dispatch system. Pre-Vote and CheckQuorum disabled. Node 5 has a faulty NIC that drops out for 5–20 s at a time.
+- **Symptom.** Dispatch writes fail in short bursts about 12 times an hour, though nodes 1–4 are healthy.
+- **Measurement/Diagnosis.** Node 5's term climbs by several each time it is cut off (each election timeout it runs a new election). When it reconnects, its higher term makes the leader step down (§3.3). Each forced election cost about 1.2 s of no writes: 12 × 1.2 s = 14.4 s per hour, 0.4% of the time.
+- **Fix.** Enabled Pre-Vote and CheckQuorum, and replaced the NIC. Disruptive elections from node 5: 12/hour → 0; write unavailability from this cause: 14.4 s/hour → 0.
+- **Lesson.** One bad node should not be able to take out the leader. Pre-Vote makes a node prove it could win before it raises its term.
+
+### 17.4 An even split across two regions (bank ledger)
+
+- **Setup.** A ledger's Raft cluster has 4 members: 2 in region East, 2 in region West. Majority = 3 of 4.
+- **Symptom.** Region West loses power. The 2 East members are healthy, yet every ledger write fails for 45 minutes (2,700 s) until West returns.
+- **Measurement/Diagnosis.** 2 of 4 is not a majority. The 4th member added no fault tolerance: 4 members tolerate 1 failure, the same as 3 (§6, symbols table).
+- **Fix.** 5 members across 3 regions (2 East, 2 West, 1 Central). Losing any one region leaves at least 3 of 5. The cost: a commit now needs a second region to acknowledge, so write latency rose from about 1 ms (in-region) to the RTT to the nearest other region, e.g. 1 ms → 12 ms.
+- **Lesson.** Use an odd number of members, and spread them so losing any one region still leaves a majority. Count survivors per failure, not total members.
+
+### 17.5 Thundering herd on lock release (IoT telemetry)
+
+- **Setup.** 500 ingestion workers compete for a per-device-group lock in etcd. Each waiter watches the whole prefix `/locks/group-7/` and, on any change, re-lists all keys to see if it is now first.
+- **Symptom.** etcd CPU at 95% and request latency p99 jumps from 5 ms to 900 ms whenever locks change hands.
+- **Measurement/Diagnosis.** Every release wakes all 500 waiters, and each lists ~500 keys: 500 × 500 = 250,000 key reads per release. At 20 releases/s that is 5,000,000 key reads/s (§10.2 "thundering herd").
+- **Fix.** Each waiter watches only the key just before its own (next-lower `create_revision`), which is what etcd's `concurrency` lock does. Per release: 1 notification and 1 small read instead of 500 notifications and 250,000 key reads. etcd CPU 95% → 10%; p99 900 ms → 6 ms.
+- **Lesson.** Queue-style locks should wake exactly one waiter. Watching the predecessor is the whole point of the sequential-key design.
+
+### 17.6 Public postmortem: GitHub, October 2018
+
+- **Setup.** GitHub ran MySQL clusters with primaries in a US East Coast data center, replicas in other sites, and automated failover through Orchestrator.
+- **Symptom.** During network maintenance on 21 October 2018, connectivity between the US East Coast network hub and the primary US East Coast data center was lost for **43 seconds**.
+- **Measurement/Diagnosis.** In that window the failover system promoted primaries in the US West Coast data center. Some writes accepted in the East had not replicated West, and the application now paid cross-country latency on every write. Restoring consistent data took time; GitHub reported **24 hours and 11 minutes** of degraded service.
+- **Fix.** GitHub's postmortem says they changed Orchestrator's configuration to stop promoting database primaries across regional boundaries, and began work on more resilient multi-region operation.
+- **Lesson.** A failover mechanism that can decide in seconds can turn a 43-second blip into a day-long recovery. Decide which failovers must never happen automatically (e.g. across regions), and make sure failover never promotes a node missing acknowledged writes — exactly what Raft's voting rule (§5.2) guarantees within one log.
+
+---
+
 ## Cross-References
 
 ### Within `distributed-systems/`
