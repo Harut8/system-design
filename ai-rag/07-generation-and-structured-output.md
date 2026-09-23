@@ -45,6 +45,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The generation step in the RAG pipeline](#1-the-generation-step-in-the-rag-pipeline)
 2. [Why structure matters: the contract with downstream](#2-why-structure-matters-the-contract-with-downstream)
 3. [JSON mode and structured outputs — the provider landscape](#3-json-mode-and-structured-outputs--the-provider-landscape)
@@ -64,10 +65,102 @@
 17. [Anti-patterns](#17-anti-patterns)
 18. [Mental models — the compressed set](#18-mental-models--the-compressed-set)
 19. [Lab exercises](#19-lab-exercises)
+20. [Interview questions and system design prompts](#20-interview-questions-and-system-design-prompts)
+21. [Real-world cases — incidents with numbers](#21-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** By the time we reach this step, search has found the right passages and put them
+in the prompt. Now the LLM must write the answer. Two things can still go wrong: the answer can say
+things the passages do not support, or it can come back in a shape the program cannot read. In a
+real product the answer is read by code first (the API, the app screen, an agent), and code breaks
+on a missing field. This chapter is about making the model's output a reliable **form** that code
+can trust: a fixed shape, checks on every answer, a plan for retries, and a safe fallback.
+
+**A real-world example.** An online shop's customer-support assistant answers 10,000 questions a
+day. The app shows three things from each answer: the text, clickable sources, and a
+"how sure are we" badge. Each call sends about 9,600 prompt tokens and gets about 500 tokens back,
+which costs about $0.036 on a Sonnet-class model, or about $363 a day. (The failure rates below
+are illustrative.)
+
+1. **Just asking "reply in JSON".** Most answers are fine. But say 2% come back wrapped in
+   ` ```json ` fences, with a trailing sentence, or with `confidence` missing. That is 200 users a day
+   who see a blank screen or an error.
+2. **Structured outputs (§3, §4).** The provider only lets the model produce text that fits the
+   declared shape. Broken JSON and missing fields drop to about zero. (Answers cut off at
+   `max_tokens` can still happen, so the code checks the stop reason, §16.1.)
+3. **Semantic checks (§6).** The shape is right, but say 4% of answers (400 a day) cite a source ID
+   that was not in the retrieved passages, or "quote" text that is not in the source. A simple
+   check catches them: does the ID exist, and does the quote appear in that passage?
+4. **Retry with the error message (§7).** Each of those 400 answers is sent back once with "chunk
+   c_999 does not exist, use only these IDs". Say 3 out of 4 get fixed. The extra 400 calls cost
+   about $15 a day, about 4% more.
+5. **Fallback (§7.4).** The last 100 get a simpler, honest reply: "Here are the most relevant help
+   articles" with links, instead of an answer with fake sources.
+6. **Streaming (§10).** The user sees the first words after about 1.5 s instead of waiting about
+   16.5 s for the whole answer.
+7. **Caching the fixed part of the prompt (§13.5, §15.3).** The 1,500 tokens of instructions and
+   schema are the same on every call. Caching them cuts the bill by about 9.5%.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Structured output | the model returns data in a fixed shape (usually JSON), not free text | filling in a form instead of writing a letter |
+| Schema | the definition of that shape: field names, types, allowed values | the blank form with labeled boxes |
+| JSON mode | the provider guarantees valid JSON, but not your fields | "write on the form" but any boxes will do |
+| Constrained decoding | while generating, the model is only allowed tokens that keep the output valid | a form field that only accepts digits |
+| Validation (3 layers) | checks: does it parse, does it have the right shape, does it make sense | spell-check, then "all boxes filled", then "does the address exist" |
+| Semantic validation | checks a program can do but a schema cannot, like "does this cited passage exist" | a clerk calling the reference you listed |
+| Output repair / retry | send the bad answer back with the exact error and ask for a fix | a teacher returning homework with the mistake circled |
+| Fallback / degradation path | what the user gets when all retries fail | a shop's "sorry, sold out, here is a similar item" |
+| Circuit breaker | stop retrying for a while when many requests are failing | a fuse that trips so the whole house doesn't burn |
+| Temperature | how random the model's word choices are; 0 = always the most likely | a chef who follows the recipe exactly (0) or improvises (1) |
+| Citation / verbatim quote | a pointer from a claim to the passage it came from, with exact copied words | a footnote with the exact sentence from the book |
+| Streaming | sending the answer word by word as it is generated | a live subtitle instead of the full transcript later |
+| TTFT | time until the first word appears | how long before the waiter brings anything to the table |
+| Prompt caching | the provider reuses the processed fixed start of the prompt, cheaper and faster | a pre-printed letterhead instead of writing it each time |
+| Stop reason | why the model stopped: finished, hit the length limit, refused, blocked | the reason a phone call ended: goodbye, dropped signal, hung up |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `tokens_in` | tokens sent to the model (instructions + schema + passages + question) | 2K – 100K | 9,600 |
+| `tokens_out` | tokens the model writes back | 100 – 2,000 | 500 |
+| `p_in`, `p_out` (`price_per_input_token`, `price_per_output_token`) | price per token, usually quoted per million | $3 / $15 per M (Sonnet 4) | 9,600 × $3/M = $0.0288 |
+| `C_query`, `C_embed`, `C_rerank`, `C_generate` | cost of one question and of each pipeline step | $0.00003 – $0.03 | generation ≈ 93% of the total (§1.4) |
+| `C_generation`, `C_input`, `C_output`, `C_overhead` | generation cost and its parts (§15.1) | — | $0.0288 + $0.0075 + retries |
+| `C_retries`, `expected_retries`, `C_repair_tokens` | extra cost from retries: share of queries retried × cost of a retry | 1% – 10% of queries | 0.05 × $0.0413 ≈ $0.0021 |
+| TTFT | time to first token | 0.5 – 1.5 s | 1.5 s |
+| ITL (`inter_token_latency`) | time between output tokens | 20 – 40 ms | 30 ms × 500 tokens = 15 s |
+| `n_output_tokens`, `n` | number of tokens generated | 100 – 2,000 | total latency 1.5 + 500 × 0.03 = 16.5 s |
+| `max_tokens` | hard cap on output length; the answer is cut off at this point | ≥ 2 × expected output | 2,048 for a ~900-token answer |
+| `temperature` | randomness of token choice | 0 for structured output | 0.0 |
+| `top_p` | sample only from the most likely tokens whose total probability is `p` | 0.95 – 1.0 | 0.95 |
+| `seed` | fixes random sampling so runs can repeat (OpenAI) | any integer | 42 |
+| `MAX_RETRIES`, `max_retries` | how many extra attempts after the first | 2 | 3 attempts in total at most |
+| `failure_threshold`, `window_size`, `cooldown_seconds` | circuit breaker: trip at this failure share over the last N requests, stay tripped this long | 0.3, 100, 60 s | 30 of the last 100 failed → fallback for 60 s |
+| `confidence` | the model's self-reported certainty, 0 – 1 | — | 0.85 |
+| `relevance` | how directly a quote supports a claim, 0 – 1 | — | 0.9 |
+| `fuzzy_threshold`, similarity `ratio` | text similarity (0 – 1) above which a non-exact quote counts as a paraphrase | 0.85 | ratio 0.91 → "paraphrased" |
+| `citation_density` | cited claims ÷ all claims | aim for 1.0 | 4 of 5 claims cited → 0.8 |
+| `budget_tokens` | tokens the model may use for hidden reasoning (extended thinking) | 1K – 16K | 8,192 |
+| `max_refinements` | review-and-rewrite rounds in self-critique | 1 | 1 round → up to 3 calls |
+| cache hit rate | share of requests where the cached prefix is reused | 50% – 95% | 90% |
+| `final_k` | number of passages put into the prompt (from `04`) | 5 – 20 | 8 |
+| `schema_version` | version label stored in each output | — | "2.1" |
+| pass rate / regression gate | share of test answers that pass validation; block a model change if it drops more than the gate | gate 2 points | 97% → 93% = blocked |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. The generation step in the RAG pipeline
+
+> **In plain words.** This is the step where the LLM reads the question plus the retrieved passages and writes the answer. The answer should come back as a small data object (text, sources, confidence), not loose prose. It is also the most expensive step of the whole pipeline.
+>
+> **Real-world example.** An 8,000-token prompt plus a 500-token answer on Claude Sonnet 4 costs about $0.03. Embedding the question and reranking 50 passages together cost about $0.002. So generation is about 93% of the cost of each question.
 
 ```
     query
@@ -182,6 +275,10 @@ not optimizations — they are the first place to look when cost is too high.
 
 ## 2. Why structure matters: the contract with downstream
 
+> **In plain words.** The answer is read by programs before people: the API, the app screen, an agent's next step. Programs need exact fields, not "roughly" the right text. A contract says what the fields are, how to check them, what to do when a check fails, and what to show if nothing works.
+>
+> **Real-world example.** The app expects a list called `citations`. The model writes "Sources: see above" instead. The app crashes on that answer and the user sees a blank screen. With 10,000 answers a day, even 1% like this is 100 broken screens a day.
+
 ### 2.1 The consumers of generation output
 
 In a production system, the generation step's output is consumed by at least three categories of
@@ -262,13 +359,17 @@ definition of "degraded" vs. "normal."
 
 ## 3. JSON mode and structured outputs — the provider landscape
 
+> **In plain words.** There are three levels. Asking nicely for JSON gives no guarantee. JSON mode guarantees valid JSON, but in any shape. Structured outputs guarantee valid JSON in exactly your shape.
+>
+> **Real-world example.** Illustrative: out of 10,000 calls, prompt-only JSON might give 100 answers wrapped in ` ```json ` fences or followed by an extra sentence. JSON mode fixes those, but some answers may skip `confidence`. Structured outputs make every field appear every time.
+
 ### 3.1 The evolution: three generations of structure enforcement
 
 | Generation | Mechanism | Provider support | Guarantee |
 |---|---|---|---|
 | **Prompt-only** | "Respond in JSON format" in the system prompt | All models | None — the model *usually* complies, but can emit markdown-wrapped JSON, trailing text, or invalid syntax |
 | **JSON mode** | Provider-level flag that forces syntactically valid JSON | OpenAI (`response_format: {"type": "json_object"}`), Anthropic (via tool use), Google | Valid JSON, but no schema conformance — any JSON object is accepted |
-| **Structured outputs** | Provider-level schema enforcement via constrained decoding | OpenAI (2024, `response_format: {"type": "json_schema", ...}`), Anthropic (tool use with input schemas), Google (via function calling) | Schema-conformant JSON — every response matches the declared schema |
+| **Structured outputs** | Provider-level schema enforcement via constrained decoding | OpenAI (2024, `response_format: {"type": "json_schema", ...}`), Anthropic (tool use with input schemas; a strict, constrained-decoding mode was added later), Google (`response_schema`, also function calling) | Schema-conformant JSON — every response matches the declared schema (only in the strict / constrained modes) |
 
 The progression matters because each generation addresses a specific failure mode the previous one
 left open:
@@ -322,7 +423,8 @@ parsed: AnswerWithCitations = response.choices[0].message.parsed
 - Recursive schemas are supported but must use `$ref`.
 - `$defs` is supported, enabling discriminated unions.
 - Top-level must be an object, not an array or primitive.
-- Maximum schema depth: 5 levels of nesting (as of 2025 API).
+- There are limits on nesting depth and on the total number of properties. The numbers have
+  changed over time; check the current docs.
 
 ### 3.3 Anthropic structured outputs via tool use
 
@@ -367,21 +469,23 @@ for block in response.content:
 ```
 
 The `tool_choice: {"type": "tool", "name": "provide_answer"}` forces the model to use that
-specific tool, which guarantees the response will contain a tool-use block with schema-conformant
-input. This is functionally equivalent to OpenAI's structured outputs, implemented through a
-different API surface.
+specific tool, which guarantees the response will contain a tool-use block. Plain tool use makes
+the model follow the `input_schema` very reliably, but it was not originally enforced by
+constrained decoding, so a missing field or wrong type was rare but possible. Anthropic later added
+a strict structured-outputs mode that does enforce the schema; check the current docs. Either way,
+keep the `model_validate` step below.
 
 ### 3.4 The provider comparison table
 
 | Feature | OpenAI structured outputs | Anthropic tool use | Google Gemini |
 |---|---|---|---|
-| Schema enforcement | Constrained decoding | Constrained decoding via tool schema | Function calling with schema |
+| Schema enforcement | Constrained decoding | Tool schema (strongly followed); constrained decoding in strict mode | `response_schema` / function calling with schema |
 | Schema language | JSON Schema (subset) | JSON Schema (via tool `input_schema`) | OpenAPI-style schema |
 | Streaming | Yes, partial JSON | Yes, partial tool input | Yes |
 | Refusal handling | `response.choices[0].message.refusal` field | Stop reason `end_turn` without tool use block | Finish reason check |
 | Recursive schemas | Yes (via `$ref`) | Yes | Limited |
 | Union types | `anyOf` supported | `anyOf` supported | Limited |
-| Max schema depth | 5 levels | No hard limit documented | 5 levels |
+| Schema size / depth limits | Documented limits (check current docs) | Documented limits in strict mode (check docs) | Documented limits (check docs) |
 | Caching interaction | Cached prefix includes schema | System prompt caching applies | Context caching applies |
 | Token overhead | Schema tokens counted in system prompt | Tool definition tokens counted in input | Schema tokens in input |
 
@@ -400,6 +504,10 @@ RAG systems, the tradeoff is unambiguously in favor of schema enforcement.
 ---
 
 ## 4. Constrained decoding: how structured outputs work under the hood
+
+> **In plain words.** The model writes one token at a time, picking from all possible next tokens. Constrained decoding hides every option that would break the format, so the model can only pick valid ones. It is like a form field that accepts only digits.
+>
+> **Real-world example.** After `"confidence":` the only allowed next tokens are the start of a number. The word `high` is blocked, so a number is guaranteed. The price is a little extra time per token (roughly 5–15%).
 
 ### 4.1 The decoding loop, unconstrained
 
@@ -480,9 +588,9 @@ Constrained decoding has measurable but usually acceptable performance costs:
 
 | Aspect | Impact | Notes |
 |---|---|---|
-| Latency per token | +5–15% | Grammar state update and mask computation per step |
+| Latency per token | roughly +5–15% (implementation-dependent) | Grammar state update and mask computation per step |
 | Output quality | Neutral to slightly improved | Prevents wasted tokens on structural errors; the model "knows" the constraint |
-| First-token latency | +10–50ms | Schema compilation and grammar construction (amortized across requests with the same schema) |
+| First-token latency | tens of ms; on some hosted APIs the first request with a *new* schema can take seconds | Schema compilation and grammar construction (cached and amortized across requests with the same schema) |
 | Vocabulary utilization | Reduced | Fewer tokens compete; sampling distribution is narrower |
 | Batch efficiency | Slightly reduced | Different requests in a batch may have different masks |
 
@@ -517,12 +625,18 @@ result: Answer = generator(prompt)
 
 The mechanism is identical — compile the schema to a grammar, compute allowed tokens at each step,
 mask the rest — but the implementation lives in the inference engine rather than behind an API.
+(The code above is the Outlines 0.x API; Outlines 1.0 renamed the entry points, so check the
+version you install.)
 This gives you more control (custom grammars, regex constraints, enum enforcement) at the cost of
 managing the inference stack.
 
 ---
 
 ## 5. Schema design for LLM outputs
+
+> **In plain words.** The schema is not just a type definition; the model reads it as instructions. Clear field names and short descriptions make the model write better values. Plan schema changes like database changes: add fields, don't rename or delete them suddenly.
+>
+> **Real-world example.** A field named `q` gets a loose summary. A field named `verbatim_quote` with the description "exact copy of text from the chunk, do not paraphrase" gets exact quotes much more often, which your code can then check.
 
 ### 5.1 The schema is a steering mechanism, not just a type declaration
 
@@ -679,6 +793,10 @@ class VersionedRAGOutput(BaseModel):
 ---
 
 ## 6. Validation layers
+
+> **In plain words.** Check every answer three times: does it parse, does it have the right fields and types, and does it make sense? Structured outputs handle the first two. The third one is always your job.
+>
+> **Real-world example.** `{"confidence": 0.95, "citations": [{"chunk_id": "c_999"}]}` parses and has the right shape. But only chunks c_101 to c_108 were in the prompt, so c_999 is invented. Only the third check catches this.
 
 ### 6.1 The three-layer validation stack
 
@@ -878,6 +996,10 @@ being consumed, or a model version change broke a field that used to work.
 
 ## 7. Retry strategies for malformed output
 
+> **In plain words.** When a check fails, ask again and include the exact error, so the model can fix it. Stop after 1–2 retries. Then serve a simpler, honest fallback. If many requests are failing, stop retrying for a while (circuit breaker).
+>
+> **Real-world example.** A call costs about $0.036. A question that needs 2 retries costs about $0.11, three times the normal price, and makes the user wait about three times as long. That is why retries need a limit.
+
 ### 7.1 Why retries are necessary even with constrained decoding
 
 Constrained decoding eliminates syntactic and structural failures (Layer 1 and 2 from §6.1). It
@@ -886,9 +1008,9 @@ does *not* eliminate:
 - **Semantic validation failures** — hallucinated citations, cross-field contradictions.
 - **Refusals** — the model declines to answer, producing a schema-conformant but useless response
   (e.g., `{"answer": "I cannot answer this question.", "citations": [], "confidence": 0.0}`).
-- **Truncation** — the response hits `max_tokens` before completing all fields. With constrained
-  decoding, this produces a special stop reason (`length` on OpenAI, `max_tokens` on Anthropic)
-  rather than invalid JSON, but the output is still incomplete.
+- **Truncation** — the response hits `max_tokens` before completing all fields. Constrained
+  decoding cannot close the JSON for you: the output is simply cut off (usually unparseable), and
+  the stop reason (`length` on OpenAI, `max_tokens` on Anthropic) is how you find out.
 - **Content filtering** — the provider's safety layer blocks the response.
 
 Each requires a different retry strategy.
@@ -979,11 +1101,17 @@ async def generate_with_validation(
             retries += 1
             if retries > MAX_RETRIES:
                 raise GenerationError(f"Structural validation failed after {MAX_RETRIES} retries: {e}")
-            # Output repair: send the error back
+            # Output repair: send the error back as a tool_result for the tool_use block
+            # (the API rejects a tool_use turn that is not followed by its tool_result)
             current_messages.append({"role": "assistant", "content": response.content})
             current_messages.append({
                 "role": "user",
-                "content": f"Your response had validation errors:\n{e}\n\nPlease fix these issues.",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "is_error": True,
+                    "content": f"Your response had validation errors:\n{e}\n\nPlease fix these issues.",
+                }],
             })
             continue
 
@@ -1000,11 +1128,16 @@ async def generate_with_validation(
             current_messages.append({"role": "assistant", "content": response.content})
             current_messages.append({
                 "role": "user",
-                "content": (
-                    f"Your response failed semantic validation:\n{e}\n\n"
-                    "Please correct the response. Ensure all citations reference chunks "
-                    "from the provided context and all quotes are verbatim."
-                ),
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "is_error": True,
+                    "content": (
+                        f"Your response failed semantic validation:\n{e}\n\n"
+                        "Please correct the response. Ensure all citations reference chunks "
+                        "from the provided context and all quotes are verbatim."
+                    ),
+                }],
             })
 
     raise GenerationError("Exhausted all retries.")
@@ -1097,20 +1230,25 @@ Retries are not free. Each retry consumes:
 
 - **Tokens**: the full prompt is re-sent (input tokens), plus the failed output and repair
   instruction (additional input tokens), plus a new output. On a prompt with 8,000 input tokens,
-  two retries triple the input token cost.
+  two retries more than triple the input token cost (3 × 8,000 plus the repair messages).
 - **Latency**: each retry adds a full round-trip. With streaming, the user sees no output during
   the retry.
 - **Rate limit headroom**: retries consume the same rate limit as primary requests.
 
-The constraint: **`max_retries × cost_per_attempt ≤ budget_per_query`**. If your budget allows
-$0.05 per query and each attempt costs $0.03, you can afford one retry. Two retries put you at
-$0.09 — nearly double budget on the failing queries.
+The constraint: **`(1 + max_retries) × cost_per_attempt ≤ budget_per_query`**. If your budget
+allows $0.05 per query and each attempt costs $0.03, you cannot afford even one retry on a failing
+query: one retry puts it at $0.06, two retries at $0.09 — 1.8x the budget. You either raise the
+budget for the (hopefully rare) failing queries, or make attempts cheaper.
 
 This is why fallback schemas and circuit breakers exist: they bound the cost of failure.
 
 ---
 
 ## 8. Determinism and reproducibility
+
+> **In plain words.** Temperature controls how random the model's word choices are. For structured answers use 0: the most likely choice every time. Log the prompt, the exact model version, and the settings so you can replay a bad answer later.
+>
+> **Real-world example.** A user reports a wrong answer with confidence 0.9. You replay the logged prompt against the pinned model `claude-sonnet-4-20250514` at temperature 0. You usually get the same answer back and can see why. Providers don't promise bit-for-bit identical output, though.
 
 ### 8.1 The three knobs that affect generation variability
 
@@ -1127,7 +1265,7 @@ user reports a bad answer and you need to reproduce it, you need the same output
 input. This requires:
 
 1. Same prompt (log it — `10` §4).
-2. Same model version (pin it — not "claude-sonnet-4" but "claude-sonnet-4-20250514").
+2. Same model version (pin the dated snapshot, e.g. "claude-sonnet-4-20250514", not an alias).
 3. Same temperature (log it).
 4. Same seed (if supported; log it).
 5. Same provider endpoint (a model deployed to different regions can produce different results due
@@ -1166,10 +1304,9 @@ you need `temp>0` on the generation step and `temp=0` on the selection step.
 
 ### 8.5 Caching and determinism
 
-Prompt caching (`12`) interacts with determinism in a non-obvious way. A cached prefix means the
-model's hidden state at the cache boundary is identical across requests with the same prefix. This
-makes output *more* deterministic for the cached portion, but has no effect on output variability
-from the non-cached suffix.
+Prompt caching (`12`) reuses the computed state for a shared prompt prefix. It is a cost and
+latency optimization: in principle it does not change what the model outputs, so it neither adds
+nor removes variability. Output variance still comes from the non-cached suffix and from sampling.
 
 For RAG specifically: caching the system prompt and schema definition means the only source of
 output variance is the retrieved context and the query — which is exactly the variance you want.
@@ -1177,6 +1314,10 @@ output variance is the retrieved context and the query — which is exactly the 
 ---
 
 ## 9. Citation and attribution in generated output
+
+> **In plain words.** A citation links each claim in the answer to the passage it came from. The best citations include an exact quote, because code can then check the quote really appears in that passage. Citations let users verify answers and let you measure hallucination.
+>
+> **Real-world example.** The answer says "Returns are accepted within 30 days [1]". Citation [1] points to chunk `policy_12` and quotes "Items may be returned within 30 days of delivery". A simple string check confirms the quote is in `policy_12`.
 
 ### 9.1 Why citations are a system design problem, not a prompt engineering problem
 
@@ -1329,7 +1470,7 @@ appear in the source). The schema design can steer this tradeoff:
 
 - **Requiring `verbatim_quote`** forces the model to commit to a specific string that can be
   verified. This reduces fabricated citations because the model "knows" the quote will be checked.
-- **Limiting citation count** (`max_items` on the citations array) prevents the model from
+- **Limiting citation count** (`maxItems` in JSON Schema, `max_length` in Pydantic) prevents the model from
   padding with low-quality citations.
 - **Making citations optional** on low-confidence answers avoids forcing the model to fabricate
   evidence when the context is thin.
@@ -1337,6 +1478,10 @@ appear in the source). The schema design can steer this tradeoff:
 ---
 
 ## 10. Streaming structured output
+
+> **In plain words.** Streaming sends the answer piece by piece while it is being generated. The total time is the same, but the user sees something almost at once. The catch: you can only fully check the answer at the end.
+>
+> **Real-world example.** With 1.5 s to the first token and 30 ms per token, a 500-token answer takes 1.5 + 500 × 0.03 = 16.5 s. Without streaming the user stares at a spinner for 16.5 s. With streaming they start reading after 1.5 s.
 
 ### 10.1 The latency problem
 
@@ -1506,6 +1651,10 @@ Three mitigation strategies:
 
 ## 11. Multi-step generation
 
+> **In plain words.** For hard questions you can split the work into several calls: first think, then fill in the form; or write, then review, then rewrite. Quality can go up, but each extra call costs roughly another full call in money and time.
+>
+> **Real-world example.** A single call takes about 15 s. Think-then-extract takes about 30 s. One round of write, review, rewrite is 3 calls, about 45 s. That is fine for a nightly batch job, often too slow for a chat window.
+
 ### 11.1 Why single-shot generation is often insufficient
 
 Single-shot generation — one prompt, one response — works well for simple factual queries. It
@@ -1614,7 +1763,9 @@ response = await client.messages.create(
         "budget_tokens": 8192,  # tokens allocated for internal reasoning
     },
     tools=[answer_tool],
-    tool_choice={"type": "tool", "name": "provide_answer"},
+    # Forcing a specific tool is not allowed together with extended thinking; use "auto",
+    # tell the model to call provide_answer, and check below that it did.
+    tool_choice={"type": "auto"},
     messages=[{
         "role": "user",
         "content": assembled_prompt,
@@ -1687,7 +1838,7 @@ async def generate_with_self_critique(
     return answer
 ```
 
-**Cost:** up to `3 × max_refinements + 1` generation calls. **Use sparingly** — the marginal
+**Cost:** up to `2 × max_refinements + 1` generation calls (one critique and one rewrite per round). **Use sparingly** — the marginal
 quality improvement decreases rapidly, and the cost increases linearly. Measure the improvement
 on your eval set (`08` §10) before enabling in production.
 
@@ -1697,9 +1848,11 @@ Each step adds a full round-trip:
 
 ```
     single-shot:   TTFT + n × ITL                      ≈ 15s
-    think-extract: 2 × (TTFT + n × ITL)                ≈ 25s
-    self-critique: 3 × (TTFT + n × ITL)                ≈ 40s
+    think-extract: 2 × (TTFT + n × ITL)                ≈ 30s
+    self-critique: 3 × (TTFT + n × ITL)                ≈ 45s   (generate + critique + rewrite)
 ```
+
+(These assume every step is the same size; a short critique step makes the last line smaller.)
 
 For synchronous request-response APIs, this is often unacceptable. For async workflows (batch
 processing, background enrichment, agent loops), it is the right tradeoff. The decision is product-
@@ -1708,6 +1861,10 @@ driven, not engineering-driven.
 ---
 
 ## 12. Output parsing libraries and patterns
+
+> **In plain words.** Libraries do the plumbing for you: turn your Pydantic class into a schema, call the model, parse the reply, retry on errors. Instructor is common for hosted APIs. Outlines is for models you run yourself.
+>
+> **Real-world example.** With Instructor and `max_retries=2`, about 10 lines give you a validated `ResearchAnswer` object. Writing the same by hand, with retries and error handling, is closer to 100 lines, but gives you full control over the retry logic.
 
 ### 12.1 The library landscape
 
@@ -1722,8 +1879,8 @@ driven, not engineering-driven.
 
 ### 12.2 Instructor in depth
 
-Instructor is the most widely adopted library for structured output in Python and warrants detailed
-examination:
+Instructor is one of the most widely used libraries for structured output in Python and warrants
+a closer look:
 
 ```python
 import instructor
@@ -1829,6 +1986,10 @@ this is usually the right choice.
 ---
 
 ## 13. Token efficiency in structured output
+
+> **In plain words.** JSON adds extra tokens: braces, quotes, and field names. Output tokens are the expensive ones (5x input on Sonnet 4). The cheapest fix is caching the fixed schema text, not making field names cryptic.
+>
+> **Real-world example.** In §13.2 the free-text answer is about 50 tokens and the JSON version about 120. The 70 extra output tokens cost about $0.001 per answer, which is about $1,050 a month at 1 million answers.
 
 ### 13.1 The overhead problem
 
@@ -1953,12 +2114,17 @@ response = client.messages.create(
 )
 ```
 
-At a 90% cache hit rate, a 1,500-token schema costs 150 effective tokens per request instead of
-1,500. This is the single most impactful token-efficiency optimization for structured output.
+At a 90% cache hit rate, a 1,500-token schema costs about 285 effective tokens per request instead
+of 1,500 (10% misses at full price = 150, plus 90% hits at one tenth = 135; ignoring the small
+cache-write surcharge). This is the single most impactful token-efficiency optimization for structured output.
 
 ---
 
 ## 14. Testing structured output
+
+> **In plain words.** Test the parts that don't change with normal tests: the schema, the validators, and the retry logic with fake model replies. Test the model's quality with a fixed set of test questions. Rerun that set every time the model or prompt changes.
+>
+> **Real-world example.** A new model version passes validation on 93% of 200 test questions, versus 97% for the current one. A 4-point drop is more than the 2-point gate, so the upgrade waits until the prompt or schema is fixed.
 
 ### 14.1 The testing problem
 
@@ -2127,7 +2293,7 @@ async def test_retry_on_semantic_validation_failure():
 
     # Verify the retry prompt included the validation error
     retry_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
-    assert "Hallucinated citations" in retry_messages[-1]["content"]
+    assert "Hallucinated citations" in retry_messages[-1]["content"][0]["content"]
 ```
 
 ### 14.6 Regression testing for model version changes
@@ -2138,7 +2304,7 @@ runs the same inputs against the new model and compares output quality:
 ```python
 def run_structured_output_regression(
     model_a: str,  # e.g., "claude-sonnet-4-20250514"
-    model_b: str,  # e.g., "claude-sonnet-4-20250715"
+    model_b: str,  # e.g., a newer dated snapshot of the same model
     test_cases: list[dict],
     schema: type[BaseModel],
 ) -> dict:
@@ -2168,6 +2334,10 @@ def run_structured_output_regression(
 
 ## 15. The cost model for generation
 
+> **In plain words.** Cost = input tokens × input price + output tokens × output price + retries. In RAG the retrieved passages are most of the input. So shortening the context usually saves more than tuning the schema.
+>
+> **Real-world example.** 100,000 questions a month, 9,600 tokens in and 500 out on Sonnet 4, 5% retried: about $3,840 a month. Caching the 1,500 fixed tokens saves about $364 (9.5%). Cutting the 8,000 context tokens in half would save more.
+
 ### 15.1 The fundamental equation
 
 ```
@@ -2194,8 +2364,9 @@ def run_structured_output_regression(
 | Claude Opus 4 | $15 | $75 | $1.50 | For complex reasoning; expensive for routine generation |
 
 **These prices change.** Do not design a cost model around specific numbers. Design it around
-the *structure*: input tokens are cheap relative to output tokens (3–5x), caching makes input
-nearly free (10–20x reduction), and the model tier choice is a 10–20x lever.
+the *structure*: input tokens are cheap relative to output tokens (3–5x), caching makes repeated
+input much cheaper (2x to 10x depending on provider), and the model tier choice is up to a
+10–20x lever.
 
 ### 15.3 Worked example
 
@@ -2241,12 +2412,12 @@ MODEL_CONFIG = {
         "temperature": 0.0,
     },
     "extraction": {
-        "model": "claude-haiku-3-5-20241022",     # Structured extraction is simpler
+        "model": "claude-3-5-haiku-20241022",     # Structured extraction is simpler
         "max_tokens": 2048,
         "temperature": 0.0,
     },
     "classification": {
-        "model": "claude-haiku-3-5-20241022",     # Enum classification is cheap
+        "model": "claude-3-5-haiku-20241022",     # Enum classification is cheap
         "max_tokens": 256,
         "temperature": 0.0,
     },
@@ -2259,8 +2430,10 @@ MODEL_CONFIG = {
 ```
 
 The rule: **use the cheapest model that reliably passes your validation layer.** "Reliably"
-means < 5% retry rate on your eval set. If the cheap model needs 20% retries, the retries cost
-more than using the better model.
+means < 5% retry rate on your eval set. On price alone the cheap model often still wins: with
+§15.3's prompt, a Haiku 3.5 attempt costs about $0.0097 versus $0.0363 for Sonnet, so even 20%
+retries (≈ $0.0116) stay cheaper. What a high retry rate really costs is latency (every retry is
+another full round-trip) and more queries ending on the degraded path.
 
 ### 15.5 Batching
 
@@ -2302,11 +2475,16 @@ with the tradeoff being latency (hours instead of seconds).
 
 ## 16. Failure modes
 
+> **In plain words.** This is a list of the ways generation breaks in production. Answers get cut off, retries loop, schemas drift out of sync, model updates change behavior, polite refusals look like real answers, prompts overflow, and agents stack up errors. Each one comes with how to detect it and how to fix it.
+>
+> **Real-world example.** `max_tokens` is set to 600, but answers with 8 citations need about 900 tokens. Those answers stop mid-citation. If the code does not check the stop reason, it may show half an answer as if it were complete.
+
 ### 16.1 Partial outputs
 
-The model hits `max_tokens` before completing the structured output. With constrained decoding,
-the provider signals this via the stop reason (`length` or `max_tokens`) rather than producing
-invalid JSON. Without constrained decoding, the output is truncated mid-JSON and unparseable.
+The model hits `max_tokens` before completing the structured output. With or without
+constrained decoding, the output is cut off mid-JSON (usually unparseable, or parseable only by a
+lenient parser that silently drops the missing part). The provider signals it via the stop reason
+(`length` or `max_tokens`); OpenAI's `parse()` helper raises an error for it.
 
 **Detection:** check the stop reason on every response.
 
@@ -2327,8 +2505,8 @@ def check_stop_reason(response) -> None:
 ```
 
 **Mitigation:** set `max_tokens` to at least 2x the expected output length. For schemas with
-variable-length arrays, use generous limits. The cost of unused `max_tokens` is zero — you pay
-only for tokens actually generated.
+variable-length arrays, use generous limits. You pay only for tokens actually generated, so
+unused `max_tokens` costs nothing in money (some providers do count it against rate limits).
 
 ### 16.2 Infinite retry loops
 
@@ -2383,7 +2561,7 @@ output equivalent of a database migration: the producer changed and the consumer
 **Detection:** the regression suite in §14.6.
 
 **Mitigation:**
-- Pin model versions in production (`claude-sonnet-4-20250514`, not `claude-sonnet-4`).
+- Pin model versions in production (a dated snapshot like `claude-sonnet-4-20250514`, not an alias).
 - Run the regression suite before promoting a new model version.
 - Monitor validation pass rates in production; alert on >2% change.
 - Maintain a model-version changelog that tracks output behavior, not just model capabilities.
@@ -2463,8 +2641,8 @@ monitoring — you discover failures at the end, when the context is gone.
 ## 17. Anti-patterns
 
 **Prompting for JSON without enforcement.** "Please respond in JSON format" in the system prompt,
-followed by `json.loads()` on the raw output. Works 95% of the time; the other 5% are
-production incidents. Use constrained decoding (§3, §4).
+followed by `json.loads()` on the raw output. Works most of the time; the rest are production
+incidents. Use constrained decoding (§3, §4).
 
 **Validating syntax but not semantics.** The response is valid JSON matching the schema, but
 citations reference nonexistent chunks, confidence is 0.99 with no supporting evidence, and the
@@ -2512,8 +2690,8 @@ the system returns a 500 error. The user gets nothing. Define a degradation path
 response, a simpler answer, a human-readable error with the retrieved context attached (§2.3).
 
 **Optimizing field names for token savings before caching the schema.** Saving 50 tokens per
-response by renaming `verbatim_quote` to `q`, when caching the schema saves 1,350 tokens per
-response. Do the cheap optimization first (§13.3).
+response by renaming `verbatim_quote` to `q`, when caching a 1,500-token schema saves about 1,200
+effective input tokens per response at a 90% hit rate (§13.5). Do the cheap optimization first (§13.3).
 
 **Evaluating generation with exact string matching.** "The capital of France is Paris." and
 "Paris is the capital of France." are both correct. Use semantic similarity or LLM-judge
@@ -2555,7 +2733,8 @@ higher level if needed (§8.4).
    the schema, verify them programmatically, and measure citation density as a quality signal
    (§9).
 
-8. **Every retry doubles the cost of a failing query.** Bound retries, implement circuit breakers,
+8. **Every retry adds another full call to the cost of a failing query** (one retry doubles it,
+   two triple it). Bound retries, implement circuit breakers,
    and define a fallback schema. The cost of retries is the strongest argument for constrained
    decoding: zero structural retries (§7.6).
 
@@ -2715,6 +2894,238 @@ backing the decision.
 
 ---
 
+## 20. Interview questions and system design prompts
+
+> **In plain words.** Answer in three steps: the simple idea, one number, one trade-off. Go into
+> grammars or code only if asked.
+>
+> **Real-world example.** "Why not just ask for JSON?" → "Prompt-only JSON has no guarantee. At
+> 10,000 answers a day, even a 1% failure is 100 broken screens. Structured outputs remove parse
+> failures, but I still validate meaning, like whether each cited chunk exists, because no schema
+> can check that."
+
+### 20.1 Conceptual questions
+
+**Q: What is structured output, and why does a RAG system need it?**
+*Sections: §1.2, §2*
+The model returns an object in a fixed shape (answer, citations, confidence) instead of free text.
+The answer is consumed by code (API serializer, UI, agent loop) that fails on a missing field or a
+wrong type. Strong answers call it a contract with four parts: schema, validation, retry policy,
+degradation path.
+
+**Q: JSON mode vs. structured outputs?**
+*Section: §3*
+JSON mode guarantees syntactically valid JSON, any shape. Structured outputs guarantee JSON that
+matches your schema, using constrained decoding. Mention that forced tool use on Anthropic gives a
+tool-call block that follows the schema closely, and strict mode enforces it; keep a validation
+step anyway.
+
+**Q: How does constrained decoding work?**
+*Section: §4*
+The schema is compiled into a grammar / state machine. At each step, tokens that would break the
+grammar get their logits set to −∞, so they can never be sampled. Cost: some per-token overhead and
+a schema-compilation step, which is cached per schema. It fixes structure, not truth.
+
+**Q: If the provider guarantees the schema, what is left to validate?**
+*Sections: §6.1, §6.3*
+Meaning. Cited `chunk_id`s must exist in the retrieved set; quotes must appear in the source;
+fields must agree with each other (`unanswerable = true` with confidence 0.9 is a contradiction);
+refusals must not pass as answers (§16.5). Also truncation: check the stop reason.
+
+**Q: How do you design retries?**
+*Sections: §7.2 – §7.6*
+Branch on the failure: content filter → don't retry; truncation → raise `max_tokens` once;
+semantic failure → output repair (send back the exact error), at most 2 retries; then a fallback
+schema or a degraded response. Add a circuit breaker so a systemic failure doesn't multiply cost.
+One retry doubles the cost of that query; two triple it.
+
+**Q: What temperature do you use for structured output, and why?**
+*Section: §8.4*
+0. Structural tokens are forced anyway; value tokens (answer text, confidence) should be the most
+likely, most faithful choice. Use `temp > 0` only when you want several candidates to choose from.
+
+**Q: How do you make citations trustworthy?**
+*Section: §9*
+Put them in the schema, with a chunk ID and a verbatim quote. Verify in code: ID in the retrieved
+set, quote found exactly (or after whitespace normalization). Track citation density and the
+paraphrase / fabrication rate as metrics.
+
+**Q: How do you stream a JSON answer?**
+*Section: §10*
+Stream the answer text field to the UI; parse the rest incrementally with a partial-JSON parser;
+validate fields as they complete; run the full validation at the end and decide what the UI does if
+it fails (keep the text with a warning rather than making it vanish).
+
+### 20.2 System design prompts
+
+**Q: Design the generation layer for a bank's customer-support assistant. 50,000 questions a day,
+answers must cite policy documents, p95 time-to-first-word under 2 s, and the mobile app renders
+answer, sources, and a "verified" badge.**
+
+```
+1. CONTRACT
+   - Pydantic schema: answer, citations[{chunk_id, verbatim_quote, doc_title}], confidence,
+     unanswerable, schema_version. One source of truth for tool schema, API docs, validation (§16.3).
+2. ENFORCEMENT
+   - Provider structured outputs / strict tool use; temperature 0; pinned dated model snapshot.
+3. VALIDATION
+   - Stop reason check (truncation) → Pydantic → semantic: chunk IDs exist, quotes verbatim,
+     no refusal text with unanswerable = false. "Verified" badge only if every citation passes.
+4. RETRIES AND FALLBACK
+   - Output repair, max 2 retries; circuit breaker at 30% failures over 100 requests;
+     fallback = "here are the relevant policy pages" with links, never an unverified answer.
+5. LATENCY
+   - Stream the answer field (TTFT ~1–1.5 s); validate citations at the end; show the badge last.
+6. COST (Sonnet 4 prices, illustrative prompt of 9,600 in / 500 out)
+   - ≈ $0.036 per call → ≈ $1,815/day at 50,000; cache the ~1,500 fixed tokens (§15.3).
+7. MONITORING AND RELEASE
+   - Log raw output, validation report, retries (§6.4). Regression suite gates model upgrades
+     (block if pass rate drops > 2 points).
+```
+
+**What interviewers listen for:** a validation layer beyond the schema, an explicit retry limit and
+fallback, stop-reason handling, a pinned model version, and streaming that does not show unverified
+claims as verified.
+
+**Q: Our structured-output pipeline costs too much. Where do you look?**
+Start with the token breakdown (§15.3): context usually dominates input, so trim or rerank harder
+(`06`). Cache the fixed system prompt and schema (§13.5). Check retry rate and multi-step calls
+(each is a full extra call). Try a cheaper model on steps that only extract or classify (§15.4).
+Move offline work to batch APIs at ~50% off (§15.5). Shorten field names last.
+
+### 20.3 Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| Does constrained decoding prevent hallucination? | No. It fixes the shape, not the truth. | §4, §6.1 |
+| What happens at `max_tokens` with structured outputs? | The output is cut off; check the stop reason (`length` / `max_tokens`). | §7.1, §16.1 |
+| Cost of unused `max_tokens`? | Zero in money; you pay for generated tokens only. | §16.1 |
+| How do OpenAI strict schemas express an optional field? | All fields required; optional = union with `null`. | §5.3 |
+| Retries allowed if each attempt costs $0.03 and the budget is $0.05? | None on a failing query: one retry = $0.06. | §7.6 |
+| Calls in self-critique with `max_refinements = 1`? | Up to 3: `2 × max_refinements + 1`. | §11.4 |
+| Latency of a 500-token answer, TTFT 1.5 s, 30 ms/token? | 1.5 + 500 × 0.03 = 16.5 s. | §10.1 |
+| 1,500-token schema at 90% cache hit rate, reads at 10% price? | ≈ 285 effective tokens (150 + 135). | §13.5 |
+| Output vs. input price on Sonnet 4? | $15 vs $3 per M tokens, 5x. | §15.2 |
+| Can you force a specific tool with extended thinking on Anthropic? | No; use `auto` and check the model called it. | §11.3 |
+| Batch API discount? | About 50%, results within 24 h. | §15.5 |
+| Why pin `claude-sonnet-4-20250514` instead of an alias? | A model update is a schema migration; you want to choose when it happens. | §16.4 |
+
+### 20.4 Debugging prompts
+
+**"After a model upgrade, 6% of answers show a blank screen."** Check if you parse raw text
+(prompt-only JSON): the new version may add ` ```json ` fences or a trailing sentence. Look at raw
+outputs in traces (`10`). Fix with structured outputs, pin the version, and add a regression gate
+(§14.6).
+
+**"Some answers end mid-sentence and have fewer citations than usual."** Truncation. Compare output
+tokens with `max_tokens`, and check whether the code reads the stop reason. A lenient parser can
+"repair" cut-off JSON and hide the problem (§16.1).
+
+**"Users click a source and it doesn't contain the quoted text."** Paraphrased or invented quotes.
+Run verbatim verification (§9.4) on a sample; split into exact / normalized / paraphrase /
+fabricated; add semantic validation with output repair (§7.3).
+
+**"Our generation bill tripled overnight, traffic is flat."** Retry storm: a model or schema change
+raised the validation failure rate, and each failing query now uses every retry. Look at retries
+per query and failure reasons; cap retries, enable a circuit breaker, fall back (§7.5).
+
+### 20.5 Common mistakes
+
+1. Saying "we use structured outputs, so the output is correct" (it is only well-shaped).
+2. No stop-reason check; truncated output treated as a real answer.
+3. Retrying without a limit, a fallback, or a circuit breaker.
+4. Two or three separate schema definitions (prompt, Pydantic, API docs) that drift apart.
+5. Temperature above 0 for structured answers, then wondering why confidence scores jump around.
+6. Upgrading the model alias without running the regression suite.
+
+---
+
+## 21. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+> **In plain words.** Each case: what users saw, the simple reason, the numbers, the fix.
+>
+> **Quick index:** blank screens after a model update → Case 1; answers ending mid-sentence →
+> Case 2; sources that don't contain the quote → Case 3; bill tripled overnight → Case 4;
+> "I'm sorry" shown as an answer → Case 5; app crashes after a schema change → Case 6.
+
+### Case 1 — Prompt-only JSON breaks after a model update
+
+**Setup.** Support bot, 20,000 answers a day. System prompt says "respond in JSON"; code runs
+`json.loads()` on the raw text. Model called by alias, not by dated version.
+**Symptom.** Error screens jump from about 80 a day to about 1,300 a day.
+**Diagnosis.** Parse failures went from 0.4% to 6.5% (6.5% × 20,000 = 1,300). The alias now pointed
+to a newer model that often wrapped JSON in ` ```json ` fences. A 200-question regression run
+reproduces it: 13 of 200 fail (6.5%).
+**Fix.** Structured outputs, pinned dated model, regression gate (block if pass rate drops more
+than 2 points). Parse failures 6.5% → 0%.
+**Lesson.** Prompt-only JSON works until the model changes. Pin versions and enforce the schema.
+
+### Case 2 — Answers cut off at `max_tokens`
+
+**Setup.** Legal-policy assistant, `max_tokens = 600`. Answers with many citations run to about
+900 tokens.
+**Symptom.** Some answers end mid-sentence; their source lists are short.
+**Diagnosis.** 3.2% of responses had stop reason `max_tokens`. The code ignored the stop reason, and
+a lenient JSON parser closed the cut-off object, so they looked valid.
+**Fix.** `max_tokens` 600 → 2,000 (about 2x the longest expected answer), treat stop reason
+`max_tokens` as a failure, cap citations at 5 with `maxItems`. Truncation 3.2% → 0.05%. Cost
+unchanged, since only generated tokens are billed.
+**Lesson.** Always read the stop reason. A parseable object is not proof of a complete one.
+
+### Case 3 — Citations that don't check out
+
+**Setup.** Internal research assistant; audit of 2,000 answers.
+**Symptom.** Users report that a clicked source doesn't contain the quoted sentence.
+**Measurement.** 7.5% of citations failed verification: 2.0% cited chunk IDs not in the prompt
+(invented), 5.5% had quotes that were paraphrased (similarity 0.85–0.97, not exact).
+**Fix.** Semantic validation plus output repair (max 2 retries): invented IDs 2.0% → 0.3%. For
+quotes: whitespace-normalized matching and "quote one sentence at most" in the field description:
+paraphrased 5.5% → 1.8%. Retries ran on 6% of queries at about 1.1x the cost of a normal call
+(bigger prompt), about +6.6% total cost.
+**Lesson.** A schema cannot check truth. A 20-line string check can.
+
+### Case 4 — Retry storm triples the bill
+
+**Setup.** Assistant with `MAX_RETRIES = 5`, no circuit breaker. Normal cost about $1,000 a day.
+**Symptom.** Cost about $3,000 the next day; some answers take over a minute.
+**Diagnosis.** A schema change made semantic validation fail on 40% of queries, and the failures
+were persistent (the same input failed every time). Each failing query used all 6 attempts:
+0.6 × 1 + 0.4 × 6 = 3.0x the calls. Failing queries waited 6 × ~16 s.
+**Fix.** Roll back the schema; `MAX_RETRIES = 2`; circuit breaker at 30% failures over 100 requests,
+routing to the fallback schema. Worst case with the new retry limit: 0.6 × 1 + 0.4 × 3 = 1.8x, and
+about 1x once the breaker trips.
+**Lesson.** Persistent failures turn a retry limit into a cost multiplier. Bound it and trip early.
+
+### Case 5 — Polite refusals shown as answers
+
+**Setup.** HR-benefits bot, 50,000 questions a week, structural validation only.
+**Symptom.** Users see "I'm sorry, I can't help with that" with a normal answer layout and a
+confidence badge, and no link to HR.
+**Measurement.** 1.8% of answers (900 a week) were refusals with `unanswerable = false` and no
+citations.
+**Fix.** Added the §6.2 rule (answerable ⇒ at least one citation) and the §16.5 refusal patterns;
+refusals are routed to the "not found" screen with the top 3 source documents and an HR contact.
+A one-week audit found the detector caught 870 of 900 (96.7%).
+**Lesson.** A refusal can fit the schema perfectly. Check that fields agree with each other.
+
+### Case 6 — Schema rename meets a response cache
+
+**Setup.** Shop assistant; response cache with 24 h TTL and a 35% hit rate. Schema v2 renamed
+`citations` to `sources`. The new app version (60% of users) reads `sources`; the old one (40%)
+reads `citations`.
+**Symptom.** App crashes spike for a day after the release.
+**Diagnosis.** New-app users got cached v1 responses (35% × 60% = 21% of requests), and old-app users
+got fresh v2 responses (65% × 40% = 26%). About 47% of requests hit a field the app didn't find.
+**Fix.** Additive change instead: keep `citations`, add `sources`, remove the old field only after
+old app versions fall below 1%. Add `schema_version` to the cache key (§5.5).
+**Lesson.** A renamed field is a breaking change for every cache and every client still reading
+the old name.
+
+---
+
 ## Rung ledger
 
 This document is **rung 3 — studied** (README §6). Its mechanisms — why constrained decoding
@@ -2727,8 +3138,8 @@ checkable with an interpreter.
 
 The pricing figures in §15.2 are current-as-of Anthropic's and OpenAI's published pricing pages
 cached mid-2025. Pricing changes; re-check before quoting a dollar figure. The *shape* of the
-argument (output tokens cost 3–5x more, caching reduces input cost ~10x, batching reduces cost
-~50%, model tiering is a 10–20x lever) is stable; the digits are not.
+argument (output tokens cost 3–5x more, caching reduces repeated input cost 2–10x, batching
+reduces cost ~50%, model tiering is a 10–20x lever) is stable; the digits are not.
 
 Deliberately **not** in this document: any absolute quality number for any schema design, any
 claim about which model produces the best structured output, and any threshold presented as
