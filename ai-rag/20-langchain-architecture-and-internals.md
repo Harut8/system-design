@@ -25,7 +25,7 @@
 > §10's LangSmith discussion and §14's alternatives survey are direct inputs to that build-vs-buy
 > decision).
 >
-> **THESIS:** LangChain is not a retrieval system, a reasoning system, or an agent framework. It is a
+> **Core idea:** LangChain is not a retrieval system, a reasoning system, or an agent framework. It is a
 > **composability layer** — a single protocol (`Runnable`) that every model, prompt, retriever, tool,
 > and parser implements, so that `invoke`, `batch`, `stream`, and their async twins work identically
 > regardless of which concrete class you're holding. The pipe operator is not syntax sugar for
@@ -48,6 +48,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why LangChain exists](#1-why-langchain-exists)
 2. [The component model: what LangChain actually ships](#2-the-component-model-what-langchain-actually-ships)
 3. [The Runnable protocol](#3-the-runnable-protocol)
@@ -65,10 +66,105 @@
 15. [Interview-critical questions](#15-interview-critical-questions)
 16. [Mental models — the compressed set](#16-mental-models--the-compressed-set)
 17. [Lab exercises](#17-lab-exercises)
+18. [Real-world cases — incidents with numbers](#18-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** Calling an LLM is one HTTP request. But a real app also needs retries when the
+provider is busy, streaming so users see words appear, a way to switch providers, tool calls, chat
+history, and a way to see what was actually sent to the model. Every team writes this plumbing again,
+with different bugs. LangChain's main idea is one shared interface, `Runnable`, with the same methods
+(`invoke`, `batch`, `stream`, and async versions) on every model, prompt, retriever, tool, and
+pipeline. The plumbing is written once and every part gets it. Most other parts of LangChain are
+convenience wrappers you could write yourself.
+
+**A real-world example (numbers are illustrative).** An internal IT help-desk assistant answers
+employee questions from 5,000 help articles. Three product teams use it, and it can call two model
+providers.
+
+1. **Without a shared layer.** Each team writes its own retry loop and streaming code, about 200 lines
+   each, 600 in total, all slightly different. Users stare at a blank box for 8 s and then get the whole
+   answer at once. A nightly job summarizes 1,000 new tickets one by one at 2 s each: 1,000 × 2 s =
+   2,000 s, about 33 minutes. When provider A has a 20-minute outage, every request in those 20 minutes
+   fails. When an answer is wrong, someone adds `print()` lines and redeploys to see the prompt.
+2. **Pipeline with `|` (§4).** `{"context": retriever | format_docs, "question": RunnablePassthrough()}
+   | prompt | model | StrOutputParser()` is one object. The retriever runs while the question is passed
+   along, and the whole chain has `invoke`, `batch`, and `stream`.
+3. **Streaming (§3).** `chain.stream(question)` sends words as the model writes them. The first words
+   show up after about 0.5 s instead of 8 s. The total time is the same; the wait feels much shorter.
+4. **Batching (§3).** `chain.batch(tickets, config={"max_concurrency": 8})` runs 8 at a time:
+   1,000 × 2 s / 8 = 250 s, about 4 minutes instead of 33.
+5. **Reliability (§4).** `model.with_retry(stop_after_attempt=3).with_fallbacks([backup_model])`:
+   short rate-limit errors are retried; during the 20-minute outage, requests go to provider B.
+6. **Tools and agents (§8, §9).** A `reset_password(user_id)` tool lets the model ask for an action.
+   LangGraph adds an approval step so a human confirms before the tool runs.
+7. **Tracing (§10).** Every step reports what it received and returned. A wrong answer is traced to
+   "the retriever returned last year's VPN article" in a few minutes, without new `print()` lines.
+
+The flip side (§13): if the app had one provider, one pipeline, and no plans to grow, plain SDK calls
+would be shorter and easier to debug.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| `Runnable` | anything with `invoke` / `batch` / `stream` methods | a standard wall socket: any plug fits |
+| `invoke` | run on one input, get one output | order one coffee |
+| `batch` | run on many inputs, several at the same time | a café making 8 orders at once |
+| `stream` | get the output in pieces as it is produced | reading subtitles as the film plays |
+| LCEL (`\|` pipe) | connecting parts into a pipeline object | Lego bricks that snap together |
+| `RunnableSequence` | the object that `a \| b \| c` builds | an assembly line |
+| `RunnableParallel` | run several parts on the same input at once | two cooks working from the same recipe card |
+| `RunnablePassthrough` | passes its input on unchanged | a clerk who forwards the letter unopened |
+| Retriever | question in, list of documents out | a librarian fetching the right books |
+| Tool | a function the model can ask you to run | a waiter the chef can send on errands |
+| Agent | a loop: ask model, run tools, repeat until done | a detective following leads until the case closes |
+| LangGraph | agent loop as an explicit graph with saved state | a flowchart with checkpoints you can resume from |
+| Callback / trace | hooks that record each step | a flight data recorder |
+| `with_structured_output` | make the model return data in a fixed schema | a form with fixed boxes instead of a blank page |
+| `langchain-core` vs `langchain-community` | stable interfaces vs community add-ons | the car maker's parts vs third-party accessories |
+
+### Symbols and parameters used in this chapter
+
+This chapter has almost no formulas. The table lists the settings and numbers its code and text use.
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `max_concurrency` | how many `batch` items run at the same time | 4 – 20 (`None` = no limit) | 1,000 jobs at 8 at a time |
+| `return_exceptions` | in `batch`, return errors per item instead of failing the whole batch | `False` (default) | 1 failure in 1,000 does not lose the other 999 |
+| `recursion_limit` | max steps before a chain or graph stops | 25 (default) | stops an agent that loops forever |
+| `run_id`, `parent_ids` | ID of one step in a trace, and IDs of the steps above it | UUIDs | the retriever's run sits under the chain's run |
+| `tags`, `metadata`, `run_name` | labels attached to traces for filtering | — | `tags=["prod", "tenant-42"]` |
+| `configurable` | per-call settings such as model choice or temperature | — | `{"llm_provider": "anthropic"}` |
+| `temperature` | randomness of the model output | 0 – 1 | 0 for support answers, 0.9 for a poem |
+| `stop_after_attempt` | max tries in `with_retry` | 2 – 5 | 3 tries, then give up or fall back |
+| `k` | number of documents a retriever returns | 4 – 10 | `search_kwargs={"k": 8}` |
+| `fetch_k` | candidates fetched before MMR picks `k` | 4 – 5 × `k` | fetch 40, keep 8 |
+| `lambda_mult` | MMR balance: 1 = only relevance, 0 = only variety | 0.5 | 0.5 = equal weight |
+| `score_threshold` | minimum similarity to keep a document | model-specific, e.g. 0.75 | drop anything below 0.75 |
+| `top_n` | how many documents a reranker keeps | 3 – 10 | rerank 40, keep 5 |
+| `c` (RRF constant) | smoothing constant in rank fusion score `weight / (rank + c)` | 60 | rank 1 → 1/61 ≈ 0.0164 |
+| `weights` | how much each retriever counts in `EnsembleRetriever` | sums to 1, e.g. 0.4 / 0.6 | keyword 0.4, vector 0.6 |
+| `chunk_size` | max chunk length (characters by default, not tokens) | 500 – 1,500 | 1,000 characters ≈ 250 English tokens |
+| `chunk_overlap` | how much neighbouring chunks share | 10 – 20% of `chunk_size` | 200 characters |
+| `similarity_threshold` | in `EmbeddingsRedundantFilter`, above this two chunks count as duplicates | 0.95 | two near-identical FAQ answers → keep one |
+| `max_iterations` | `AgentExecutor`: max think-act-observe loops | 15 (default); 6 in §9 | stop after 6 tool rounds |
+| `max_execution_time` | `AgentExecutor`: wall-clock limit in seconds | 30 – 120 | stop after 60 s |
+| `thread_id` / `session_id` | key for saved conversation state | one per chat | `"user-42"` |
+| window `k` (memory) | number of recent turns kept | 5 – 10 | keep the last 6 exchanges |
+| tokens | the units models read and bill by | ~4 English characters each | 1,000 characters ≈ 250 tokens |
+| p50 / p95 | latency that 50% / 95% of requests are faster than | ms or s | p95 = 3 s → 1 in 20 is slower |
+| time to first token | wait before the first streamed word appears | 0.3 – 1 s | 0.5 s streamed vs 8 s unstreamed |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Why LangChain exists
+
+> **In plain words.** An LLM API call itself is simple: text in, text out. The pain is everything around it: retries, streaming, swapping providers, tool calls, and seeing what was sent. LangChain gives every piece the same small set of methods so that plumbing is written once.
+>
+> **Real-world example.** A support team has 12 places in its code that call a model. Without a shared layer, each has its own retry loop and its own streaming code, and when the provider has a 20-minute outage, 12 call sites need a failover patch. With one shared interface, the failover is added in one place.
 
 Strip away everything else and an LLM API is a function: text (and maybe some structured messages)
 goes in, text comes out, over HTTP, with a schema that differs by vendor in ways that seem trivial
@@ -141,6 +237,10 @@ tool, and can you say so with the same precision you'd use to say when it isn't.
 
 ## 2. The component model: what LangChain actually ships
 
+> **In plain words.** LangChain sorts everything into a few kinds of parts: models, prompts, output parsers, loaders and splitters, retrievers, tools, agents, and callbacks. Most of these parts share one interface (`Runnable`), which is why they snap together.
+>
+> **Real-world example.** An HR policy bot uses a loader (reads 300 PDF handbooks), a splitter (cuts them into about 6,000 chunks), a vector store and retriever (finds the 4 best chunks), a prompt (fills in the question and chunks), a chat model (writes the answer), and an output parser (turns the reply into plain text).
+
 LangChain organizes the LLM-application problem into a small number of component families, each
 defined as an abstract base class in `langchain_core` with a common method surface, plus dozens to
 hundreds of concrete implementations spread across `langchain`, `langchain-community`, and the
@@ -199,12 +299,18 @@ streaming tokens to a UI.
 The organizing fact that makes this taxonomy more than a glossary: **every single one of these base
 classes — `BaseChatModel`, `BasePromptTemplate`, `BaseOutputParser`, `BaseRetriever`, `BaseTool`,
 `VectorStoreRetriever`, and the `RunnableSequence`/`RunnableParallel`/etc. that compose them —
-inherits from `Runnable`.** That is not an implementation detail; it is the single fact that makes
+inherits from `Runnable`.** (Not every family does: `Embeddings`, `VectorStore`, `BaseLoader`,
+`TextSplitter`, and `BaseMemory` are plain classes, which is why a vector store enters a chain through
+its `.as_retriever()` Runnable rather than directly.) That is not an implementation detail; it is the single fact that makes
 LCEL possible, and it is where this chapter goes next.
 
 ---
 
 ## 3. The Runnable protocol
+
+> **In plain words.** `Runnable` is a contract: "you can call me with `invoke` for one input, `batch` for many, and `stream` for pieces as they are ready." A class only has to write `invoke`; it gets the other methods for free, though the free versions are basic.
+>
+> **Real-world example.** A retriever that only implements `invoke` can still be called with `batch` on 100 queries; the default runs them in a thread pool. A chat model overrides `stream`, so the user sees the first word after about 0.5 s instead of waiting 8 s for the whole answer.
 
 `Runnable[Input, Output]`, defined in `langchain_core.runnables.base`, is a generic abstract class
 with this method surface (elided to what matters for understanding, not the full signature list):
@@ -229,9 +335,10 @@ class Runnable(Generic[Input, Output], ABC):
     async def astream_events(self, input: Input, config=None, version="v2") -> AsyncIterator[StreamEvent]: ...
 ```
 
-Only `invoke` (and its async twin, `ainvoke`) is genuinely abstract — every concrete `Runnable` must
-implement it. Everything else has a **default implementation on the base class that is expressed in
-terms of `invoke`**, which is the load-bearing design decision of the whole protocol: it means any
+Only `invoke` is genuinely abstract — every concrete `Runnable` must implement it. Even `ainvoke` has a
+default (it runs the sync `invoke` in a thread-pool executor), so a class that wants real async I/O
+overrides it. Everything else has a **default implementation on the base class that is expressed in
+terms of `invoke`**, which is the central design decision of the whole protocol: it means any
 class that implements `invoke` correctly *for free* gets a batch method, a stream method, and an async
 version of both, with reasonable (if not optimal) default behavior. A component only needs to override
 the defaults when it can do meaningfully better than them — and the two cases where that matters a lot
@@ -411,7 +518,7 @@ chain.invoke({"question": "..."})                                        # OpenA
 chain.invoke({"question": "..."}, config={"configurable": {"llm_provider": "anthropic"}})  # Anthropic
 ```
 
-This is the single clearest example of the composability payoff the THESIS is about: a chain built
+This is the single clearest example of the composability payoff the core idea above is about: a chain built
 once, against an abstract `Runnable`, can be pointed at a different concrete model at request time —
 useful for A/B testing providers, per-tenant model routing, or a fallback tier — without touching the
 chain's definition. Under the hood, both calls return a `DynamicRunnable` subclass
@@ -423,6 +530,10 @@ framework maintains for you rather than one you'd write by hand at every call si
 ---
 
 ## 4. LCEL: composition as an algebra over Runnables
+
+> **In plain words.** LCEL is just the `|` pipe between parts: `prompt | model | parser`. The pipe builds a pipeline object, and that object has the same methods as a single part, so pipelines can be nested, batched, streamed, and wrapped with retries or fallbacks.
+>
+> **Real-world example.** A RAG chain `{context: retriever, question: passthrough} | prompt | model | parser` fetches documents and passes the question along at the same time, then fills the prompt. Adding `.with_fallbacks([backup_model])` means that when the main provider fails, the same question goes to the backup instead of to the user as an error.
 
 LCEL — the LangChain Expression Language — is not a separate language; it's the name for the pattern
 of composing `Runnable` objects using Python's own operators and a handful of purpose-built wrapper
@@ -615,6 +726,10 @@ learned the marketing rather than the mechanism.
 
 ## 5. Prompts: templates, placeholders, and structured output
 
+> **In plain words.** A prompt template is a form with blanks; you fill the blanks with a dict. To get structured data back (like JSON), you can either ask nicely in the prompt and parse the text (output parser) or use the provider's built-in schema enforcement (`with_structured_output`), which fails far less often.
+>
+> **Real-world example.** A ticket triage bot needs `severity`, `summary`, and `requires_escalation` for every ticket. With a text parser, an illustrative 2 in 100 replies might come back as broken JSON and need a retry; with `with_structured_output(Ticket)`, the provider returns fields that match the schema directly.
+
 **`ChatPromptTemplate`** is the workhorse for anything chat-model-based, and its `from_messages`
 constructor takes a list of `(role, template_string)` tuples or message-like objects:
 
@@ -728,6 +843,10 @@ leaks because the providers aren't actually equivalent" criticism covered fully 
 
 ## 6. Document loading and transformation
 
+> **In plain words.** Loaders read files into `Document` objects (text plus metadata like the file name). Splitters cut long documents into chunks. The default splitter counts characters, not tokens, and does not understand headings or tables.
+>
+> **Real-world example.** A 40-page employee handbook becomes 40 `Document` objects, one per page. `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)` turns it into roughly 125 chunks: 40 pages × about 2,500 characters = 100,000 characters, and each chunk of up to 1,000 characters (about 250 tokens of English) adds about 800 new characters because neighbouring chunks share up to 200.
+
 The `Document` object is deliberately minimal: `page_content: str` plus `metadata: dict[str, Any]`,
 and (more recently) an optional `id: str`. Every loader's job is to produce a `list[Document]` (via
 `.load()`) or, for anything large enough that materializing the whole list is wasteful, an
@@ -741,8 +860,8 @@ docs = loader.load()
 docs[0].metadata   # {"source": "./docs/handbook.pdf", "page": 0}
 ```
 
-Every loader is required to populate `metadata["source"]` at minimum — it's the one convention the
-framework actually enforces, because without it a retrieved chunk has no traceable origin, which
+Loaders are expected to populate `metadata["source"]` at minimum — a strong convention that almost
+every built-in loader follows (the framework does not validate it), and it matters because without it a retrieved chunk has no traceable origin, which
 breaks citation (`06-context-engineering.md`, planned) at the root. Beyond `source`, metadata
 population is loader-specific and wildly inconsistent in quality across the `langchain-community`
 catalog — some loaders extract page numbers, headers, or structural markers; many extract nothing
@@ -773,9 +892,10 @@ it recurses using the *next* separator in the list, down to the empty-string sep
 cut) as the fallback of last resort. This is "recursive" in the sense of *retrying with progressively
 more aggressive separators*, not in the sense of understanding document structure — it has no idea
 what a paragraph, a heading, or a code block is; it's pattern-matching on characters (`"\n\n"`, then
-`"\n"`, then `". "`, then `" "`). `chunk_overlap` is applied by re-including the trailing
-`chunk_overlap` characters of one chunk at the start of the next, a crude fixed-window overlap rather
-than anything content-aware.
+`"\n"`, then `". "`, then `" "` in the example above; the library default list is
+`["\n\n", "\n", " ", ""]`, with no sentence separator). `chunk_overlap` is applied by carrying up to
+`chunk_overlap` characters' worth of trailing pieces from one chunk into the start of the next, a crude
+fixed-window overlap rather than anything content-aware.
 
 The parameter worth flagging as a default that will bite you in production: **`length_function=len`
 counts characters, not tokens**, and most model context windows and cost accounting are token-based.
@@ -840,7 +960,7 @@ retrieval-quality tradeoff `02` §9 already covers in depth; nothing about doing
 `DocumentTransformer` changes that arithmetic, it just gives the operation a composable interface
 consistent with everything else in this pipeline.
 
-The load-bearing point for this section, stated plainly: **LangChain's document-loading and splitting
+The main point for this section, stated plainly: **LangChain's document-loading and splitting
 layer is glue code around genuinely hard problems (parsing, chunking) that are covered in depth in
 `02`. Don't rewrite that theory here — know it there, and know here that the defaults you get by
 importing `RecursiveCharacterTextSplitter` are reasonable, character-based, structure-blind, and
@@ -849,6 +969,10 @@ usually the wrong choice to ship unexamined into a production system with a real
 ---
 
 ## 7. The retriever abstraction
+
+> **In plain words.** A retriever takes a question and returns a list of documents. LangChain has wrappers that make retrieval better: rerank the results, mix keyword and vector search, rewrite the question several ways, or turn part of the question into a metadata filter.
+>
+> **Real-world example.** An e-commerce search for "waterproof hiking boots under $150" can use `EnsembleRetriever` (keyword + vector search, merged by rank), a reranker that keeps the best 5 of 40 candidates, and `SelfQueryRetriever` to turn "under $150" into a real `price < 150` filter.
 
 `BaseRetriever`'s actual contract is one method: `_get_relevant_documents(query: str, *, run_manager:
 CallbackManagerForRetrieverRun) -> list[Document]` (plus its async twin). The public entry point is
@@ -978,6 +1102,10 @@ distribution rather than the two or three examples in a tutorial.
 
 ## 8. Tools and function calling
 
+> **In plain words.** A tool is a Python function with a name, a description, and a list of arguments that the model can read. The model does not run the tool; it asks for it, your code runs it, and you send the result back. The better the description and type hints, the more often the model picks the right tool with the right arguments.
+>
+> **Real-world example.** A travel bot gives the model a `get_current_weather(city, unit)` tool. The user asks "weather in Lisbon?"; the model replies with a tool call `{"city": "Lisbon"}`; your code runs the function and returns "18 degrees and cloudy"; the model then writes the final sentence for the user.
+
 A LangChain `Tool` is a Python callable plus three things a model needs to decide whether and how to
 call it: a `name`, a `description`, and an `args_schema` (a JSON-Schema-describable shape for its
 arguments). The `@tool` decorator is the fast path — it infers all three from ordinary Python:
@@ -985,7 +1113,7 @@ arguments). The `@tool` decorator is the fast path — it infers all three from 
 ```python
 from langchain_core.tools import tool
 
-@tool
+@tool(parse_docstring=True)
 def get_current_weather(city: str, unit: Literal["celsius", "fahrenheit"] = "celsius") -> str:
     """Get the current weather for a city.
 
@@ -1000,11 +1128,12 @@ get_current_weather.description   # "Get the current weather for a city."
 get_current_weather.args          # JSON Schema derived from the type hints + docstring Args section
 ```
 
-The mechanism: the function's name becomes the tool name; the first line of the docstring becomes the
-description; and the argument schema is built by introspecting the function's type hints via
-`pydantic.create_model` (constructing an ad-hoc Pydantic model whose fields mirror the function
-signature), with per-argument descriptions parsed out of a Google- or NumPy-style `Args:` docstring
-section if present. This means **a tool's usability by the model is a direct function of how well you
+The mechanism: the function's name becomes the tool name; the docstring becomes the description; and
+the argument schema is built by introspecting the function's type hints via `pydantic.create_model`
+(constructing an ad-hoc Pydantic model whose fields mirror the function signature). With
+`parse_docstring=True`, a Google-style docstring is split: the summary becomes the description and the
+`Args:` section supplies per-argument descriptions. With plain `@tool`, the whole docstring (including
+the `Args:` block) is the description and the arguments get no individual descriptions. This means **a tool's usability by the model is a direct function of how well you
 type-hint and document the underlying Python function** — a bare `def foo(x, y): ...` with no
 docstring and no type hints produces a schema so vague the model has little to work with, which is a
 real, common cause of poor tool-selection accuracy that has nothing to do with the model and everything
@@ -1090,6 +1219,10 @@ costs more than expected.
 
 ## 9. Agents: from AgentExecutor to LangGraph
 
+> **In plain words.** An agent is a loop: ask the model, run any tools it requests, give it the results, repeat until it answers. The old `AgentExecutor` hides that loop and cannot be extended. LangGraph makes the loop an explicit graph you can add steps to, and it saves state after each step.
+>
+> **Real-world example.** A bank operations agent may call a `refund_payment` tool. With LangGraph you add an approval node, so any refund over, say, $500 pauses until a human clicks approve, even if that happens the next day on a different server. `AgentExecutor` has no place to put that pause.
+
 **The legacy shape.** `AgentExecutor` pairs an "agent" — itself a `Runnable` that, given the current
 scratchpad of intermediate steps, decides on either an `AgentAction` (call this tool with these
 args) or an `AgentFinish` (here's the final answer) — with a list of tools, and runs the think-act-
@@ -1163,6 +1296,10 @@ conditional edge (if the latest `AIMessage` has `.tool_calls`, go to "tools"; ot
 unconditional edge from "tools" back to "agent". That is, structurally, identical to the manual loop in
 §8 — LangGraph's contribution isn't a smarter loop, it's making that loop's structure a first-class,
 inspectable, extensible graph object, with persistence attached for free via the checkpointer.
+(With the 1.0 releases of LangChain and LangGraph, the recommended prebuilt is
+`langchain.agents.create_agent`, which builds the same model-node/tools-node loop on LangGraph and adds
+middleware hooks; `langgraph.prebuilt.create_react_agent` still works but is marked deprecated. The
+mechanics described here apply to both.)
 
 For anything beyond the vanilla ReAct shape — a review step before a risky tool executes, parallel
 tool branches with different failure handling, a supervisor node routing between specialist sub-agents
@@ -1233,6 +1370,10 @@ structurally cannot satisfy without working against its own design.**
 
 ## 10. Callbacks, tracing, and LangSmith
 
+> **In plain words.** Callbacks are hooks that fire at every step ("model started", "retriever finished", "tool failed"). They are how tracing tools like LangSmith see inside a chain, and how a UI shows progress such as "Searching..." and then "Writing answer...".
+>
+> **Real-world example.** A chain has 5 steps; each request produces a tree of about 6 runs (1 parent plus 5 children). When one answer is wrong, you open that request's trace and see which step got bad input, instead of adding `print()` lines and redeploying.
+
 Every lifecycle event of every component — a chain starting, a chat model producing a new token, a
 retriever finishing, a tool erroring — fires a method on every registered `BaseCallbackHandler`. The
 full interface (abbreviated) looks like this:
@@ -1273,9 +1414,13 @@ code changes — it's environment variables:
 
 ```bash
 export LANGCHAIN_TRACING_V2=true
-export LANGCHAIN_API_KEY=ls__...
+export LANGCHAIN_API_KEY=lsv2_...
 export LANGCHAIN_PROJECT=support-agent-prod
 ```
+
+(Newer LangSmith docs use the equivalent `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, and
+`LANGSMITH_PROJECT` names; the `LANGCHAIN_*` names above are still honored. Check for both when
+auditing a deployment.)
 
 Setting `LANGCHAIN_TRACING_V2=true` causes LangChain to register a `LangChainTracer` callback handler
 globally, so *every* `Runnable.invoke()` call anywhere in the process gets traced without touching a
@@ -1310,15 +1455,19 @@ domain — `gen_ai.request.model`, `gen_ai.usage.input_tokens`, span kinds for a
 tool execution — so that a trace assembled from a LangChain chain, a raw SDK call, and an entirely
 different framework in the same request can land in the *same* trace backend under a *shared* schema,
 rather than three incompatible proprietary formats. `10-llm-observability-and-tracing.md` (planned)
-treats this as the load-bearing reason to instrument at the OTEL layer even in a LangChain-heavy
+treats this as the main reason to instrument at the OTEL layer even in a LangChain-heavy
 codebase: LangSmith's native tracing is excellent *within* LangChain's boundary and blind *outside* it,
-while an OTEL-based callback handler (there is a community `langchain-core` callback handler that emits
-OTEL spans instead of, or alongside, LangSmith runs) gives you one trace format across every system
+while OTEL-based instrumentation (third-party OpenTelemetry instrumentation libraries for LangChain
+exist, and LangSmith itself can ingest and export OTEL traces) gives you one trace format across every system
 that touches a request, LangChain or not.
 
 ---
 
 ## 11. Memory, and why it's being deprecated
+
+> **In plain words.** A chat bot needs earlier messages to answer the next one. LangChain's old memory classes store and replay those messages, but they are awkward to combine with pipelines. The newer options are `RunnableWithMessageHistory` (history loaded by session ID) and, for agents, LangGraph's checkpointer (saves the whole state).
+>
+> **Real-world example.** A support chat that replays every message costs more with every turn: with about 300 tokens per exchange, turn 40 sends 12,300 input tokens (illustrative). Keeping only the last 6 exchanges caps it at 2,400.
 
 LangChain's memory classes solve one problem: a chat application needs the *previous* turns of a
 conversation available when generating the *next* one, and something has to store, retrieve, and
@@ -1388,7 +1537,7 @@ further.** A checkpointer persists the *entire graph state* (of which the messag
 just one field) after every node execution, keyed by `thread_id` — which gives you conversation memory
 as a side effect of the same mechanism that gives you crash recovery, human-in-the-loop interrupts, and
 time-travel debugging (replaying execution from any earlier checkpoint). Rather than choosing among
-seven memory-class variants each solving a narrow slice of "what to keep and what to forget," a
+half a dozen memory-class variants each solving a narrow slice of "what to keep and what to forget," a
 LangGraph application keeps its full state and addresses the token-growth problem the same way any
 other engineering system does — explicitly, in a node you write (a summarization node, a
 sliding-window trim node using `langchain_core.messages.trim_messages`, or a semantic-retrieval node
@@ -1403,6 +1552,10 @@ new memory-class variants.
 
 ## 12. The package split: core, community, partner, and langchain itself
 
+> **In plain words.** LangChain is split into several packages: `langchain-core` (the stable interfaces), provider packages like `langchain-openai` (official adapters), `langchain-community` (many community integrations of mixed quality), and `langchain` itself (higher-level helpers). Install and import only what you use.
+>
+> **Real-world example.** A service that only calls OpenAI and defines a few chains needs `langchain-core` and `langchain-openai`. Pulling in `langchain-community` for one loader adds many optional integrations to your dependency tree and more updates to track.
+
 Before `v0.1` (January 2024), `langchain` was a single package containing everything — abstractions,
 orchestration logic, and every third-party integration anyone had contributed. The split into four
 categories was a direct response to problems that monolith caused in practice, and each category has a
@@ -1410,7 +1563,7 @@ distinct contract:
 
 | Package | Contract | Dependency weight | Stability guarantee | Who maintains it |
 |---|---|---|---|---|
-| `langchain-core` | `Runnable` protocol, every base class, message types, LCEL primitives | minimal (Pydantic) | strongest in the ecosystem | LangChain team |
+| `langchain-core` | `Runnable` protocol, every base class, message types, LCEL primitives | small (Pydantic + a few light libraries) | strongest in the ecosystem | LangChain team |
 | `langchain` | provider-neutral orchestration built on `langchain-core` (legacy chains, `EnsembleRetriever`, agent helpers) | moderate | stable, but larger surface than core | LangChain team |
 | `langchain-community` | the long tail of third-party integrations | heavy, mostly optional | variable, integration by integration | community, uneven review |
 | partner packages (`langchain-openai`, ...) | one provider's adapter to `langchain-core` interfaces | scoped to that provider's SDK | first-party tested, versioned independently | LangChain + the provider |
@@ -1420,7 +1573,8 @@ distinct contract:
 `BaseCallbackHandler`, `VectorStore`, `BaseChatMessageHistory` — plus the message types
 (`HumanMessage`, `AIMessage`, `ToolMessage`, `SystemMessage`) and LCEL's composition primitives
 (`RunnableSequence`, `RunnableParallel`, `RunnableLambda`, and so on). Its dependency footprint is
-deliberately minimal (Pydantic, and not much else) and its release cadence is deliberately slow and
+deliberately small (Pydantic plus a few light libraries such as `tenacity`, `PyYAML`, `jsonpatch`, and
+the `langsmith` client — no provider SDKs) and its release cadence is deliberately slow and
 carries the strongest backward-compatibility guarantees in the whole ecosystem — it's the layer
 everything else, including every partner package, is built against, so breaking it breaks everything
 downstream simultaneously.
@@ -1455,7 +1609,7 @@ everything shipped together; installing `pip install langchain` pulled in option
 services most users never touched, bloating install size and surface area for supply-chain risk; and
 there was no way to tell, from the package boundary alone, whether a given class was a stable interface
 you could build production infrastructure against or a community integration of unknown maintenance
-status. The split fixed all three by making the boundary a load-bearing engineering decision rather
+status. The split fixed all three by making the boundary a deliberate engineering decision rather
 than an organizational afterthought: `langchain-core`'s stability guarantee is meaningful specifically
 *because* it no longer ships in the same release as `langchain-community`'s churn, and a partner
 package's first-party status is a real, checkable signal (who publishes it, how often, with what test
@@ -1465,6 +1619,14 @@ practical implication for a codebase: **prefer partner packages over the equival
 `langchain-openai`'s `ChatOpenAI` over any community-maintained alternative), and treat anything
 imported from `langchain-community` as "third-party code of unverified quality that happens to share
 an interface," which is a materially different trust level than `langchain-core`.
+
+**Version note (LangChain 1.0, October 2025).** The 1.0 release slimmed the `langchain` package down to
+agent-building essentials (`create_agent`, messages, tools, chat-model and embedding initializers) and
+moved legacy chains, the old retrievers (`EnsembleRetriever`, `MultiQueryRetriever`,
+`SelfQueryRetriever`, `ContextualCompressionRetriever`), and memory classes into a separate
+`langchain-classic` package. The `langchain.chains` / `langchain.retrievers` imports in this chapter
+match the 0.3 layout; on 1.x, import the same classes from `langchain_classic`. `langchain-core` and the
+`Runnable` protocol described here did not change shape.
 
 ---
 
@@ -1529,7 +1691,7 @@ that a Python debugger steps into as generic framework frames rather than your b
 a genuine, measurable increase in the cost of debugging a wrong answer compared to a linear script of
 function calls — `pdb` or an IDE debugger stepping through `Runnable.invoke` → `RunnableSequence.invoke`
 → another `Runnable.invoke` is less legible than stepping through your own three functions. Also valid:
-version churn across `0.0.x` → `0.1` → `0.2` → `0.3` broke import paths repeatedly (the memory module's
+version churn across `0.0.x` → `0.1` → `0.2` → `0.3` → `1.0` broke import paths repeatedly (the memory module's
 reorganization and various chain classes' deprecation are the two most-cited examples), and a team
 maintaining production code against LangChain has genuinely paid a non-trivial migration tax more than
 once. Also valid, and covered in §5's `with_structured_output` `method` parameter and elsewhere: the
@@ -1556,6 +1718,10 @@ answer that reads as senior.**
 ---
 
 ## 14. LangChain versus the alternatives
+
+> **In plain words.** LangChain is one of several choices. LlamaIndex is strongest at "index documents and query them". Haystack favours pipelines written as config. Calling the provider SDK directly is simplest when you have one provider and one pipeline.
+>
+> **Real-world example.** A startup with one product feature calling one model can write about 200 lines of plain SDK code and own it. A platform team serving 6 internal teams on 3 providers gets more value from a shared framework with swappable models and one tracing setup.
 
 **LlamaIndex** started from the opposite end of the same problem space — RAG-specific indexing and
 querying primitives first, general-purpose orchestration second — and it shows in the defaults: its
@@ -1625,6 +1791,10 @@ faith.
 
 ## 15. Interview-critical questions
 
+> **In plain words.** These are questions you may be asked about LangChain in an interview, with the answer a strong candidate gives. Read the question, answer it yourself, then compare.
+>
+> **Real-world example.** "What does `|` do?" A weak answer: "it connects things." A strong answer: "it calls `__or__`, which builds a `RunnableSequence` object; nothing runs until you call `invoke`, `batch`, or `stream` on it."
+
 The following are the questions a senior candidate should expect to be asked cold, with the answer a
 strong response gives — not a script to memorize, but the shape of reasoning that shows the mechanism
 is actually understood rather than the marketing. A useful self-test before an interview: for each
@@ -1638,8 +1808,9 @@ retries, streaming, concurrency, and tracing are implemented once in a shared pr
 reimplemented per component — see §1 and §3.
 
 **2. What is the `Runnable` protocol, and which methods are actually abstract versus which have
-default implementations?** Only `invoke`/`ainvoke` are abstract; `batch`, `stream`, and their async
-forms have default implementations expressed in terms of `invoke` (§3). A component only overrides the
+default implementations?** Only `invoke` is abstract; `ainvoke` (which by default runs `invoke` in a
+thread-pool executor), `batch`, `stream`, and their async forms have default implementations expressed
+in terms of `invoke` (§3). A component only overrides the
 defaults when it can do something meaningfully better — chat models override `stream` for real
 token-by-token output; sequences override `transform` to chain generators rather than materializing
 each step's full output before starting the next.
@@ -1998,3 +2169,139 @@ after the fix.
 ensemble is properly filtered" is not the same guarantee as "the ensemble is properly filtered" —
 `04`'s per-branch authorization invariant applies to every branch independently, and `EnsembleRetriever`
 does not enforce that for you.
+
+---
+
+## 18. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of problem teams hit when running LangChain in production: what users saw, the numbers that showed the cause, the fix, and the lesson.
+>
+> **Real-world example.** A chat UI that used to stream words suddenly shows nothing for 6 s and then the full answer. The cause turned out to be one small post-processing function added to the chain (Case 1).
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+Quick index: streaming stopped after a small change → Case 1; chat gets slower and pricier the longer
+it runs → Case 2; nightly batch job dies halfway → Case 3; trace is missing a step and token counts are
+too low → Case 4; users see another tenant's documents → Case 5; prompts with personal data showed up
+in a tracing service → Case 6; simple requests cost too much → Case 7.
+
+### Case 1 — Streaming stops after a "harmless" post-processing step
+
+**Setup.** A support chat UI streams answers from `prompt | model | StrOutputParser()`. A developer
+adds `RunnableLambda(strip_internal_links)` at the end to remove internal URLs.
+
+**Symptom.** Time to first token goes from about 0.4 s to about 6.5 s, which is the full generation
+time. Users report the bot "freezes, then dumps the answer". No errors in the logs.
+
+**Measurement/Diagnosis.** `len(list(chain.stream(q)))` was 212 chunks before the change and 1 chunk
+after. `strip_internal_links` uses `return`, not `yield`, so its wrapper uses the default invoke-once
+behaviour and waits for the whole input (§3, §4).
+
+**Fix.** Rewrite it as a generator that buffers only until a link can be safely stripped, then yields.
+Chunk count back to about 200; time to first token about 0.45 s.
+
+**Lesson.** Every step after the model must be a generator if you want streaming. Add a test that
+asserts the chunk count is greater than 1.
+
+### Case 2 — The longer the chat, the slower and more expensive it gets
+
+**Setup.** An HR assistant uses `ConversationBufferMemory`. Each request carries a 500-token system
+prompt, the full history (about 300 tokens per exchange), and a 100-token new question.
+
+**Symptom.** Long sessions get slower, and the monthly input-token bill is far above the estimate.
+
+**Measurement/Diagnosis.** Turn `i` sends `500 + 300 × (i − 1) + 100` tokens. Turn 40 sends
+12,300 tokens. A 40-turn session sends 258,000 input tokens in total (§11).
+
+**Fix.** Keep the last 6 exchanges and summarize older ones only when needed. Turn 40 now sends
+`500 + 300 × 6 + 100 = 2,400` tokens, and the 40-turn session sends 89,700 tokens in total, about
+2.9× less. (Summary cost not included; it is one extra call only when old turns are dropped.)
+
+**Lesson.** Unbounded history is a cost bug. Choose the window or summary rule on purpose.
+
+### Case 3 — The nightly batch job dies halfway
+
+**Setup.** A job classifies 10,000 tickets with `chain.batch(tickets)`, no `max_concurrency`, default
+`return_exceptions=False`. Provider limit: 500 requests per minute. Each call takes about 3 s.
+
+**Symptom.** The job fails after a few minutes with a `RateLimitError`. All results in memory are lost
+and the job restarts from zero the next night.
+
+**Measurement/Diagnosis.** With no concurrency limit, hundreds of requests start at once and quickly
+pass 500 per minute. One 429 error aborts the whole `batch` (§3).
+
+**Fix.** `max_concurrency=20`: 20 calls every 3 s is 400 requests per minute, under the limit. Total
+time 10,000 × 3 s / 20 = 1,500 s, about 25 minutes. Add `.with_retry(stop_after_attempt=3)` and
+`return_exceptions=True`, save results as you go, and re-run only the failed items (12 of 10,000 in
+the first run after the fix).
+
+**Lesson.** Set `max_concurrency` from the provider's rate limit, and never let one error throw away
+9,988 good results.
+
+### Case 4 — A step is missing from traces, and the cost dashboard is wrong
+
+**Setup.** A chain uses a `RunnableLambda(enrich)` that calls a second LLM (a query rewriter) with
+`rewriter.invoke(x)` and no `config`.
+
+**Symptom.** Traces show one model call per request. The token dashboard (built on a callback
+handler) reports 1,200 tokens per request, but the provider invoice works out to 2,000.
+
+**Measurement/Diagnosis.** In 1,000 traced requests the rewriter appeared 0 times. It used about
+800 tokens per request, but because `config` was not forwarded, its runs were not attached to the
+request's callbacks (§3).
+
+**Fix.** Change `enrich` to accept `config` and call `rewriter.invoke(x, config=config)`. The trace
+now shows both calls, and the dashboard reports 2,000 tokens per request, matching the invoice.
+
+**Lesson.** Any function inside a chain that calls another `Runnable` must forward `config`.
+
+### Case 5 — Hybrid search leaks another tenant's documents
+
+**Setup.** A multi-tenant document search uses `EnsembleRetriever` with a vector retriever filtered
+by `tenant_id` and a `BM25Retriever` built once over all tenants' documents (§7, Lab 9).
+
+**Symptom.** A customer reports seeing a file title from another company.
+
+**Measurement/Diagnosis.** An audit ran 5,000 queries as tenant A: 37 result lists (0.74%) contained
+at least one document from another tenant, all of them from the BM25 branch.
+
+**Fix.** Build a BM25 index per tenant, and add a final filter after fusion that drops any document
+whose `tenant_id` is not the caller's. Re-running the 5,000 queries: 0 leaks.
+
+**Lesson.** Every branch of an ensemble must apply the same access filter. The wrapper does not do it
+for you.
+
+### Case 6 — Personal data ends up in the tracing service
+
+**Setup.** A developer sets `LANGCHAIN_TRACING_V2=true` in a shared environment file to debug
+staging. The same file is later used by the production deployment.
+
+**Symptom.** A privacy review finds customer names and account numbers in LangSmith traces.
+
+**Measurement/Diagnosis.** Over 3 days, about 120,000 production requests were traced, each with full
+prompts and completions. The variable turns on a global tracer for every `Runnable` call (§10).
+
+**Fix.** Tracing is enabled per environment by an explicit, reviewed setting; production uses
+redaction of inputs and outputs before export, and a startup check fails the deploy if tracing is on
+without redaction configured. The 3 days of traces were deleted.
+
+**Lesson.** Treat tracing environment variables like data-export settings, because that is what they
+are.
+
+### Case 7 — A simple question costs as much as a long one
+
+**Setup.** An internal assistant binds all 40 company tools to every request with `bind_tools`. Each
+tool's schema and description is about 150 tokens.
+
+**Symptom.** Even "hi" costs about 6,000 input tokens. Tool choice accuracy is also poor on similar
+tools.
+
+**Measurement/Diagnosis.** 40 × 150 = 6,000 tool-schema tokens per call (§8). At 200,000 calls per
+day that is 1.2 billion tokens a day just for tool definitions.
+
+**Fix.** A cheap router step picks the 6 most relevant tools per request: 6 × 150 = 900 tokens. That
+saves 5,100 tokens per call, 1.02 billion tokens a day; at an illustrative $2.50 per million input
+tokens, about $2,550 per day.
+
+**Lesson.** Tool definitions are paid for on every call. Bind only the tools the request needs.
