@@ -38,8 +38,8 @@
 >
 > Hybrid retrieval exists because lexical and dense search fail on **disjoint** query classes, so
 > unioning them raises the ceiling that no amount of reranking could. Reranking exists because a
-> cross-encoder is roughly two orders of magnitude more accurate per comparison and roughly four
-> orders more expensive, which is affordable over 100 documents and impossible over 10 million.
+> cross-encoder judges each (query, document) pair much more accurately than an embedding comparison,
+> but costs a full model run per pair — affordable over 100 documents, impossible over 10 million.
 >
 > Both follow from the same shape as `03` §6.1's quantize-then-rescore: **cheap and wide, then
 > expensive and narrow.** So the design question is never "which retriever is best." It is *what is
@@ -50,6 +50,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The cascade, and the one property that governs it](#1-the-cascade-and-the-one-property-that-governs-it)
 2. [BM25: what it computes, and why it refuses to die](#2-bm25-what-it-computes-and-why-it-refuses-to-die)
 3. [Where dense retrieval fails, and why the failures are complementary](#3-where-dense-retrieval-fails-and-why-the-failures-are-complementary)
@@ -67,10 +68,85 @@
 15. [Anti-patterns](#15-anti-patterns)
 16. [Mental models — the compressed set](#16-mental-models--the-compressed-set)
 17. [Lab exercises](#17-lab-exercises)
+18. [Interview questions and system design prompts](#18-interview-questions-and-system-design-prompts)
+19. [Real-world cases — incidents with numbers](#19-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** Chapter `03` built an index that finds *similar-meaning* text fast. That alone
+misses things: similar meaning isn't the same as "contains the exact product code the user typed",
+and the fast index's top results are only roughly ordered. This chapter builds the full search
+pipeline that most production RAG systems use:
+
+1. **Search two ways at once**: keyword search (BM25) *and* meaning search (embeddings).
+2. **Merge** the two result lists into one (fusion, usually RRF).
+3. **Re-rank** the top ~100 merged results with a slower, much more accurate model (a reranker).
+4. **Remove near-duplicates** and send the best 5–20 passages to the LLM.
+
+**A real-world example.** An IT help-desk bot over 2 million support articles. A user asks:
+*"ERR-4012 when syncing my Outlook calendar on Mac"*.
+
+- **Keyword search** finds the one article containing `ERR-4012` (a rare code gets a huge score) but
+  ranks it next to articles that merely mention "Outlook" many times.
+- **Meaning search** finds articles about "calendar sync problems on macOS" — including ones that
+  never use the words "error" or "Outlook" — but has no idea what `ERR-4012` is.
+- **Fusion** combines both lists: the `ERR-4012` article and the good macOS-sync articles are all in
+  the top 100.
+- **The reranker** reads the question and each of the 100 candidates *together* and puts the
+  `ERR-4012` macOS article first.
+- **The LLM** gets the top 5 and writes the answer with a citation.
+
+Remove either search branch and some question types fail completely; remove the reranker and the
+right article is often in position 30 instead of 1.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Cascade | cheap step over many items → expensive step over few items | CV screening: keyword filter on 1,000 CVs, phone call with 20, interview with 3 |
+| Lexical / keyword search (BM25) | score documents by which query words they contain, rare words count more | Ctrl-F, but smart about rare words |
+| Dense / semantic search | find text with similar meaning via embeddings (`01`, `03`) | a librarian who understands what you mean, not what you said |
+| Hybrid search | run both and combine | asking the librarian *and* searching the catalogue |
+| Learned sparse (SPLADE, BM42) | keyword-style search whose word weights come from a model | Ctrl-F that also knows synonyms |
+| Fusion / RRF | merge ranked lists using only positions, not scores | two judges' rankings combined: whoever both judges rank highly wins |
+| Reranker / cross-encoder | a model that reads query and document together and scores the pair | the final interview, after screening |
+| Bi-encoder | the embedding model: encodes query and document separately | judging from two separate photos instead of meeting in person |
+| Late interaction (ColBERT) | compare the query and document word-by-word using stored per-word vectors | comparing every item on two shopping lists |
+| MMR / dedup | drop results that repeat what's already selected | a playlist that doesn't play the same song three times |
+| Recall ceiling | nothing later can recover a document the first step didn't find | if the screener rejected a CV, the interviewer never sees that candidate |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `q`, `Q` | the query (and its words `qᵢ`) | — | "ERR-4012 outlook mac" → 3 terms |
+| `D`, `d` | a document / chunk | — | one support article chunk |
+| `N` | number of documents in the corpus | 10K – 100M | 2M support chunks |
+| `f(qᵢ, D)` | how many times word `qᵢ` appears in `D` | 0 – 5 in a chunk | "outlook" appears twice |
+| `IDF(qᵢ)` | how rare a word is across the corpus: `ln(1 + (N − n + 0.5)/(n + 0.5))`, `n` = docs containing it | high for rare words | `ERR-4012` in 3 of 2M docs → IDF ≈ 13; "the" in all docs → ≈ 0 |
+| `k₁` | BM25: how fast repeated words stop adding score | 1.2 (default) | 10 mentions ≈ not much better than 3 |
+| `b` | BM25: how much long documents are penalised | 0.75 (default), 0 = off | short uniform chunks → barely matters |
+| `\|D\|`, `avgdl` | length of this document / average length | tokens | a 600-token chunk vs a 300 average |
+| `k` (RRF) | RRF smoothing constant (not the number of results!) | 60 | rank 1 → 1/61, rank 2 → 1/62 |
+| `rank_q(d)` | position of document `d` in list `q` (1 = top) | — | 3rd in keyword list → `rank = 3` |
+| `branch_depth` | how many results each search branch returns | 50 – 200 | top 100 from BM25, top 100 from vectors |
+| `fusion_depth` | how many merged results go to the reranker | 50 – 200 | 100 candidates reranked |
+| `final_k` | how many passages go into the LLM prompt | 5 – 20 | top 5 |
+| `λ` (MMR) | balance of relevance vs. variety: 1 = only relevance, 0 = only variety | 0.5 – 0.7 | 0.6 |
+| recall@k | share of questions whose correct passage is in the top `k` | 0 – 1 | found in top 100 for 94 of 100 questions → 0.94 |
+| nDCG@k, MRR | ranking quality: rewards correct passages near the top | 0 – 1 | MRR = 1 if correct answer is 1st, 0.5 if 2nd |
+| p50 / p99 | latency that 50% / 99% of queries are faster than | ms | reranker p99 = 250 ms |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. The cascade, and the one property that governs it
+
+> **In plain words.** Search runs in stages: a fast, rough step picks a few hundred candidates out of millions, then slower, smarter steps reorder them. The key rule: **only the first step can find documents**. If the right document isn't among the first few hundred, no later step can bring it back.
+>
+> **Real-world example.** Hiring: an automatic keyword filter picks 50 CVs out of 2,000, then humans interview 5. If the best candidate's CV said "PostgreSQL" while the filter looked for "SQL database", that person is gone for good — better interviewers can't fix a bad filter.
+
 
 ```
     corpus: 10,000,000 chunks
@@ -150,6 +226,11 @@ job being *to hand the next stage a small enough set that the next stage's cost 
 ---
 
 ## 2. BM25: what it computes, and why it refuses to die
+
+> **In plain words.** BM25 is classic keyword search. A document scores higher when it contains the query's words, especially *rare* words, with diminishing returns for repeats and a penalty for very long documents. It needs no AI model and is excellent at exact things: product codes, error codes, names.
+>
+> **Real-world example.** Query: `invoice INV-2024-00871`. "invoice" appears in 400,000 documents (low weight); `INV-2024-00871` appears in one (huge weight). BM25 puts that one document first. An embedding model sees "some invoice number" and returns random invoices.
+
 
 In 2023 the fashionable position was that lexical search was legacy. It isn't, and understanding
 *why* tells you exactly when to lean on it.
@@ -234,6 +315,11 @@ unexplained dense-branch weakness.
 
 ## 3. Where dense retrieval fails, and why the failures are complementary
 
+> **In plain words.** Meaning-based (embedding) search is great when the user's words differ from the document's words, and bad at exact codes, rare names, numbers and negation. Keyword search is the opposite. Because they fail on *different* questions, running both finds more than either alone.
+>
+> **Real-world example.** "How do I stop being charged every month?" finds the article "Cancelling a recurring subscription" only via embeddings (no shared words). "Error 0x80070005" finds its article only via keywords. A help desk gets both kinds of question all day.
+
+
 ### 3.1 The failure list
 
 | Failure | Mechanism |
@@ -308,6 +394,11 @@ of your support escalations, the aggregate is actively misleading.
 
 ## 4. Learned sparse: the third branch
 
+> **In plain words.** A middle option: keyword-style search where a model decides how important each word is, and can add related words that aren't in the text. It can help, but costs model runs at ingest and is usually a later optimization — get BM25 + embeddings + reranker working first.
+>
+> **Real-world example.** SPLADE might index a chunk about "laptop battery drains fast" also under "power" and "charge", so the query "poor charge life" matches it even without embeddings.
+
+
 Between "term statistics with no model" and "dense vector with no terms" sits a family that produces
 sparse term-weighted vectors *from* a model. Same inverted-index machinery, learned weights.
 
@@ -381,6 +472,11 @@ first-order one.
 ---
 
 ## 5. Fusion: rank versus score, and RRF in detail
+
+> **In plain words.** You now have two ranked lists with incompatible scores (BM25 scores like 14.2, cosine scores like 0.83). RRF ignores the scores and uses only positions: each list gives a document `1/(60 + position)`, and the totals are sorted. Documents both lists like rise to the top.
+>
+> **Real-world example.** Document A is #1 in keywords and absent from vectors: `1/61 = 0.0164`. Document B is #5 in both lists: `1/65 + 1/65 = 0.0308`. B wins — agreement between the two methods beats one method's strong opinion.
+
 
 Two branches returned two ranked lists. Merge them.
 
@@ -485,6 +581,11 @@ cascade is gone, silently, from one unset parameter. §6 is entirely about not d
 
 ## 6. The candidate budget — the parameter nobody reports
 
+> **In plain words.** Three different "how many" numbers: how many results each search returns, how many go to the reranker, and how many go to the LLM. They cost different things (index time, reranker money, prompt tokens) and must be reported separately, or results can't be compared.
+>
+> **Real-world example.** A team reports "hybrid improved recall". It turns out the old setup reranked 20 candidates and the new one 100. The gain came from the bigger candidate list, not from hybrid search.
+
+
 Every "hybrid beat dense by 4 points" claim has a hidden variable: how deep each branch went. It is
 the most under-reported parameter in retrieval and it confounds a large fraction of published
 comparisons.
@@ -541,6 +642,11 @@ for the same reason: the numbers are meaningless without it, and six weeks later
 ---
 
 ## 7. Reranking with cross-encoders
+
+> **In plain words.** A reranker reads the question and a candidate passage *together* and gives a precise relevance score. It's too slow to run on millions of documents, but fine on the top 100. It can only reorder what the first stage found.
+>
+> **Real-world example.** For "Can contractors expense home internet?", embeddings rank the general "Expense policy" first. The reranker notices that a lower-ranked chunk actually says "contractors are not eligible for home-office reimbursements" and moves it to #1.
+
 
 ### 7.1 What it is, restated
 
@@ -622,6 +728,11 @@ is the most common cascade-ordering bug.
 
 ## 8. Late interaction and LLM rerankers — the rest of the ladder
 
+> **In plain words.** More ways to rerank, from cheap to expensive: word-by-word vector matching (ColBERT; fast but needs much more storage), cross-encoders, and asking an LLM to rank (flexible, slowest, costliest). Use an LLM reranker only for a small final set with special rules.
+>
+> **Real-world example.** A legal search tool asks an LLM to reorder the final 10 results with the rule "prefer the most recent version of a regulation and primary sources over commentary" — a rule no off-the-shelf reranker knows.
+
+
 Cross-encoders are one rung. The ladder has four, and they trade off along the same axis: how much
 query-document interaction the model gets, versus how much can be precomputed.
 
@@ -681,6 +792,11 @@ uses, so it will come back.
 
 ## 9. The reranker landscape as an interface-and-constraint table
 
+> **In plain words.** When choosing a reranker, the limits matter more than leaderboard scores: max documents per call, max text length, hosted vs. self-hosted, license, languages. Test quality on your own data.
+>
+> **Real-world example.** A bank that can't send data to external APIs must self-host an open reranker on its own GPUs; the hosted option's quality doesn't matter if it's not allowed.
+
+
 Model rankings rotate every few months. Interfaces and constraints change slowly, and they are what
 your architecture actually depends on. Evaluate on your own corpus (§13, lab 5); use this to know
 what you are choosing between.
@@ -722,6 +838,11 @@ better answer in an afternoon than any of them can give you at all.
 ---
 
 ## 10. The latency budget, as arithmetic
+
+> **In plain words.** Total search time = embed the question + the slower of the two searches (they run in parallel) + reranking. The reranker is usually the biggest part. Decide in advance what to skip when time runs out: skip reranking first, never skip both searches.
+>
+> **Real-world example.** Budget 800 ms: embedding 30 ms, BM25 15 ms ∥ vector 20 ms, rerank 100 candidates 250 ms → ~300 ms. If the reranker times out, return the fused list — slightly worse order, still correct documents — and count how often that happens.
+
 
 Retrieval latency is not one number, it is a sum with a critical path, and writing it out is how you
 find out where your p99 actually comes from.
@@ -810,6 +931,11 @@ Three things this encodes:
 
 ## 11. Diversity and deduplication at merge time
 
+> **In plain words.** If the top 10 contains the same paragraph six times (from copies or versions of a document), the LLM gets 4 useful passages instead of 10. Remove near-copies first; use MMR (prefer results that add something new) only if needed.
+>
+> **Real-world example.** An HR bot's top 5 for "parental leave" are the 2023, 2024 and 2025 versions of the same policy plus two copies from different intranet pages. After dedup: the 2025 policy, the FAQ, the payroll rule, the form, and the manager guide.
+
+
 ### 11.1 The problem, quantified upstream
 
 `02` §10.4 makes the case: if your top-10 contains six near-copies of the same passage — versioned
@@ -867,6 +993,11 @@ change?"), MMR actively hurts. Measure it (lab 7); don't adopt it because it sou
 
 ## 12. Filtering and authorization inside the cascade
 
+> **In plain words.** Permission filters ("only documents this user may see") must be applied inside *every* search branch, before anything else — never afterwards. And "prefer recent documents" is a ranking preference, not a filter.
+>
+> **Real-world example.** A contractor searches "salary bands". If the permission check runs after retrieval, the reranker has already processed HR-only documents and a title may leak into logs or citations. Filtering inside each branch means those documents are never retrieved at all.
+
+
 ### 12.1 Authorization filters go first, and are not negotiable
 
 Access control belongs at the *first* stage, applied inside the index, for three reasons in
@@ -920,6 +1051,11 @@ loss into a hard one, and hard losses are invisible — you never see what you e
 ---
 
 ## 13. Evaluating a cascade without fooling yourself
+
+> **In plain words.** Measure each stage with the right number (first stage: did we find it? reranker: is it near the top?), change one thing at a time, tune the old setup as well as the new one, and check results per question type.
+>
+> **Real-world example.** "Hybrid +2 points" overall turned out to be +15 points on questions with product codes and 0 elsewhere. That tells you exactly why keyword search is worth keeping.
+
 
 `08-evaluation-methodology.md` covers evaluation properly. This section covers the traps specific to
 multi-stage retrieval, which are not obvious and which invalidate most informal comparisons.
@@ -985,6 +1121,11 @@ paraphrase queries, multi-clause queries, short queries.
 ---
 
 ## 14. Cost model for the retrieval layer
+
+> **In plain words.** Search cost per question = the index (fixed monthly) + embedding the question + reranking. Reranking cost grows with the number of candidates, so that number is the main cost dial. Reranking is usually cheap compared with the LLM answer.
+>
+> **Real-world example.** Reranking 100 chunks might cost a fraction of a cent; generating an answer from 20 chunks of 500 tokens costs more. Cutting the prompt from 20 to 10 chunks saves more than removing the reranker — and keeps quality.
+
 
 ### 14.1 Per query
 
@@ -1257,6 +1398,187 @@ produced our best recorded nDCG, and is it what's deployed?"
 deployed config against the best-measured one.
 *Time:* ~3 hours.
 *Unblocks:* `09-eval-infrastructure-and-ci.md`, `10`, and P0's regression gate.
+
+---
+
+## 18. Interview questions and system design prompts
+
+> **In plain words.** Answer in three steps: the simple idea, one number, one trade-off. Only go into
+> formulas if asked.
+>
+> **Real-world example.** "Why hybrid search?" → "Keyword and meaning search fail on different
+> questions: codes and names vs. paraphrases. On a support corpus, keyword search alone often finds
+> 5–15% of answers that embeddings miss. The cost is a second index and a fusion step."
+
+### 18.1 Conceptual questions
+
+**Q: What is a retrieval cascade and what's its governing property?**
+*Sections: §1*
+Cheap and wide first (BM25 + ANN over millions), expensive and narrow later (reranker over ~100,
+LLM over ~10). Governing property: only the first stage adds candidates, so first-stage recall is
+the ceiling. Strong answers add the consequence: measure `neither` (§3.3) before buying a reranker.
+
+**Q: Explain BM25. Which parts matter for RAG chunks?**
+*Sections: §2.1, §2.2*
+IDF (rare terms weigh more) × saturating term frequency (`k₁`) with length normalization (`b`).
+On short, uniform chunks, term frequency is mostly 0/1 and length ≈ average, so BM25 is mostly IDF:
+a rare-term detector. Tune the analyzer (tokenization of codes like `user-id`, `10-K`), not `k₁`/`b`.
+
+**Q: Why use RRF instead of adding normalized scores?**
+*Section: §5*
+Scores are on incompatible scales (BM25 unbounded, cosine bounded), min-max normalization depends
+on which other documents came back, and distributions drift with model/corpus changes. RRF uses
+only ranks: `Σ 1/(k + rank)`, `k = 60`. Trade-off: it loses magnitude, so you can't threshold RRF
+scores to decide "nothing relevant found".
+
+**Q: Bi-encoder vs cross-encoder?**
+*Section: §1.2, §7*
+Bi-encoder: encodes query and document separately → documents precomputed → indexable, fast, less
+accurate. Cross-encoder: reads the pair jointly → more accurate, nothing precomputable → cost is
+one model pass per candidate, so only for ~100 candidates.
+
+**Q: Can a reranker improve recall?**
+*Section: §13.2*
+Not recall@`fusion_depth` — it reorders a fixed set. It can improve recall@`final_k` by promoting
+relevant passages into the top `final_k`. Mixing these two up is a common interview trap.
+
+**Q: Where do permission filters go?**
+*Section: §12*
+Inside every first-stage branch. Post-filtering under-returns (`03` §7), wastes reranker spend, and
+risks leaking unauthorized content through logs, titles, or citations. Enforce with an assertion
+in tests.
+
+### 18.2 System design prompts
+
+**Q: Design retrieval for an internal IT help-desk assistant: 2M chunks, 50 QPS peak, p95 < 1 s
+end-to-end (retrieval budget 300 ms), queries mix error codes and natural-language descriptions.**
+
+```
+1. FIRST STAGE (the ceiling)
+   - BM25 (analyzer keeps codes like ERR-4012, 0x80070005 as single tokens) + dense (asymmetric
+     embeddings, 01 §3). Both filtered by the user's ACL inside the query.
+   - branch_depth = 100 each; measure lexical_only / dense_only / neither on a golden set (§3.3).
+2. FUSION
+   - RRF, k = 60. A reranker follows, so fusion is judged on recall@fusion_depth (§5.3).
+3. RERANK
+   - fusion_depth = 100 → top 20; hosted or self-hosted cross-encoder; timeout = remaining budget,
+     fall back to fused order and count fallbacks (§10.3).
+4. DEDUP → final_k = 5–8 passages to the LLM (token budget decided in 06).
+5. LATENCY: embed 30 ms + max(BM25 15, ANN 20) + rerank ~200 ms ≈ 250 ms.
+6. EVAL: ablation table (§13.3) incl. "dense + rerank" row; stratify codes vs. descriptions.
+```
+
+**What interviewers listen for:** recall ceiling reasoning, branches in parallel with cancellation,
+explicit depths, ACL inside the branches, a fallback that is measured, and stratified evaluation.
+
+**Q: Our reranker bill is too high. What do you do?**
+Sweep `fusion_depth` (cost is linear in it; recall gain flattens after ~50–100), cache reranks for
+repeated queries, self-host if volume is high, and check whether the prompt (`final_k` × chunk size)
+is the bigger cost anyway (§14.1).
+
+### 18.3 Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| Default BM25 `k₁`, `b` in Elasticsearch? | 1.2 and 0.75. | §2.1 |
+| What does RRF's `k = 60` do? | Flattens rank differences so agreement across lists beats one list's top rank. | §5.2 |
+| Rank 5 in both lists vs rank 1 in one? | `2/65 = 0.031` beats `1/61 = 0.016`. | §5.2 |
+| Why does ES hybrid often hand the reranker only ~15 docs? | `rank_window_size` defaults to `size` (e.g. 10). Set it to 100+. | §5.4 |
+| Reranker cost scaling? | Linear in candidates. | §14.1 |
+| When is MMR harmful? | When the answer needs several similar passages ("what did each amendment change?"). | §11.3 |
+| Why can't a cross-encoder be the first stage? | Nothing precomputable; N model passes per query. | §1.2 |
+| "Prefer recent documents" — filter or ranking? | Ranking signal; as a filter it silently drops valid old documents. | §12.3 |
+
+### 18.4 Debugging prompts
+
+**"Users searching for error codes get irrelevant answers."** Check the lexical branch exists and
+its analyzer keeps the code intact (`ERR-4012` not split into `err` + `4012`); check fusion window
+depth; check the code isn't in a field excluded from BM25.
+
+**"We added a reranker and nothing improved."** Measure first-stage recall@`fusion_depth`: if the
+answer isn't in the candidates, the reranker can't help (§1.1). Check `fusion_depth > final_k`.
+
+**"Some users get fewer results than others."** ACL post-filtering or per-branch filter mismatch
+(§12). Compare result counts by user permission breadth.
+
+### 18.5 Common mistakes
+
+1. Reaching for a reranker before measuring first-stage recall.
+2. Quoting "recall@100" without branch/fusion depths (§6.3).
+3. Score fusion with min-max normalization and a fixed threshold.
+4. Applying ACLs after retrieval.
+5. Comparing a tuned new system with an untuned baseline (§4.2's BM42 correction).
+
+---
+
+## 19. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+> **In plain words.** Each case: what users saw, the simple reason, the numbers, the fix.
+>
+> **Quick index:** codes not found → Case 1; reranker useless → Case 2; hybrid "improvement" was an
+> illusion → Case 3; contractors saw HR docs → Case 4; slow p99 → Case 5; duplicates in answers →
+> Case 6.
+
+### Case 1 — Dense-only search can't find error codes
+
+**Setup.** SaaS support bot, 400K chunks, embeddings only.
+**Symptom.** 18% of escalated tickets contain an error code the bot "didn't know", though every
+code is documented.
+**Measurement.** Golden set of 200 questions, stratified: on the 40 code-containing questions,
+dense recall@20 = 0.35; BM25 recall@20 = 0.90. On the 160 natural-language questions: dense 0.86,
+BM25 0.61.
+**Fix.** Added BM25 with an analyzer that keeps `ABC-1234` intact; RRF; overall recall@20 0.76 →
+0.91; code stratum 0.35 → 0.93.
+**Lesson.** Always stratify; the aggregate hid a completely broken query class.
+
+### Case 2 — Reranker added, no gain
+
+**Setup.** Policy assistant, hybrid search, `fusion_depth = 20`, `final_k = 10`, new reranker.
+**Symptom.** Offline answer quality unchanged, cost up.
+**Measurement.** recall@20 of the first stage = 0.71. The reranker had only 20 candidates to reorder
+into 10 slots, and 29% of answers weren't in the 20 at all.
+**Fix.** `branch_depth` 50 → 150 per branch, `fusion_depth` 20 → 100: first-stage recall 0.71 →
+0.90; with the reranker, recall@10 0.64 → 0.84.
+**Lesson.** The reranker needs a large enough candidate set that actually contains the answers.
+
+### Case 3 — The hybrid win that was a config change
+
+**Setup.** Team reports "hybrid beats dense by 6 points".
+**Diagnosis.** Dense baseline ran with `ef_search = 40` and `branch_depth = 20` (defaults); hybrid run
+used `branch_depth = 100`. Re-running dense at `branch_depth = 100`, `ef_search = 200`: the gap
+shrinks to 1.5 points ± 2 (inside the CI on 150 queries).
+**Lesson.** Tune the baseline as hard as the challenger (§13.1). The lexical branch may still be
+worth it for a specific stratum — measure that instead.
+
+### Case 4 — ACL applied after reranking
+
+**Setup.** Enterprise search; vector store filter couldn't express `group IN (...) OR owner = X`,
+so a developer post-filtered "temporarily".
+**Symptom.** Contractors got 1–2 results where employees got 10; a debug log contained titles of
+HR-only documents that had been reranked.
+**Fix.** Moved ACL into both branches (flattened group membership into an indexed `allowed_principals`
+field), added the assertion from §12.1 to integration tests.
+**Lesson.** Authorization is a first-stage invariant, not a post-processing step.
+
+### Case 5 — p99 dominated by the reranker
+
+**Setup.** Chat assistant, hosted reranker on 200 candidates. p50 retrieval 280 ms, p99 1.9 s.
+**Diagnosis.** Reranker p99 1.6 s (vendor tail latency, request size 200 × 400 tokens).
+**Fix.** `fusion_depth` 200 → 80 (recall@80 within 1 point of recall@200), 400 ms reranker timeout
+with fallback to fused order (fired on 1.8% of requests, alerted if > 5%). p99 → 520 ms.
+**Lesson.** Candidates cost latency linearly; the fallback must be designed and counted.
+
+### Case 6 — Six copies of one paragraph
+
+**Setup.** Intranet assistant; documents published on multiple sites and kept in several versions.
+**Symptom.** Answers cite the same paragraph repeatedly and miss related policies.
+**Measurement.** Distinct passages in top-10: average 5.2.
+**Fix.** MinHash near-duplicate collapse over the 100 reranked candidates, keep the newest version:
+distinct passages 5.2 → 8.9; answer completeness on multi-part questions up 11 points.
+**Lesson.** Dedup is cheap and parameter-free; try it before MMR.
 
 ---
 
