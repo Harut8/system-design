@@ -1895,6 +1895,70 @@ INTERVIEW ANSWER STRUCTURE:
 
 ---
 
+## 16. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent.
+
+**Quick index:** features stop updating overnight → 16.1 · checkpoints keep timing out → 16.2 · counters too high after a restart → 16.3 · output missing after a long outage → 16.4 · downstream sees duplicates although the sink is "exactly-once" → 16.5 · state and checkpoints explode after a window change → 16.6 · recovery takes 14 minutes despite 3-second checkpoints → 16.7
+
+### 16.1 The quiet partition that froze every feature
+
+- **Setup.** An IoT telemetry pipeline reads a 24-partition topic with a 10-second watermark delay and 5-minute tumbling windows. Devices are keyed by site; 2 partitions carry only a few test sites that stop sending at night.
+- **Symptom.** From 01:00, the dashboard's "last updated" time stops moving for *all* sites, even busy ones. No errors, no backpressure, Kafka lag near zero.
+- **Measurement/Diagnosis.** The source watermark sits at 00:58:40 while the newest event time is 06:58:40: watermark lag = 6 hours. Per-partition watermarks show partitions 17 and 21 stuck; the source watermark is the minimum over partitions (§4.2, §4.5), so no window closed for 6 hours.
+- **Fix.** Add `.withIdleness(Duration.ofMinutes(1))`. Watermark lag drops from 6 h to about 10-15 s (the 10 s delay plus a few seconds of processing), and windows close again roughly 10 s after they end.
+- **Lesson.** Always configure idleness, and alert on watermark lag (newest event time minus current watermark), not only on Kafka lag.
+
+### 16.2 Checkpoints that never finish under backpressure
+
+- **Setup.** A clickstream job writes to Redis with synchronous calls. Checkpoint interval 60 s, timeout 10 min (600 s), aligned checkpoints. Evening traffic peaks at 40K events/s; the Redis sink handles about 30K/s.
+- **Symptom.** From 19:00 checkpoints fail with "Checkpoint expired before completing"; 9 of the 10 checkpoints between 19:00 and 21:00 fail. A pod restart at 20:50 replays from 18:58: almost 2 hours of data.
+- **Measurement/Diagnosis.** `busyTimeMsPerSecond` on the sink is ~1000 (saturated); upstream `outPoolUsage` is 1.0. Barriers sit behind full network buffers, so alignment takes 480-600+ s (§6.2). Kafka lag grows at 40K - 30K = 10K events/s.
+- **Fix.** (1) Async I/O with 100 in-flight requests and batched writes: sink capacity rises to ~60K/s, so backpressure disappears. (2) `execution.checkpointing.aligned-checkpoint-timeout: 30s` so that if backpressure returns, a checkpoint switches to unaligned after 30 s. Checkpoint duration drops from 480+ s to about 20-25 s.
+- **Lesson.** Checkpoint timeouts under load are usually a backpressure problem. Fix the slow step first; unaligned checkpoints only make the snapshots survive it.
+
+### 16.3 Click counters that doubled after a crash
+
+- **Setup.** A feature job maintains `clicks_today` in Redis with `INCR` for every click, 80K clicks/s, checkpoint every 60 s.
+- **Symptom.** After a TaskManager crash, the ranking team sees `clicks_today` jump for many users; some show twice their real count for the last minute of activity.
+- **Measurement/Diagnosis.** The crash happened 45 s after the last checkpoint. Flink replayed 45 x 80K = 3.6M clicks. Flink's own state was rolled back, but Redis was not, so all 3.6M `INCR`s were applied a second time (§6.3, §15.3).
+- **Fix.** Keep the count in Flink state and write the *value* with `SET` plus a checkpoint-epoch version check (Lua script), instead of `INCR`. After the next crash drill (replay of 50 s = 4M clicks), Redis values match an offline recount exactly: 0 inflated keys instead of ~millions.
+- **Lesson.** Flink's exactly-once covers its own state. External writes must be transactional or idempotent; `INCR` is neither.
+
+### 16.4 Twenty-two minutes down, sixty seconds of output gone
+
+- **Setup.** A job writes enriched orders to Kafka with `DeliveryGuarantee.EXACTLY_ONCE`, producer `transaction.timeout.ms` = 15 min, checkpoints every 60 s, 30K records/s.
+- **Symptom.** A Kubernetes node-pool upgrade keeps the job down for 22 minutes. After restart, the downstream warehouse is missing about one minute of orders from just before the outage.
+- **Measurement/Diagnosis.** The last checkpoint had completed, but the job died before committing the pre-committed transaction. On restart Flink tried to re-commit it, but 22 min > 15 min, so the broker had already aborted it. Lost: 60 s x 30K = 1.8M records (§7.2).
+- **Fix.** Raise broker `transaction.max.timeout.ms` and producer `transaction.timeout.ms` to 1 hour, add a runbook limit (max planned downtime 45 min), and alert on job downtime > 30 min. The next 25-minute upgrade loses 0 records.
+- **Lesson.** The transaction timeout must cover checkpoint interval + checkpoint duration + the longest outage you expect, and the broker's maximum must allow it.
+
+### 16.5 "Exactly-once" sink, duplicate rows downstream
+
+- **Setup.** Same kind of transactional Kafka sink, 12K records/s, checkpoint every 60 s. A downstream Kafka Connect job loads the topic into a warehouse.
+- **Symptom.** The warehouse has ~720K duplicate rows after each job restart; there are about 2 restarts a day.
+- **Measurement/Diagnosis.** The connector's consumer uses the default `isolation.level=read_uncommitted`, so it reads records from transactions that Flink later aborts, and then the replayed copies again. 60 s x 12K = 720K records per aborted transaction window (§6.3).
+- **Fix.** Set `isolation.level=read_committed` on every downstream consumer. Duplicates drop from ~1.44M/day to 0; the cost is that data becomes visible up to ~60 s later (one checkpoint interval).
+- **Lesson.** Two-phase commit only helps readers that wait for commits. Exactly-once is a contract between the writer and every reader.
+
+### 16.6 A "small" window change that needed a terabyte
+
+- **Setup.** A video platform computes `views_last_24h` per video. A product request changes the window from sliding 24 h / 1 h to sliding 24 h / 1 min "for fresher numbers". 20M videos; each window pane holds a ~32-byte accumulator.
+- **Symptom.** After the deploy, RocksDB disks fill, checkpoints grow and time out, and throughput per subtask falls several times over.
+- **Measurement/Diagnosis.** Panes per key went from 24 to 1,440 (§3.2). State: 20M x 1,440 x 32 B = ~922 GB instead of 20M x 24 x 32 B = ~15 GB. Each event is now added to 1,440 windows instead of 24.
+- **Fix.** Roll back to 24 h / 1 h via savepoint, then implement the fresher feature as a `ProcessFunction` with 1,440 one-minute buckets per video, each event updating one bucket and emitting the running sum. Throughput recovers; state is in the same range as the buckets (~922 GB if all 1,440 buckets are full), so the team keeps buckets only for the ~2M videos with views in the last day (~92 GB).
+- **Lesson.** For sliding windows, state and work scale with size/slide. Always compute keys x panes x bytes before changing a window.
+
+### 16.7 Tiny checkpoints, slow restore
+
+- **Setup.** A job with 400 GB of RocksDB state on 20 TaskManagers. Incremental checkpoints upload ~1.5 GB each and finish in 3 s. S3 download rate for the job: ~500 MB/s.
+- **Symptom.** After a single TaskManager dies, features are stale for about 16 minutes. The team expected "a few seconds, like the checkpoints".
+- **Measurement/Diagnosis.** The keyed job is one failover region, so all tasks restart (§10.3), and without local recovery every task downloads its full share of the checkpoint: 400 GB / 500 MB/s = ~800 s (13.3 min), plus ~2-3 min of catch-up (§10.4).
+- **Fix.** Enable `state.backend.local-recovery: true`. The 19 surviving TaskManagers reuse their local copies; only the replacement downloads its share: 20 GB / 500 MB/s = ~40 s. Total recovery drops from ~16 min to about 3 min.
+- **Lesson.** Incremental checkpoints make *writing* snapshots cheap, not *restoring* them. Measure restore time with a real crash drill.
+
+---
+
 ## Summary of Key Numbers
 
 | Parameter | Typical Production Value |

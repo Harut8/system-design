@@ -1986,7 +1986,7 @@ These are **composite scenarios** built from failure modes this chapter describe
 
 - **Setup:** A payments service joins 800 GB of transactions with merchants on `merchant_id` to build settlement reports.
 - **Symptom:** 3,199 tasks finish in about 1 minute; one runs for 70 minutes. The report misses its 08:00 deadline.
-- **Measurement/Diagnosis:** 20% of transactions (card-present test transactions) have `merchant_id = NULL`: 160 GB, all hashing to one partition. The Spark UI shows max input 160 GB vs median 250 MB.
+- **Measurement/Diagnosis:** 20% of transactions (internal test and adjustment entries) have `merchant_id = NULL`: 160 GB, all hashing to one partition. The Spark UI shows max input 160 GB vs median 250 MB.
 - **Fix:** NULL keys can never match in an inner join, so filter them before the join (`isNotNull`) and route them to a separate report. Stage time went from 70 minutes to about 2 minutes. AQE skew join was enabled as a safety net for other hot keys.
 - **Lesson:** Look at the key distribution first. NULLs and default values are the most common hot keys.
 
@@ -2010,7 +2010,7 @@ These are **composite scenarios** built from failure modes this chapter describe
 
 - **Setup:** A bank's daily ledger rollup writes `df.write.mode("overwrite").partitionBy("date").parquet(path)`, where `df` holds one day.
 - **Symptom:** After a routine re-run, the table contains only one date. 730 daily partitions are gone.
-- **Measurement/Diagnosis:** `spark.sql.sources.partitionOverwriteMode` was the default `static`, which clears the whole output path before writing. The job had "worked" for months only because it previously wrote to a new path each day.
+- **Measurement/Diagnosis:** `spark.sql.sources.partitionOverwriteMode` was the default `static`, which clears the whole output path before writing. Nobody noticed earlier because, until a recent refactor, each day was written to its own path.
 - **Fix:** Restore from backups; set `partitionOverwriteMode = dynamic` so only the dates in `df` are replaced; later move the table to Iceberg and use `INSERT OVERWRITE` / `MERGE` with snapshot history for rollback.
 - **Lesson:** Test re-runs on a copy before relying on them. Know which overwrite mode you are in.
 
