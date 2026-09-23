@@ -3,8 +3,8 @@
 > **Prerequisites:** [`00-mental-models.md`](00-mental-models.md) (the pipeline as dataflow — an
 > agent is that same dataflow with a decision node that used to be code replaced by a model call,
 > and every consequence in that chapter about correctness living in the data still applies),
-> [`04-retrieval-hybrid-and-reranking.md`](04-retrieval-hybrid-and-reranking.md) (§13's
-> multi-hop-retrieval-multiplies-everything remark is this chapter's §4 written out in full),
+> [`04-retrieval-hybrid-and-reranking.md`](04-retrieval-hybrid-and-reranking.md) (its
+> forward pointer to multi-hop retrieval is this chapter's §4 written out in full),
 > [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (the golden-set and
 > regression-gate discipline this chapter's §14 reuses wholesale — an agent trajectory is a
 > harder-to-score version of the same problem, not a different one),
@@ -28,8 +28,8 @@
 > mechanics this chapter's §7 assumes as background), `14-agent-evaluation.md` (planned — §14 here
 > is that chapter's summary; the full trajectory-scoring machinery belongs there),
 > `16-multi-tenancy-and-isolation.md` (planned — §13's tenant-isolation requirement is that
-> chapter's subject applied to an agent runtime), `17-safety-guardrails-and-prompt-injection.md`
-> (planned — §7.3's "every tool output is untrusted input" rule is that chapter's thesis, needed
+> chapter's subject applied to an agent runtime), [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md)
+> (§7.3's "every tool output is untrusted input" rule is that chapter's thesis, needed
 > one level earlier than that chapter can assume), `18-failure-modes-and-incident-walkthrough.md`
 > (planned — §10's failure taxonomy is the vocabulary that walkthrough will use), and the P3/P4
 > projects in this folder's `README.md` (§5 project ladder) directly.
@@ -50,6 +50,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The spectrum from chains to agents](#1-the-spectrum-from-chains-to-agents)
 2. [Deterministic workflows versus agentic workflows](#2-deterministic-workflows-versus-agentic-workflows)
 3. [Agent architectures — ReAct, Plan-and-Execute, Reflexion, LATS](#3-agent-architectures--react-plan-and-execute-reflexion-lats)
@@ -67,10 +68,95 @@
 15. [Anti-patterns](#15-anti-patterns)
 16. [Interview questions](#16-interview-questions)
 17. [Lab exercises](#17-lab-exercises)
+18. [Real-world cases — incidents with numbers](#18-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A normal program decides "what happens next" in code you can read and test. An
+*agent* hands that decision to a language model at run time. That makes it flexible, but the model
+can pick the wrong tool, loop forever, repeat a payment, or spend far more money than planned. This
+chapter is about keeping as many decisions as possible in plain code, and putting hard limits
+around the few decisions the model really has to make.
+
+**A real-world example.** An online shop gets **10,000 support tickets a day**: refunds, "where is my
+order", how-to questions, and a small tail of odd requests. All numbers below are illustrative, with
+an assumed price of $3 per million tokens.
+
+1. **Version A — "one smart agent".** One model with 15 tools and the instruction "handle this
+   ticket". It averages 7 model calls per ticket at ~3,000 tokens each = **21,000 tokens per ticket**,
+   so 210M tokens a day, about **$630/day**. Some tickets loop until they hit the step cap. When the
+   refund tool times out, the agent retries and some customers get refunded twice.
+2. **Fix 1 — workflow first (§2).** One cheap classifier call (~1,000 tokens) sorts each ticket.
+   The 85% that are refunds, order status or how-to go down fixed code paths (~3,000 tokens). Only
+   the 15% "other" tickets go to a small agent with 4 tools (~15,000 tokens). Average:
+   1,000 + 0.85 × 3,000 + 0.15 × 15,000 = **5,800 tokens per ticket**, about **$174/day** — 72% less.
+3. **Fix 2 — a bounded loop (§4).** The agent gets at most 12 steps, 40,000 tokens and 60 seconds,
+   plus a check that stops it when it repeats the same action (§10.5).
+4. **Fix 3 — safe tools (§7).** The refund tool takes an *idempotency key* built from the ticket ID,
+   so a retry can never refund twice. Refunds over $200 wait for a human's approval (§9).
+5. **Fix 4 — measure it (§14).** A test set of 300 past tickets checks not only "was the answer
+   right" but also "how many steps did it take and what did it cost".
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Workflow | code fixes the steps; the model only fills in content | a recipe: the steps are printed, the cook only chooses the seasoning |
+| Agent | the model decides the next step at run time | a cook with no recipe who decides as they go |
+| Tool | a function the model may ask the program to run | a kitchen appliance the cook may switch on |
+| Agent loop | think → act (call a tool) → look at the result → repeat | a detective: guess, check a clue, update the guess |
+| ReAct | the standard loop: one action, then read the result, then think again | "measure twice, cut once", one cut at a time |
+| Plan-and-Execute | write the whole plan first, then run it | writing a shopping list before going to the store |
+| Reflexion | after a failed try, write down what went wrong and retry with that note | a student's list of "mistakes I made on the last test" |
+| LATS | try several paths as a search tree and keep the best | a chess player looking a few moves ahead on several lines |
+| Supervisor | one agent hands sub-tasks to specialist agents | a project manager giving work to team members |
+| Blackboard | a shared workspace; a controller picks who writes next | a whiteboard in a meeting with one person holding the marker |
+| Tool registry | the single list of allowed tools, their inputs and permissions | the company's list of approved vendors |
+| Idempotent | doing it twice has the same effect as doing it once | pressing an elevator button twice still calls one elevator |
+| Circuit breaker | stop calling a tool that keeps failing, try again later | a fuse that trips so the house doesn't burn |
+| Approval gate | pause and wait for a human before a risky action | a manager's signature on a large expense |
+| Trajectory | the full list of steps an agent took for one task | a GPS track of the whole trip, not just the destination |
+| Checkpoint | saved progress so a crashed task can resume | a video game save point |
+
+### Symbols and parameters used in this chapter
+
+The code in this chapter uses a handful of limits and metrics. Values below are this chapter's code
+defaults or common starting points, not universal rules.
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `max_steps` / `max_iterations` | most model calls one task may make | 8 – 12 | the agent stops after 12 thoughts even if it isn't done |
+| `max_tokens` (loop budget) | most tokens one task may spend in total | 40,000 | 7 calls × 3,000 tokens = 21,000, well under the cap |
+| `max_wall_clock_s` | most seconds one task may run | 60 s | a slow tool can't hold the user for 5 minutes |
+| `tokens_used`, `usage.total_tokens` | tokens spent so far / by one call (prompt + output) | 1,000 – 10,000 per call | a call with 2,500 in and 300 out = 2,800 |
+| `RECENT_KEPT_IN_FULL` | how many recent steps stay word-for-word; older ones get summarized | 4 | step 9 sees steps 5–8 in full plus a summary of 1–4 |
+| `k` (tool selection) | how many tools are shown to the model per step | 8 | 8 of 400 tools, picked by similarity to the task |
+| `max_concurrency` | most tool calls running at the same time | 5 | 3 lookups run together, not one after another |
+| `timeout_s` | most seconds one tool call may take | 10 s | a stuck API call is cut off after 10 s |
+| `max_attempts`, `base_delay` | retry count and first wait time (doubles each retry, plus random jitter) | 3, 0.5 s | waits of ~0.5 s, then ~1 s, then give up |
+| `failure_threshold`, `reset_timeout_s` | circuit breaker: failures before it opens; seconds before one test call | 5, 30 s | after 5 failures, stop calling the CRM for 30 s |
+| `window`, `repeat_threshold` | stuck-loop check: how many recent actions to look at, how many repeats count as stuck | 4, 2 | same search twice in the last 4 steps → the 3rd try is blocked |
+| `confidence` thresholds | cut-offs for auto / approval / human takeover | 0.75 and 0.4 | 0.6 confidence → goes to an approval gate |
+| `max_rounds` | most turns in a blackboard or debate run | 10 | the controller stops after 10 contributions |
+| `max_replans` | how many times a plan may be rewritten | 2 | step 2 fails twice → stop re-planning |
+| `b`, depth | LATS: options tried per node, and how deep the tree goes | 3 – 5, 3 – 10 | 5 options × depth 4 × 2 calls (propose + score) = 40 calls |
+| `Σ` | "sum of" | — | `Σ(calls until stop)` = add up the cost of every call |
+| success rate | share of tasks that ended with a correct answer | 0.8 – 0.99 | 910 of 1,000 tasks correct → 0.91 |
+| step precision / step recall | share of the agent's steps that were right / share of the expected steps it did | 0 – 1 | 3 right out of 5 taken → precision 0.6; 3 of 4 expected → recall 0.75 |
+| `extra_steps` | steps taken beyond the expected path | 0 – 5 | took 7 steps, golden path had 4 → 3 extra |
+| cost per resolved task | total spend ÷ number of successful tasks | — | 10,000 tokens at 95% success → 10,526 tokens per success |
+| p50 / p95 / p99 | the value 50% / 95% / 99% of tasks stay under | — | p95 = 9 steps → set the cap a bit above, e.g. 12 |
+| trace ID / trajectory ID | an ID that ties all steps of one request / one agent's task together | — | open one ID and see every step it took |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. The spectrum from chains to agents
+
+> **In plain words.** Some AI features are just one model call. Others let the model decide which step comes next, how many steps to take, or even talk to other agents. The more the model decides, the harder it is to test, the less predictable the cost, and the bigger the risk.
+>
+> **Real-world example.** A "summarize this email" feature makes 1 call and costs about the same every time. A research agent for the same team might make 3 calls on one question and 40 on another, so its bill can swing more than 10x from day to day.
 
 Treat this as one axis, not six categories: **how much of the control flow is decided at compile
 time (by an engineer, in code) versus at run time (by a model, in tokens).** Everything else —
@@ -148,7 +234,7 @@ orchestration problem gets harder — not vague unease about "less control":
    ever calls `search()` and `summarize()` has an attack surface bounded by what those two
    functions can do. An agent with a general-purpose `execute_shell()` tool has an attack surface
    bounded by what a shell can do, and every prompt-injection payload in its retrieved context
-   (`17`, planned) is now attempting to steer a general-purpose actuator, not a text generator.
+   (`17`) is now attempting to steer a general-purpose actuator, not a text generator.
 4. **Debuggability requires a trace, not a stack trace.** A chain's failure is "node 3 threw."
    An autonomous agent's failure is usually "the trajectory of 14 decisions was individually
    locally reasonable and collectively wrong," which is a property of a sequence, not a point, and
@@ -162,6 +248,10 @@ chapter is teaching is deciding, feature by feature, whether you need to pay it.
 ---
 
 ## 2. Deterministic workflows versus agentic workflows
+
+> **In plain words.** A workflow is code that decides the steps; the model only writes the content. An agent lets the model decide the steps. Use a workflow wherever you can list the cases in advance, and only let the model decide the part you truly can't list.
+>
+> **Real-world example.** A help desk sees 5 ticket types. A classifier plus 5 code branches can be tested with 5 test cases. Handing the same job to an agent with 10 tools gives no fixed set of test cases, and in this chapter's example costs several times more per ticket.
 
 Use this vocabulary precisely, because the industry does not and the imprecision costs real
 money: a **workflow** is a system whose control flow — which steps run, in which order, under
@@ -186,8 +276,8 @@ five tests, and a green test suite means the deployed behavior is bounded by wha
 agent's space of things that can happen is the space of token sequences the model can emit, which
 for any interesting model is not enumerable, so "we tested it" can only ever mean "we sampled it,"
 and a green eval run means the sampled behavior was acceptable on the sampled inputs — a much
-weaker and much more honest claim (this is the same rung-1-versus-rung-3 distinction as
-`08` §readme and `../python-mastery/31-measurement-methodology.md`, applied to control flow instead
+weaker and much more honest claim (this is the same measured-versus-studied distinction as
+this folder's README §6 and `../python-mastery/31-measurement-methodology.md`, applied to control flow instead
 of to a metric).
 
 An agent's flexibility comes from the mirror-image property: it can handle an input shape nobody
@@ -201,14 +291,14 @@ enumerable branches versus genuinely novel cases?** Support ticket routing over 
 categories is almost entirely enumerable — build a workflow, and reserve the model for the
 residual "none of the above" bucket, ideally routed to a human, not a bigger agent. Open-ended
 research-assistant queries over an unbounded corpus are not enumerable — an agentic retrieval loop
-(`04` §13's forward reference) is closer to the right shape, but even there the *tool set* and
+(`04`'s forward reference to multi-hop retrieval) is closer to the right shape, but even there the *tool set* and
 *termination policy* should be fixed by code; only "which tool, how many times" is the model's
 decision.
 
 ### 2.2 Anthropic's five workflow patterns, and why they are the right default
 
 The useful taxonomy to internalize — because interviewers will probe for it directly — treats an
-LLM call as one **augmented building block** (a call plus retrieval, tools, and memory) and
+LLM call as one building block — the **augmented LLM** (a call plus retrieval, tools, and memory) and
 composes building blocks with code:
 
 - **Prompt chaining**: fixed sequence of calls, each step's output feeding the next, with optional
@@ -227,7 +317,7 @@ composes building blocks with code:
   subtasks, and what are they" — but the workers themselves can still be pure functions.
 - **Evaluator-optimizer**: one call generates, another call critiques against explicit criteria,
   and the loop repeats until the critique passes or a retry budget is exhausted. This is Reflexion
-  (§3.3) collapsed into two roles and a fixed exit condition, and it is a workflow, not an agent,
+  (§3.4) collapsed into two roles and a fixed exit condition, and it is a workflow, not an agent,
   because the *loop structure* is code even though the *content* of each pass is a model call.
 
 The pattern connecting all five: **the LLM decides content, code decides structure.** That is the
@@ -239,7 +329,7 @@ fraction of real product requirements than the "agents can do anything" pitch su
 Every one of §1.1's four costs is purchased, in full, the moment a team defaults to "give it a
 system prompt and a pile of tools and let it figure out the steps" for a task whose steps were
 actually enumerable. The failure mode is not dramatic — it does not usually look like a rogue agent
-doing something alarming. It looks like a routing task that now costs 6x more in tokens than a
+doing something alarming. It looks like a routing task that now costs several times more in tokens than a
 classifier would have, that fails unpredictably on inputs a `case` statement would have handled
 correctly every time, that has no test suite because "testing an agent" felt like a research
 problem, and whose on-call engineer cannot answer "why did it do that" for last night's incident
@@ -278,6 +368,10 @@ enumerable, and scope the model's autonomy to exactly that decision.**
 
 ## 3. Agent architectures — ReAct, Plan-and-Execute, Reflexion, LATS
 
+> **In plain words.** These are four ways to let a model work through a task. ReAct does one step at a time and looks at each result. Plan-and-Execute writes a plan first. Reflexion learns from its own failed tries. LATS explores several paths and keeps the best. Each one costs more than the one before and recovers from mistakes better.
+>
+> **Real-world example.** For a travel-booking task that needs 6 tool calls: ReAct is ~6 model calls; Plan-and-Execute is ~1 plan plus cheap tool calls; Reflexion with 3 tries can be ~18 calls; LATS with 3 options per step and 2 calls per option can pass 30 calls.
+
 Once §2 has identified a decision that genuinely belongs to the model, the next question is *how*
 the model should make it — as a single reasoning pass, an interleaved loop, a plan committed up
 front, or a search over multiple candidate trajectories. These four architectures are not
@@ -303,7 +397,7 @@ emits a `Thought`, then an `Action` (a tool call), the runtime executes the acti
 again. The structural discipline — one action per turn, mandatory observation before the next
 thought — is the entire value proposition. It does not make the model smarter; it forces the
 model's reasoning to be grounded in what actually happened rather than in what it assumed would
-happen, which is the single largest source of compounding hallucination in ungoverned
+happen, which is a major source of compounding hallucination in ungoverned
 chain-of-thought.
 
 ```python
@@ -337,15 +431,18 @@ ReAct loop, a tool call, or a sub-agent — works through the list, with the pla
 invoked again to re-plan if a step fails or new information invalidates the remaining plan.
 
 ```python
-def plan_and_execute(task: str, tools: dict) -> str:
+def plan_and_execute(task: str, tools: dict, max_replans: int = 2) -> str:
     plan = llm_plan(task)                       # one call: ["step 1", "step 2", "step 3"]
-    results = []
-    for i, step in enumerate(plan):
-        outcome = execute_step(step, tools, context=results)
-        if outcome.failed:
-            plan = llm_replan(task, plan, done=results, failed_at=i)  # re-plan, don't restart
-            continue
+    results, i, replans = [], 0, 0
+    while i < len(plan):
+        outcome = execute_step(plan[i], tools, context=results)
+        if outcome.failed and replans < max_replans:
+            # re-plan the remaining steps, keep the finished ones (don't restart)
+            plan = plan[:i] + llm_replan(task, plan, done=results, failed_at=i)
+            replans += 1
+            continue                            # retry position i under the new plan
         results.append(outcome)
+        i += 1
     return llm_synthesize(task, results)
 ```
 
@@ -453,9 +550,13 @@ and only then if you can afford either's multiplier.
 
 ## 4. The agent loop
 
+> **In plain words.** Every agent is a loop: think, act, look at the result, repeat. The loop needs hard limits on steps, tokens and time, checked before each new model call. Without them, one confused task can run until someone notices the bill.
+>
+> **Real-world example.** With a cap of 12 steps and 40,000 tokens, a task that gets stuck costs at most about 40,000 tokens. Without the cap, one stuck task running 50 steps at 30,000 tokens per step burns 1.5M tokens — as much as ~60 normal 24,000-token tasks.
+
 Every architecture in §3 that involves more than one step reduces, at the implementation level, to
-the same four-phase loop — **Observe, Think, Act, Observe** — and almost every production incident
-involving an agent traces back to one of that loop's four control points being unbounded: no
+the same four-phase loop — **Observe, Think, Act, Observe** — and many production incidents
+involving an agent trace back to one of that loop's four control points being unbounded: no
 budget on tokens, no cap on iterations, no detector for repeated action, no explicit termination
 contract with the model. This section is the part of the chapter that turns §3's architecture
 choice into something that runs safely in production.
@@ -551,7 +652,8 @@ Cheap-model-for-intermediate-steps is the other lever worth naming explicitly: t
 inside a long ReAct loop rarely needs the largest available model — routing, tool selection, and
 simple observation summarization are frequently well within a small model's competence, and
 reserving the frontier model for the final synthesis call, or for steps flagged as high-uncertainty,
-is a 2-5x cost reduction with negligible quality loss on well-scoped tool-use tasks. This is model
+can cut cost several-fold on well-scoped tool-use tasks — but measure the quality loss on your
+own eval set (§14) rather than assuming it is negligible. This is model
 routing (`12-serving-latency-and-caching.md`, planned) applied inside a single agent's own loop.
 
 ### 4.3 Termination conditions, enumerated
@@ -578,11 +680,15 @@ whoever wrote it first:
 The single most common production bug in agent loops is implementing only condition 1 and
 assuming the others are edge cases. They are not edge cases; for a sufficiently large volume of
 tasks running against a model with any non-zero probability of never emitting a clean "final
-answer," they are the majority of your cost tail.
+answer," they are a large share of your cost tail.
 
 ---
 
 ## 5. Multi-agent patterns
+
+> **In plain words.** Several agents can share a job the way people share work in a team. A manager agent (supervisor) is the safest setup; agents that freely talk to each other are the hardest to control. Many "multi-agent" systems that work well are really fixed pipelines.
+>
+> **Real-world example.** A report writer with 4 stages — draft, critique, revise, format — is 4 model calls in a fixed order and can be tested like normal code. The same job as 4 agents chatting freely has no fixed number of messages and no clear owner of "we're done".
 
 Multi-agent systems exist to manage complexity by decomposition, the same reason microservices
 exist, and they inherit the same central lesson: decomposition only pays for itself when the
@@ -662,8 +768,9 @@ by majority vote) decide the outcome. It is the multi-agent analogue of Reflexio
 externalized to a second party instead of a second attempt by the same one, and it buys the same
 kind of benefit self-consistency voting (§2.2's parallelization pattern) buys: independent
 "opinions" are more likely to catch an error than one opinion re-read by the same source. The cost
-is proportional to the number of debaters and rounds — 2-3x a single call's cost is typical for a
-two-agent, one-rebuttal debate — and the benefit is concentrated in exactly the cases where a
+is proportional to the number of debaters and rounds — a two-agent, one-rebuttal debate is 2 × 2 = 4
+debater calls plus 1 judge call, so roughly 5x a single call's cost (more, since rebuttal prompts
+carry the other side's argument) — and the benefit is concentrated in exactly the cases where a
 single model's confident wrong answer would otherwise go unchecked: high-stakes classification,
 adversarial content review, contested factual claims. Debate is not a general-purpose quality
 multiplier; running it on a task with an unambiguous right answer buys nothing over asking once,
@@ -681,7 +788,7 @@ implemented as an agent instead of a bare LLM call — the control flow is entir
 and the only thing distributed across "agents" rather than one long prompt is context isolation
 (each stage's prompt only contains what it needs, not the whole history) and role specialization
 (each stage's system prompt is tuned for its one job, not a generalist prompt trying to do
-everything). This is, empirically, the shape of the large majority of "multi-agent systems" that
+everything). In practice this is a very common shape for "multi-agent systems" that
 actually run reliably in production, and recognizing it as a workflow rather than an agent system
 is directly useful in an interview: it lets you claim the reliability properties of §2 for a system
 that superficially looks like the harder case in §5.3.
@@ -701,12 +808,16 @@ def assembly_line(brief: str, agents: list["Agent"]) -> str:
 | Supervisor | Centralized (one router) | One dispatch round-trip (+ retries) | Good — supervisor sees every result | Task with a known, moderate set of specialties |
 | Hierarchical | Centralized per level | Additive down the tree | Good per level, weaker in aggregate | Specialist set too large for one flat router |
 | Peer-to-peer | Distributed / negotiated | Unbounded without an explicit protocol | Poor — no one node has the full picture | Small, bounded two-party handoffs only |
-| Debate | External judge | 2-3x a single call, in parallel | Good for catchable errors, poor for shared blind spots | High-stakes, checkable-by-disagreement claims |
+| Debate | External judge | ~3 sequential call times (2 rounds + judge); debaters run in parallel within a round | Good for catchable errors, poor for shared blind spots | High-stakes, checkable-by-disagreement claims |
 | Assembly line | Fully centralized (it's a workflow) | Linear in stage count | Excellent — each stage is independently testable | Sequential specialization, the common case |
 
 ---
 
 ## 6. Agent communication and the blackboard pattern
+
+> **In plain words.** Agents pass work either by sending messages or by writing to shared state. The biggest risk is that one agent's short summary drops a detail the next agent needs. Pass structured data and document IDs, not retold stories.
+>
+> **Real-world example.** A research agent writes "found 3 good papers" for the writer agent. The writer now has no titles or DOIs and has to guess. Passing 3 records with title, authors, DOI and key finding costs maybe a few hundred extra tokens and loses nothing.
 
 Every multi-agent pattern in §5 has to answer the same underlying question regardless of its
 topology: **how does information produced by one agent become available to another, without being
@@ -821,6 +932,10 @@ practices prevent it:
 
 ## 7. Tool orchestration
 
+> **In plain words.** Tools are where the agent actually changes things, so this is where you put the checks. Keep one list of allowed tools, check permissions in code, validate every input and output, run independent calls in parallel, and make risky actions safe to retry.
+>
+> **Real-world example.** A shop has 400 tools across teams. The support agent is shown only the 8 most relevant ones, cannot see the "delete customer" tool at all because the user lacks that permission, and its refund call carries the key `refund:ticket-81234` so a retry can't pay twice.
+
 Tools are how an agent's decisions become effects in the world, which makes tool orchestration the
 layer where §1.1's security-surface and testability costs are actually incurred or actually
 contained. Everything in this section exists to make the boundary between "the model decided" and
@@ -926,7 +1041,7 @@ the agent's context — not because well-behaved tools return malformed data oft
 one time a tool errors in an unexpected shape (an API returning an HTML error page where JSON was
 expected, say) is exactly the time an unvalidated result gets interpreted by the model as legitimate
 content and reasoned over as if it were real, which is a second, quieter channel for the same
-prompt-injection risk `17` (planned) covers for retrieved documents: **any content a tool returns is
+prompt-injection risk `17` covers for retrieved documents: **any content a tool returns is
 untrusted input, whether or not the call itself succeeded.**
 
 ```python
@@ -999,6 +1114,10 @@ instead of guessing.
 ---
 
 ## 8. State management for agents
+
+> **In plain words.** An agent keeps three kinds of memory: the chat so far, its progress on the current task, and what it believes about outside systems. Save task progress after every step so a crash doesn't restart the job. Treat beliefs about outside systems as possibly out of date.
+>
+> **Real-world example.** An agent migrating 200 records crashes after record 140. With a checkpoint after each step, it resumes at 141. Without one, it starts again at 1 and may create 140 duplicates.
 
 An agent's state is not one thing, and treating it as one thing — a single growing transcript
 passed to every call — is the most common source of the context bloat, information loss, and
@@ -1110,6 +1229,10 @@ instead of inspecting a structure.
 
 ## 9. Human-in-the-loop patterns
 
+> **In plain words.** Some actions are risky enough that a person should approve them first. The agent pauses, saves its state, and continues only after a yes or no. Reviewers' decisions are useful data for improving the agent later.
+>
+> **Real-world example.** Refunds under $200 run on their own; larger ones wait for a support lead. If reviewers reject 95% of one kind of proposal, the agent should stop proposing it — fix the rule rather than keep paying for reviews.
+
 The honest framing for this section: a human-in-the-loop gate is not a concession that the agent
 isn't good enough yet. It is a permanent architectural feature for any action whose cost of being
 wrong exceeds the cost of a delay to check, and that set of actions does not shrink to zero as
@@ -1206,6 +1329,10 @@ that is a §2 control-flow fix, not a permanent human tax.
 
 ## 10. Failure handling
 
+> **In plain words.** Agents fail in normal ways (timeouts, errors) and in new ways (calling a tool that doesn't exist, repeating the same action forever). Retry only safe actions, stop calling broken tools for a while, send errors back to the model so it can fix itself, and stop loops early.
+>
+> **Real-world example.** The model calls `serch_orders` instead of `search_orders`. Instead of crashing, the program replies "Did you mean 'search_orders'?" and the next step usually gets it right. If the order service has failed 5 times in a row, the breaker blocks calls for 30 s instead of letting 300 tasks keep hitting it.
+
 Failure in an agentic system has more distinct shapes than failure in a plain RPC call, because an
 agent can fail by doing the wrong thing while returning success, not only by erroring — and the
 handling strategy has to cover both.
@@ -1297,7 +1424,7 @@ def handle_hallucinated_call(action: str, args: dict, registry: ToolRegistry) ->
 
 The fuzzy-match hint is a small addition with an outsized effect on recovery rate: most hallucinated
 tool names are near-misses of a real tool (wrong casing, a plausible-but-wrong synonym), and giving
-the model that hint in the observation resolves the majority of these on the very next step without
+the model that hint in the observation often resolves these on the very next step without
 burning an escalation or a wasted retry.
 
 ### 10.5 Stuck-loop detection
@@ -1327,6 +1454,10 @@ pays for the same loop again, longer.
 ---
 
 ## 11. Orchestration frameworks compared
+
+> **In plain words.** Frameworks give you the loop, saved state and multi-agent wiring so you don't write them yourself. They differ in what they make easy. Start with one; build your own only for a specific need the framework can't meet.
+>
+> **Real-world example.** A team prototypes a 3-role writing crew in an afternoon with a role-based framework. When they later need approval gates that survive a restart, a graph framework with a built-in checkpointer, or their own code, becomes the better fit.
 
 Every framework in this section is solving the same core problem — give control flow that includes
 model decisions a structure that is inspectable, resumable, and composable — and they differ mainly
@@ -1362,8 +1493,9 @@ has historically put less emphasis than LangGraph on durable checkpointing and f
 authorization, which matters if the production target needs §8.3 and §7.3's guarantees natively
 rather than layered on separately.
 
-**Semantic Kernel** is Microsoft's SDK, built around a planner that decomposes a goal into a
-sequence of calls against registered "plugins" (its name for tools), with first-class integration
+**Semantic Kernel** is Microsoft's SDK, originally built around planners that decompose a goal into a
+sequence of calls against registered "plugins" (its name for tools) — newer releases deprecate the
+standalone planners in favor of the model's native function calling over the same plugins — with first-class integration
 into the Azure ecosystem and strong support for combining native code functions and LLM-based
 "semantic" functions in the same plan — architecturally closer to §3.3's Plan-and-Execute than to
 ReAct's step-by-step interleaving, and the natural choice when an organization's existing platform
@@ -1405,6 +1537,10 @@ speculatively.
 ---
 
 ## 12. Production concerns — observability, cost, latency, security
+
+> **In plain words.** In production you need to see every decision the agent made, know what each task and customer costs, keep it fast, and keep it safe. Security rules must live in code and data permissions, never only in the prompt.
+>
+> **Real-world example.** A user asks why the agent emailed the wrong customer. With one trace per task, you open trajectory `t-5521` and see all 9 steps, including the tool result that contained a hidden instruction. Without it, you have one log line saying "email sent".
 
 Everything in §4 through §10 is necessary but not sufficient; a system that implements all of it
 correctly in a single test run still needs the operational layer that tells you, at 3 a.m., whether
@@ -1466,6 +1602,10 @@ specifically crafted to defeat it.
 ---
 
 ## 13. Enterprise agent platform design
+
+> **In plain words.** When many teams build agents, a platform team should build the shared parts once: the tool list, logging, permission and approval rules, per-customer isolation, and testing tools. Product teams then build only their own agent.
+>
+> **Real-world example.** Twelve teams each writing their own approval gate means twelve versions, some broken. One shared policy engine means a single rule change — "all `delete_*` tools need approval" — applies to all twelve agents the same day.
 
 This is the section that answers the job description's actual line — "lead the development of
 agent orchestration frameworks" is a platform-engineering mandate, not an agent-building one: the
@@ -1560,6 +1700,10 @@ agent is.
 
 ## 14. Evaluation of agent systems
 
+> **In plain words.** Checking only the final answer is not enough. Also check the steps the agent took, whether it picked the right tools, and what each successful task cost. Replay recorded tool responses in tests so they are fast and repeatable.
+>
+> **Real-world example.** Agent A is right 95% of the time at 10,000 tokens per task; agent B is right 99% at 40,000. Per successful task that is ~10,526 vs ~40,404 tokens, so B costs almost 4x as much per success. Whether the extra 4 points are worth it is a business call, now visible.
+
 This section is the summary; `14-agent-evaluation.md` (planned) is where the full machinery
 belongs. The core move is the same one `08-evaluation-methodology.md` made for retrieval, applied
 to a harder scoring target: a retrieval system's output is a ranked list, comparable against a
@@ -1595,7 +1739,7 @@ def score_trajectory(actual: list[dict], golden: list[dict]) -> dict:
     }
 ```
 
-Trajectory scores are what let a regression gate (§8.4 of `08`, reused directly here) catch a
+Trajectory scores are what let a regression gate (`08` §14, reused directly here) catch a
 change that keeps the success rate flat while doubling the average number of tool calls — a
 regression that a pure outcome metric is structurally blind to.
 
@@ -1681,6 +1825,10 @@ eval run.
 ---
 
 ## 16. Interview questions
+
+> **In plain words.** Interviewers want to hear the trade-off, not just the term. Start with one plain sentence, give one number, then name what can go wrong and how you would limit it.
+>
+> **Real-world example.** "How do you stop an agent running forever?" → "Hard caps checked before every call: for example 12 steps, 40,000 tokens, 60 seconds — plus a repeat-action check, because the step cap alone lets a stuck task burn its whole budget."
 
 Organized by theme; each entry states what a weak answer sounds like and what separates it from a
 strong one, because in a senior platform-engineering interview the differentiator is rarely
@@ -1833,7 +1981,7 @@ about what it just did, not merely delayed or crashed.
 *Goal:* build the loop in §4.1 for real, against a small tool set (three to five tools) over a task
 you can objectively check (a multi-hop QA task over a fixed corpus is a good choice, since `04`'s
 retrieval work gives you the tools for free).
-*Steps:* implement the loop with all five termination conditions from §4.3 wired, not just max
+*Steps:* implement the loop with all seven termination conditions from §4.3 wired, not just max
 iterations. Deliberately induce each one: give it a task with no valid answer (should hit max
 iterations cleanly), remove a tool it needs mid-run (should hit the circuit-breaker path), and feed
 it a task that invites a repeat-action loop (should trip stuck-loop detection). Log every step as a
@@ -1965,6 +2113,127 @@ specific failure reason logged.
 
 ---
 
+## 18. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of problem teams hit when running agents: what people saw, what the numbers showed, what fixed it, and the lesson.
+>
+> **Real-world example.** A single stuck task class that is 1% of traffic can be over a third of the token bill (Case 1).
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+**Quick index:** token bill jumps with no traffic change → Case 1; customers refunded twice →
+Case 2; agent picks wrong tools and prompts are huge → Case 3; reports cite wrong facts after a
+handoff → Case 4; approvals vanish after deploys → Case 5; success rate flat but costs double →
+Case 6.
+
+### Case 1 — 1% of tasks, 39% of the bill
+
+**Setup.** A research agent runs 20,000 tasks a day. The only limit is `max_iterations = 50`. No
+token budget, no stuck-loop check.
+
+**Symptom.** The token bill is far above the forecast, with no rise in traffic.
+
+**Measurement.** Normal tasks: 19,800 × 6 steps × 4,000 tokens = 475.2M tokens/day. 200 tasks (1%)
+repeat the same failing search until they hit the cap, and their history grows so each step
+averages ~30,000 tokens: 200 × 50 × 30,000 = 300M tokens/day. Those 1% of tasks are
+300 / 775.2 = **38.7%** of all tokens.
+
+**Fix.** Add a 40,000-token cumulative budget and the §10.5 repeat check (§4.3 conditions 3 and 5).
+Stuck tasks now cost at most ~40,000 tokens each: 200 × 40,000 = 8M. Daily total goes from 775.2M
+to 483.2M tokens, **−37.7%**, and each stuck task is escalated with a reason instead of burning quietly.
+
+**Lesson.** The cost problem of an agent is its tail, not its average. Budgets and loop checks come
+before the model call, every call.
+
+### Case 2 — Customers refunded twice
+
+**Setup.** A support agent has a `refund` tool. Tool timeout 10 s, automatic retry up to 3 attempts.
+The payment API's p99 latency is 12 s.
+
+**Symptom.** Finance finds duplicate refunds, a few hundred dollars a day.
+
+**Diagnosis.** Of 10,000 refunds a week, 1.5% (150) hit the 10 s timeout. For ~80% of those (120),
+the payment had actually gone through before the timeout; the retry refunded again. At an average of
+$45, that is 120 × $45 = **$5,400/week** paid twice.
+
+**Fix.** Mark `refund` as non-idempotent in the registry (§7.1), pass an idempotency key built by the
+orchestrator from the ticket (`refund:<ticket_id>`, §7.6), and raise the timeout above the API's p99
+(15 s). Duplicates drop to **0**; the remaining timeouts return the original result on retry.
+
+**Lesson.** A retry is only safe if doing it twice equals doing it once. The key must come from the
+task, not from the model or the attempt.
+
+### Case 3 — 140 tools in every prompt
+
+**Setup.** A company-wide assistant shows all 140 registered tools in every prompt, ~150 tokens of
+schema each.
+
+**Symptom.** The agent often picks a similar-sounding but wrong tool, and every call is slow and
+expensive.
+
+**Measurement.** Tool catalog alone: 140 × 150 = **21,000 tokens per call**. On a 500-task eval set,
+tool-selection accuracy (§14.3) is 71%.
+
+**Fix.** Dynamic tool selection (§7.2): retrieve the top `k = 8` tools per step. Catalog shrinks to
+8 × 150 = **1,200 tokens** (19,800 saved per call). On the same eval set, the right tool is in the
+top 8 for 96% of steps, and selection accuracy rises to 89%.
+
+**Lesson.** More tools is not free context. Treat tools like documents in retrieval: shortlist first,
+then let the model choose.
+
+### Case 4 — The summary that lost the numbers
+
+**Setup.** A supervisor runs a research agent, then a writer agent. The research agent hands off a
+prose summary of what it found.
+
+**Symptom.** Reviewers find that 18% of reports cite a wrong figure or a paper with no traceable
+source.
+
+**Diagnosis.** Comparing handoffs with the research agent's raw tool results shows the summary kept
+the conclusion but dropped the exact figures and DOIs; the writer filled the gaps from memory (§6.4).
+
+**Fix.** Hand off a list of structured records (`title, authors, doi, key_finding, figure`) and pass
+document IDs instead of paraphrases. Bad citations fall from 18% to 3%; handoff size grows about 6%.
+
+**Lesson.** Every summary between agents is lossy compression. Pass structure and references, and
+let the final step see the original outputs.
+
+### Case 5 — Approvals that disappear on deploy
+
+**Setup.** Refunds over $200 wait for approval. Pending approvals are kept in an in-memory queue.
+The service is redeployed about twice a day; ~40 approvals are requested per day and wait ~3 hours
+on average.
+
+**Symptom.** Reviewers approve requests, but nothing happens; customers chase support again.
+
+**Diagnosis.** The chance that a restart falls inside a 3-hour wait is about 2 × 3 / 24 = 25%, so
+~**10 of 40** pending approvals a day are lost with the pod.
+
+**Fix.** Persist the pending action and task state durably before suspending (§9.1, §8.3). Lost
+approvals drop to **0**; a restart now only delays the resume.
+
+**Lesson.** A human wait can last hours or days. Anything that must survive the wait must live in
+durable storage, not in process memory.
+
+### Case 6 — Same success rate, double the cost
+
+**Setup.** A team tweaks an agent's system prompt. The eval gate checks only task success rate.
+
+**Symptom.** The change ships. A week later the per-task cost has roughly doubled.
+
+**Measurement.** Success rate is 91% before and after. Average tool calls per task went from 4.2 to
+8.6. At ~2,500 tokens per step, that is 10,500 → 21,500 tokens per task, and cost per resolved task
+10,500 / 0.91 ≈ 11,538 → 21,500 / 0.91 ≈ **23,626 tokens** (+105%).
+
+**Fix.** Add trajectory metrics (§14.2) and cost per resolved task (§14.4) to the regression gate,
+failing any change that raises mean `extra_steps` by more than 1 at flat success. The prompt change
+is rolled back and reworked.
+
+**Lesson.** An outcome-only metric can't see how the agent got there. Gate on steps and cost too.
+
+---
+
 ## Rung ledger
 
 This document is **rung 3 — studied** (README §6, this folder's convention): the architectural
@@ -1975,11 +2244,10 @@ peer-to-peer coordination, why authorization and injection defense must sit outs
 reasoning — are derivable from the mechanisms themselves and are architecture, not measurement.
 
 **Verified against primary sources, read for their mechanism, not their benchmark numbers:** the
-ReAct paper (Yao, Zhao, Yu, Du, Shafran, Narasimhan & Cao, 2210.03629) for the interleaved
-thought-action-observation loop structure; the Reflexion paper (Shinn, Cassano, Gopinath, Narasimhan
-& Yao, 2303.11366) for the verbal-reinforcement-via-episodic-memory mechanism; the LATS paper (Zhou,
-Yao, Shafran, Zamora, Hausman, Hariharan, Ichter & Narasimhan, or the commonly cited 2310.04406
-record) for the tree-search-plus-reflection combination; Anthropic's "Building Effective Agents"
+ReAct paper (Yao, Zhao, Yu, Du, Shafran, Narasimhan & Cao, arXiv 2210.03629, ICLR 2023) for the interleaved
+thought-action-observation loop structure; the Reflexion paper (Shinn et al., arXiv 2303.11366,
+NeurIPS 2023) for the verbal-reinforcement-via-episodic-memory mechanism; the LATS paper (Zhou et al.,
+arXiv 2310.04406, ICML 2024) for the tree-search-plus-reflection combination; Anthropic's "Building Effective Agents"
 engineering post for the workflows-versus-agents distinction and the five named workflow patterns
 in §2.2, quoted structurally (which patterns exist and what each composes) rather than for any
 benchmark claim; and the classical blackboard-architecture literature (Hearsay-II and the
@@ -1995,8 +2263,8 @@ vocabulary to argue with, not a citation to defer to.
 **Deliberately not in this document:** version-specific API syntax for any named framework in §11
 (LangGraph, CrewAI, AutoGen, and Semantic Kernel all ship breaking changes faster than a static
 document can track); any specific benchmark number for agent task success rates on any named
-framework or model, since those numbers are corpus- and task-specific in exactly the way `04` §17's
-ledger already argues reranker leaderboards are; and any claim about which multi-agent framework
+framework or model, since those numbers are corpus- and task-specific in exactly the way `04`'s
+rung ledger already argues reranker leaderboards are; and any claim about which multi-agent framework
 "wins," for the same reason.
 
 The labs in §17 are what convert this to **rung 1 — measured**, on your own tools, your own tasks,
