@@ -1912,7 +1912,7 @@ These are **composite scenarios** built from failure modes this chapter describe
 ### 16.2 Checkpoints that never finish under backpressure
 
 - **Setup.** A clickstream job writes to Redis with synchronous calls. Checkpoint interval 60 s, timeout 10 min (600 s), aligned checkpoints. Evening traffic peaks at 40K events/s; the Redis sink handles about 30K/s.
-- **Symptom.** From 19:00 checkpoints fail with "Checkpoint expired before completing"; 9 of the 10 checkpoints between 19:00 and 21:00 fail. A pod restart at 20:50 replays from 18:58: almost 2 hours of data.
+- **Symptom.** From 19:00 checkpoints fail with "Checkpoint expired before completing"; 9 of the 10 checkpoints between 19:00 and 21:00 fail; the only one that succeeds finishes at 19:40. A pod restart at 20:50 replays from 19:40: 70 minutes of data.
 - **Measurement/Diagnosis.** `busyTimeMsPerSecond` on the sink is ~1000 (saturated); upstream `outPoolUsage` is 1.0. Barriers sit behind full network buffers, so alignment takes 480-600+ s (§6.2). Kafka lag grows at 40K - 30K = 10K events/s.
 - **Fix.** (1) Async I/O with 100 in-flight requests and batched writes: sink capacity rises to ~60K/s, so backpressure disappears. (2) `execution.checkpointing.aligned-checkpoint-timeout: 30s` so that if backpressure returns, a checkpoint switches to unaligned after 30 s. Checkpoint duration drops from 480+ s to about 20-25 s.
 - **Lesson.** Checkpoint timeouts under load are usually a backpressure problem. Fix the slow step first; unaligned checkpoints only make the snapshots survive it.
@@ -1946,7 +1946,7 @@ These are **composite scenarios** built from failure modes this chapter describe
 - **Setup.** A video platform computes `views_last_24h` per video. A product request changes the window from sliding 24 h / 1 h to sliding 24 h / 1 min "for fresher numbers". 20M videos; each window pane holds a ~32-byte accumulator.
 - **Symptom.** After the deploy, RocksDB disks fill, checkpoints grow and time out, and throughput per subtask falls several times over.
 - **Measurement/Diagnosis.** Panes per key went from 24 to 1,440 (§3.2). State: 20M x 1,440 x 32 B = ~922 GB instead of 20M x 24 x 32 B = ~15 GB. Each event is now added to 1,440 windows instead of 24.
-- **Fix.** Roll back to 24 h / 1 h via savepoint, then implement the fresher feature as a `ProcessFunction` with 1,440 one-minute buckets per video, each event updating one bucket and emitting the running sum. Throughput recovers; state is in the same range as the buckets (~922 GB if all 1,440 buckets are full), so the team keeps buckets only for the ~2M videos with views in the last day (~92 GB).
+- **Fix.** Roll back to 24 h / 1 h via savepoint, then implement the fresher feature as a `ProcessFunction` with 1,440 one-minute buckets per video, each event updating one bucket and emitting the running sum. Each event now updates 1 bucket instead of 1,440 windows, so throughput recovers. Bucket state is still 1,440 x 32 B per video, so the team keeps buckets only for the ~2M videos with views in the last day: 2M x 1,440 x 32 B = ~92 GB instead of ~922 GB.
 - **Lesson.** For sliding windows, state and work scale with size/slide. Always compute keys x panes x bytes before changing a window.
 
 ### 16.7 Tiny checkpoints, slow restore
