@@ -34,7 +34,7 @@
 >
 > **THESIS:** a query is **not** the retrieval input. It is the raw material from which one or more
 > retrieval inputs are *manufactured*. The gap between what a user types and what the index needs is
-> the single largest source of retrieval failure after the recall ceiling (`04` §1), and closing it
+> a major source of retrieval failure alongside the recall ceiling (`04` §1), and closing it
 > is query understanding's job. Every technique here — rewriting, decomposition, HyDE,
 > multi-query — is a different strategy for manufacturing better retrieval inputs from the same raw
 > query. Each one adds an LLM call, which means latency and cost. The design question is never
@@ -49,6 +49,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The gap between what users type and what indexes need](#1-the-gap-between-what-users-type-and-what-indexes-need)
 2. [Query classification and routing](#2-query-classification-and-routing)
 3. [Query rewriting with LLMs](#3-query-rewriting-with-llms)
@@ -66,10 +67,96 @@
 15. [Anti-patterns](#15-anti-patterns)
 16. [Mental models — the compressed set](#16-mental-models--the-compressed-set)
 17. [Lab exercises](#17-lab-exercises)
+18. [Interview questions and system design prompts](#18-interview-questions-and-system-design-prompts)
+19. [Real-world cases — incidents with numbers](#19-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** People do not type questions the way documents are written. They use their own
+words ("vacation days" when the handbook says "PTO"), leave things out ("what about part-timers?"),
+pack three questions into one sentence, or describe a symptom when the document explains a cause.
+Search then fails even though the answer is in the index. This chapter is about turning what the
+user typed into one or more *better search inputs* before search runs. The original question
+always runs too; the extra versions only add candidates. Each extra version usually costs one LLM
+call (a few hundred milliseconds and a fraction of a cent), so the real skill is choosing **which**
+fix to apply to **which** question, and skipping all of them when the question is already fine.
+
+**A real-world example.** An HR assistant over a 40,000-chunk employee handbook, about 5,000
+questions a day. Numbers below are illustrative.
+
+1. *"What's the 401(k) match?"* — short, precise, uses the handbook's own words. **Do nothing.**
+   Search finds the right chunk at rank 1. (If you ran HyDE here, the LLM might invent "4%" when
+   the handbook says 6%, and pull search toward the wrong chunks.)
+2. *"Can I roll over my vacation days?"* — the handbook says "PTO carry-forward". Without help, the
+   right chunk is not in the top 20. **Rewrite** (§3) → *"paid time off (PTO) carry-forward
+   policy"* → the right chunk is now rank 2.
+3. Next turn: *"What about part-timers?"* — on its own this means nothing. **Resolve** it using the
+   chat history (§9) → *"PTO carry-forward policy for part-time employees"*.
+4. *"Can I take parental leave and PTO back to back, and does it affect my bonus?"* — three
+   different chunks are needed. **Decompose** (§5) into three sub-questions, search each, then merge.
+5. *"My paycheck is lower than last month."* — a symptom. The handbook explains *how deductions
+   are calculated*. **Step-back** (§4) or **HyDE** (§7) turns the symptom into text that looks like
+   the explanation.
+
+On a test set of 200 such questions, searching the raw question finds the right chunk in the top
+20 for 70% of them (recall@20 = 0.70). Routing each question to the right fix raises that to 0.82.
+Because question 1's kind (about 60% of traffic) gets no LLM call, routing costs about 2,500 LLM
+calls a day (5,000 × (0.25 × 1 rewrite + 0.10 × 2 decompose+rewrite + 0.05 × 1 HyDE)). Running all
+four strategies on every question would cost 20,000 calls a day — 8 times more — for no extra recall.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Query understanding | turning the typed question into better search inputs before searching | a librarian asking "what do you actually need?" before walking to the shelves |
+| Vocabulary mismatch | user and document use different words for the same thing | you say "fizzy drink", the menu says "soda" |
+| Query rewriting | an LLM rewrites the question into the corpus's words | a friend rephrasing your question for the shop assistant |
+| Step-back prompting | ask a more general question about the underlying cause or concept | before asking "why is my bread flat?", look up "how yeast works" |
+| Decomposition | split a multi-part question into separate sub-questions | splitting one shopping trip into the bakery, the butcher, and the pharmacy |
+| Multi-query | several different phrasings of the *same* question | asking three shop assistants in three different ways |
+| HyDE | have the LLM write a fake answer, then search with that fake answer | describing the book you want by its blurb, not by your question |
+| Query expansion | add synonyms and related words to the query (mainly for keyword search) | adding "soda, pop, soft drink" to your search box |
+| Pseudo-relevance feedback (PRF) | take words from the first results and search again | "people who bought this also bought…" applied to search words |
+| Coreference resolution | replace "it", "that", "what about…" with what they refer to | reminding someone who joined the conversation late |
+| Routing | decide which of the above to apply to each question | a triage nurse deciding who needs an X-ray and who needs a plaster |
+| Branch | one search input that runs and feeds the merge step | one fishing line among several |
+| Fusion (RRF) | merge the result lists of all branches by rank position | combining several judges' rankings |
+| Ablation | turn one technique off at a time and measure the difference | removing one ingredient to see if the dish still tastes the same |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `top_k`, `top_k_per_query` | results returned per search branch | 10 – 20 | each of 3 sub-queries returns its top 10 |
+| `k` (in RRF) | RRF smoothing constant, not a result count | 60 | rank 1 adds 1/61, rank 3 adds 1/63 |
+| `n` | number of variants (multi-query) or hypothetical documents (HyDE) | 2 – 3 | 3 phrasings of the same question |
+| `max_sub_queries` | cap on sub-questions from decomposition | 5 (target 2 – 3) | "compare A and B" → 2 sub-queries |
+| `temperature` | LLM randomness: 0 = same output every time | 0 for rewrite; 0.3 – 0.4 for variety | multi-query uses 0.3 so variants differ |
+| `max_tokens` | cap on the LLM's output length | 150 – 500 | a rewrite needs about 200 at most |
+| `confidence` | heuristic classifier's certainty; below the threshold, ask the LLM | threshold 0.6 | score 0.6 → no LLM classifier call |
+| `complexity_score` | rule-based score from comparison words, "and", commas, extra "?" | ≥ 0.8 moderate, ≥ 2.0 complex | "compare X and Y" = 1.5 + 0.5 = 2.0 → complex |
+| `latency_budget_ms` | total time allowed for the answer | 2,000 ms | 2,000 − 800 generation − 200 retrieval = 1,000 ms for query understanding |
+| `llm_call_ms` | planning estimate for one LLM call | 500 ms | budget of 1,000 ms fits 2 serial calls |
+| p50 / p99 | latency that 50% / 99% of requests are faster than | rewrite: 300 / 800 ms | HyDE p99 1,200 ms dominates the parallel step |
+| `α`, `β`, `γ` | Rocchio weights: original query, good results, bad results | 1.0, 0.75, 0.15 | lower `β` (≤ 0.5) drifts less |
+| `similarity_threshold` | minimum cosine similarity for a semantic cache hit | 0.92 – 0.95 | 0.93: "deploy a container" ≈ "deploying containers" |
+| `ttl_hours`, `max_size` | cache entry lifetime and capacity | 24 h, 10,000 entries | corpus updates daily → 24 h TTL |
+| `max_turns`, `max_chars` | how much chat history the resolver sees | 5 turns, 2,000 chars | referent is usually in the last 2 – 3 turns |
+| recall@k | share of questions whose correct chunk is in the top `k` | 0 – 1 | 164 of 200 found in top 20 → 0.82 |
+| nDCG@k | ranking quality: rewards correct chunks near the top | 0 – 1 | 0.65 → 0.71 after rewriting |
+| pp | percentage points: absolute difference between two percentages | — | 72% → 78% = +6 pp |
+| Jaccard (top-10) | overlap of two result sets: shared ÷ total distinct | 0 – 1 | 8 shared of 12 distinct → 0.67 |
+| cost per call | dollars per query-understanding LLM call | $0.0005 – $0.003 | 100,000 rewrites/day × $0.001 = $100/day |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. The gap between what users type and what indexes need
+
+> **In plain words.** Users describe their problem in their own words; documents explain it in the author's words. When the two share few words, search misses the answer even though it is in the index. The fix is to change the question before searching, not the index.
+>
+> **Real-world example.** A user types "why is my deployment failing". The answer chunk says "images over the 10 GiB layer-size limit are rejected during push". The two texts share no useful words, so neither keyword nor meaning search puts that chunk in the top 20.
 
 A user types "why is my deployment failing." The index contains a chunk whose first sentence is
 "Container images that exceed the 10 GiB layer-size limit are rejected during the push phase of the
@@ -79,7 +166,7 @@ embedding will be near dozens of chunks about deployments, very few of which exp
 failure. The lexical branch will return nothing useful. The retrieval system will fail, and from the
 outside it will look like a retrieval quality problem when it is in fact a *query quality* problem.
 
-This is not an edge case. It is the dominant case. Real user queries are:
+This is not an edge case. It is common in real traffic. Real user queries are often:
 
 - **Under-specified.** "how does auth work" — which auth? For which service? The user knows what
   they mean; the index does not.
@@ -171,6 +258,10 @@ lookup. Rewriting costs an LLM call. That cost difference is why §10 exists.
 ---
 
 ## 2. Query classification and routing
+
+> **In plain words.** First decide what kind of question this is, then pick only the fixes it needs. A cheap rule-based check runs on every question in about 1 ms; an LLM classifier (about 250 ms) runs only when the rules are unsure. Many questions need no fix at all.
+>
+> **Real-world example.** "What is the default timeout for service X?" scores 0 on the complexity rules → simple lookup → no LLM call. "Compare X and Y, and does it affect billing?" scores 1.5 (comparison) + 1.0 (two "and"s) + 0.3 (comma) = 2.8 → complex → decompose.
 
 Not every query needs manufacturing. A precise, well-formed query with domain-specific vocabulary
 that matches the corpus will retrieve well as-is. Running it through a rewriter adds latency,
@@ -385,8 +476,8 @@ def route(
 
 ### 2.5 Why routing matters more than any single technique
 
-The literature and the tutorial ecosystem are full of papers and blog posts advocating for
-individual techniques — "always rewrite," "always use HyDE," "always decompose." In practice,
+Many tutorials and blog posts present individual techniques as defaults — "always rewrite,"
+"always use HyDE," "always decompose." In practice,
 the dominant effect of query understanding is not which technique you use but *whether you apply
 the right technique to the right query*. A well-routed system that uses simple rewriting on
 vocabulary-mismatch queries and decomposition on complex queries will outperform a system that
@@ -399,6 +490,10 @@ implementation of that decision.
 ---
 
 ## 3. Query rewriting with LLMs
+
+> **In plain words.** An LLM rephrases the question in the words the documents use: expands abbreviations, swaps vague words for precise ones, drops filler. The original question still runs; the rewrite is one extra search, and the two result lists are merged.
+>
+> **Real-world example.** "my container keeps dying" → "container OOMKilled restart CrashLoopBackOff troubleshooting". One LLM call, about 300 ms at p50. If the rewrite is bad, the original question's results are still in the merged list.
 
 Rewriting is the simplest and most broadly applicable manufacturing strategy: take the raw query,
 pass it through an LLM with instructions to produce a better retrieval query, use the rewritten
@@ -603,11 +698,20 @@ applied to query variants rather than retrieval branches.
 
 ## 4. Step-back prompting
 
+> **In plain words.** Some questions describe a specific symptom, while the documents explain the general mechanism behind it. Step-back asks the LLM for a more general question about that mechanism and searches with both.
+>
+> **Real-world example.** "Why is my Lambda timing out calling DynamoDB?" → step-back: "How does DynamoDB throttling and capacity work?". The original finds timeout docs; the step-back finds the capacity docs that explain the cause. Two searches, one extra LLM call.
+
 Step-back prompting addresses a specific mismatch that rewriting cannot fix: the query is at one
 level of abstraction and the corpus is at another. The user asks "why is my Lambda function timing
 out when calling DynamoDB?" The corpus has a chunk explaining "DynamoDB adaptive capacity and burst
 capacity management" — the general concept that explains the specific symptom. A rewrite stays at
 the symptom level. A step-back moves to the concept level.
+
+The technique comes from Zheng et al., "Take a Step Back: Evoking Reasoning via Abstraction in
+Large Language Models" (Google DeepMind, 2023). The paper uses the step-back question to recall
+high-level principles before reasoning, and also to retrieve background documents; this section
+uses it as an extra retrieval branch.
 
 ### 4.1 The mechanism
 
@@ -709,6 +813,10 @@ mechanism enables answer to specific question. This is an agentic multi-hop retr
 ---
 
 ## 5. Query decomposition
+
+> **In plain words.** A question that asks several things at once needs several different chunks, and no single search finds them all. Decomposition splits it into 2 – 3 simple sub-questions, searches each, and merges the results.
+>
+> **Real-world example.** "How does service A handle auth, and can it use our LDAP?" → "service A authentication mechanism" + "service A LDAP integration". Each sub-question returns its top 10; merged, both needed chunks are present.
 
 Decomposition handles the class of queries that are inherently multi-part: they require information
 from multiple chunks that no single query variant would retrieve together. "Compare the pricing
@@ -914,6 +1022,10 @@ The guard against over-decomposition:
 
 ## 6. Multi-query generation
 
+> **In plain words.** Instead of one better phrasing, ask the LLM for several *different* phrasings of the same question and merge what they find. Chunks found by several phrasings rise to the top. Past about 3 phrasings, each extra one adds little.
+>
+> **Real-world example.** Illustrative curve: recall@20 goes from 0.70 with 1 phrasing to about 0.85 with 3. The 4th adds about 1 pp; the 6th about 0.2 pp, at the same cost as the first.
+
 Multi-query generation is related to but distinct from decomposition. Where decomposition breaks a
 complex question into sub-questions about different topics, multi-query generates *different
 phrasings* of the same question. The goal is not to cover different information needs but to cover
@@ -1082,10 +1194,19 @@ budget.
 
 ## 7. HyDE — Hypothetical Document Embeddings
 
+> **In plain words.** Ask the LLM to write a short, possibly wrong, answer to the question, then search with that fake answer instead of the question. A fake answer looks more like the real answer chunk than the question does. It helps on "how" and "why" questions and hurts on exact-fact questions, where the invented fact points search the wrong way.
+>
+> **Real-world example.** "What is backpressure?" → the LLM writes a paragraph about flow control in streams → that paragraph lands next to the real "flow control in reactive streams" chunk. But for "default value of max_connections?" it may write "100" when the docs say 50.
+
 HyDE is a conceptually different strategy from rewriting and multi-query. Instead of manufacturing
 a better *query*, it manufactures a hypothetical *answer* and uses that answer's embedding for
 retrieval. The insight: **the embedding of a plausible answer is closer to the embedding of the
 actual answer-containing chunk than the embedding of the question is.**
+
+HyDE was introduced by Gao, Ma, Lin, and Callan, "Precise Zero-Shot Dense Retrieval without
+Relevance Labels" (2022). The paper's setting was zero-shot retrieval with no relevance labels,
+using an unsupervised dense encoder (Contriever); treat its gains as a hypothesis to re-measure
+with your own embedding model (§7.6).
 
 ### 7.1 Why HyDE works
 
@@ -1211,6 +1332,13 @@ async def hyde_retrieve(
     return reciprocal_rank_fusion(all_results, k=60)
 ```
 
+Two notes on this sketch. First, it embeds the hypothetical documents with the *query* input type.
+With an asymmetric embedding model (`01` §3), the hypothetical text is document-shaped, so
+embedding it with the document input type is the choice that matches HyDE's idea of projecting
+into document space; measure both. Second, it fuses separate result lists with RRF. The original
+paper instead averaged the hypothetical-document vectors together with the query vector into one
+search vector (§7.5 shows the averaging step).
+
 ### 7.3 When HyDE helps
 
 HyDE helps for a specific and measurable class of queries: those where the **vocabulary mismatch
@@ -1245,8 +1373,8 @@ HyDE can actively degrade retrieval in several cases:
 
 The last point is the most important operationally: **HyDE works best when the LLM's parametric
 knowledge is a reasonable prior for the corpus's content, and worst when the corpus is novel to
-the LLM.** For public documentation of popular technologies, HyDE is strong. For internal
-proprietary documentation, it is often harmful.
+the LLM.** For public documentation of popular technologies, HyDE tends to help. For internal
+proprietary documentation, it can be harmful — measure it per stratum before enabling it.
 
 ### 7.5 HyDE with multiple hypothetical documents
 
@@ -1295,6 +1423,10 @@ transfer.
 ---
 
 ## 8. Query expansion — classical and modern
+
+> **In plain words.** Add related words and synonyms to the query so keyword search can match them. The old way (PRF) takes words from the first results; the new way asks an LLM. Expansion helps keyword search much more than meaning search.
+>
+> **Real-world example.** "retry strategy" + "exponential backoff jitter max delay" → BM25 now matches a chunk that never says "retry strategy". Send the expanded query to BM25 only; keep the short query for the embedding branch.
 
 Query expansion adds terms to the query to increase vocabulary coverage. It is the oldest technique
 in this chapter — predating neural approaches by decades — and it remains useful because the
@@ -1470,6 +1602,10 @@ The two are complementary and can run together: rewrite for dense, expand for le
 ---
 
 ## 9. Conversational query resolution
+
+> **In plain words.** In a chat, follow-ups like "what about the pricing?" only make sense with the earlier turns. Before anything else, an LLM rewrites the follow-up into a complete question using the chat history. Skip this step when the question is already complete.
+>
+> **Real-world example.** Turn 1: "Tell me about service X." Turn 2: "What about the pricing?" → "What is the pricing of service X?". About 300 ms, and only for turns with pronouns or very short follow-ups.
 
 In a multi-turn conversation, the user's query is often incomplete — it contains pronouns,
 ellipsis, or implicit references that make sense only in the context of prior turns. "What about
@@ -1648,6 +1784,10 @@ savings of one fewer LLM call. The tradeoff is worth it when your latency budget
 
 ## 10. The cost model for query understanding
 
+> **In plain words.** Each fix adds an LLM call that runs *before* search, so it adds directly to the user's wait. Fixes can run in parallel, and then the slowest one sets the delay. The dollar cost is small per question but adds up with volume.
+>
+> **Real-world example.** Rewrite (300 ms) and HyDE (500 ms) in parallel add 500 ms: end-to-end goes from about 950 ms to about 1,450 ms. At 100,000 questions a day and about $0.001 per call, one rewrite on every question costs about $100 a day.
+
 Every technique in this chapter adds at least one LLM call. Each LLM call adds latency, cost,
 and a failure mode. The cost model must account for all three.
 
@@ -1690,8 +1830,9 @@ Your numbers will differ and you should measure them (`10`).
 
 The critical observation: **query understanding adds latency *serially* before retrieval.**
 Retrieval cannot begin until the manufactured queries are ready. In a pipeline where retrieval
-takes 50ms and reranking takes 100ms, adding a 500ms query rewrite step more than triples the
-total latency.
+takes 50ms and reranking takes 100ms, adding a 500ms query-understanding step turns 150ms of
+pre-generation latency into 650ms — more than four times as much. Counting an 800ms generation
+step, end-to-end latency goes from ~950ms to ~1450ms.
 
 ```
     Without query understanding:
@@ -1782,6 +1923,10 @@ def select_strategies_within_budget(
 ---
 
 ## 11. Caching query transformations
+
+> **In plain words.** Many users ask the same questions. Save the rewritten or split questions and reuse them next time instead of calling the LLM again. Clear the saved entries when the documents change.
+>
+> **Real-world example.** If 30% of questions repeat, a cache removes 30% of query-understanding LLM calls. A 24-hour lifetime suits a handbook updated daily. A "looks similar" cache needs a strict similarity threshold (about 0.93) or different questions share the wrong rewrite.
 
 If the same query (or a semantically similar query) is asked repeatedly, the LLM call to rewrite
 it should not be repeated. Caching query transformations amortizes the latency and cost of query
@@ -1918,6 +2063,10 @@ Not all query understanding steps are worth caching:
 ---
 
 ## 12. Combining techniques: the query preprocessing pipeline
+
+> **In plain words.** The steps run in a fixed order: complete the question from chat history, check the cache, classify, run the chosen fixes in parallel, save to the cache, then search with the original question plus every new version. If any LLM call fails or is too slow, just skip it.
+>
+> **Real-world example.** Budget 2,000 ms. Resolution 300 ms, cache miss, heuristic classification 1 ms, rewrite and HyDE in parallel 500 ms → about 800 ms before search starts. If HyDE times out, search runs with the original and the rewrite only.
 
 Individual techniques are building blocks. The query preprocessing pipeline is the architecture
 that combines them into a coherent system. The design questions are: what order, what conditions,
@@ -2132,6 +2281,10 @@ async def manufacture_with_fallback(
 
 ## 13. Evaluation of query understanding
 
+> **In plain words.** Do not judge a rewrite by reading it. Judge it by whether search finds the right chunk more often. Turn each fix on and off, measure, and look at the numbers per question type, because a fix can help one type and hurt another.
+>
+> **Real-world example.** Illustrative ablation: recall@20 0.72 as-is, 0.78 with rewriting, 0.81 with rewriting + HyDE, 0.82 with all three. The third technique adds 1 pp and 70 ms, so it is not worth running on every question.
+
 Query understanding is unusually difficult to evaluate because its output (manufactured queries)
 is not the final output — it is an intermediate that influences retrieval, which influences
 generation. The question is not "is the rewritten query good?" but "did the rewritten query
@@ -2298,6 +2451,10 @@ not "try a different rewriting prompt."
 ---
 
 ## 14. Failure modes and debugging
+
+> **In plain words.** The LLM can quietly change the question: drop a "not", add details the user never said, invent product names, or lose the relationship between two things. You only see this if you log every generated query and what it retrieved.
+>
+> **Real-world example.** "How do I delete a user WITHOUT deleting their data?" → rewrite: "How to delete user data". The negation is gone, and the rewrite's results may push the right chunk down the merged list.
 
 Query understanding can fail in ways that are invisible without instrumentation. The manufactured
 queries are intermediate artifacts that are not shown to the user, and their effect on retrieval
@@ -2769,6 +2926,241 @@ of the span attributes recorded.
 without reading code or logs.
 *Time:* ~3 hours.
 *Unblocks:* `10`, production debugging.
+
+---
+
+## 18. Interview questions and system design prompts
+
+> **In plain words.** Answer in three steps: the simple idea, one number, one trade-off. The two
+> ideas interviewers check most often: the original query always runs, and you route each question
+> to the one fix it needs instead of running every fix on everything.
+>
+> **Real-world example.** "Should we use HyDE?" → "Only for 'how' and 'why' questions where the
+> answer is phrased very differently from the question. It costs one LLM call, about 500 ms at p50,
+> and on exact-fact questions it can invent a number and pull search toward the wrong chunk. I'd
+> measure it per question type before turning it on."
+
+### 18.1 Conceptual questions
+
+**Q: What problem does query understanding solve, and why not just improve the retriever?**
+*Sections: §1, §13.5*
+The words users type often differ from the words in the documents (vocabulary, level of detail,
+several questions at once, missing context). A better retriever narrows the gap from the index side;
+query understanding narrows it from the question side. Strong answers add: tune the retriever first
+(embedding model, chunking, hybrid, reranker), because query understanding measured against a weak
+baseline looks better than it is.
+
+**Q: Why must the original query always run alongside the rewrite?**
+*Sections: §3.4, §15 anti-pattern 2*
+Each generated query is an extra branch into fusion. A bad rewrite then only adds candidates that
+the reranker can drop; it cannot remove the original query's good results. If the rewrite replaces
+the original, one bad rewrite (for example, a dropped "not") loses the answer entirely.
+
+**Q: Rewriting vs. multi-query vs. decomposition — what is the difference?**
+*Sections: §3, §5, §6*
+Rewriting: one better phrasing of the same question (1 LLM call). Multi-query: several different
+phrasings of the same question, merged with RRF; chunks found by several phrasings rise. Decomposition:
+different sub-questions for different pieces of information, each retrieving different chunks.
+
+**Q: How does HyDE work, and when does it hurt?**
+*Section: §7 (Gao et al., 2022)*
+The LLM writes a hypothetical answer; you embed and search with it, because a fake answer sits
+closer to the real answer chunk than the question does. It hurts on exact-fact lookups (invented
+numbers), identifier-heavy queries (codes are not reproduced), and corpora the LLM has never seen
+(it writes a generic answer). It helps least with strong asymmetric embedding models.
+
+**Q: What is step-back prompting?**
+*Section: §4 (Zheng et al., 2023)*
+Generate a more general question about the underlying concept, and search with both. It helps when
+the user describes a symptom and the corpus explains the mechanism. One step back is usually enough;
+two steps is often too vague ("how does networking work").
+
+**Q: Why is query expansion mainly a keyword-search technique?**
+*Section: §8.4*
+Extra terms create exact-match hits for BM25, but they blur the meaning of the embedding vector.
+Send the expanded query to the BM25 branch and the original or rewritten query to the dense branch.
+
+**Q: In a chat, what runs first and why?**
+*Sections: §9.2, §12.3*
+Coreference resolution: every later step (classification, rewrite, decomposition, HyDE) needs a
+complete, standalone question. Gate it with a cheap pronoun/short-follow-up check so standalone
+questions skip the LLM call.
+
+### 18.2 System design prompts
+
+**Q: Design query understanding for a customer-support assistant: 200,000 questions a day, p95
+end-to-end under 2.5 s, generation ~800 ms, retrieval + rerank ~200 ms, mix of product questions,
+error codes, and multi-turn chats.**
+
+```
+1. RESOLVE   - only if chat history AND (pronoun OR ≤4 tokens); combined resolve+rewrite
+               prompt saves one round trip (§9.4). ~300 ms p50.
+2. CACHE     - exact-match on the normalized standalone question; TTL 24 h; clear on reindex.
+               Semantic cache only with a strict threshold (~0.93+), checked on labeled pairs.
+3. CLASSIFY  - heuristic on every question (~1 ms); LLM classifier only if confidence < 0.6.
+4. ROUTE     - lookup / error code → passthrough (HyDE would damage codes)
+               vocabulary mismatch → rewrite (dense) + expand (BM25)
+               multi-part / comparison → decompose into 2-3 sub-queries, keep grouped
+               troubleshooting → HyDE or step-back
+5. BUDGET    - 2,500 - 800 - 200 = 1,500 ms for QU; parallel strategies, per-call timeout,
+               fail open to the original query.
+6. MODEL     - small, fast model for all QU calls; the large model only for generation.
+7. COST      - if ~0.5 LLM calls/question on average: 100,000 calls/day × ~$0.001 ≈ $100/day
+               (vs. ~$800/day for 4 calls on every question).
+8. OBSERVE   - trace every generated query, its results, and the routing decision.
+9. EVAL      - ablation per strategy and per question type; intent-preservation check on a
+               sample of rewrites (target ≥ 95%).
+```
+
+**What interviewers listen for:** routing instead of a fixed pipeline, the original query always
+running, a latency budget with timeouts and fail-open, identifiers protected from rewrite and HyDE,
+branch-specific rewrites (dense vs. BM25), caching with invalidation, and per-type evaluation.
+
+**Q: Our RAG bot's latency doubled after adding query rewriting, and quality barely moved. What
+do you do?**
+Measure how many questions actually needed a rewrite (Lab 1: recall per question type without any
+query understanding). Put a heuristic router in front so precise questions skip the LLM call, move
+the rewrite to a small model, add an exact-match cache, and run strategies in parallel with a timeout.
+Then re-run the ablation: if rewriting does not raise recall on any question type, remove it.
+
+### 18.3 Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| Does a bad rewrite remove good results? | Not if the original query also runs and results are fused. | §3.4 |
+| What goes first in a chat pipeline? | Coreference resolution. | §9.2 |
+| HyDE on "default value of max_connections"? | No — it invents a number and searches near it. | §7.4 |
+| Expanded query to which branch? | BM25 (lexical); keep the short query for dense. | §8.4 |
+| How many multi-query variants? | Usually 3; measure the knee on your data. | §6.3 |
+| How many sub-queries from decomposition? | 2 – 3, hard cap 5. | §5.5 |
+| Rocchio default weights? | `α = 1.0`, `β = 0.75`, `γ = 0.15`. | §8.1 |
+| Main PRF failure? | Query drift: bad first results add noise terms. | §8.2 |
+| Parallel rewrite (300 ms) + HyDE (500 ms) adds? | ~500 ms — the slowest one. | §10.2 |
+| Cache coreference resolution? | No — it depends on each chat's history. | §11.4 |
+| Which model for QU calls? | A small, fast one; the big model for generation. | §15 anti-pattern 7 |
+| How to judge a rewrite? | By its effect on recall and nDCG, not by reading it. | §13, §15 anti-pattern 10 |
+
+### 18.4 Debugging prompts
+
+**"Answers ignore the word 'not' or 'without' in the question."** The rewrite dropped the negation
+(§14.1). Check the trace for the rewritten text, check that the original query still runs, add a
+negation rule to the prompt, and run the intent-preservation check on a sample.
+
+**"Questions with product codes got worse after we enabled HyDE."** The hypothetical answer does not
+reproduce the code, so the HyDE vector loses the only signal (§7.4). Route identifier-heavy and
+lookup questions away from HyDE; make sure BM25 still sees the original query.
+
+**"Follow-up questions in chat get generic answers."** Coreference resolution is missing or not
+triggered (§9). Check the gating heuristic on short follow-ups like "and for teams?", and check
+that the resolved query, not the raw one, reaches retrieval.
+
+**"Comparison questions return information on each item but nothing on how they interact."**
+Decomposition lost the relationship (§14.4). Keep one sub-query about the interaction itself.
+
+**"Latency p99 jumped from 1.6 s to 3 s after a QU change."** A strategy's p99 is dominating the
+parallel step, or strategies run serially. Check for per-call timeouts and that the router does not
+send most questions to the slowest strategy (§10.2, §12.4).
+
+### 18.5 Common mistakes
+
+1. Replacing the original query with the rewrite instead of adding a branch.
+2. Running every strategy on every question.
+3. Using HyDE on exact-fact and identifier questions.
+4. Sending expansion terms to the dense branch.
+5. Judging rewrites by how they read, not by recall.
+6. Comparing against an untuned baseline retriever (§13.5).
+7. Caching rewrites with no TTL or reindex invalidation.
+
+---
+
+## 19. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+> **In plain words.** Each case: what users saw, the simple reason, the numbers, the fix.
+>
+> **Quick index:** answers ignore "without" → Case 1; HyDE looked neutral overall → Case 2; latency
+> and LLM bill too high → Case 3; follow-ups get generic answers → Case 4; different questions get
+> the same answer → Case 5; comparison answers miss the interaction → Case 6.
+
+### Case 1 — The rewrite that dropped "without"
+
+**Setup.** Account-management help center, 120,000 chunks. Each question was rewritten, and the
+rewrite *replaced* the original query.
+**Symptom.** "How do I delete a user without deleting their data?" returned instructions for purging
+user data.
+**Measurement.** Intent-preservation check (§13.3) on 500 sampled rewrites: 31 changed the intent
+(6.2%); 22 of the 31 involved "not", "without", or "except". On 60 test questions containing a
+negation, recall@20 was 0.83 with the original query and 0.52 with the rewrite alone.
+**Fix.** Ran the original query alongside the rewrite (RRF), and added a prompt rule to keep
+negations and scope words exactly. Intent changes 31/500 → 7/500 (6.2% → 1.4%); negation-question
+recall@20 0.52 → 0.85.
+**Lesson.** A rewrite is an extra branch, never a replacement; negation is where rewriters fail most.
+
+### Case 2 — HyDE that looked neutral overall
+
+**Setup.** Bank internal operations wiki, 300,000 chunks, HyDE on every question.
+**Symptom.** Staff reported wrong limits in answers about transfer caps; the aggregate eval showed
+no change.
+**Measurement.** 200-question test set. Lookup questions (120): recall@20 0.88 without HyDE, 0.79
+with. Troubleshooting questions (80): 0.61 without, 0.74 with. Aggregate: 0.772 without, 0.770
+with — the two effects cancelled out.
+**Fix.** Routed HyDE to troubleshooting questions only: aggregate recall@20 0.772 → 0.824, and HyDE
+calls dropped by 60% (only 40% of questions are troubleshooting).
+**Lesson.** Always split evaluation by question type; an average can hide a gain and a loss of the
+same size.
+
+### Case 3 — Every strategy on every question
+
+**Setup.** E-commerce support bot, 200,000 questions a day, fixed pipeline: rewrite, HyDE,
+decomposition, and multi-query on every question (4 LLM calls, about $0.0015 each).
+**Symptom.** Query-understanding bill ~$1,200 a day (800,000 calls); users complained about slow
+answers.
+**Measurement.** The heuristic classifier marked 58% of questions as simple. Ablation: turning the
+pipeline off for those 58% changed their recall@20 by less than 1 pp. All four strategies ran in
+parallel, so each question waited for the slowest (HyDE, ~500 ms p50).
+**Fix.** Routing: 58% passthrough, 30% rewrite only (1 call), 12% decompose + rewrite (2 calls) →
+0.54 calls per question → 108,000 calls a day → ~$162 a day. Mean added latency ~500 ms → ~140 ms
+(0.58 × 1 + 0.30 × 300 + 0.12 × 400 ms). Overall recall@20 0.84 → 0.85 (within noise).
+**Lesson.** Routing is the biggest cost and latency lever; most questions need no fix.
+
+### Case 4 — Follow-ups with no memory
+
+**Setup.** Telecom chat assistant; each turn was searched as typed, with no coreference resolution.
+**Symptom.** "What about the family plan?" after a question on roaming returned generic plan pages.
+**Measurement.** 22% of turns were follow-ups. recall@20 on follow-ups 0.31, on first turns 0.80;
+overall 0.22 × 0.31 + 0.78 × 0.80 = 0.69.
+**Fix.** Gated resolution (pronoun or ≤ 4 tokens with chat history), combined with the rewrite in
+one prompt (§9.4). Follow-up recall 0.31 → 0.77; overall 0.69 → 0.79. The extra ~300 ms applied
+only to gated turns.
+**Lesson.** In chat, resolve first; an unresolved "it" or "what about…" almost guarantees a miss.
+
+### Case 5 — The semantic cache that answered the wrong question
+
+**Setup.** SaaS documentation assistant with a semantic cache of rewrites, similarity threshold
+0.88, no invalidation on reindex.
+**Symptom.** "Reset password for an admin account" got the rewrite cached for "reset password for
+a user account" and retrieved end-user pages.
+**Measurement.** Judged sample of 1,000 cache hits: 70 were false hits (7.0%). After a product
+rename two months earlier, 12% of cached rewrites still used the old feature name.
+**Fix.** Threshold 0.88 → 0.94, 24 h TTL, cache cleared on every reindex. False hits 7.0% → 0.6%;
+hit rate 38% → 29% — fewer hits, but correct ones.
+**Lesson.** A cache hit is only a saving if it is the right answer; tie the cache to the corpus
+version.
+
+### Case 6 — Decomposition that lost the interaction
+
+**Setup.** Health-insurance policy assistant; comparison and multi-part questions were decomposed.
+**Symptom.** "How does the deductible interact with the out-of-pocket maximum?" got one paragraph
+on each term and nothing on how they combine.
+**Measurement.** Manual review of 40 relationship questions: 18 decompositions (45%) had no
+sub-query about the interaction. The chunk explaining the interaction was in the top 20 for 18 of
+40 questions (recall@20 = 0.45).
+**Fix.** Added a prompt rule to always keep one sub-query that asks about the relationship itself.
+Missing-interaction decompositions 18 → 3; interaction-chunk recall@20 0.45 → 0.80 (32 of 40).
+**Lesson.** Splitting a question can remove the part that connects the pieces; check coverage,
+not only the sub-queries.
 
 ---
 
