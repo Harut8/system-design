@@ -51,6 +51,7 @@
 14. [Mental models — the compressed set](#14-mental-models--the-compressed-set)
 15. [Lab exercises](#15-lab-exercises)
 16. [Interview questions and system design prompts](#16-interview-questions-and-system-design-prompts)
+17. [Real-world cases — incidents with numbers](#17-real-world-cases--incidents-with-numbers)
 
 ---
 
@@ -92,6 +93,7 @@ sentence that was lost while reading the PDF can never be found.
 | §11 | Measuring whether one chunking method is actually better than another. |
 | §12 | What it costs. |
 | §16 | Interview questions. |
+| §17 | Seven realistic incidents with numbers: what broke, how it was measured, how it was fixed. |
 
 ### Symbols and terms used in this chapter
 
@@ -129,6 +131,10 @@ the details when you need them.
 
 ## 1. Thesis, restated as an engineering claim
 
+> **In plain words.** The pipeline is a chain: read the file, clean the text, cut it into chunks, embed them, search. Each step can keep or lose information, never add it back. So a better embedding model cannot fix text the PDF reader garbled. Fix problems in pipeline order: reading first, model last.
+>
+> **Real-world example.** A 40-page, two-column HR PDF: the cheap reader mixes the columns on 12 of the 40 pages (30%). Any question whose answer sits on those 12 pages fails, with any embedding model. A better parser fixes all 12 pages. A bigger embedding model fixes none of them.
+
 `01` argued that the embedding model is a schema decision because its migration cost is O(corpus).
 Chunking has exactly the same property and is almost never treated with the same seriousness. If
 you change your chunk size from 512 to 1024 tokens, you must re-chunk every document, re-embed
@@ -161,11 +167,15 @@ Three consequences, which the rest of the chapter is in service of:
   looked up.
 - **You cannot A/B two chunking strategies against a chunk-labeled golden set**, because the labels
   are defined in terms of one of the two chunkings. This is a real methodological trap that
-  invalidates a lot of published chunking comparisons, and §11.2 is the fix.
+  can invalidate published chunking comparisons, and §11.2 is the fix.
 
 ---
 
 ## 2. The ingestion pipeline, stage by stage
+
+> **In plain words.** Getting a file into search takes seven steps: fetch, read (parse), clean, cut, add labels, embed, index. Save the output of every step and label it with a version number. Then when you change one step, you rerun only the steps after it.
+>
+> **Real-world example.** 400,000 PDFs of about 20 pages each, parsed at about 1 second per page, is 8 million CPU-seconds (about 93 CPU-days). If you saved the parsed text, changing the chunk size means re-running only cut → embed → index. If you didn't, you pay those 93 CPU-days again. (Illustrative numbers.)
 
 Everything between "a file exists" and "a vector is in the index" is this pipeline. Naming its
 stages separately matters because each has its own failure mode, its own cost, its own idempotency
@@ -197,6 +207,10 @@ shadow-indexing and incremental migration.
 ---
 
 ## 3. Parsing — the stage that decides your ceiling
+
+> **In plain words.** Parsing turns a file into text. Markdown and HTML are easy. A PDF only stores "draw these letters at these positions", so the reader has to guess the paragraphs, the column order and the tables. Bad guesses create text that no later step can repair. Scanned PDFs have no text at all until you run OCR.
+>
+> **Real-world example.** A leave table with rows "Annual 20 / Sick 10 / Parental 16" comes out of a cheap reader as "Annual Sick Parental 20 10 16". Now "how many sick days?" has no clear answer in the text. Writing each row as a sentence ("Sick leave: 10 days per year") fixes it. A scanned PDF of the same policy comes out as 0 characters and silently disappears from search.
 
 ### 3.1 The format taxonomy, ordered by how much structure survives
 
@@ -439,6 +453,10 @@ the language's own parser. Two rules make code chunks retrievable:
 ---
 
 ## 4. Normalization, and why the two retrieval branches want different text
+
+> **In plain words.** Normalization is cleaning the text: remove invisible characters, fix words broken across lines, make quotes and spaces consistent. Some "cleaning" destroys meaning, like turning `x²` into `x2` or lowercasing `US` into `us`. Keyword search and vector search want different cleaning, so keep one clean original and make a separate lowercased copy for keyword search only.
+>
+> **Real-world example.** A PDF writes "classiﬁcation" with a single `ﬁ` character. A keyword search for "classification" finds 0 matches in that document until you replace `ﬁ` with `fi`. The same cleaning code must also run on the user's query, or the two sides won't match.
 
 ### 4.1 The safe transforms
 
@@ -862,6 +880,10 @@ Not every normalizer improvement justifies a reindex. The decision framework:
 
 ## 5. What chunk size actually trades off
 
+> **In plain words.** Small chunks match questions precisely but may lack context ("it grew 3%": what grew?). Big chunks keep context but mix many topics, so they match everything a little and nothing well. Overlap repeats text at chunk edges so nothing gets cut in half, but it costs more than it looks.
+>
+> **Real-world example.** Top-10 retrieval with 256-token chunks gives the LLM 2,560 tokens; with 1,024-token chunks it gives 10,240 tokens, 4× more. Of course the big chunks "find more". And 20% overlap on a 100M-token corpus at $0.02 per million tokens raises the embedding bill from $2.00 to $2.50, 25% more, plus 25% more storage every month.
+
 Chunk size is not a tuning knob with a monotone quality curve. It is squeezed by four constraints,
 two pushing down and two pushing up, and the optimum is where they balance *for your corpus and
 your query distribution*. That's why the answer is a measurement (§11) and not a number in a blog
@@ -901,7 +923,7 @@ Retrieving `k=10` chunks of 1,024 tokens gives it 10,240. These are not comparab
 and yet "recall@10 improved when I increased chunk size" is a conclusion people draw constantly.
 Of course it did — you quadrupled the context budget.
 
-This has two consequences. The measurement consequence is §11.2's: compare at a fixed *token
+This has two consequences. The measurement consequence is §11.3's: compare at a fixed *token
 budget*, not a fixed `k`. The design consequence is that **chunk size and `k` are one joint
 decision, bounded by the generation context budget** (`06-context-engineering.md`) and by the
 reranker's per-candidate cost (`04`). Fixing one and tuning the other is fine; reporting a result
@@ -963,7 +985,7 @@ to know the effect exists, or you'll read the recall improvement as free.
 **And there is published evidence that overlap can cost you quality outright, not just money.** In
 Chroma's evaluation (the full table is in §6.4), with `text-embedding-3-large`, recursive splitting
 at 400 tokens scored **89.5 recall / 17.7 Precision_Ω with zero overlap** versus **88.1 / 13.9 with
-200 tokens of overlap** — worse on both axes, while costing 1.25× the tokens and bytes. The
+200 tokens of overlap** — worse on both axes, while costing 2× the tokens and bytes (200 of 400 tokens repeated, `f = 0.5`). The
 degradation is sharpest at large chunks: 800/400 was the weakest recursive configuration in their
 table on every metric.
 
@@ -988,6 +1010,10 @@ the first place. Overlap is the fallback for corpora without usable structure, n
 ---
 
 ## 6. Chunking strategies, ordered by how much structure they use
+
+> **In plain words.** There are five ways to cut: every N tokens (fixed size), at paragraphs then sentences (recursive), at the document's own headings (structure-aware), where the topic seems to change (semantic), or by asking an LLM. Use headings when the document has them, since the author already marked the topics. The fancier methods cost more and often don't win.
+>
+> **Real-world example.** An HR handbook with 120 headings becomes 120 sections, one chunk each, and each chunk starts with its heading path ("Leave Policy > Parental Leave"). Cutting every 500 characters instead splits "Primary caregivers get 16 weeks" from "at full salary", and a question about parental pay finds half the answer.
 
 The ordering below is deliberate: each strategy uses strictly more information about the document
 than the one before it. That, and not sophistication, is the axis that predicts whether it will
@@ -1106,7 +1132,7 @@ version you have pinned; treat any splitter parameter you didn't set deliberatel
 |---|---|---|---|
 | LangChain | `RecursiveCharacterTextSplitter` | the canonical implementation; counts in **characters** by default — pass `from_tiktoken_encoder()` or `from_huggingface_tokenizer()` class method for token counting | default separators lack sentence terminators (see the Chroma finding above); default `chunk_size` is characters, not tokens, and the default value has changed across versions |
 | LangChain | `RecursiveCharacterTextSplitter.from_tiktoken_encoder(encoding_name="cl100k_base", chunk_size=512)` | token-counting variant | still splits on *character* separators, but measures chunk size in *tokens* — a subtle but correct behavior: boundaries fall on separator characters, limits are enforced in tokens |
-| LlamaIndex | `SentenceSplitter` | recursive with built-in sentence detection; defaults to ~1024 tokens | sentence detection uses regex, not a model — good enough for prose, fails on abbreviations and code |
+| LlamaIndex | `SentenceSplitter` | recursive with built-in sentence detection; defaults to ~1024 tokens | sentence detection is rule/statistics-based (NLTK Punkt plus a regex fallback), not a neural model — good enough for prose, can still fail on unusual abbreviations and on code |
 | LlamaIndex | `SentenceWindowNodeParser` | splits per-sentence, stores a configurable window of surrounding sentences as metadata for §7's retrieval-unit decoupling | one vector per sentence — read §12.2's storage cost before committing to this at scale |
 | Unstructured | `chunk_by_title()` | recursive splitting that also respects element boundaries from the parser | tightly coupled to Unstructured's own element model — if you use a different parser, this won't help |
 | `text-splitter` (Rust crate, also Python via `semantic-text-splitter`) | `TextSplitter` | Rust-native, tokenizer-aware, fast enough for 100M+ token corpora in minutes | less configurability than LangChain; the tradeoff is speed for knobs |
@@ -1182,7 +1208,7 @@ improvement is measured against a fair baseline rather than against a straw man.
 | LangChain | `MarkdownHeaderTextSplitter` | Markdown | splits on heading levels you specify; outputs chunks with heading metadata attached — the heading path in §6.3's `contextualize()` comes for free |
 | LangChain | `MarkdownTextSplitter` | Markdown | recursive splitting with Markdown-aware separators (headers, code fences, lists) — combines §6.2 and §6.3 |
 | LangChain | `HTMLHeaderTextSplitter` | HTML | splits on `<h1>`–`<h6>` tags; strips surrounding markup by default |
-| LangChain | `HTMLSectionSplitter` | HTML | splits on `<section>`, `<article>`, `<div>` boundaries from a Readability-style extractor — handles application-shaped pages better than header-only splitting |
+| LangChain | `HTMLSectionSplitter` | HTML | splits HTML into sections at the header tags you configure, keeping section metadata; check your pinned version's docs for exactly which elements it keys on |
 | LlamaIndex | `HierarchicalNodeParser` | any (you supply the structure) | builds a parent→child hierarchy natively, which feeds §7's parent-document retrieval directly; configurable at multiple chunk sizes (e.g. 2048/512/128) |
 | LlamaIndex | `MarkdownNodeParser` | Markdown | heading-level splitting with metadata propagation |
 | Docling | `HierarchicalChunker` | any Docling-parsed document | operates on Docling's structured `DoclingDocument` model rather than raw text — the cleanest path from tier-2 parsing (§3.3) to structure-aware chunks; headings, tables, list items are typed elements, not string patterns |
@@ -1322,9 +1348,9 @@ size-controlled variant — the uncontrolled percentile version is the one that 
 | Library | Class / function | Variant | Size control | Notes |
 |---|---|---|---|---|
 | LlamaIndex | `SemanticSplitterNodeParser` | adjacent-pair distance, percentile threshold (Kamradt) | **none** — this is the variant that came last | pass `breakpoint_percentile_threshold` to tune sensitivity; even so, there is no `max_chunk_size` parameter — chunks can exceed the embedding model's context limit |
-| LangChain (experimental) | `SemanticChunker` | adjacent-pair distance | optional `min_chunk_size` only (no max) | marked as experimental; three threshold modes: `percentile`, `standard_deviation`, `interquartile` |
+| LangChain (experimental) | `SemanticChunker` | adjacent-pair distance | optional `min_chunk_size` only (no max) | marked as experimental; threshold modes include `percentile`, `standard_deviation`, `interquartile` (and `gradient` in recent versions) |
 | Chroma | `ClusterSemanticChunker` | within-chunk similarity maximization | **yes** — `max_chunk_size` parameter | the variant that won on IoU in their evaluation; not a pip-installable library as of 2026 — it's in their research code, so you'd port it |
-| `semantic-text-splitter` (Rust + Python) | `TextSplitter(...)` with `semantic` mode | adjacent-pair distance with a configurable model | yes — `capacity` sets the token limit | Rust-native, fast; one of the few semantic chunkers that enforces a hard size ceiling |
+| `semantic-text-splitter` (Rust + Python) | `TextSplitter(capacity)` | **not embedding-based** — "semantic" here means a hierarchy of text levels (sentence, word, newline, Markdown element), not topic similarity | yes — `capacity` sets the character/token limit | Rust-native, fast, hard size ceiling; listed here because the name is easy to misread — it is a structure-aware recursive splitter, not a §6.4 semantic chunker |
 | Greg Kamradt's notebook | reference implementation | the original breakpoint algorithm | **none** | the pedagogical version — read it to understand the algorithm, don't ship it |
 
 **The ingest-cost arithmetic, made explicit:**
@@ -1355,8 +1381,8 @@ def semantic_chunking_cost(corpus_tokens: int, avg_sentence_tokens: int,
   papers with run-on sections, interviews, narrative reports.
 - When you've tried recursive splitting with a tuned separator list and structure-aware splitting
   isn't available, and recall@budget on your golden set shows a gap.
-- Only the **size-controlled** variants (`ClusterSemanticChunker`, `semantic-text-splitter` with
-  capacity) — the uncontrolled ones can't guarantee chunks fit the model's context window.
+- Only the **size-controlled** variants (`ClusterSemanticChunker`, or a percentile chunker you wrap
+  with a hard max-size split) — the uncontrolled ones can't guarantee chunks fit the model's context window.
 
 **When it's wrong:**
 - Any corpus with real structure. You're paying an embedding pass per sentence to infer boundaries
@@ -1414,10 +1440,10 @@ the source doesn't support. This is §6.5's fabrication risk, and it is specific
 
 | Library / tool | Pattern | Notes |
 |---|---|---|
-| LlamaIndex `LLMTextSplitter` | A (boundary detection) | sends a prompt asking the LLM to identify logical section breaks; returns original text between breaks |
+| Framework LLM splitters (check your pinned LangChain / LlamaIndex version; names change) | A (boundary detection) | send a prompt asking the LLM to identify logical section breaks; return original text between breaks |
 | Custom prompt + any LLM | A or B | most teams roll their own; the prompt is the strategy |
-| LlamaIndex propositions extractor (`SummaryExtractor` / custom `NodePostprocessor`) | B (propositions) | extracts atomic facts; store alongside original spans for faithful citation |
-| `dense-x-retrieval` (reference code) | B (propositions) | the original implementation from the Chen et al. paper |
+| LlamaIndex `DenseXRetrievalPack` (llama-pack) or a custom extractor | B (propositions) | extracts atomic facts; store alongside original spans for faithful citation |
+| The paper's released "propositionizer" model (a fine-tuned Flan-T5) | B (propositions) | from the Chen et al. paper; a small dedicated model instead of a general LLM |
 
 **Prompt patterns that work, with the tradeoffs named:**
 
@@ -1526,8 +1552,8 @@ classes for what is one function with a different separator list.
 Strengths: `HierarchicalNodeParser` builds the parent→child tree §7 needs natively, `SentenceWindowNodeParser` implements §7.2's sentence-window pattern out of the box, and the
 `NodePostprocessor` pipeline makes it natural to chain splitting with enrichment. Weaknesses: the
 `Node` abstraction is heavier than a dict, which adds friction when integrating with non-LlamaIndex
-stores, and `SentenceSplitter`'s regex-based sentence detection fails on abbreviations and
-non-English punctuation.
+stores, and `SentenceSplitter`'s rule-based sentence detection (NLTK Punkt plus a regex fallback)
+can fail on unusual abbreviations and non-English punctuation.
 
 **Docling** (IBM, Linux Foundation) — the tightest coupling between parser and chunker. Strengths:
 `HierarchicalChunker` and `HybridChunker` operate on Docling's structured `DoclingDocument`, which
@@ -1540,10 +1566,10 @@ if you parse with something else, you can't use Docling's chunkers.
 
 | Tool | What it does | When to reach for it |
 |---|---|---|
-| `semantic-text-splitter` (Rust + Python) | fast tokenizer-aware splitting with optional semantic mode; enforces hard size ceilings | when you need throughput above what Python-native splitters deliver, or a semantic chunker that guarantees max chunk size |
+| `semantic-text-splitter` (Rust + Python) | fast tokenizer-aware recursive splitting over a hierarchy of text levels (not embedding-based, despite the name); enforces hard size ceilings | when you need throughput above what Python-native splitters deliver |
 | `chonkie` | lightweight Python chunking library; token-aware, semantic, and recursive modes without framework dependencies | when LangChain/LlamaIndex is too heavy and you want a focused library |
 | `unstructured` chunking functions | `chunk_by_title()`, `chunk_elements()` — operate on Unstructured's element model | when you already use Unstructured for parsing and want chunking on the same elements |
-| `text_splitter` (Hugging Face) | minimal token-aware splitter | when you want the thinnest dependency and own the rest |
+| Hugging Face `tokenizers` + your own loop | token counting with the exact tokenizer of an open embedding model | when you want the thinnest dependency and own the rest |
 | `spaCy` sentencizer | rule-based or model-based sentence segmentation | when you need accurate sentence boundaries as input to any chunking strategy — better than regex for non-English or abbreviation-heavy text |
 | `tree-sitter` + bindings | AST-based code splitting | the only correct tool for code chunking (§3.7); language grammars are maintained upstream |
 
@@ -1618,8 +1644,9 @@ This is the practical summary of §6.1–§6.6, ordered by effort and expected r
 4. If the gap persists and structure isn't available: test semantic chunking
    (§6.4) with a size-controlled variant only. Measure at 2x the embedding
    cost of step 2.
-   → Library: semantic-text-splitter (Rust, enforces max size) or port
-     Chroma's ClusterSemanticChunker.
+   → Library: port Chroma's ClusterSemanticChunker, or wrap a percentile
+     chunker with a hard max-size split. (semantic-text-splitter is NOT an
+     embedding-based chunker despite its name — see §6.4.1.)
 
 5. If the corpus is small, high-value, and structurally hostile: test
    LLM-based boundary detection (§6.5 pattern A). Price it before
@@ -1632,6 +1659,10 @@ This is the practical summary of §6.1–§6.6, ordered by effort and expected r
 ---
 
 ## 7. Decoupling the retrieval unit from the generation unit
+
+> **In plain words.** Search over small pieces, but hand the LLM the bigger piece around them. Small pieces give precise matches; the bigger piece gives the context needed to answer. Store a `parent_id` on each small chunk so you can look up its section.
+>
+> **Real-world example.** Index 200-token paragraphs, return the 1,500-token section that contains each hit. If 10 paragraph hits belong to only 3 sections, send those 3 sections once each (4,500 tokens), not 10 copies.
 
 ### 7.1 The core move
 
@@ -1698,7 +1729,7 @@ Parent-document retrieval isn't free of consequences, just of tokens:
   in context budget (`06`).
 - **`k` becomes ambiguous.** "Top 10" now means ten children, which might be three parents' worth of
   text or ten. Budget in tokens after parent expansion, not in `k` before it — the same discipline
-  §5.3 and §11.2 demand.
+  §5.3 and §11.3 demand.
 - **The parent store is a second store.** It can be a blob store or a row store; it does not need to
   be the vector database, and it usually shouldn't be.
 - **Reranking applies to children, relevance applies to parents.** A cross-encoder scores the child
@@ -1708,6 +1739,10 @@ Parent-document retrieval isn't free of consequences, just of tokens:
 ---
 
 ## 8. Metadata — the part that makes filtering and citation possible
+
+> **In plain words.** Metadata is labels stored next to each chunk: which document, which page, which customer, when it was updated. Use labels to filter search results ("only this customer's documents") and to cite sources. Don't paste labels like dates or IDs into the text you embed; embeddings handle them badly.
+>
+> **Real-world example.** A company has HR rules for 10 countries. With a `country = DE` filter, a German employee's question only searches the German chunks, instead of hoping the embedding somehow prefers them. A `page = 12` label lets the answer say "see page 12".
 
 ### 8.1 What every chunk needs
 
@@ -1760,6 +1795,10 @@ touching every vector — the migration cost, again, of a decision that looked l
 ---
 
 ## 9. Chunk identity, idempotency, and incremental update
+
+> **In plain words.** Give each chunk an ID computed from its text (a hash). When a document changes, re-cut it, compare IDs, and re-embed only the chunks whose text changed. Also delete the chunks that no longer exist, or search keeps returning outdated text.
+>
+> **Real-world example.** A 300-chunk handbook gets one paragraph edited at the top. With IDs based on position ("chunk #1, #2…"), every chunk after the edit gets a new number, so up to 300 re-embeds. With IDs based on the text, only 1–2 chunks change, so 1–2 re-embeds.
 
 A corpus is not a snapshot; documents change. Everything in this section is about making the update
 path cost proportional to *what changed*, not to corpus size. `15-ingestion-pipelines-and-freshness.md`
@@ -1855,6 +1894,10 @@ months.
 
 ## 10. Deduplication
 
+> **In plain words.** The same text often appears many times: a footer on every page, a PDF attached to 40 tickets. Exact copies are easy to find with a hash. Near-copies (same text, one date changed) need a similarity estimate such as MinHash. Removing duplicates from the search results matters even more than removing them from the index.
+>
+> **Real-world example.** The footer "Confidential — internal use only" appears on 1,000 pages. A question about confidentiality rules gets 10 copies of the footer in its top 10 and 0 useful answers. Removing the repeated footer at ingest, plus skipping near-duplicates in the results, fixes it.
+
 ### 10.1 Exact duplicates
 
 `content_hash` over the normalized text (§4.1 — normalize *before* hashing, always). Cheap,
@@ -1901,13 +1944,13 @@ def minhash(sh: set[str], num_perm: int = 128, seed: int = 0) -> list[int]:
     return sig
 
 def estimated_jaccard(sig_a: list[int], sig_b: list[int]) -> float:
-    """Expected value equals the true Jaccard similarity; standard error ~1/sqrt(num_perm)."""
+    """Expected value equals the true Jaccard similarity J; standard error sqrt(J(1-J)/num_perm)."""
     return sum(x == y for x, y in zip(sig_a, sig_b)) / len(sig_a)
 ```
 
-The `~1/sqrt(num_perm)` standard error is the number that sets your parameter: 128 permutations
-gives roughly ±0.09, which is fine for a 0.9 threshold and useless for distinguishing 0.85 from
-0.90. If you need a tighter threshold, pay for more permutations — and if you're comparing every
+The standard error `sqrt(J(1−J)/num_perm)` (at most `0.5/sqrt(num_perm)`) is the number that sets
+your parameter: at 128 permutations and J ≈ 0.9 it is about ±0.027, so a 95% band is roughly
+±0.05. That is fine for a 0.9 threshold and unreliable for distinguishing 0.85 from 0.90. If you need a tighter threshold, pay for more permutations — and if you're comparing every
 pair, you need LSH banding rather than the pairwise loop this sketch implies.
 
 ### 10.3 The duplication you should *not* remove
@@ -1938,6 +1981,10 @@ near-duplicate suppression at merge time because that's where the budget is actu
 ---
 
 ## 11. Evaluating a chunking strategy
+
+> **In plain words.** To know if one way of cutting beats another, you need a list of real questions with the correct answer marked in the original document, by character position, not by chunk. Compare methods at the same number of tokens given to the LLM, not the same number of chunks. And measure how much useless text comes along, not just whether the answer was found.
+>
+> **Real-world example.** 50 HR questions, answers marked as character ranges. Two cutting methods, both given 2,000 tokens per question: both find the answer about 90% of the time (recall), but one returns 3% useful text and the other 8%. The second is clearly better, and a recall-only report would call it a tie. (Illustrative numbers.)
 
 ### 11.1 You cannot argue about chunking without a golden set
 
@@ -2062,7 +2109,8 @@ character level is what makes overlap-heavy and overlap-free configurations comp
 ### 11.4 Recall barely discriminates between chunkings — token efficiency does
 
 This is the most useful thing in Chroma's results and it is not their headline. Look at the spread
-across all thirteen configurations in §6.4's table:
+across all thirteen configurations in Chroma's full `text-embedding-3-large` table (§6.4 reproduces
+nine of them; the worst precision and Precision_Ω figures come from rows omitted there):
 
 | Metric | Worst | Best | Spread |
 |---|---|---|---|
@@ -2078,7 +2126,7 @@ efficiency is not remotely saturated.
 Three consequences, and they redirect real effort:
 
 1. **If you evaluate chunking on recall@k alone, you will conclude that chunking barely matters** —
-   which is exactly the conclusion a great many teams have reached, and it is an artifact of the
+   which is a conclusion teams often reach, and it is an artifact of the
    metric, not a finding about chunking. An 8-point recall spread looks like noise next to a 5.7×
    precision spread that the metric never showed you.
 2. **The thing chunking actually controls is the cost side of the quality/cost tradeoff.** Wasted
@@ -2116,7 +2164,7 @@ concrete corpus-level reason why.
 
 And the baseline must be a *fair* one: recursive splitting with a separator list matched to your
 format (§6.2 — including sentence terminators, which Chroma found was necessary for fairness) and
-heading-path prefixes if you have headings (§6.3), not the library default. A large share of
+heading-path prefixes if you have headings (§6.3), not the library default. Some
 published wins for sophisticated chunking are wins against an unconfigured baseline.
 
 ### 11.6 Query-set composition decides the answer
@@ -2142,7 +2190,7 @@ concrete text, so the mechanics are visible and the common mistakes have an exam
 #### 11.7.1 The source corpus
 
 Suppose you're building a RAG system over a company's internal documentation. Here's a realistic
-fragment from an HR policy document — 580 words, the kind of text that actually lives in corporate
+fragment from an HR policy document — about 330 words (~450 tokens), the kind of text that actually lives in corporate
 knowledge bases:
 
 ```text
@@ -2205,8 +2253,8 @@ GOLDEN_SET = [
         "answer_spans": [
             {
                 "doc_id": "hr_policy_leave_v3",
-                "char_start": 42,     # "All full-time employees are entitled to 20..."
-                "char_end": 195,      # "...contracted hours."
+                "char_start": 45,     # "All full-time employees are entitled to 20..."
+                "char_end": 223,      # "...contracted hours."
                 "rationale": "States the 20-day entitlement and part-time pro-rata rule",
             },
         ],
@@ -2218,8 +2266,8 @@ GOLDEN_SET = [
         "answer_spans": [
             {
                 "doc_id": "hr_policy_leave_v3",
-                "char_start": 195,    # "Leave accrues at the rate..."
-                "char_end": 339,      # "...must be used by March 31."
+                "char_start": 224,    # "Leave accrues at the rate..."
+                "char_end": 396,      # "...must be used by March 31."
                 "rationale": "Accrual rate, 5-day carry-over cap, March 31 deadline",
             },
         ],
@@ -2231,14 +2279,14 @@ GOLDEN_SET = [
         "answer_spans": [
             {
                 "doc_id": "hr_policy_leave_v3",
-                "char_start": 600,    # "For absences exceeding 3 consecutive..."
-                "char_end": 755,      # "...10 consecutive working days."
+                "char_start": 714,    # "For absences exceeding 3 consecutive..."
+                "char_end": 928,      # "...10 consecutive working days."
                 "rationale": "Medical certificate requirement and independent exam",
             },
             {
                 "doc_id": "hr_policy_leave_v3",
-                "char_start": 757,    # "Short-term disability (STD)..."
-                "char_end": 950,      # "...50% of base salary."
+                "char_start": 930,    # "Short-term disability (STD)..."
+                "char_end": 1155,      # "...50% of base salary."
                 "rationale": "STD kicks in on day 11, then LTD after STD period",
             },
         ],
@@ -2250,8 +2298,8 @@ GOLDEN_SET = [
         "answer_spans": [
             {
                 "doc_id": "hr_policy_leave_v3",
-                "char_start": 1185,   # "Employees on parental leave continue..."
-                "char_end": 1420,     # "...self-pay the premiums."
+                "char_start": 1485,   # "Employees on parental leave continue..."
+                "char_end": 1715,     # "...self-pay the premiums."
                 "rationale": "Yes during paid period; benefits suspended during unpaid",
             },
         ],
@@ -2263,8 +2311,8 @@ GOLDEN_SET = [
         "answer_spans": [
             {
                 "doc_id": "hr_policy_leave_v3",
-                "char_start": 975,    # "Primary caregivers are entitled..."
-                "char_end": 1185,     # "...birth or adoption date."
+                "char_start": 1179,   # "Primary caregivers are entitled..."
+                "char_end": 1483,     # "...birth or adoption date."
                 "rationale": "Both caregiver types, durations, extension rules",
             },
         ],
@@ -2295,18 +2343,19 @@ def count_tokens(text: str) -> int:
 
 # Strategy A: 200-token chunks, no overlap
 chunks_a = recursive_split(document, chunk_size=200, overlap=0)
-# Produces roughly 6-7 chunks, boundaries at paragraph breaks
+# Produces roughly 4 chunks (each leave section is ~70-150 tokens), boundaries at section breaks
 
 # Strategy B: 400-token chunks, 50-token overlap
 chunks_b = recursive_split(document, chunk_size=400, overlap=50)
-# Produces roughly 3-4 chunks with some boundary blurring
+# Produces roughly 2 chunks with some boundary blurring
 
-# Score both at the same 600-token budget
+# Score both at the same 400-token budget. The whole document is only ~450 tokens, so a
+# budget at or above that would retrieve everything and make every strategy score 1.0.
 for name, chunks in [("200/0", chunks_a), ("400/50", chunks_b)]:
     for entry in GOLDEN_SET:
         ranked = retrieve_top_k(entry["query"], chunks, k=10)
-        recall = recall_at_budget(ranked, entry["answer_spans"], budget_tokens=600, count=count_tokens)
-        iou = token_iou(ranked, entry["answer_spans"], budget_tokens=600, count=count_tokens)
+        recall = recall_at_budget(ranked, entry["answer_spans"], budget_tokens=400, count=count_tokens)
+        iou = token_iou(ranked, entry["answer_spans"], budget_tokens=400, count=count_tokens)
         print(f"{name} | {entry['query_id']} | recall={recall:.2f} | IoU={iou:.3f}")
 ```
 
@@ -2456,8 +2505,8 @@ GOLDEN_SET_ENTRY = {
     "answer_spans": [
         {
             "doc_id": "hr_policy_leave_v3",  # note: v3, not "latest"
-            "char_start": 42,
-            "char_end": 195,
+            "char_start": 45,
+            "char_end": 223,
         },
     ],
 }
@@ -2601,6 +2650,10 @@ expensive) or nobody re-labels (eval is broken and nobody knows).
 
 ## 12. Cost model for the chunking layer
 
+> **In plain words.** Chunking costs money in three places: once at ingest (parsing, embedding, any LLM calls), every month in storage (more chunks = bigger index), and again whenever you change the chunker (redo everything). Embedding is usually the cheap part. Good parsers and LLM-written context are the expensive parts.
+>
+> **Real-world example.** 100M tokens, 512-token chunks, 15% overlap: about 229,900 chunks, $2.35 to embed, about 1.41 GB of vectors. Adding LLM-written context to every chunk costs about $102 on Anthropic's published figure, roughly 40× the embedding bill.
+
 ### 12.1 Ingest cost
 
 ```
@@ -2627,8 +2680,8 @@ A worked example, with every input labeled as an assumption so the arithmetic is
 > - Stride: 512 − 77 = 435 tokens → chunks ≈ 100M / 435 ≈ **229,900**
 >
 > Now add contextual retrieval (`01` §9.2) at ~100 generated tokens per chunk: 229,900 × 100 =
-> **23M generated tokens**, at generation prices. Even at cheap-model rates that is one to two
-> orders of magnitude above the $2.35 embedding bill. `01` §9.2's $1.02/M-document-tokens figure —
+> **23M generated tokens**, at generation prices — plus the input side, since each call reads the
+> document. Depending on the model that is several times to tens of times the $2.35 embedding bill. `01` §9.2's $1.02/M-document-tokens figure —
 > Anthropic's, on Anthropic's assumptions, with prompt caching — implies ~$102 here. Roughly 40×
 > the embedding cost, for the same corpus.
 
@@ -2644,7 +2697,7 @@ Storage is the recurring bill, and chunk size controls it almost linearly:
 >
 > | Chunk size | Stride | Chunks | Vector bytes |
 > |---|---|---|---|
-> | 256 | 218 | ~459,800 | ~2.82 GB |
+> | 256 | 218 | ~458,700 | ~2.82 GB |
 > | 512 | 435 | ~229,900 | ~1.41 GB |
 > | 1024 | 870 | ~114,900 | ~0.71 GB |
 >
@@ -2892,7 +2945,7 @@ the baseline.
 *Unblocks:* the §12.1 cost decision, and `08`.
 
 **Lab 7 — Parent-document retrieval.**
-*Goal:* measure the §7 decoupling, which §12.2 says is nearly free.
+*Goal:* measure the §7 decoupling, which §7.3 says is nearly free.
 *Steps:* index small children (say 256 tokens) with `parent_id` pointing at their enclosing section.
 At query time, retrieve children, map to parents, dedup parents, and fill the same token budget as
 your baseline. Compare against a flat chunking at the budget-equivalent size. Count how often
@@ -2932,6 +2985,10 @@ touches the whole document; the no-op case writes nothing; the deleted section i
 ---
 
 ## 16. Interview questions and system design prompts
+
+> **In plain words.** Interviewers want to hear that you fix problems in pipeline order (parse, then clean, then cut, then model), that you measure instead of quoting "512 tokens", and that you know the silent failures: empty scans, cut-off chunks, stale chunks after deletes.
+>
+> **Real-world example.** Asked "what chunk size would you use?", a weak answer is "512 with 20% overlap". A strong one: "I'd test 256, 512 and 1,024 on our own questions at a fixed token budget, report recall and wasted tokens, and remember 20% overlap costs 25% more."
 
 This section maps the chapter's content to the questions you'll actually face — in system design
 rounds, ML-focused interviews, and architecture reviews. Each question below names the sections it
@@ -3170,10 +3227,10 @@ Walk through the methodology that avoids the common traps:
 These are open-ended prompts where the interviewer watches you navigate tradeoffs. The section
 references tell you where the facts live; the structure below tells you how to present them.
 
-**"Design the document processing pipeline for a legal RAG system with 10K filings."**
+**"Design the document processing pipeline for a RAG system over 10-K filings."**
 
 Key moves:
-- 10K filings are PDFs, often multi-column with complex tables — tier-2 parsing minimum (§3.3),
+- 10-K filings often arrive as PDFs (or PDF-like HTML exports), with complex financial tables — tier-2 parsing minimum (§3.3),
   layout model that recovers reading order and table structure.
 - Tables are the make-or-break case: serialize row-wise for retrieval, keep full HTML for
   generation, repeat the header row in every chunk of a split table (§3.4).
@@ -3328,6 +3385,147 @@ with enclosing context carried into each chunk (§3.7).
 
 ---
 
+## 17. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of problem teams hit in production: what users saw, what was measured, what fixed it, and the numbers before and after.
+>
+> **Real-world example.** Quick index: whole documents missing from answers → Case 1; answers mixing two unrelated topics → Case 2; answers missing the second half of code/JSON examples → Case 3; embedding bill 2× the estimate and repeated results → Case 4; bot quotes an outdated policy with a current citation → Case 5; search slowly getting slower after daily updates → Case 6; "bigger chunks won the test" but answers didn't improve → Case 7.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent. They are not any specific company's post-mortem. Every
+derived number (products, ratios, percentages) can be recomputed from the inputs given.
+
+### Case 1 — Scanned PDFs that silently vanish
+
+**Setup.** An internal policy assistant over 12,000 PDFs, parsed with a fast text extractor (tier 1,
+§3.3). No extraction checks.
+
+**Symptom.** Questions about older policies get "I couldn't find that". No error in any log.
+
+**Measurement/Diagnosis.** An extraction-yield check (§3.2) showed 1,800 of the 12,000 documents
+(15%) produced under 20 characters per page: they were scans with no text layer. They produced 0
+chunks and 0 vectors. On 40 golden-set questions whose answers lived in those documents, 0 of 40 were
+answered.
+
+**Fix.** A gate that routes any document under 100 characters/page to OCR. The 1,800 documents
+averaged 8 pages, so 14,400 pages; at an assumed $1.50 per 1,000 pages that is about $21.60. After
+re-ingest, 34 of 40 (85%) of those questions were answered.
+
+**Lesson.** An empty parse is data loss that reports no error. Assert on extraction yield at parse
+time and route failures loudly.
+
+### Case 2 — Two-column papers read across the gutter
+
+**Setup.** Search over 3,000 two-column research PDFs, averaging 12 pages, parsed with a geometric
+extractor.
+
+**Symptom.** Answers quote "sentences" that jump between two unrelated topics mid-clause.
+
+**Measurement/Diagnosis.** Reading 20 extracted documents by eye (§15 lab 1) found column
+interleaving in 14 of 20 (70%). Recall@budget on a 60-question golden set was 0.52.
+
+**Fix.** Re-parse with a layout model (tier 2). 3,000 × 12 = 36,000 pages; at an assumed $10 per
+1,000 pages that is $360, one time. Chunker and embedding model unchanged. Recall@budget went from
+0.52 to 0.81.
+
+**Lesson.** The team had already spent a week testing embedding models. The one hour of reading
+extracted text was the cheaper and bigger win (§1, anti-pattern 1).
+
+### Case 3 — A character-based splitter on code-heavy docs
+
+**Setup.** Developer documentation split at 2,000 characters. The embedding model's limit is 512
+tokens and it truncates silently (`01` §8).
+
+**Symptom.** Questions about the end of long JSON or code examples never find the right chunk.
+
+**Measurement/Diagnosis.** Prose ran about 4 characters per token, so a 2,000-character chunk was
+about 500 tokens, just under the limit. JSON ran about 2.2 characters per token, so the same chunk
+was about 900 tokens and everything after token 512 was never embedded (§5.4). Counting tokens
+showed 9,000 of 50,000 chunks (18%) over the limit. Recall on questions answered in the second half
+of those chunks was 0.31, against 0.84 overall.
+
+**Fix.** Split by tokens with a 480-token limit, using the embedding model's tokenizer. Each
+~900-token chunk became 2 chunks, so 50,000 + 9,000 = 59,000 chunks (+18%). Chunks over the limit:
+18% → 0%. Recall on the affected questions: 0.31 → 0.79.
+
+**Lesson.** Count tokens, not characters, and in the tokenizer of the model you actually call.
+
+### Case 4 — 50% overlap "to be safe"
+
+**Setup.** A support knowledge base of 40M tokens, 400-token chunks with 200 tokens of overlap
+(`f = 0.5`), 1,536-dimension float32 vectors.
+
+**Symptom.** The embedding bill and the index were twice the estimate, and the top 10 results often
+contained the same passage two or three times.
+
+**Measurement/Diagnosis.** `1/(1 − 0.5) = 2.0×`: 80M tokens embedded instead of 40M. Stride 200
+tokens → 200,000 chunks → 200,000 × 6,144 bytes ≈ 1.23 GB of vectors. A near-duplicate census
+(§15 lab 8) found only 6.1 distinct passages in an average top 10.
+
+**Fix.** Split at headings (§6.3) with 0 overlap: 100,000 chunks, about 0.61 GB, half the embedding
+tokens. Add near-duplicate suppression at merge time (§10.4). Distinct passages in the top 10: 6.1 →
+9.4. Recall@budget: 0.83 → 0.84, within the confidence interval, so no measurable loss.
+
+**Lesson.** Overlap costs `1/(1 − f)`, not `f`, and it fills the top-k with copies. Structure is the
+better fix for bad boundaries (§5.5).
+
+### Case 5 — Outdated policy, current citation
+
+**Setup.** An HR wiki of 2,500 pages. The update job only upserted new chunks; it never deleted old
+ones.
+
+**Symptom.** The bot says parental leave is 12 weeks, citing the current page, which says 16 weeks.
+
+**Measurement/Diagnosis.** The index held 31,400 chunks, but re-chunking the current wiki produced
+24,000. The other 7,400 (about 24% of the index) were orphans from deleted or rewritten text. On 30
+questions about policies changed in the last year, 11 of 30 answers quoted the old text.
+
+**Fix.** The diff-based update from §9.2: compare the old and new chunk IDs for each page and delete
+what is gone. Orphans: 7,400 → 0. Stale answers: 11 of 30 → 1 of 30 (the last one was a page
+nobody had re-ingested yet).
+
+**Lesson.** Deletion is part of the update, not a cleanup job. A stale chunk with a citation is
+worse than no answer (§9.2).
+
+### Case 6 — Position-based IDs and a slowly slower index
+
+**Setup.** 200,000 documents, about 40 chunks each (8M chunks), IDs like `doc_id:chunk_number`. About
+2% of documents (4,000) are edited each day, usually near the top.
+
+**Symptom.** Query p99 latency crept from 45 ms to 120 ms over a month. Ingest dashboards looked
+normal.
+
+**Measurement/Diagnosis.** An edit near the top renumbers every chunk after it, so each edited
+document re-embedded and rewrote all 40 chunks: 160,000 deletes and 160,000 inserts per day. The
+vector store marks deletes as tombstones (§9.3). After 30 days: 4.8M tombstones, 60% of the size of
+the live index.
+
+**Fix.** Content-addressed IDs (§9.1): an edit now changes about 2 chunks per document, so 8,000
+re-embeds per day, 20× fewer. Plus a weekly compaction. p99 went back to 48 ms, and daily embedding
+tokens fell by the same 20×.
+
+**Lesson.** The ID scheme decides the update cost. Churn from unstable IDs shows up months later as
+latency, not as an ingest error.
+
+### Case 7 — "Bigger chunks won the test"
+
+**Setup.** A team compared 256-token and 1,024-token chunks at top-10 using recall@10: 0.71 vs
+0.86. They switched to 1,024.
+
+**Symptom.** Answer quality didn't improve, and LLM input cost per question went up about 4×.
+
+**Measurement/Diagnosis.** Top-10 meant 2,560 tokens for small chunks and 10,240 for big ones, so
+the test compared different context budgets (§5.3). Re-scored at a fixed 4,096-token budget (16
+small chunks vs 4 big ones): recall@budget 0.84 vs 0.82, with overlapping ±0.04 intervals. But
+token-level IoU was 7.1% vs 2.0%: the big chunks carried much more irrelevant text (§11.4).
+
+**Fix.** 256-token chunks for search, with parent-section expansion (§7) capped at 4,096 tokens.
+LLM input per question: 10,240 → 4,096 tokens, 60% less, with no measurable recall change.
+
+**Lesson.** Compare chunkings at a fixed token budget and report wasted tokens, not just recall.
+
+---
+
 ## Rung ledger
 
 This document is **rung 3 — studied** (README §6). Its mechanisms — how PDF content streams work,
@@ -3352,7 +3550,7 @@ measurement is §15's job, not this document's.
 
 That restraint matters more here than in most chapters: chunking has the highest ratio of confident
 published numbers to reproducible ones in this whole track, largely because of §11.2's labeling
-trap — most comparisons are scored against labels defined by one of the strategies being compared.
+trap — many comparisons are scored against labels defined by one of the strategies being compared.
 
 The labs in §15 are what convert this to **rung 1 — measured**, and their outputs must always travel
 with their corpus, their size, their hit rule, and their token budget attached — the same discipline
