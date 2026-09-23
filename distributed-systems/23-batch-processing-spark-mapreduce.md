@@ -1843,4 +1843,193 @@ In practice, most production systems use a hybrid:
 
 ---
 
+## 17. Interview Questions
+
+> **In plain words.** Batch interviews test whether you can explain where the time goes in a big job (usually the shuffle), how the job survives failures, and how you would size and fix a slow or crashing job. Always answer with numbers: data size, partition count, memory per task.
+>
+> **Real-world example.** "Our nightly Spark job went from 1 hour to 6 hours after a marketing campaign." A strong answer: open the Spark UI, compare max vs median task time, find one 60 GB partition from a hot key, and fix it with AQE skew join or salting, instead of just adding machines.
+
+### Conceptual questions
+
+**Q1. What is a shuffle and why is it expensive?**
+*Sections: §2, §9*
+A shuffle regroups records by key across the cluster. Every map task writes its output split into `R` pieces to local disk, and every reduce task fetches its piece from all `M` map tasks, so there are `M × R` fetches. It costs serialization, disk writes, network transfer and often a sort, and it is a barrier: the next stage cannot finish until all map outputs exist. Example: 1,000 maps × 200 reducers = 200,000 blocks.
+
+**Q2. Narrow vs wide dependencies — and why do they matter?**
+*Sections: §4, §5, §12*
+Narrow: each parent partition feeds at most one child partition (`map`, `filter`, `union`), so steps are pipelined inside one task and a lost partition is rebuilt from one parent. Wide: a child partition needs data from many parents (`groupByKey`, `join` on non-co-partitioned data, `repartition`), so Spark cuts a stage boundary and shuffles. Wide dependencies set the number of stages, the shuffle cost, and how much must be recomputed after a failure.
+
+**Q3. How does Spark recover from a lost executor?**
+*Sections: §12*
+It uses lineage. Lost cached or in-progress partitions are recomputed from the nearest surviving input: shuffle files, cache, checkpoint, or the source. If the lost executor held shuffle output and there is no external shuffle service, the map tasks that wrote it are rerun too (you see "FetchFailed" and a stage retry). Checkpointing cuts long lineages; the external shuffle service keeps shuffle files alive after an executor dies.
+
+**Q4. How do you choose the number of shuffle partitions?**
+*Sections: §13, §14*
+Aim for roughly 100–200 MB per partition and at least 2–3 partitions per core. Partitions = shuffle bytes / target size. 400 GB / 128 MB = 3,200. The default `spark.sql.shuffle.partitions = 200` is right only for roughly 13–40 GB shuffles. With AQE, set the number high and let coalescing merge small partitions toward `advisoryPartitionSizeInBytes` (64 MB default).
+
+**Q5. When does Spark use a broadcast join, and when is it dangerous?**
+*Sections: §7, §13*
+When one side is under `spark.sql.autoBroadcastJoinThreshold` (10 MB default), or with a `broadcast()` hint. The small table is collected to the driver and sent to every executor, so the big side is not shuffled. Danger: raising the threshold to GBs. The table must fit in driver memory and in every executor, and it is copied to every executor (1.5 GB × 60 executors = 90 GB of network traffic).
+
+**Q6. What is data skew and how do you fix it?**
+*Sections: §13, §14*
+A few keys hold much of the data, so one task runs far longer than the rest. Detect it in the Spark UI: max task time and input far above the median. Fixes in order: remove junk keys (NULL, 0, "unknown") before joining; turn on AQE skew join (joins only); salt the hot key into `N` sub-keys and aggregate twice; split hot keys and process them separately; broadcast the small side.
+
+**Q7. How do you size executors on a 16-core, 64 GB node?**
+*Sections: §10, §14*
+Leave 1 core and a few GB for the OS and node agent. Use 4–5 cores per executor → 3 executors. Memory per container = (64 − 6) / 3 ≈ 19.3 GB, which includes overhead, so heap ≈ 19.3 / 1.1 ≈ 17 GB and overhead ≈ 2 GB. Of each heap, 300 MB is reserved and 60% of the rest is Spark's execution + storage pool.
+
+**Q8. What does AQE do?**
+*Sections: §13*
+After each shuffle stage it reads real partition sizes and re-plans the rest: merges small partitions, turns a sort-merge join into a broadcast join if one side turned out small, and splits skewed join partitions. It is on by default since Spark 3.2.
+
+**Q9. What is speculative execution and when is it unsafe?**
+*Sections: §16*
+Spark runs a backup copy of a task that is much slower than the median (multiplier × median, once a quantile of tasks has finished) and keeps whichever finishes first. It helps with bad disks or noisy neighbours. It is unsafe when tasks have side effects outside Spark's output committer: sending emails, plain INSERTs into a database, calling external APIs. Those happen twice.
+
+**Q10. Why was Spark faster than MapReduce for iterative jobs?**
+*Sections: §3*
+MapReduce writes each job's output to HDFS and the next job reads it back. A 20-iteration algorithm pays 20 full disk round trips. Spark keeps the working set in memory across iterations and chains many steps into one job with a DAG of stages, so only shuffles touch local disk.
+
+### System design prompt 1 — nightly revenue pipeline
+
+*"Design a daily job that computes revenue per product per region from 2 TB of order events, finished by 06:00, safe to re-run."*
+
+1. **Input and layout.** Parquet on S3, partitioned by `date`. Read only yesterday's partition and only needed columns. 2 TB / 128 MB = 16,384 read tasks.
+2. **Cluster.** 20 nodes × 15 usable cores = 300 slots; executors of 5 cores, ~17 GB heap + 2 GB overhead.
+3. **Joins.** Broadcast the 5 MB `regions` table. Sort-merge join with the 40 GB `products` table on `product_id`.
+4. **Shuffle sizing.** ~400 GB shuffle → 3,200 partitions (~128 MB), AQE on to merge and split.
+5. **Skew.** Profile top keys. Route `product_id = 0/NULL` rows to a separate path; AQE skew join for the rest.
+6. **Reliability.** External shuffle service (YARN) or decommissioning / remote shuffle (K8s). Speculation on, because output goes through the committer.
+7. **Idempotent output.** Overwrite only `date=D` with dynamic partition overwrite, or `MERGE`/`INSERT OVERWRITE` into Iceberg/Delta. Run data-quality checks (row count vs yesterday, no negative totals) before publishing.
+8. **Monitoring.** Alert on job duration, max/median task time, shuffle spill, and failed stage retries.
+
+**What interviewers listen for:** you compute partition counts from data size; you name the shuffle as the main cost; you pick the join strategy from table sizes; you mention skew before being asked; your re-run story does not create duplicates or delete other days.
+
+### System design prompt 2 — backfill 2 years of features
+
+*"New feature logic must be applied to 2 years of user events (≈ 730 daily partitions, 1 TB each)."*
+
+- Process in chunks (for example 7–30 days per run), not one 730 TB job. A failure then costs one chunk, not the whole backfill.
+- Each chunk writes its own date partitions with dynamic overwrite, so chunks can be retried or run in parallel.
+- Keep a progress table (which dates are done) so the backfill resumes after a crash.
+- Size one chunk, measure it, then multiply to estimate cost and time before starting.
+- Run on a separate cluster or queue so the daily jobs keep their SLA.
+
+**What interviewers listen for:** chunking, idempotent per-partition writes, resumability, cost estimate from a pilot run, isolation from production jobs.
+
+### Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| Default `spark.sql.shuffle.partitions`? | 200 | §14 |
+| Default broadcast join threshold? | 10 MB (`spark.sql.autoBroadcastJoinThreshold`) | §7 |
+| What triggers a new stage? | A wide dependency (shuffle) | §4 |
+| Default AQE target partition size? | 64 MB (`advisoryPartitionSizeInBytes`) | §13 |
+| AQE on by default since? | Spark 3.2 | §13 |
+| When is a partition "skewed" for AQE? | > 5 × median AND > 256 MB | §13, §14 |
+| Does AQE skew handling fix a skewed groupBy? | No, joins only; salt the aggregation | §14 |
+| `rdd.cache()` vs `df.cache()` default level? | MEMORY_ONLY vs MEMORY_AND_DISK | §5 |
+| Default executor memory overhead? | max(10% of heap, 384 MB) | §14 |
+| Share of heap for Spark's unified pool? | 0.6 × (heap − 300 MB) | §10 |
+| Transformations vs actions? | Transformations are lazy; actions run the job | §5 |
+| `repartition` vs `coalesce`? | repartition shuffles; coalesce merges partitions without a full shuffle | §5, §16 |
+
+### Debugging prompts
+
+**D1.** "Stage 3 shows 199 tasks finished in 40 s and 1 task running for 50 minutes. Its input is 48 GB; the median is 200 MB."
+Diagnosis: skew on the grouping or join key. Check the top keys (`groupBy(key).count().orderBy(desc("count"))`). Likely NULL/default values or a bot account. Fix: filter or separate the hot key, enable AQE skew join if it is a join, salt if it is an aggregation.
+
+**D2.** "Executors die with `Container killed by YARN for exceeding memory limits. 17.6 GB of 17.6 GB physical memory used.` This is a PySpark job with pandas UDFs."
+Diagnosis: the heap is fine, but off-heap memory (Python workers, Arrow buffers, netty) exceeded `memoryOverhead` (1.6 GB for a 16 GB heap). Fix: raise `spark.executor.memoryOverhead` (for example to 4 GB) and lower the heap so the container still fits on the node.
+
+**D3.** "Job got slower every week. Spark UI shows 'Shuffle Spill (Disk)' of 2 TB and 200 reduce tasks."
+Diagnosis: data grew but the partition count stayed at the default 200, so each task handles ~10 GB. Fix: raise shuffle partitions to reach ~128 MB each, enable AQE.
+
+**D4.** "Stages keep retrying with `FetchFailedException`, and the cluster runs on spot instances."
+Diagnosis: executors holding shuffle files are being removed, so reducers can't fetch map output and whole map stages rerun. Fix: external or remote shuffle service, graceful decommissioning, or on-demand nodes for shuffle-heavy stages.
+
+**D5.** "Driver OOM right after someone set `autoBroadcastJoinThreshold` to 2 GB."
+Diagnosis: a 1.5 GB table is now collected to the 4 GB driver and broadcast. Fix: restore a sane threshold (10–100 MB) and let a sort-merge join handle the big table.
+
+### Common mistakes
+
+- Saying "Spark is fast because it is in memory" without mentioning that shuffles still write to local disk.
+- Leaving `spark.sql.shuffle.partitions` at 200 for a 1 TB shuffle.
+- Raising the broadcast threshold to gigabytes to "avoid shuffles".
+- Assuming AQE fixes every kind of skew (it only splits skewed join partitions).
+- Turning on speculation for tasks that write to external systems without idempotency.
+- Using `mode("overwrite")` with `partitionBy` in static mode and wiping the whole table.
+- Calling `collect()` on large results.
+
+---
+
+## 18. Real-world cases — incidents with numbers
+
+> **In plain words.** These are the ways batch jobs usually go wrong in practice: wrong partition counts, one hot key, memory settings that don't match the workload, and re-runs that corrupt data. Each case shows the symptom you would see, the numbers that pointed to the cause, and the fix.
+>
+> **Real-world example.** A job that ran in 50 minutes for a year suddenly takes 5 hours. Nothing in the code changed; the data tripled and the partition count did not.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent.
+
+**Quick index:** slow job + huge spill → Case 1 · one task never finishes → Case 2 · driver OOM after config change → Case 3 · containers killed by YARN → Case 4 · history vanished after re-run → Case 5 · duplicate side effects → Case 6 · endless stage retries on spot nodes → Case 7
+
+### Case 1 — The default 200 partitions on a growing shuffle (e-commerce)
+
+- **Setup:** Daily order-enrichment job, DataFrame API, `spark.sql.shuffle.partitions = 200` (default), AQE off (Spark 3.1).
+- **Symptom:** Runtime grew from 50 minutes to 5 hours over six months.
+- **Measurement/Diagnosis:** The main join shuffles 1.2 TB. 1.2 TB / 200 ≈ 6 GB per reduce task. Each task has about 1 GB of execution memory, so the stage shows 3 TB of "Shuffle Spill (Disk)" and several OOM task retries.
+- **Fix:** Set shuffle partitions to 10,000 (1.2 TB / 10,000 ≈ 126 MB each) and enable AQE so quieter days get coalesced. Spill dropped to near zero; runtime to about 55 minutes.
+- **Lesson:** Partition count must follow data size. Compute it: shuffle bytes / ~128 MB.
+
+### Case 2 — NULL merchant IDs in a payments join
+
+- **Setup:** A payments service joins 800 GB of transactions with merchants on `merchant_id` to build settlement reports.
+- **Symptom:** 3,199 tasks finish in about 1 minute; one runs for 70 minutes. The report misses its 08:00 deadline.
+- **Measurement/Diagnosis:** 20% of transactions (card-present test transactions) have `merchant_id = NULL`: 160 GB, all hashing to one partition. The Spark UI shows max input 160 GB vs median 250 MB.
+- **Fix:** NULL keys can never match in an inner join, so filter them before the join (`isNotNull`) and route them to a separate report. Stage time went from 70 minutes to about 2 minutes. AQE skew join was enabled as a safety net for other hot keys.
+- **Lesson:** Look at the key distribution first. NULLs and default values are the most common hot keys.
+
+### Case 3 — Raising the broadcast threshold to "avoid shuffles"
+
+- **Setup:** Someone set `spark.sql.autoBroadcastJoinThreshold = 2GB` to speed up a join. Driver: 4 GB heap. 60 executors.
+- **Symptom:** The job now fails with driver `OutOfMemoryError` on days when the dimension table grows.
+- **Measurement/Diagnosis:** The dimension table is 1.5 GB on disk (larger in memory). It is collected to the driver, then sent to all 60 executors: 1.5 GB × 60 = 90 GB of broadcast traffic, and each executor holds a hash table of it.
+- **Fix:** Threshold back to 64 MB; the 1.5 GB table goes through a sort-merge join. Runtime went from failing to a stable 25 minutes.
+- **Lesson:** Broadcast is great for tables in the tens of MB, not GBs. The table must fit on the driver and on every executor.
+
+### Case 4 — Containers killed for exceeding memory (IoT telemetry, PySpark)
+
+- **Setup:** IoT telemetry job using pandas UDFs. Executors: 16 GB heap, default overhead max(10%, 384 MB) = 1.6 GB, container 17.6 GB.
+- **Symptom:** `Container killed by YARN for exceeding memory limits. 17.6 GB of 17.6 GB physical memory used.` Tasks retry, and the job fails after 4 attempts.
+- **Measurement/Diagnosis:** JVM heap usage peaks at 11 GB, so the heap is not the problem. Python workers and Arrow buffers live outside the heap and use about 3 GB per executor, which is more than the 1.6 GB overhead.
+- **Fix:** Heap 14 GB + `spark.executor.memoryOverhead = 4g` = 18 GB container (fits the node). No more kills.
+- **Lesson:** Python, Arrow and native libraries use overhead memory, not heap. Size the overhead for them.
+
+### Case 5 — "Overwrite" deleted two years of history (bank ledger)
+
+- **Setup:** A bank's daily ledger rollup writes `df.write.mode("overwrite").partitionBy("date").parquet(path)`, where `df` holds one day.
+- **Symptom:** After a routine re-run, the table contains only one date. 730 daily partitions are gone.
+- **Measurement/Diagnosis:** `spark.sql.sources.partitionOverwriteMode` was the default `static`, which clears the whole output path before writing. The job had "worked" for months only because it previously wrote to a new path each day.
+- **Fix:** Restore from backups; set `partitionOverwriteMode = dynamic` so only the dates in `df` are replaced; later move the table to Iceberg and use `INSERT OVERWRITE` / `MERGE` with snapshot history for rollback.
+- **Lesson:** Test re-runs on a copy before relying on them. Know which overwrite mode you are in.
+
+### Case 6 — Speculation duplicated customer alerts (IoT telemetry)
+
+- **Setup:** A batch job scans device telemetry and, inside `foreachPartition`, sends "battery low" emails through an HTTP API. `spark.speculation = true`.
+- **Symptom:** About 3% of customers receive the same alert twice.
+- **Measurement/Diagnosis:** Of 2,000,000 alerts, about 60,000 were duplicates. They all came from partitions where a speculative copy ran; both copies called the email API before one was killed.
+- **Fix:** Write alerts to a table (committed once by Spark) and let a separate sender deliver them with an idempotency key (`device_id + date`). Duplicates went to 0.
+- **Lesson:** Tasks may run more than once (retries and speculation). Side effects inside tasks must be idempotent or moved out.
+
+### Case 7 — Spot instances and lost shuffle files (video platform on Kubernetes)
+
+- **Setup:** Nightly video-analytics job on Kubernetes, executors on spot nodes, no external or remote shuffle service.
+- **Symptom:** Runtime swings between 2 and 6 hours. Logs show repeated `FetchFailedException` and "Resubmitting stage".
+- **Measurement/Diagnosis:** About 10% of spot nodes are reclaimed per hour. Each lost executor takes its shuffle files with it, so the map stage that produced them reruns, and the next reclaim can hit that rerun too.
+- **Fix:** Enable graceful decommissioning with shuffle block migration and move shuffle data to a remote shuffle service (for example Apache Celeborn); keep the driver on an on-demand node. Runtime settled at about 2 hours.
+- **Lesson:** Shuffle files are state. Cheap, short-lived nodes need somewhere safe to keep them.
+
+---
+
 *Next: Chapter 24 covers distributed caching (TinyLFU, ARC) as referenced in the roadmap. The batch processing patterns described here integrate with the stream processing foundation from [Chapter 22](./22-stream-processing-flink-watermarks-eos.md) — together they cover the full Lambda/Kappa spectrum. For the lakehouse table formats (Iceberg, Delta Lake) that unify batch and streaming output, see `databases/22-data-lake-lakehouse.md`.*

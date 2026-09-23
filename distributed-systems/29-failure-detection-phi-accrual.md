@@ -2,6 +2,7 @@
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The Fundamental Problem of Failure Detection](#1-the-fundamental-problem-of-failure-detection)
 2. [Heartbeat-Based Detection](#2-heartbeat-based-detection)
 3. [Timeout Tuning — The Art and Science](#3-timeout-tuning--the-art-and-science)
@@ -10,10 +11,100 @@
 6. [Failure Detector Properties — Chandra-Toueg Classification](#6-failure-detector-properties--chandra-toueg-classification)
 7. [Production Pitfalls and War Stories](#7-production-pitfalls-and-war-stories)
 8. [Design Patterns and Recommendations](#8-design-patterns-and-recommendations)
+9. [Interview Questions — Failure Detection](#9-interview-questions--failure-detection)
+10. [Real-world cases — incidents with numbers](#10-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** In a cluster, machines have to decide whether their peers are still alive. The only
+evidence is messages: "I'm alive" pings (heartbeats) that arrive, or don't. A missing message could
+mean the peer crashed, or just that it is slow, paused, or cut off by the network, and you cannot
+tell which from the outside. Declare death too fast and you kick out healthy machines; too slow and
+you keep sending work to a dead one. This chapter is about making that call well.
+
+**A real-world example.** A ride-hailing dispatch service runs on 12 nodes. Each node owns the live
+sessions of about 5,000 of 60,000 online drivers. Every node sends a heartbeat to its peers once
+per second. (Numbers are illustrative.)
+
+- **Fixed short timeout (1.5 s).** A node hits a 2 s JVM garbage-collection pause a few times a day.
+  Each time, peers see 2+ s of silence and declare it dead. Its 5,000 driver sessions move to the
+  other 11 nodes (about 9% more load each). The node wakes up, rejoins, and the sessions move back.
+  Riders see "searching for driver" hiccups several times a day, and nothing actually broke.
+- **Fixed long timeout (30 s).** No false alarms, but when a node really crashes, its 5,000 drivers
+  get no ride offers for 30 s.
+- **Phi accrual detector (§4).** Instead of one fixed number, each node learns what "normal" looks
+  like for each peer (average gap 1 s, how much it varies) and outputs a suspicion score φ. With
+  Akka-style defaults (threshold 8, 3 s grace for pauses, 100 ms minimum spread), a 2 s GC pause
+  (3 s of silence) scores φ ≈ 0, while a real crash crosses φ = 8 after about 4.5 s of silence.
+- **SWIM-style indirect probes and suspicion (§5).** Before convicting, ask 3 other nodes to ping
+  the suspect. If any of them gets an answer, the problem was one network path, not the node.
+- **Fencing with epochs (§8).** If the "dead" node was only paused and wakes up still thinking it
+  owns its drivers, its writes carry an old epoch number and the database rejects them.
+- **Health checks (§8).** A node whose heartbeat thread is fine but whose request threads are
+  deadlocked still looks alive to heartbeats. A `/readyz` check that does real work catches it.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Heartbeat | a small "I'm alive" message sent on a schedule | a roommate texting "home safe" every night |
+| Timeout | how long to wait before assuming the worst | "if they haven't called by 10 pm, start worrying" |
+| False positive | declaring a healthy node dead | calling the police because a friend's phone battery died |
+| False negative | missing a real crash | not noticing the fridge stopped working until the milk goes bad |
+| Phi (φ) accrual | a suspicion score that rises the longer the silence lasts, scaled to how unusual that silence is | a parent's worry that grows each minute a usually-punctual teenager is late |
+| Threshold | the φ value at which you act | "after 2 hours late, I call around" |
+| Inter-arrival time | the gap between two heartbeats | the time between a bus and the next one |
+| Sliding window | the last W gaps, used to learn what is normal | remembering the last 1,000 bus gaps, forgetting older ones |
+| Gossip | nodes pass news to a few random peers, who pass it on | office rumors spreading |
+| SWIM / indirect probe | if a node doesn't answer me, ask others to try | "can you call her? She isn't picking up for me" |
+| Suspicion + incarnation | a "maybe dead" state the node can refute by saying "I'm alive, version 2" | a missing-person report cancelled when the person calls in |
+| Gray failure | partly broken: alive for heartbeats, broken for real work | a shop with the lights on but nobody at the till |
+| Fencing token / epoch | a number that grows with each new owner; old owners' actions get rejected | changing the locks after a new tenant moves in |
+| GC pause | the program freezes to clean memory | a cashier stopping to count the drawer |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `T_hb` | heartbeat interval: how often "I'm alive" is sent | 100 ms – 10 s | 1 s |
+| `k` | timeout multiplier for a fixed timeout | 3 – 10 | 3 missed beats → dead |
+| `T_timeout` | fixed timeout `= k × T_hb` | 1 – 40 s | 3 × 1 s = 3 s |
+| `N` | number of nodes in the cluster | 3 – 10,000 | 12 dispatch nodes |
+| `W` | sliding window size (number of stored gaps) | 100 – 1000 | Cassandra and Akka: 1000 |
+| `x_i` | one observed gap between heartbeats | ≈ `T_hb` | 1003 ms |
+| `μ` | mean (average) gap in the window | ≈ `T_hb` | 1000 ms |
+| `σ`, `σ²` | standard deviation / variance of gaps (how jittery) | 5 – 200 ms | 50 ms |
+| `t_now`, `t_last` | current time; arrival time of the last heartbeat | — | 12:00:05.2 and 12:00:04.0 |
+| `Δt` | silence so far `= t_now − t_last` | — | 1.2 s |
+| `z` | how many σ above the mean the silence is: `(Δt − μ)/σ` | — | (1200 − 1000)/50 = 4 |
+| `F(t)` | chance a live node's heartbeat arrives within `t` (CDF) | 0 – 1 | F(1100 ms) ≈ 0.977 |
+| `P_later(Δt)` | chance a live node's heartbeat would be even later `= 1 − F(Δt)` | — | 0.023 at 1100 ms |
+| `φ` (phi) | suspicion `= −log10(P_later)`; φ = 1, 2, 3, 8 ↔ 10%, 1%, 0.1%, 10⁻⁸ | 0 – ∞ | φ = 4.5 at Δt = 1200 ms (μ 1000, σ 50) |
+| `phi_convict_threshold` | Cassandra's φ threshold for marking a node DOWN | 8 (10–12 on cloud) | exponential model: 8 ↔ ≈ 18.4 × μ of silence |
+| Akka `threshold` | Akka's φ threshold for "unreachable" | 8 | — |
+| `acceptable-heartbeat-pause` | Akka grace added to the mean | 3 s | mean 1 s + 3 s = 4 s |
+| `min-std-deviation` | Akka floor on σ | 100 ms | observed σ 5 ms → use 100 ms |
+| `SRTT`, `RTTVAR`, `RTO` | TCP-style smoothed average, smoothed deviation, timeout | — | RTO = SRTT + 4 × RTTVAR |
+| `α`, `β` | smoothing weights for SRTT / RTTVAR | 1/8, 1/4 | new SRTT = 7/8 old + 1/8 sample |
+| `G` | clock granularity in the RTO formula | 1 – 10 ms | — |
+| `T_min` | hard floor on any computed timeout | 2 × `T_hb` | 2 s |
+| `jitter_fraction` | random spread added to heartbeat times | 0.1 – 0.5 | 1 s + up to 0.3 s |
+| SWIM period `T`, `k` helpers | probe period; number of nodes asked for an indirect ping | 1 s; 3 | ping-req via 3 nodes |
+| incarnation `i` | a node's own version counter used to refute suspicion | grows by 1 | suspect(B, 4) beaten by alive(B, 5) |
+| suspicion timeout | how long a suspect has to refute before it is declared dead | a few seconds, scaled by `log N` | — |
+| `f` | number of faulty (possibly lying) nodes tolerated | 1 – 2 | need f + 1 independent suspicions |
+| `P, ◇P, S, ◇S, W, ◇W` | Chandra–Toueg failure detector classes (§6) | — | ◇ = "eventually" |
+| epoch / fencing token | number that increases with each new leader or lock holder | grows by 1 | writes with epoch 5 rejected after epoch 6 |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. The Fundamental Problem of Failure Detection
+
+> **In plain words.** From outside, a crashed machine and a very slow machine look the same: both stay silent. So every failure detector guesses, and sometimes guesses wrong. Wrongly calling a healthy node dead is often worse than being a bit slow to notice a real crash, because the reaction (moving its work) adds load everywhere.
+>
+> **Real-world example.** A bank's ledger database has a primary and a standby. A 10 s network blip makes the standby think the primary died; it promotes itself, and for a few minutes two machines think they are the primary. Waiting 30 s would have avoided the failover but meant 30 s of downtime on a real crash.
 
 ### Why Perfect Detection Is Impossible
 
@@ -70,6 +161,10 @@ There is no configuration that achieves both instant detection and zero false po
 ---
 
 ## 2. Heartbeat-Based Detection
+
+> **In plain words.** Each node regularly says "I'm alive". If a peer stops hearing it for long enough, it gets suspicious. You can send the message directly to everyone (simple, but expensive with many nodes) or pass it around by gossip. Spread the send times out so all nodes do not talk at the same instant.
+>
+> **Real-world example.** 500 nodes heartbeating everyone every second is 500 × 499 = 249,500 messages per second. With gossip, each node talks to one random peer per second, about 500 gossip exchanges per second in total, and news still reaches everyone within a handful of rounds.
 
 ### Fixed-Interval Heartbeat Protocols
 
@@ -158,6 +253,10 @@ This deterministically spreads heartbeats across the interval without randomness
 ---
 
 ## 3. Timeout Tuning — The Art and Science
+
+> **In plain words.** A single fixed timeout is either too short on a bad day or too long on a good day. Better: learn the normal gap and its jitter, and set the timeout from them (like TCP does). But never let it get tighter than a safe floor.
+>
+> **Real-world example.** Heartbeats arrive every 1000 ms ± 1 ms on a quiet network, so a learned timeout might shrink to 1005 ms. The next harmless 50 ms delay then evicts a healthy node. A floor of 2 s prevents that.
 
 ### Why Static Timeouts Fail in Production
 
@@ -275,6 +374,10 @@ Where `T_min` is a hard floor (e.g., 2x the heartbeat interval). Akka enforces a
 ---
 
 ## 4. The Phi (φ) Accrual Failure Detector — Deep Dive
+
+> **In plain words.** Instead of "alive or dead", the detector gives a suspicion score φ. The score asks: how unusual is this silence for this node? φ = 1 means a live node would be this late 10% of the time, φ = 2 means 1%, φ = 3 means 0.1%, φ = 8 means one in 100 million. Each application picks its own threshold.
+>
+> **Real-world example.** Heartbeats normally arrive every 1000 ms with a spread of 50 ms. After 1050 ms of silence φ ≈ 0.8 (nothing unusual). After 1200 ms φ ≈ 4.5. After 1300 ms φ ≈ 9, over the common threshold of 8.
 
 ### Origin and Motivation
 
@@ -466,6 +569,10 @@ When a node first joins the cluster or first contacts a new peer, there are no s
 
 ## 5. Advanced Failure Detection Patterns
 
+> **In plain words.** If a node does not answer me, maybe only my path to it is broken. SWIM asks a few other nodes to try before raising the alarm, and even then first marks the node "suspect" so it can answer "I'm alive" before it is thrown out. Lifeguard adds: if I am the slow one, I should be slower to accuse others.
+>
+> **Real-world example.** Node A's ping to B times out after 500 ms. A asks C, D and E to ping B; E gets an answer, so B stays in. If none answer, B is marked suspect for a few seconds; B sees this and gossips "alive, incarnation 5", which overrides "suspect, incarnation 4".
+
 ### SWIM Protocol Failure Detection
 
 SWIM (Scalable Weakly-consistent Infection-style Process Group Membership) takes a fundamentally different approach from heartbeat-based detection. Instead of each node monitoring every other node via continuous heartbeats, SWIM uses randomized probing:
@@ -560,6 +667,10 @@ Byzantine failure detection -- where a node may actively lie about its liveness 
 
 ## 6. Failure Detector Properties — Chandra-Toueg Classification
 
+> **In plain words.** Theory grades failure detectors on two things: does it eventually catch every crash (completeness), and does it avoid accusing healthy nodes (accuracy)? The key result: to reach agreement you do not need a perfect detector, only one that is eventually right about at least one healthy node.
+>
+> **Real-world example.** Raft's election timeout makes mistakes during network trouble (extra elections), but once the network is stable it stops falsely suspecting the leader, and that is enough for the cluster to keep agreeing on the log.
+
 Chandra and Toueg (1996) formalized failure detectors as distributed oracles that provide (possibly incorrect) hints about which processes have crashed. They defined two orthogonal properties:
 
 ### Completeness
@@ -605,6 +716,10 @@ Chandra and Toueg showed that **$\Diamond\mathcal{W}$ (eventually weak) is suffi
 ---
 
 ## 7. Production Pitfalls and War Stories
+
+> **In plain words.** Most false alarms come from the node or network being slow, not dead: garbage-collection pauses, CPU starvation, clock jumps, one-way network problems. And some real failures are invisible to heartbeats, because the heartbeat thread still works while everything else is broken.
+>
+> **Real-world example.** A JVM node pauses 6 s for garbage collection a few times a day. With a 3 s timeout, each pause becomes a "crash", its data is re-streamed to other nodes, and their extra load causes more pauses.
 
 ### GC Pauses and False Failure Detection
 
@@ -670,6 +785,10 @@ SWIM's indirect ping mechanism partially addresses this: if B cannot directly re
 ---
 
 ## 8. Design Patterns and Recommendations
+
+> **In plain words.** Use several layers of checks, because each catches different problems. Give leader detection a longer, safer timeout than everything else. And assume the detector will sometimes be wrong: make sure a node wrongly declared dead cannot do damage when it wakes up (fencing).
+>
+> **Real-world example.** A payments service uses TCP keepalives, a 1 s heartbeat with phi threshold 8, a /readyz check every 5 s, and an external probe every minute. The old leader with epoch 5 wakes after a pause and tries to write; the database has already seen epoch 6 and rejects it.
 
 ### Multi-Layer Detection
 
@@ -771,6 +890,252 @@ Leader A (epoch=5)               Storage              Leader B (epoch=6)
 | **Bootstrapping** | Seed the arrival window with the configured heartbeat interval; use fixed timeout until sufficient samples |
 | **Thundering herd** | Jitter heartbeat scheduling by 10-50% of the interval |
 | **Partial failures** | Multi-layer detection: network + process heartbeat + application health check + external monitoring |
+
+---
+
+## 9. Interview Questions — Failure Detection
+
+> **In plain words.** Interviewers want to see that you know a missing heartbeat is ambiguous, that
+> every timeout trades speed against false alarms, and that you design for the wrong call (fencing,
+> suspicion states) instead of pretending the detector is perfect.
+>
+> **Real-world example.** "Our 12-node dispatch cluster evicts a node a few times a day and it is
+> always back within 3 seconds. What do you change?" A strong answer: check GC logs, switch from a
+> 1.5 s fixed timeout to phi accrual with a pause allowance, add a suspicion step, and fence writes.
+
+### Conceptual questions
+
+**Q1. Why can't a failure detector be perfect?**
+*Sections: §1, §6.*
+In an asynchronous network there is no upper bound on message delay or process pause. A crashed
+node and a node that is merely very slow (GC, congestion, partition) produce the same observation:
+silence. Any finite timeout will sometimes convict a slow node (false positive); an infinite one
+never detects crashes. FLP shows consensus is impossible deterministically in this model;
+Chandra–Toueg show that an *unreliable* detector that is eventually accurate (◇W / ◇S) is enough
+for consensus with a correct majority.
+
+**Q2. Explain the phi accrual detector and what φ = 8 means.**
+*Sections: §4.*
+Keep a window of recent heartbeat gaps; fit a distribution (normal in the paper, exponential in
+Cassandra). With `Δt` the silence since the last heartbeat, compute `P_later(Δt)`, the chance a
+live node would be this late, and output `φ = −log10(P_later)`. φ = 1, 2, 3 mean 10%, 1%, 0.1%;
+φ = 8 means 10⁻⁸ under the model. The application picks the threshold. Real delays are
+heavier-tailed than the model, so the true false-suspicion rate is higher.
+
+**Q3. Why is a threshold on φ better than a fixed timeout?**
+*Sections: §3, §4.*
+It adapts to each peer and each network: a peer with jittery gaps (σ = 200 ms) automatically gets
+a longer effective timeout than one with steady gaps. It also separates mechanism from policy: a
+load balancer can act at φ = 3, a leader election at φ = 10, both from the same detector.
+
+**Q4. Why do Akka and Cassandra modify the textbook formula?**
+*Sections: §3, §4.*
+With a normal model and a steady network, σ shrinks to a few ms and a 50 ms hiccup produces a
+huge φ. Akka adds `acceptable-heartbeat-pause` (3 s) to the mean and floors σ at 100 ms. Cassandra
+uses an exponential model (`φ ≈ 0.434 × Δt/μ`), which grows linearly and tolerates long gaps, and
+drops overly long intervals from the window.
+
+**Q5. How does SWIM differ from all-to-all heartbeating?**
+*Sections: §2, §5.*
+All-to-all costs O(N²) messages per interval (500 nodes ≈ 249,500). SWIM has each node ping one
+random peer per period, with `k` indirect pings through helpers on failure: O(1) expected load per
+node. First detection takes about e/(e−1) ≈ 1.58 periods on average regardless of N; gossip then
+spreads it in O(log N) periods. Suspicion plus incarnation numbers let a live node refute.
+
+**Q6. What is a gray failure and why do heartbeats miss it?**
+*Sections: §7, §8.*
+The node is partly broken: heartbeat thread fine, request path broken (deadlocked pool, bad disk,
+5% packet loss). Heartbeats only prove the heartbeat thread runs. You need application-level
+health checks, outlier detection on real request errors/latency, and client-side signals.
+
+**Q7. A node was declared dead but was only paused. What stops it from corrupting data?**
+*Sections: §8.*
+Fencing. Every new owner gets a higher epoch/token; storage rejects writes with a lower one.
+Leases add self-fencing: the old owner stops acting when its lease expires, assuming bounded clock
+drift.
+
+### System design prompts
+
+**Prompt A. Design membership and failure detection for a 2,000-node cache cluster across 3 availability zones.**
+
+1. *Requirements:* detect crashes within ~5 s, false evictions below about one per day cluster-wide,
+   no O(N²) traffic.
+2. *Dissemination:* SWIM-style probing (1 s period, 3 indirect helpers) plus piggybacked gossip;
+   membership changes reach all nodes in O(log N) periods.
+3. *Suspicion:* suspect state with a timeout that scales with log N and shrinks as independent
+   suspicions arrive (Lifeguard); incarnation numbers for refutation.
+4. *Local health:* a node that is itself slow widens its own timeouts (Lifeguard LHM) so an
+   overloaded node does not accuse everyone else.
+5. *Cross-zone:* a longer probe timeout for cross-zone targets; do not evict a whole zone at once —
+   cap evictions per minute (for example, at most 5% of nodes) and alert a human beyond that.
+6. *Action:* on confirmed failure, reassign key ranges; the new owner gets a new epoch.
+7. *Gray failures:* clients report per-node error rates; outlier ejection removes nodes with 5x the
+   median error rate even if they answer pings.
+
+*What interviewers listen for:* message complexity; the suspect/confirm split; a cap on mass
+eviction; fencing; recognizing that the detector's own node can be the sick one.
+
+**Prompt B. Choose leader failure detection for a Raft-based config store serving 50,000 clients.**
+
+1. Heartbeat 100 ms, election timeout randomized in [1000, 2000) ms (10x–20x), longer across regions.
+2. Measure p99.9 RTT and GC/fsync pauses first; the election timeout must be well above them.
+3. Pre-vote and check-quorum so a partitioned node cannot disrupt the cluster, and a leader that
+   loses its majority steps down.
+4. Client sessions/leases use a separate, longer timeout (for example 10 s) than leader election,
+   because losing a client session deletes its locks.
+5. Fencing tokens on every lock handed to clients.
+
+*What interviewers listen for:* separate timeouts for separate decisions; randomization against
+split votes; quorum instead of a single observer; no correctness dependence on timing.
+
+### Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| Formula for φ? | `φ = −log10(P_later(t_now − t_last))`, `P_later = 1 − F` | §4 |
+| φ = 1 / 2 / 3 mean? | 10% / 1% / 0.1% chance a live node would be this late (under the model) | §4 |
+| Cassandra default `phi_convict_threshold`? | 8; often raised to 10–12 on cloud | §3, §4 |
+| Cassandra's model? | Exponential: `φ = Δt / (μ ln 10)`; φ = 8 ↔ ≈ 18.4 μ of silence | §4 |
+| Akka defaults? | threshold 8, window 1000, min σ 100 ms, pause 3 s, heartbeat 1 s | §4 |
+| Normal model, μ = 1000 ms, σ = 50 ms, Δt = 1200 ms? | z = 4 → P_later ≈ 3.2×10⁻⁵ → φ ≈ 4.5 | §4 |
+| Why use a monotonic clock? | NTP steps make wall-clock gaps jump, causing false positives | §7 |
+| TCP RTO formula? | `SRTT + max(G, 4·RTTVAR)`, α = 1/8, β = 1/4 | §3 |
+| SWIM message load per node? | O(1) expected per period | §5 |
+| How does a SWIM node refute suspicion? | Gossip `alive` with a higher incarnation number | §5 |
+| Weakest detector for consensus? | ◇W (equivalent to ◇S), with a correct majority | §6 |
+| Kubernetes default before pod eviction? | node grace period, then 300 s taint toleration | §5 |
+
+### Debugging prompts
+
+**D1.** *Symptoms:* nodes flap DOWN/UP every few hours, each episode lasts 2–6 s, always the same
+JVM service, CPU and network look normal. *Diagnosis:* stop-the-world GC pauses longer than the
+detector tolerates. Check GC logs for pauses that line up with the DOWN events. *Fix:* reduce
+pause times (heap sizing, ZGC/Shenandoah), and add a pause allowance or raise the threshold.
+
+**D2.** *Symptoms:* a new custom detector works for weeks on a quiet network, then after a deploy
+every tiny hiccup causes evictions; logs show σ ≈ 2 ms. *Diagnosis:* σ collapsed on a very steady
+network, so a 60 ms delay is z = 30. *Fix:* floor σ (100 ms) and floor the timeout.
+
+**D3.** *Symptoms:* at exactly 03:00 all nodes suspect all others at once, then recover. *Diagnosis:*
+wall-clock step from NTP; intervals were measured with `System.currentTimeMillis()`. *Fix:*
+monotonic clock.
+
+**D4.** *Symptoms:* 10% of checkout requests time out, but the membership view shows all nodes
+healthy. *Diagnosis:* gray failure on one of 10 nodes (heartbeat thread fine, worker pool
+deadlocked). *Fix:* readiness checks that exercise the real path; outlier ejection on request errors.
+
+**D5.** *Symptoms:* one overloaded node reports many *other* nodes as suspect. *Diagnosis:* the
+accuser is the sick one: it processes acks too slowly. *Fix:* Lifeguard-style local health
+multiplier; require corroboration before conviction.
+
+### Common mistakes
+
+- Treating φ = 8 as a literal "one in 100 million" guarantee; real delays have heavy tails.
+- Saying the paper's normal model is what Cassandra uses (Cassandra uses an exponential model).
+- One timeout for everything: leader election, client sessions, and load-balancer ejection need
+  different thresholds.
+- Forgetting that the detector's *action* (rebalancing) adds load and can cause more false positives.
+- Measuring gaps with wall-clock time.
+- No fencing: assuming a node declared dead has actually stopped.
+- Relying only on heartbeats and missing gray failures.
+
+---
+
+## 10. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent. Case 10.5 is based on a public postmortem.
+
+**Quick index:** flapping nodes after GC → 10.1 · evictions from tiny hiccups → 10.2 · everyone
+suspects everyone at one instant → 10.3 · errors but "all nodes healthy" → 10.4 · short partition
+causes a long outage → 10.5 · Kubernetes node NotReady under CPU load → 10.6
+
+### 10.1 Chat presence service: fixed timeout versus GC pauses
+
+- **Setup.** A chat app's presence service runs on 40 JVM nodes holding 2 million WebSocket
+  connections (50,000 per node). Heartbeat 1 s, fixed timeout 3 s.
+- **Symptom.** About 120 evictions per day, each followed by the node rejoining within 10 s. Every
+  eviction forces 50,000 clients to reconnect, and users see "offline" flicker.
+- **Measurement/Diagnosis.** GC logs show 4–8 s full-GC pauses, about 3 per node per day
+  (40 × 3 = 120), matching the evictions one to one. No crash was found in any of them.
+- **Fix.** Heap tuning plus a low-pause collector brought the worst pause below 500 ms. The detector
+  moved to phi accrual (threshold 8, 3 s pause allowance, 100 ms σ floor), so a real crash is
+  convicted after about 4.5 s of silence instead of 3 s. False evictions fell from about 120 per
+  day to about 1 per week.
+- **Lesson.** Look at what the detector is catching before tuning it. A 1.5 s slower detection of
+  real crashes bought a large drop in self-inflicted outages.
+
+### 10.2 IoT telemetry: the detector that learned to be too strict
+
+- **Setup.** A telemetry ingest cluster of 16 nodes on a dedicated, very quiet network. A homegrown
+  phi detector with the normal model and no σ floor.
+- **Symptom.** After weeks of calm, nodes start getting evicted by routine 50–100 ms hiccups
+  (a log rotation, a kernel scheduling delay).
+- **Measurement/Diagnosis.** The window shows μ = 1000 ms, σ = 2 ms. A 1060 ms gap is
+  z = 30 → φ ≈ 197, far over the threshold of 8.
+- **Fix.** Floor σ at 100 ms: the same 1060 ms gap is now z = 0.6 → φ ≈ 0.56. Also add
+  `T_min` = 2 s. Evictions from hiccups dropped to zero.
+- **Lesson.** Adaptive detectors can adapt themselves into hypersensitivity. Always floor σ and the
+  timeout.
+
+### 10.3 Payments cluster: the 03:00 clock step
+
+- **Setup.** A payments service with 30 nodes measures heartbeat gaps with the wall clock.
+  μ = 1000 ms, σ = 100 ms.
+- **Symptom.** At 03:00 the time daemon steps the clock forward by 2 s. Within one second, every
+  node suspects most peers; 8 nodes are evicted and payment authorizations fail for 40 s while
+  ownership moves around.
+- **Measurement/Diagnosis.** A heartbeat received 0.5 s earlier now looks 2.5 s old: z = 15 →
+  φ ≈ 50. The eviction times match the clock-step log line.
+- **Fix.** Measure intervals with a monotonic clock (`System.nanoTime()` / `CLOCK_MONOTONIC`) and
+  configure the time daemon to slew instead of step. Zero repeat events in the following quarter.
+- **Lesson.** Durations need monotonic time; wall-clock time is for showing dates to people.
+
+### 10.4 E-commerce checkout: alive for heartbeats, dead for customers
+
+- **Setup.** Checkout runs on 10 nodes behind a load balancer; SWIM-based membership; the load
+  balancer's health check is a TCP connect.
+- **Symptom.** 10% of checkouts time out after 5 s. Membership shows 10/10 healthy.
+- **Measurement/Diagnosis.** One node's worker pool (200 threads) is deadlocked on a lock; its
+  heartbeat and accept threads are fine. 100% of its requests time out, and it receives 1/10 of
+  traffic.
+- **Fix.** A `/readyz` check that runs a real lightweight checkout path every 5 s (fail after
+  2 misses) and outlier ejection when a node's error rate is 5x the median. The bad node is removed
+  within about 10 s; the error rate drops from 10% to 0.1% (normal baseline).
+- **Lesson.** Heartbeats prove that the heartbeat thread is alive, nothing more. Check the path
+  customers use.
+
+### 10.5 Public postmortem: GitHub, October 21, 2018
+
+- **Setup.** GitHub ran MySQL clusters managed by Orchestrator, which detects failed primaries and
+  promotes replicas, across East Coast and West Coast data centers.
+- **Symptom.** Network connectivity between the US East Coast network hub and the primary East
+  Coast data center was lost for **43 seconds**. Orchestrator promoted West Coast replicas to
+  primary during that window.
+- **Measurement/Diagnosis.** When connectivity returned, both sides had accepted writes the other
+  did not have, and application traffic now went across the country to the new primaries. GitHub
+  ran in a degraded state for **24 hours and 11 minutes** while it restored and reconciled data.
+- **Fix.** Among the follow-ups GitHub described: changing the Orchestrator configuration so
+  primaries are not promoted across regional boundaries.
+- **Lesson.** The detector was "right" that the primary was unreachable, but a 43 s partition
+  triggered an action whose cost was a full day. Match the failover action and its blast radius to
+  the detector's confidence; make cross-region promotion a deliberate decision.
+
+### 10.6 Video platform: Kubernetes node NotReady under CPU starvation
+
+- **Setup.** A video transcoding cluster on Kubernetes. The kubelet updates node status every 10 s;
+  the node is marked NotReady after a 40 s grace period; pods are evicted after a further 300 s.
+  No CPU is reserved for system daemons.
+- **Symptom.** During upload peaks, nodes flip to NotReady; some stay long enough that 30
+  transcoding pods are evicted and restarted, losing up to 5 minutes of work each.
+- **Measurement/Diagnosis.** Transcoder pods use 100% of node CPU; the kubelet misses status
+  updates for 45–60 s (more than 4 intervals), crossing the 40 s grace period. The node never
+  crashed.
+- **Fix.** Reserve CPU for system daemons (`system-reserved`/`kube-reserved`, e.g. 1 core per
+  node) and set CPU limits on transcoder pods. Longest kubelet status gap fell from 60 s to under
+  12 s; NotReady events went from about 20 per week to 0.
+- **Lesson.** A starving heartbeat sender is the classic false positive. Give the component that
+  proves liveness its own guaranteed resources.
 
 ---
 
