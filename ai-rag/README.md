@@ -84,6 +84,7 @@ keeps every claim honest by construction.
 | `appendix-c-eval-recipe-book.md` | Copy-pasteable eval setups | planned |
 | [`appendix-d-doc-processing-benchmarks.md`](appendix-d-doc-processing-benchmarks.md) | Parser, chunker, embedding, vector store benchmarks and best choices by use case | **written** |
 | [`appendix-e-deployment-and-compute.md`](appendix-e-deployment-and-compute.md) | Compose vs Kubernetes, model serving, GPU sizing and scheduling, pipeline orchestration, compute cost | **written** |
+| [`appendix-f-recall-at-every-layer.md`](appendix-f-recall-at-every-layer.md) | Every "recall" in the pipeline (span survival, token, embedding, ANN, candidate, context, citation, abstention, judge) on one page: what each counts, its answer key, a worked example, and a per-stage leak report | **written** |
 
 ---
 

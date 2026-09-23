@@ -942,6 +942,9 @@ a monitor, not from a recall regression three weeks later.
 > **Real-world example.** An index with 0.99 ANN recall inside a pipeline with retrieval recall 0.72 costs at most about 1 point. Spending a week to push ANN recall to 0.999 cannot fix the other 27 missing points.
 
 This section exists because of a naming collision that causes real confusion in real design reviews.
+[Appendix F](appendix-f-recall-at-every-layer.md) lists **every** "recall" in this folder (chunking,
+embedding, index, candidate, context, citation, abstention, judge) on one page, with one worked
+question and a per-stage leak report.
 
 ### 7.1 The two recalls
 

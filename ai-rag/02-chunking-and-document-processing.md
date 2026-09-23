@@ -120,7 +120,7 @@ sentence that was lost while reading the PDF can never be found.
 | idempotent | running the same step twice gives the same result, no duplicates | — | re-ingesting a document doesn't create a second copy |
 | MinHash / Jaccard | a way to find *near*-duplicate texts by comparing overlapping word sets | similarity 0 – 1 | two versions of the same footer, 0.95 similar |
 | golden set | your own list of real questions with the correct answer marked | 50 – 500 | "How many sick days?" → leave policy §2 |
-| recall@k | share of questions whose correct answer appears in the top `k` | 0 – 1 | 45 of 50 found in top 5 → 0.9 |
+| recall@k | share of the correct passages found in the top `k`; with one correct passage per question it equals the share of questions answered in the top `k` (hit rate). All the "recalls": [appendix F](appendix-f-recall-at-every-layer.md) | 0 – 1 | 45 of 50 found in top 5 → 0.9 |
 | recall ceiling / `⊇` | "can be at most": each step can only keep or lose information | — | parsed ⊇ cleaned ⊇ chunked: nothing lost in parsing can be found later |
 | `O(corpus)` | cost grows with the size of the whole collection | — | changing chunk size = re-chunk + re-embed everything |
 

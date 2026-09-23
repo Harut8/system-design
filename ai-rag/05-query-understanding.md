@@ -142,7 +142,7 @@ four strategies on every question would cost 20,000 calls a day — 8 times more
 | `similarity_threshold` | minimum cosine similarity for a semantic cache hit | 0.92 – 0.95 | 0.93: "deploy a container" ≈ "deploying containers" |
 | `ttl_hours`, `max_size` | cache entry lifetime and capacity | 24 h, 10,000 entries | corpus updates daily → 24 h TTL |
 | `max_turns`, `max_chars` | how much chat history the resolver sees | 5 turns, 2,000 chars | referent is usually in the last 2 – 3 turns |
-| recall@k | share of questions whose correct chunk is in the top `k` | 0 – 1 | 164 of 200 found in top 20 → 0.82 |
+| recall@k | share of the correct chunks found in the top `k`; with one correct chunk per question it equals the share of questions answered in the top `k` (hit rate). All the "recalls": [appendix F](appendix-f-recall-at-every-layer.md) | 0 – 1 | 164 of 200 found in top 20 → 0.82 |
 | nDCG@k | ranking quality: rewards correct chunks near the top | 0 – 1 | 0.65 → 0.71 after rewriting |
 | pp | percentage points: absolute difference between two percentages | — | 72% → 78% = +6 pp |
 | Jaccard (top-10) | overlap of two result sets: shared ÷ total distinct | 0 – 1 | 8 shared of 12 distinct → 0.67 |
