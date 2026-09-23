@@ -33,6 +33,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The problem, the metrics, and what "recall" means exactly](#1-the-problem-the-metrics-and-what-recall-means-exactly)
 2. [How the indexes work — the math behind every parameter](#2-how-the-indexes-work--the-math-behind-every-parameter)
 3. [Measure index recall before you tune anything](#3-measure-index-recall-before-you-tune-anything)
@@ -53,9 +54,50 @@
 
 ---
 
+## Start here — the whole chapter in plain words
+
+Imagine an online music service with **10 million songs**. Each song has been turned into a list of
+768 numbers (an *embedding*, see `01`) that describes how it sounds. You play a song and ask for
+"10 songs like this one".
+
+- **The slow way:** compare your song with all 10 million, one by one, and keep the 10 closest.
+  Always correct, but it takes about a third of a second per request, on a machine that can serve
+  only a handful of users at once. That's **brute force**.
+- **The fast way:** build a **vector index** ahead of time, a kind of map of which songs sound
+  similar. At query time you follow the map and look at only ~3,000 songs instead of 10 million.
+  The answer comes back in ~1 ms.
+- **The catch:** the map is a shortcut, so sometimes it misses a song that really belonged in the
+  top 10. If 9 of the 10 songs you got back are in the true top 10, your **recall** is 0.9 (90%).
+- **Everything in this chapter is about that trade:** how fast, how much memory, how many true
+  matches you're willing to miss, and what breaks in real life (filters like "only songs available
+  in my country", deleted songs, data that doesn't fit in memory).
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Vector / embedding | a list of numbers describing a piece of text | GPS coordinates, but with 768 numbers instead of 2 |
+| Distance / similarity | how close two vectors are | how far apart two places are on a map |
+| Brute force (flat) | compare with everything | reading every book in the library to find similar ones |
+| ANN index | a shortcut structure that avoids comparing with everything | the library's catalogue and shelf signs |
+| Recall | what share of the true best matches you actually got | you asked for the 10 best; 9 were right → 90% |
+| HNSW | a graph where each item links to similar items | "friends of friends": ask people who know people |
+| IVF | groups similar items into buckets and searches only a few | a supermarket's aisles: go only to the aisles that match |
+| Quantization | storing numbers with less precision to save memory | a thumbnail instead of the full-size photo |
+| Filter | "only results where tenant = X" | "nearest pharmacy that is *open now*" |
+| Tombstone | a deleted item still sitting in the index, marked dead | a closed shop still printed on the map |
+
+If a section below gets too technical, read its **In plain words** box and the example, and skip
+the rest until you need it.
+
+---
+
 ## 1. The problem, the metrics, and what "recall" means exactly
 
 ### 1.0 Why an index at all — the brute-force cost
+
+> **In plain words.** Searching without an index means comparing the question with every single stored item. That's fine for a few thousand items and far too slow for millions. An index is a shortcut that looks at a tiny fraction of the items and is usually right.
+>
+> **Real-world example.** A company help-center bot with 20,000 articles doesn't need an index at all: comparing against 20,000 vectors takes under a millisecond. The same bot for a bank with 10 million chat transcripts does — brute force there takes ~0.3 s per question and melts the server at 20 questions per second.
+
 
 Given a query vector `q ∈ ℝ^d` and a corpus `X = {x_1 … x_N}`, the retriever needs the `k` vectors
 closest to `q`. Exact search (a "flat" index) computes all `N` distances:
@@ -119,6 +161,11 @@ ASC` works; the operator class must match the operator (`vector_cosine_ops` ↔ 
 runs a sequential scan.
 
 ### 1.1 Recall — the exact definitions
+
+> **In plain words.** Recall answers one question: *of the results that really were the closest, how many did the index find?* You get the true answer by running the slow brute-force search once, then compare. Recall 0.95 means the index found 95 out of every 100 true best matches.
+>
+> **Real-world example.** You ask for the 10 products most similar to a red running shoe. The perfect answer (brute force) contains 10 specific shoes. The index returns 10 shoes, 9 of which are in that perfect list and 1 is the 11th-best shoe. Recall = 9/10 = 0.9. Note that the miss is *nearly* right, not random. Also note: recall says nothing about whether the customer actually likes those shoes — that's relevance, a different measurement (`08`).
+
 
 Let `G_k(q)` be the true top-k for query `q` (from brute force, same metric) and `A_k(q)` be what the
 index returned.
@@ -221,6 +268,11 @@ They are separable, and debugging requires separating them:
 
 ## 2. How the indexes work — the math behind every parameter
 
+> **In plain words.** There are only a few basic ideas: (1) check everything (flat), (2) sort items into buckets and check a few buckets (IVF), (3) link each item to similar items and walk the links (HNSW, DiskANN), and (4) store smaller, rounded copies of the vectors to save memory (quantization). Every parameter you'll see is a dial on one of these four ideas.
+>
+> **Real-world example.** Finding a restaurant similar to your favourite one in a big city: (1) visit every restaurant; (2) go only to the 3 neighbourhoods known for that cuisine; (3) ask the owner for a similar place, then ask that owner, and so on; (4) decide using the short menu summary instead of reading the full menu.
+
+
 You cannot tune a parameter you can't explain. This section gives the mechanism of each index
 family precisely enough to predict what a knob will do before you turn it.
 
@@ -232,6 +284,11 @@ other indexes as the final rescoring step. Every store has it: pgvector (no inde
 FAISS `IndexFlatIP` / `IndexFlatL2`, Qdrant `exact=True`.
 
 ### 2.2 IVF — inverted file (clustering)
+
+> **In plain words.** IVF sorts all vectors into buckets of similar items ahead of time (like aisles in a supermarket). At query time it finds the few buckets closest to the question and searches only inside them. `nlist` = how many buckets exist; `nprobe` = how many buckets you check per question. More buckets checked = more accurate, slower.
+>
+> **Real-world example.** In a supermarket you look for pasta sauce in the "Pasta" aisle and maybe the "Sauces" aisle (nprobe = 2) — not in all 40 aisles. If the store put one pesto jar in "Italian specialties", you miss it unless you also check that aisle (nprobe = 3). That's exactly how IVF loses recall: an item sitting at the edge between two buckets.
+
 
 **Build.** Run k-means on (a sample of) the corpus to get `nlist` centroids `c_1 … c_nlist`. Assign
 every vector to its nearest centroid. Each centroid owns a "list" (a cell) of vectors.
@@ -274,6 +331,11 @@ flattens; typical useful range is `nprobe/nlist` of 0.5%–5%.
   16,384 × 768) plus a list ID per vector. No graph.
 
 ### 2.3 HNSW — Hierarchical Navigable Small World graph
+
+> **In plain words.** HNSW links each vector to a handful of similar vectors, like a social network. To search, start somewhere, look at your neighbours, move to whichever is closest to the question, and repeat until nobody closer can be found. Extra "express" layers on top let you jump across the whole dataset in a few steps first, like taking the highway before local streets. Three dials: **M** = how many links each item has; **ef_construction** = how carefully links are chosen when an item is added; **ef_search** = how many promising paths you keep open while searching.
+>
+> **Real-world example.** Looking for a good plumber in a new city: you ask a colleague, who names a friend who's closer to what you need, who names someone even better. If you only ever follow the single best tip (`ef_search` = 1), you may hit a dead end. If you keep a list of the 100 best tips so far and keep checking them (`ef_search` = 100), you almost always find the best plumber, but it takes more calls.
+
 
 HNSW is the default in pgvector, Qdrant, Weaviate, Milvus, Elasticsearch/OpenSearch (Lucene), and
 Redis. Every node is a vector; edges connect it to nearby vectors; search walks the graph greedily
@@ -421,6 +483,11 @@ It trades a few milliseconds of latency for ~10–30× less RAM. pgvectorscale's
 Milvus `DISKANN`, and Azure/SQL Server implementations follow this design.
 
 ### 2.5 Quantization — how the compressed numbers are computed
+
+> **In plain words.** Each vector is 768+ numbers stored with high precision (4 bytes each). Quantization stores them more roughly: 1 byte each (int8, 4× smaller), or just "positive/negative" (1 bit, 32× smaller), or as short codes (PQ). The rough version is used to *find candidates quickly*; the exact version is then used to *re-check the best few*.
+>
+> **Real-world example.** Choosing a holiday photo: you scroll through thumbnails (small, fast, slightly blurry) to pick your 20 favourites, then open those 20 at full resolution to choose the best one. Thumbnails alone might confuse two similar photos; the full-size check fixes that. Binary quantization is like describing each photo with yes/no answers: with 20 questions many photos look alike; with 3,000 questions they're easy to tell apart — which is why binary works for large embeddings and poorly for small ones.
+
 
 §6 covers *when* to use each. Here is *what* each does to a vector.
 
@@ -577,6 +644,11 @@ Two rules:
 
 ## 3. Measure index recall before you tune anything
 
+> **In plain words.** Before you change any setting, measure how accurate the index is today. It's easy: take a few hundred real user questions, find their true best matches with brute force (the answer key), and compare with what the index returns. Then every tuning change is judged by a number, not a feeling.
+>
+> **Real-world example.** It's like checking your car's speedometer against GPS before a road trip. Two vector databases compared at their default settings is like comparing two cars where one is in eco mode and the other in sport mode — you learn about the modes, not the cars. Set both to the same accuracy (e.g. 95% recall), *then* compare speed and cost.
+
+
 This section is a protocol. Everything after it assumes you have run it.
 
 ### 3.1 You get ground truth for free — use it
@@ -707,6 +779,11 @@ recall@10 = 0.96; 4% of queries below 0.8". That second number is what turns int
 ---
 
 ## 4. HNSW parameters in anger
+
+> **In plain words.** `M` and `ef_construction` are decided when the index is built — changing them means rebuilding (hours for large data). `ef_search` can be changed on every query for free. So: build once with generous settings, then tune `ef_search` until you hit your accuracy target at acceptable speed.
+>
+> **Real-world example.** Building the road network of a city (`M`, `ef_construction`) is expensive and done once. Choosing how many alternative routes your GPS compares for each trip (`ef_search`) is free and can change per trip. Also: when the city doubles in size, the GPS must compare more routes to stay as accurate — re-tune `ef_search` after big data growth.
+
 
 The mechanism is in §2.3 (and, with proofs, `../databases/11-hnsw-vector-search-internals.md` §7). This is the operational
 delta: what you can change when, in what order, and what breaks.
@@ -839,6 +916,11 @@ getting `lists` wrong is the usual reason people conclude "IVF doesn't work":
 
 ## 5. The memory arithmetic
 
+> **In plain words.** Memory needed ≈ number of vectors × bytes per vector. A 768-number vector at 4 bytes per number is ~3 KB; the graph links add ~150 bytes; ids and metadata a bit more. Multiply, then multiply again by the number of copies (replicas). Do this before choosing any product — it rules out many options in five minutes.
+>
+> **Real-world example.** A SaaS product with 10 million document chunks and a 768-dim model: 10M × ~3.4 KB ≈ 34 GB per copy, ~100 GB with 3 replicas. That already fits one large Postgres server. Switch to a 3072-dim model and it's ~130 GB per copy — the same product idea now needs quantization or a different architecture.
+
+
 This is arithmetic, not measurement, and it should be done on a napkin *before* you pick a store —
 it eliminates most of the option space in five minutes.
 
@@ -915,6 +997,11 @@ overlap decision made carelessly in the chunker is a 25% line item in this table
 ---
 
 ## 6. Quantization, and the rescoring trick that makes it work
+
+> **In plain words.** Store small, rough copies of the vectors in memory for the fast search, and keep the full copies (in memory or on disk) to double-check only the top few dozen candidates. You get most of the memory savings with almost none of the accuracy loss. *Oversampling* = how many extra candidates you double-check (e.g. 4× means check 40 to return 10).
+>
+> **Real-world example.** An online store with 60M product vectors cuts memory from ~390 GB to ~20 GB by searching on 1-bit codes, fetching 40 candidates, and re-ranking those 40 with the full vectors from SSD. Recall stays ~0.97, latency goes up by a few milliseconds (§17 Case 6).
+
 
 ### 6.1 The one structural idea
 
@@ -1074,6 +1161,11 @@ distance boundaries. Prefer truncation first for that reason — and note that t
 
 ## 7. Filtered search — the actual hard problem
 
+> **In plain words.** Real searches almost always come with a condition: "only this customer's documents", "only documents I'm allowed to read", "only the last 90 days". Vector indexes are built to find the nearest items overall, not the nearest items *that also match a condition*. When the condition matches only a small share of the data, a naive index returns too few results or misses the right ones.
+>
+> **Real-world example.** "Find the nearest pharmacy that's open now" at 2 a.m. If your app finds the 10 nearest pharmacies and then removes the closed ones, you may be left with none, although an open one exists 3 km away. That's post-filtering. The fixes: search only among open pharmacies from the start (pre-filter), keep looking further until you have enough open ones (iterative scan), or keep a separate list of 24-hour pharmacies (partitioning). In a SaaS product, the small customers are the "2 a.m." case: their data is a tiny share of the index (§17 Case 2).
+
+
 Everything above concerns unfiltered top-k. Almost no production query is unfiltered. Queries look
 like *"nearest neighbours in tenant 4471, in documents this user may read, from the last 90 days,
 excluding archived."* This is where vector indexes actually break, and where published benchmarks
@@ -1223,6 +1315,11 @@ the twenty minutes it takes to find out.
 ---
 
 ## 8. Updates, deletes, and index drift
+
+> **In plain words.** You can't cleanly remove an item from a graph index, because other items' links pass through it. So deletes just mark the item as dead and keep it in place. Over months, dead items pile up, waste memory, slow searches and lower accuracy — without anyone changing anything. The fix is regular cleanup or a full rebuild.
+>
+> **Real-world example.** A city map where closed shops aren't erased, just stamped "CLOSED". Your GPS still routes past them and wastes time checking them. After a year, a third of the shops on the map are closed and your searches find noticeably worse results. A company wiki where pages are edited every day gets exactly this: every edit deletes old chunks and adds new ones (§17 Case 3).
+
 
 Benchmarks measure a freshly built index. Yours will have been through months of inserts, updates
 and deletes. This section covers what those do to a graph index, mechanically, and what each store
@@ -1379,6 +1476,11 @@ every ~10 weeks, or monthly for margin.
 ---
 
 ## 9. Where the bytes live: RAM, SSD, object storage
+
+> **In plain words.** An HNSW search jumps to thousands of random places in the data. Jumps inside RAM are nearly free; each jump to an SSD takes ~0.1 ms; thousands of them make a query slow. A normal database index (B-tree) needs only 3–4 jumps, which is why it's fine on disk. So graph indexes live in RAM, or use special disk-friendly designs, or (for many small, rarely used datasets) live in cheap cloud storage and get loaded when needed.
+>
+> **Real-world example.** A dictionary (B-tree): open near the right letter, 3–4 page flips, done — works fine even if the book is in another room. A treasure hunt (HNSW): each clue points to another clue somewhere else; if all clues are on your desk (RAM) you finish in a minute; if each clue is in a different building (disk), you spend the day walking. A "chat with your files" app with 400,000 users keeps each user's data in cheap cloud storage and loads it when the user opens the app, instead of paying for all of it in RAM 24/7 (§17 Case 7).
+
 
 ### 9.0 Why HNSW wants RAM when a B-tree is happy on disk
 
@@ -1557,6 +1659,11 @@ the architecture.
 
 ## 10. pgvector versus a dedicated store
 
+> **In plain words.** If you already use Postgres and have up to roughly 10–50 million vectors, keep them in Postgres with pgvector: one system, transactions, SQL filters and permissions in the same query. Move to a dedicated vector database only when you hit a specific limit (memory, speed under load, filtering, thousands of tenants) — not because "everyone uses one".
+>
+> **Real-world example.** Adding a room to your house versus building a second house. The extra room shares the plumbing, heating and front door (backups, monitoring, access control). A second house makes sense only when the first one can't hold everything — and you then have two houses to maintain and keep in sync.
+
+
 The most common real decision in this space. It deserves to be made on thresholds rather than vibes.
 
 ### 10.1 What Postgres gives you that is easy to undervalue
@@ -1622,6 +1729,11 @@ from the artifacts you kept (`02` §2).
 ---
 
 ## 11. The 2026 landscape — what each store actually offers, and how to pick
+
+> **In plain words.** Don't start from a ranking of databases. Write down your needs (how many vectors, how many customers, what filters, how fresh, what budget), then check which products meet them. Usually two or three do; test those on your own data for a week and pick.
+>
+> **Real-world example.** Buying a car: first write down "5 seats, city driving, €30K, charging at home", then look at models. Starting from "which car is the best?" gets you a sports car for a family of five.
+
 
 Vendor rankings go stale within months, and each vendor's own benchmark favours its defaults (§3.3).
 This section gives you three durable tools instead: a feature matrix, a decision flow with numeric
@@ -1751,6 +1863,11 @@ will have to run them yourself.
 ---
 
 ## 12. Cost model for the index layer
+
+> **In plain words.** Most of the index cost is fixed: you pay for memory and servers every month whether or not anyone searches. Add storage, the compute to answer queries, and — often forgotten — the compute to rebuild the index regularly.
+>
+> **Real-world example.** Like renting a shop: rent (memory) is due every month even with no customers; electricity (query compute) grows with traffic; and the yearly renovation (index rebuilds) is a real cost that no one puts in the plan.
+
 
 `11-token-accounting-and-cost.md` handles tokens. The index is the other half, and it is the half
 that is fixed cost — it accrues whether or not anyone queries.
@@ -2029,6 +2146,11 @@ vendor's warm number.
 
 ## 16. Interview questions and system design prompts
 
+> **In plain words.** In interviews, first explain the idea in one simple sentence (the analogies in this chapter are fine to use), then give one number, then name one trade-off. Only go into formulas if asked.
+>
+> **Real-world example.** "What is `ef_search`?" → "How many candidate results HNSW keeps while searching, like how many routes a GPS compares. Higher is more accurate and slower; it must be at least the number of results you want, or you get fewer results back."
+
+
 Same format as `01` §17: each question names the sections it draws from and gives the answer
 structure an interviewer is listening for, not just the facts.
 
@@ -2234,6 +2356,11 @@ operator class (§1.0.1).
 ---
 
 ## 17. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a real kind of problem teams hit in production: what users saw, why it happened in simple terms, the numbers, and the fix.
+>
+> **Real-world example.** Quick index: fewer results than asked for → Case 1; small customers get nothing → Case 2; quality slowly gets worse → Case 3; model too big for pgvector → Case 4; filter added later doesn't work → Case 5; memory bill too high → Case 6; fast in tests, slow in production → Case 7.
+
 
 These are **composite scenarios** built from failure modes documented in the pgvector, Qdrant and
 turbopuffer docs cited in this chapter and from common production patterns. They aren't specific
