@@ -29,6 +29,10 @@ Prerequisites: Distributed filesystems (HDFS/S3) from `14-distributed-filesystem
 
 ## 1. Batch Processing Fundamentals
 
+> **In plain words.** Batch processing means "take a pile of data that is already complete, crunch all of it, write the result." Nobody waits for an answer in real time, so the goal is to finish the whole pile as cheaply and reliably as possible, not to answer in milliseconds.
+>
+> **Real-world example.** An e-commerce site runs a job at 02:00 that reads yesterday's 2 TB of order events and writes revenue per product per region. If it finishes by 06:00, the finance dashboard is fresh for the morning. A streaming system would cost more and give the same number.
+
 ### What Batch Processing Is
 
 Batch processing is the execution of a series of computations on a **finite, bounded dataset** without manual intervention. The defining characteristics: the input is complete before processing begins, latency is measured in minutes to hours (not milliseconds), and throughput is the primary optimization target.
@@ -85,12 +89,17 @@ Workloads where batch wins:
 5. Cost
    Batch clusters scale to zero between runs.
    Streaming clusters run 24/7.
-   For workloads that tolerate hourly latency, batch is 3-10x cheaper.
+   For workloads that tolerate hourly latency, batch is often several
+   times cheaper (exact ratio depends on cluster size and duty cycle).
 ```
 
 ---
 
 ## 2. MapReduce: The Original Distributed Batch Framework
+
+> **In plain words.** MapReduce splits a huge job into many small pieces. "Map" looks at each record on its own and tags it with a key. The framework then moves all records with the same key to the same machine (the "shuffle"). "Reduce" combines each key's records into one answer.
+>
+> **Real-world example.** Counting votes in a national election: each polling station (map) counts its own ballots per candidate. The counts are sent to one regional office per candidate (shuffle). Each office adds up its candidate's numbers (reduce). 10,000 stations work in parallel; only small totals travel.
 
 ### The Core Abstraction
 
@@ -203,7 +212,8 @@ Reduce side:
   THIS is why MapReduce is slow:
   • Every intermediate result is written to disk (map side spill)
   • All data for a reducer crosses the network (all-to-all shuffle)
-  • Reduce cannot start until ALL mappers finish (barrier synchronization)
+  • Reduce cannot start until ALL mappers finish (barrier synchronization;
+    reducers may start COPYING early, but reduce() waits for the last map)
 ```
 
 ### Multi-Stage MapReduce
@@ -270,14 +280,19 @@ Hadoop 2.x / 3.x Architecture:
   RM tries to schedule map tasks on the same node as the HDFS block.
   "Move computation to data, not data to computation."
 
-  Block placement (HDFS default replication = 3):
-  Block B1 → Node 1 (local), Node 3 (rack-local), Node 7 (off-rack)
-  Map task for B1 → prefer Node 1, then Node 3, then any node.
+  Block placement (HDFS default replication = 3, default policy):
+  Block B1 → Node 1 (writer's node, rack A), Node 7 and Node 8 (both on rack B)
+  Map task for B1 → prefer a node holding B1 (node-local: 1, 7 or 8),
+  then another node on rack A or B (rack-local), then any node (off-rack).
 ```
 
 ---
 
 ## 3. MapReduce Limitations and the Road to Spark
+
+> **In plain words.** MapReduce writes every intermediate result to disk and reads it back for the next step. For jobs with many steps, or jobs that loop over the same data many times, most of the time is spent on disk I/O. Spark's fix: keep intermediate data in memory.
+>
+> **Real-world example.** A fraud model trained with 20 passes over a 100 GB dataset. MapReduce reads and writes 100 GB on every pass: 20 × 200 GB = 4 TB of disk traffic. Spark reads 100 GB once, caches it in cluster memory, and does the other 19 passes from RAM.
 
 ### Why MapReduce Wasn't Enough
 
@@ -300,17 +315,18 @@ MapReduce Pain Points:
    │iter 0│      │iter 1│      │iter 2│      │iter 3│
    └──────┘      └──────┘      └──────┘      └──────┘
    Each iteration: read entire graph + ranks, compute, write back.
-   20 iterations × 100 GB graph = 4 TB of I/O for what should be in-memory.
+   20 iterations × (100 GB read + 100 GB write) = 4 TB of I/O for what
+   should be in-memory.
 
 3. No native support for interactive queries
    Each query is a new MR job: JVM startup, task scheduling, HDFS read.
-   Simple COUNT(*) on a cached dataset: 30+ seconds.
+   Even a simple COUNT(*) takes tens of seconds (there is no in-memory cache).
 
 4. Only Java (practically)
    Hadoop Streaming allowed Python/Ruby, but with serialization overhead.
 
 5. High operational complexity
-   HDFS NameNode = single point of failure (before HA federation).
+   HDFS NameNode = single point of failure (before NameNode HA in Hadoop 2.x).
    Tuning: 200+ XML configuration parameters.
    Map task count, reduce task count, sort buffer size, spill percentage,
    JVM heap, shuffle buffer — all manual.
@@ -339,6 +355,7 @@ Spark:
 
   ┌───────────────────────────────────────────────────────────┐
   │  Logistic Regression (100 iterations, 100 GB input)       │
+  │  (illustrative numbers, in line with the Spark papers)    │
   │                                                           │
   │  Hadoop MapReduce:  ~110 minutes (read from HDFS × 100)   │
   │  Spark (cached):    ~5 minutes   (read from HDFS × 1,     │
@@ -356,6 +373,10 @@ Spark:
 ---
 
 ## 4. Apache Spark Architecture
+
+> **In plain words.** One "driver" program plans the work and hands out tasks. Many "executors" (worker processes) do the tasks, one data partition per task. Work is cut into "stages" at every point where data must be moved between machines (a shuffle).
+>
+> **Real-world example.** A kitchen: the head chef (driver) reads the order and splits it into steps. 50 cooks (executors) chop vegetables in parallel, each with their own bowl (partition). When dishes must be regrouped by table (shuffle), everyone stops, passes plates, then the next step starts. Fewer regrouping points = faster service.
 
 ### Cluster Architecture
 
@@ -380,7 +401,8 @@ Spark Cluster Architecture:
              │  DAG of stages  │  task assignments
              │                 │
 ┌────────────▼─────────────────▼──────────────────────────────┐
-│  Cluster Manager (YARN / Kubernetes / Standalone / Mesos)    │
+│  Cluster Manager (YARN / Kubernetes / Standalone; Mesos was  │
+│  deprecated in Spark 3.2)                                    │
 │  Allocates executor containers on worker nodes               │
 └────────────┬─────────────────┬──────────────────────────────┘
              │                 │
@@ -483,6 +505,10 @@ Physical stages (DAG scheduler):
                          │
                          ▼ action: collect() / save()
 
+  (The global orderBy adds one more range-partitioning shuffle before the
+   final sort; it is folded into Stage 3 here for brevity. If `items` were
+   under 10 MB, Spark would broadcast it and Stage 1's shuffle would vanish.)
+
   Stage 0 and Stage 1 can run in PARALLEL (no dependency between them).
   Stage 2 waits for BOTH to complete (join requires both sides).
   Stage 3 waits for Stage 2.
@@ -491,6 +517,10 @@ Physical stages (DAG scheduler):
 ---
 
 ## 5. The RDD Abstraction
+
+> **In plain words.** An RDD is a big dataset split into pieces, plus the recipe for how each piece was made. Spark doesn't run the recipe until you ask for a result. If a machine dies and a piece is lost, Spark re-runs the recipe for just that piece instead of keeping backup copies.
+>
+> **Real-world example.** A 1 TB clickstream split into 8,000 partitions. `filter` and `map` are narrow: partition 17 only needs input partition 17, so if it is lost Spark redoes 1 of 8,000 pieces. `groupByKey` is wide: every output partition needs data from all 8,000 inputs, so that step costs a full shuffle.
 
 ### Resilient Distributed Datasets
 
@@ -527,6 +557,10 @@ Narrow (pipelineable):             Wide (requires shuffle):
   Examples: map, filter, flatMap    Examples: groupByKey, reduceByKey,
             union (of aligned)                join, repartition, distinct
 
+  Note: an operation is narrow if the parent is ALREADY partitioned the
+  right way, e.g. reduceByKey or join on RDDs that share the same
+  partitioner needs no new shuffle.
+
   Pipelined within same stage.      Stage boundary — requires shuffle.
   Failure: recompute one partition.  Failure: recompute all parent partitions
                                      that fed this partition.
@@ -555,9 +589,10 @@ Why lazy evaluation matters:
   rdd.count()  // NOW the entire pipeline executes
 
   Benefits:
-  1. Optimizer can fuse transformations (pipeline map + filter)
-  2. Can eliminate dead branches (transformation chain never used)
-  3. Can push predicates down (filter before map)
+  1. Spark can fuse transformations (pipeline map + filter in one task)
+  2. Branches that no action uses are never computed
+  3. With DataFrames/SQL, Catalyst can also reorder work (push filters
+     down, prune columns). The RDD API does NOT reorder your lambdas.
   4. Only materializes what's needed for the action
 ```
 
@@ -567,7 +602,9 @@ Why lazy evaluation matters:
 Storage levels for RDD persistence:
 ════════════════════════════════════
 
-rdd.persist(StorageLevel.MEMORY_ONLY)      // default for .cache()
+rdd.persist(StorageLevel.MEMORY_ONLY)      // default for rdd.cache()
+                                           // (DataFrame.cache() defaults
+                                           //  to MEMORY_AND_DISK)
 rdd.persist(StorageLevel.MEMORY_AND_DISK)
 rdd.persist(StorageLevel.DISK_ONLY)
 rdd.persist(StorageLevel.MEMORY_ONLY_SER)  // serialized, less memory
@@ -599,6 +636,10 @@ When cache is evicted (LRU per executor):
 
 ## 6. Spark SQL and the DataFrame API
 
+> **In plain words.** DataFrames are tables with named, typed columns. Because Spark can see which columns and filters you use, it can plan the work much better than with raw RDD code, like a database does with SQL.
+>
+> **Real-world example.** `orders.filter(status == 'completed').groupBy('region').sum('amount')` on a Parquet table with 40 columns: Spark reads only the 3 columns it needs and skips row groups that can't contain 'completed'. If the columns are similar in size, reading 3 of 40 cuts the bytes read by about 92%.
+
 ### From RDDs to DataFrames
 
 ```
@@ -624,9 +665,11 @@ Spark SQL (all versions):
   → Same Catalyst optimizer, same Tungsten execution.
 
   ┌────────────────────────────────────────────────────────┐
-  │  All three APIs compile down to the SAME physical plan │
-  │  through Catalyst. The choice is about ergonomics,     │
-  │  not performance.                                      │
+  │  DataFrame, Dataset and SQL all go through Catalyst;   │
+  │  DataFrame code and the same SQL give the SAME plan.   │
+  │  Caveat: typed Dataset lambdas (ds.map(p => ...)) are  │
+  │  opaque to Catalyst, and the RDD API skips it entirely,│
+  │  so those can be slower.                               │
   └────────────────────────────────────────────────────────┘
 ```
 
@@ -674,6 +717,10 @@ Step 5: Code Generation (Tungsten)
 ---
 
 ## 7. Catalyst Optimizer Deep Dive
+
+> **In plain words.** Catalyst is Spark's query planner. It rewrites your query into an equivalent but cheaper one (filter earlier, drop unused columns) and then picks how to run each step, especially which join method to use.
+>
+> **Real-world example.** Joining 2 TB of orders with a 5 MB country table: Catalyst sees the small side is under 10 MB and sends a copy of it to every executor (broadcast join). The 2 TB side never moves over the network. Without that, both sides would be shuffled.
 
 ### Rule-Based Optimization
 
@@ -763,6 +810,10 @@ Spark's join strategies (ordered by preference):
 
 ## 8. Tungsten Execution Engine
 
+> **In plain words.** Tungsten makes each machine faster. It stores rows as compact bytes instead of Java objects (less memory, less garbage collection) and generates one tight loop for a whole stage instead of calling many small functions per row.
+>
+> **Real-world example.** A Person("Alice", 30) takes about 96 bytes as Java objects but 32 bytes as a Tungsten row. On 1 billion rows that is roughly 96 GB vs 32 GB of memory, which decides whether the data fits in cache or spills to disk.
+
 ### The Motivation
 
 ```
@@ -791,22 +842,21 @@ Standard Java objects:
   │ padding (4 bytes)                        │
   └──────────────────────────────────────────┘
 
-  Total for one Person("Alice", 30):  ~120 bytes
+  Total for one Person("Alice", 30):  ~96 bytes (32 + 32 + 32, 8-byte
+                                      aligned, no compressed oops)
   Actual useful data:                 ~9 bytes (5 chars + 4 byte int)
-  Overhead: ~13x
+  Overhead: ~11x
 
-Tungsten binary format:
-  ┌──────────────────────────────────┐
-  │ null bitmap: 0b00 (2 bits)       │  ← no nulls
-  │ field 1 offset: 16 (4 bytes)     │
-  │ field 2 value: 30 (4 bytes)      │  ← int stored inline
-  │ field 1 length: 5 (4 bytes)      │
-  │ field 1 data: "Alice" (5 bytes)  │
-  │ padding (3 bytes)                │
-  └──────────────────────────────────┘
+Tungsten binary format (UnsafeRow):
+  ┌─────────────────────────────────────────────┐
+  │ null bitset (8 bytes, 1 bit per field)      │  ← no nulls
+  │ field 1 slot: offset + length of "Alice"    │  (8 bytes)
+  │ field 2 slot: 30, int stored inline         │  (8 bytes)
+  │ variable-length area: "Alice" (5 B + 3 pad) │  (8 bytes)
+  └─────────────────────────────────────────────┘
 
-  Total: ~24 bytes
-  5x less memory, no GC pressure, cache-friendly layout.
+  Total: 32 bytes, one contiguous block
+  ~3x less memory, no per-object headers, no GC pressure, cache-friendly.
 ```
 
 ### Whole-Stage Code Generation
@@ -844,15 +894,21 @@ With whole-stage codegen (Tungsten):
   }
 
   Eliminates: virtual dispatch, boxing, row-at-a-time overhead.
-  Operates on columnar batches (1024 rows), SIMD-friendly.
+  Reads columnar batches from Parquet/ORC (4096 rows by default,
+  spark.sql.parquet.columnarReaderBatchSize).
   Compiled by JVM JIT → machine code with loop unrolling, vectorization.
 
-  Speedup: 2-10x over interpreted Volcano for scan-heavy workloads.
+  Speedup: often several-fold over the Volcano model for CPU-bound
+  scan/filter/aggregate stages (varies a lot by query).
 ```
 
 ---
 
 ## 9. Shuffle Internals
+
+> **In plain words.** A shuffle regroups data by key across the cluster: every map task writes one file split by destination, and every reduce task pulls its slice from every map task. It is usually the slowest and most failure-prone part of a job.
+>
+> **Real-world example.** 1,000 map tasks and 200 reduce partitions means 1,000 × 200 = 200,000 small blocks to fetch. If 400 GB is shuffled, each reduce partition gets about 2 GB, which often does not fit in memory and spills to disk.
 
 ### Spark Shuffle Architecture
 
@@ -865,9 +921,13 @@ Lifecycle of a shuffle:
 Map side (shuffle write):
   1. Each task processes one partition of the input RDD
   2. For each record: compute target partition = hash(key) % numReducePartitions
-  3. Buffer records in a PartitionedAppendOnlyMap (in-memory hash map)
-  4. When buffer fills (spark.shuffle.spill.initialMemoryThreshold = 5 MB):
-     → Sort by (partition, key) → spill to local disk as sorted run
+  3. Buffer records in memory: a PartitionedAppendOnlyMap (hash map) if
+     there is a map-side combine, otherwise a PartitionedPairBuffer
+  4. The buffer starts tracking its size at 5 MB
+     (spark.shuffle.spill.initialMemoryThreshold) and asks for more
+     execution memory as it grows. When it cannot get more:
+     → Sort by partition ID (and by key if aggregation/ordering is
+       needed) → spill to local disk as a sorted run
   5. At end of task: merge all spills into one sorted shuffle file
      + write an index file (byte offset of each partition)
 
@@ -926,25 +986,33 @@ SortShuffleManager (default since Spark 1.2):
   Good for large shuffles, external sort for spills.
 
 BypassMergeSortShuffleWriter (optimization):
-  When: no map-side combine AND numReducePartitions < 200 (configurable)
+  When: no map-side combine AND numReducePartitions ≤ 200
+        (spark.shuffle.sort.bypassMergeThreshold)
   Writes one file per reduce partition, then concatenates.
   Avoids sorting overhead — faster for small partition counts.
 
 Tungsten UnsafeShuffleWriter:
-  Uses Tungsten binary format (off-heap, no Java objects).
-  8-byte key prefix for sorting (avoids deserializing full keys).
-  2-3x faster for large shuffles with simple keys.
+  Works on serialized Tungsten binary records (no Java objects).
+  Sorts compact 8-byte entries (partition ID + record pointer) instead
+  of deserialized records. Used when there is no map-side aggregation
+  and the serializer supports relocating records (e.g. Kryo, or
+  Spark SQL's UnsafeRow serializer).
 
-Push-Based Shuffle (Spark 3.2+, external shuffle service):
-  Map tasks PUSH shuffle data to remote shuffle service.
-  Shuffle service pre-merges data by partition.
-  Reducers read pre-merged data → fewer fetches.
-  Reduces the M × R problem to M + R transfers.
+Push-Based Shuffle (Spark 3.2+, YARN external shuffle service; based
+  on LinkedIn's Magnet):
+  Map tasks PUSH shuffle blocks to shuffle services on other nodes.
+  Each service pre-merges blocks of the same reduce partition.
+  Reducers read a few large merged files instead of M small blocks
+  → far fewer small random disk reads and fetch requests.
 ```
 
 ---
 
 ## 10. Memory Management and Spilling
+
+> **In plain words.** Each executor splits its memory into a part Spark manages (for caching and for sorts/joins) and a part your own code uses. When Spark-managed memory runs out during a sort or join, it writes partial results to local disk ("spill") and merges them later.
+>
+> **Real-world example.** An 8 GB executor: 300 MB reserved, about 4.7 GB for Spark (caching + execution), about 3.2 GB for user code. A task aggregating a 2 GB shuffle partition with 4 tasks sharing the executor gets roughly 1/4 of the ~4.7 GB pool, so it spills to disk at least once.
 
 ### Unified Memory Management
 
@@ -972,7 +1040,8 @@ Total executor memory: spark.executor.memory (e.g., 8 GB)
   │  │                                                │  │
   │  │  ┌─────────────────┬─────────────────────────┐│  │
   │  │  │  Storage Memory │  Execution Memory       ││  │
-  │  │  │  (50%)          │  (50%)                  ││  │
+  │  │  │  (50% = storage-│  (50%)                  ││  │
+  │  │   Fraction)     │                         ││  │
   │  │  │                 │                         ││  │
   │  │  │  Cached RDDs,   │  Shuffles, joins,       ││  │
   │  │  │  broadcasts,    │  sorts, aggregations    ││  │
@@ -983,8 +1052,14 @@ Total executor memory: spark.executor.memory (e.g., 8 GB)
   │  └────────────────────────────────────────────────┘  │
   └──────────────────────────────────────────────────────┘
 
-  Key: execution can evict storage (cached data) when it needs memory,
-  but storage cannot evict execution. This prevents OOM during shuffles.
+  Worked numbers for an 8 GB heap: (8192 − 300) MB = 7,892 MB usable.
+  Unified = 0.6 × 7,892 ≈ 4,735 MB (≈ 2,368 storage + 2,368 execution
+  at the start). User memory = 0.4 × 7,892 ≈ 3,157 MB.
+
+  Key: execution can evict cached blocks when it needs memory, but only
+  until storage shrinks back to its protected share
+  (spark.memory.storageFraction = 0.5). Storage can never evict
+  execution. This makes OOM during shuffles less likely (not impossible).
 
 Off-heap memory (spark.memory.offHeap.enabled):
   Tungsten manages memory outside the JVM heap.
@@ -1022,8 +1097,9 @@ Spill mechanics:
   External merge sort of all spill files + remaining in-memory data
   → final sorted output
 
-  Spill is NOT a failure — it's by design. But it's 100x slower than
-  in-memory processing, so tuning to minimize spills is critical.
+  Spill is NOT a failure — it's by design. But it adds serialization
+  and disk I/O and can make a task many times slower, so large spills
+  are worth tuning away.
 
   Key tuning knobs:
   • spark.executor.memory — more memory = fewer spills
@@ -1034,6 +1110,10 @@ Spill mechanics:
 ---
 
 ## 11. Spark on Kubernetes and YARN
+
+> **In plain words.** Spark needs a cluster manager to hand it machines. YARN is the classic Hadoop option; Kubernetes is the newer option that runs Spark as containers next to your other services.
+>
+> **Real-world example.** A company already running its web apps on Kubernetes runs a nightly Spark job as 1 driver pod + 50 executor pods (4 cores, 8 GB each = 200 cores, 400 GB heap). The pods disappear when the job ends, so the cluster can shrink overnight.
 
 ### Spark on YARN
 
@@ -1083,7 +1163,7 @@ Architecture:
   │                                                         │
   │  ┌────────────┐                                         │
   │  │  Driver Pod │ ← created by spark-submit              │
-  │  │  (Spark AM) │                                        │
+  │  │  (driver)   │                                        │
   │  └──────┬─────┘                                         │
   │         │ creates executor pods via K8s API              │
   │         │                                               │
@@ -1092,25 +1172,32 @@ Architecture:
   │  │   0         │ │   1          │ │   2          │     │
   │  └─────────────┘ └──────────────┘ └──────────────┘     │
   │                                                         │
-  │  Shuffle data: local PVC or external shuffle service    │
+  │  Shuffle data: executor local disk (emptyDir/PVC) or a  │
+  │  remote shuffle service (e.g. Apache Celeborn)          │
   └─────────────────────────────────────────────────────────┘
 
   Advantages over YARN:
   ✓ Unified infrastructure (same cluster for all workloads)
   ✓ Better resource isolation (pod-level cgroups)
   ✓ Container images instead of classpath management
-  ✓ Native auto-scaling (HPA/VPA/Karpenter)
+  ✓ Node autoscaling (Cluster Autoscaler/Karpenter) + Spark dynamic
+    allocation with shuffle tracking
   ✓ Multi-tenant by namespace
 
   Challenges:
   ✗ No data locality (S3/GCS replaces HDFS — locality is irrelevant)
   ✗ Shuffle on local ephemeral storage (pod restarts lose shuffle data)
-  ✗ Needs external shuffle service or remote shuffle for resilience
+  ✗ No built-in external shuffle service on K8s: use shuffle tracking +
+    executor decommissioning, or a remote shuffle service
 ```
 
 ---
 
 ## 12. Fault Tolerance and Lineage
+
+> **In plain words.** Spark survives machine failures by remembering how each piece of data was computed, not by copying it. When a piece is lost, Spark recomputes only that piece, going back as far as the last saved copy (shuffle files, cache or checkpoint).
+>
+> **Real-world example.** A 10-stage job loses one executor at stage 8. If stage 7's shuffle files are still readable, Spark reruns only the lost stage-8 tasks (maybe 2 minutes). If they are gone, it must also rerun the stage-7 tasks that wrote them, and possibly earlier stages.
 
 ### RDD Lineage Recovery
 
@@ -1150,7 +1237,9 @@ Example:
     → Recompute from source. For 10-stage pipeline: recompute ALL stages.
 
   Cost with checkpointing:
-    rdd4.checkpoint()  ← materialize to HDFS before continuing
+    sc.setCheckpointDir("hdfs://ckpt/")
+    rdd4.persist(); rdd4.checkpoint()  ← materialize to HDFS (persist
+                                         first, or rdd4 is computed twice)
     → Failure in rdd5: recompute from rdd4 checkpoint (1 stage, not 4).
 ```
 
@@ -1179,13 +1268,18 @@ that serves shuffle files independently of executor lifecycle.
                                      └──────────┘
 
   On YARN: NodeManager shuffle auxiliary service.
-  On K8s: separate DaemonSet process, or remote shuffle service
-          (Apache Celeborn, LinkedIn Magnet, Uber Zeus).
+  On K8s: no built-in ESS. Options: shuffle tracking + graceful
+          decommissioning (migrates shuffle blocks off a dying executor),
+          or a remote shuffle service (Apache Celeborn, Apache Uniffle).
 ```
 
 ---
 
 ## 13. Adaptive Query Execution (AQE)
+
+> **In plain words.** AQE lets Spark change its plan halfway through a job, after it sees the real size of the data. It merges tiny partitions, switches to a cheaper join when one side turns out small, and splits oversized partitions in joins.
+>
+> **Real-world example.** A query planned with 200 shuffle partitions filters out 95% of the data. AQE sees 200 partitions totalling about 1 GB and merges them into ~16 partitions of ~64 MB, so 16 tasks run instead of 200 mostly-empty ones.
 
 ### Runtime Query Re-Optimization
 
@@ -1250,7 +1344,9 @@ Before AQE:
 At runtime:
   After filter on orders: only 8 MB survives.
   AQE: 8 MB < 10 MB broadcast threshold → switch to BroadcastHashJoin.
-  → Eliminates one entire shuffle stage.
+  → The map-side shuffle write already happened, but the sort and the
+    all-to-all network fetch of the big side are skipped (AQE reads the
+    shuffle files locally instead).
 
 3. Skew Join Optimization:
 ══════════════════════════
@@ -1262,7 +1358,8 @@ Before AQE:
   All other reducers: finish in 5 seconds.
 
 After AQE:
-  AQE detects partition with 10M rows (> skewedPartitionThresholdInBytes).
+  AQE marks a partition skewed if it is > 5 × the median partition size
+  (skewedPartitionFactor) AND > 256 MB (skewedPartitionThresholdInBytes).
   Splits the skewed partition into sub-partitions.
   Replicates the matching partition from the other side.
   → 10M rows processed by 10 tasks of 1M each → 10x faster.
@@ -1287,6 +1384,10 @@ After AQE:
 ---
 
 ## 14. Data Skew and Performance Tuning
+
+> **In plain words.** Skew means a few keys hold far more data than the rest, so one task gets a giant share and the whole job waits for it. Tuning is about sizing partitions, memory and cores so every task gets a fair, fitting share of work.
+>
+> **Real-world example.** A ride-hailing job groups trips by driver_id. 12% of rows have driver_id = NULL (cancelled before assignment). All NULLs hash to one partition: 199 tasks finish in 1 minute, one runs for 40 minutes. Filtering NULLs first (or salting) brings the stage back to about 1 minute.
 
 ### Identifying Skew
 
@@ -1318,7 +1419,10 @@ Symptoms of data skew:
 ```
 1. AQE Skew Join (automatic, Spark 3.0+)
    spark.sql.adaptive.skewJoin.enabled = true (default)
+   spark.sql.adaptive.skewJoin.skewedPartitionFactor = 5 (default)
    spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes = 256MB
+   Covers sort-merge (and, in newer versions, shuffled hash) JOINS only.
+   It does NOT fix a skewed groupBy — use salting for that.
 
 2. Salting (manual, universal technique)
    Add random prefix to the hot key to distribute it across partitions.
@@ -1327,17 +1431,20 @@ Symptoms of data skew:
    SELECT user_id, COUNT(*) FROM events GROUP BY user_id
 
    -- After: "bot_account" spread across 10 partitions
-   SELECT
-     regexp_replace(salted_user_id, '^[0-9]+_', '') AS user_id,
-     SUM(cnt) AS total
+   -- (compute the salt ONCE in a subquery; two separate RAND() calls
+   --  in SELECT and GROUP BY would not match)
+   SELECT user_id, SUM(cnt) AS total
    FROM (
-     SELECT
-       CONCAT(FLOOR(RAND() * 10), '_', user_id) AS salted_user_id,
-       COUNT(*) AS cnt
-     FROM events
-     GROUP BY CONCAT(FLOOR(RAND() * 10), '_', user_id)
-   )
-   GROUP BY regexp_replace(salted_user_id, '^[0-9]+_', '')
+     SELECT user_id, salt, COUNT(*) AS cnt
+     FROM (SELECT user_id, FLOOR(RAND() * 10) AS salt FROM events) e
+     GROUP BY user_id, salt
+   ) s
+   GROUP BY user_id
+
+   Note: Spark already does map-side partial aggregation for COUNT/SUM,
+   which softens skew for these. Salting matters most for joins and for
+   aggregations that can't be pre-combined (collect_list, percentiles,
+   exact COUNT DISTINCT).
 
 3. Isolate + Union (split hot and cold paths)
    val hotKeys = Set("bot_account", "null", "unknown")
@@ -1369,7 +1476,7 @@ Critical Spark configuration for production:
 │ spark.sql.shuffle.partitions            │ 200          │ 2-3x cores total │
 │ spark.sql.adaptive.enabled              │ true (3.2+)  │ true             │
 │ spark.executor.memory                   │ 1g           │ 4-16g            │
-│ spark.executor.cores                    │ 1            │ 4-5 (YARN)       │
+│ spark.executor.cores                    │ 1 on YARN    │ 4-5 (YARN)       │
 │ spark.executor.memoryOverhead           │ 10% or 384MB │ 10-20%           │
 │ spark.memory.fraction                   │ 0.6          │ 0.6-0.8          │
 │ spark.sql.files.maxPartitionBytes       │ 128MB        │ 128-256MB        │
@@ -1385,16 +1492,28 @@ Memory sizing formula:
   executor_cores = 4-5 (more → GC pressure, less → poor parallelism)
   executors_per_node = (node_cores - 1) / executor_cores
 
+  The container = heap + memoryOverhead, so divide the node memory
+  first, then take the overhead out of each share:
+    container_per_executor = (node_memory - OS_reserved - NodeManager)
+                             / executors_per_node
+    executor_memory ≈ container_per_executor / 1.1
+
   Example: 64 GB RAM, 16 cores per node:
-    executors_per_node = (16 - 1) / 4 = 3
-    executor_memory = (64 - 4 - 2) / 3 ≈ 19g
-    executor_memoryOverhead = 19g × 0.1 ≈ 2g
-    Total per executor: ~21g (fits in 64 GB / 3)
+    executors_per_node = floor((16 - 1) / 4) = 3   (uses 12 of 15 cores;
+                         5 cores per executor would use all 15)
+    container_per_executor = (64 - 4 - 2) / 3 ≈ 19.3g
+    executor_memory = 19.3 / 1.1 ≈ 17g
+    executor_memoryOverhead = max(384 MB, 0.1 × 17g) ≈ 2g
+    Total per node: 3 × (17 + 2) = 57g ≤ 58g available
 ```
 
 ---
 
 ## 15. Batch vs Stream: Lambda and Kappa Architectures
+
+> **In plain words.** Lambda runs a batch pipeline (exact but late) and a streaming pipeline (fast but approximate) side by side and merges them. Kappa keeps only the streaming pipeline and replays history through it when logic changes. Today many teams write both batch and streaming output into the same lakehouse tables.
+>
+> **Real-world example.** A video platform counts views. The stream gives a live counter within seconds. A nightly batch job recomputes yesterday's exact counts after removing bot views and overwrites that day's partition. Viewers see live numbers; creator payouts use the batch numbers.
 
 ### Lambda Architecture
 
@@ -1535,6 +1654,10 @@ In practice, most production systems use a hybrid:
 
 ## 16. Production Patterns and Anti-Patterns
 
+> **In plain words.** Most batch incidents come from a few habits: jobs that create duplicates when re-run, pulling huge results onto one machine, unnecessary shuffles, and bad partition counts. Make every job safe to re-run and check its output before publishing it.
+>
+> **Real-world example.** A bank's nightly ledger rollup fails at 90% and is retried. With `append` mode the retry writes 1.8 days of rows for one day. With `overwrite` of the `date=2026-09-22` partition, the retry just replaces it and totals stay correct.
+
 ### Patterns
 
 ```
@@ -1573,9 +1696,14 @@ In practice, most production systems use a hybrid:
 4. Speculative Execution
    ─────────────────────
    spark.speculation = true
-   If one task is 1.5x slower than median, Spark launches a copy on another
-   executor. Whichever finishes first wins. Kills stragglers.
+   Once a fraction of a stage's tasks has finished
+   (spark.speculation.quantile: 0.75 up to Spark 3.5, 0.9 in 4.0), any
+   task running longer than multiplier × median (1.5 up to 3.5, 3 in 4.0)
+   gets a copy on another executor. Whichever finishes first wins.
    Critical for batch SLAs — one slow task can delay the entire job.
+   Only safe when task output is committed through Spark's output
+   committer or is otherwise idempotent (no side effects like sending
+   emails or calling a payment API inside a task).
 
 5. Data Quality Gates
    ──────────────────

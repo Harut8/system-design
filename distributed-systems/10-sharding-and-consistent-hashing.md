@@ -31,13 +31,13 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 
 Every database starts on a single machine. You scale vertically -- more CPU, more RAM, bigger disks -- until you cannot. The wall is not hypothetical. It has concrete coordinates:
 
-- **Storage**: A single machine tops out around 64TB of NVMe (8 drives x 8TB). Your 200TB dataset does not fit.
+- **Storage**: A typical server holds tens of TB of NVMe (for example, 8 drives x 8TB = 64TB). Your 200TB dataset does not fit.
 - **Memory**: Even the largest cloud instances (e.g., AWS u-24tb1.112xlarge) cap at 24TB of RAM. If your working set is 50TB, you cannot keep it in memory on one node.
 - **Write throughput**: A single SSD sustains roughly 500K-1M random IOPS. If your workload demands 10M random writes/sec, one machine cannot deliver it.
 - **Read throughput**: A single node has finite CPU and network bandwidth. At 500K QPS per node with p99 < 5ms, your 5M QPS target requires at least 10 nodes.
-- **Availability**: A single machine is a single point of failure. Hardware MTBF for enterprise SSDs is roughly 2 million hours, but a cluster of 100 nodes will see a drive failure roughly every 2.3 days on average.
+- **Availability**: A single machine is a single point of failure. Enterprise SSDs are rated at roughly 2 million hours MTBF. With 100 nodes x 8 drives = 800 drives, that is one drive failure every 2,000,000 / 800 = 2,500 hours (about every 3.5 months) on average -- and field failure rates are usually worse than the rating.
 
-Vertical scaling is also nonlinear in cost. Doubling a machine's RAM and CPU rarely doubles its price -- it often quadruples it. Horizontal scaling with commodity hardware gives linear cost scaling.
+Vertical scaling is also nonlinear in cost. At the high end, price grows faster than capacity: the biggest machines cost more per GB of RAM and per core than mid-size ones. Horizontal scaling with commodity hardware gives roughly linear cost scaling.
 
 ### 1.2 Horizontal Scaling: Distribute the Problem
 
@@ -141,9 +141,9 @@ Key "Charlie" → P1     Key "Hotel" → P2     Key "Tango" → P4
 - **Uneven partition sizes**: Key distribution is rarely uniform. If you partition user IDs alphabetically, the "S" partition will be larger than the "Q" partition because more names start with S.
 - **Manual or complex auto-splitting**: Range boundaries must be chosen carefully, and rebalancing requires splitting or merging ranges.
 
-**How BigTable/HBase do range splits**: BigTable and HBase use range partitioning with automatic splitting. Each tablet (BigTable) or region (HBase) is responsible for a contiguous range of row keys. When a tablet exceeds a size threshold (default: 8GB for Cloud Bigtable, configurable in HBase), the system automatically splits it at a midpoint into two tablets. The split is transparent to clients -- the metadata table is updated, and future requests are routed to the correct half. HBase also supports merge operations when adjacent regions become too small.
+**How BigTable/HBase do range splits**: BigTable and HBase use range partitioning with automatic splitting. Each tablet (BigTable) or region (HBase) is responsible for a contiguous range of row keys. When a tablet or region exceeds a size threshold (HBase: `hbase.hregion.max.filesize`, 10GB by default; Bigtable manages its own thresholds), the system automatically splits it at a midpoint into two tablets. The split is transparent to clients -- the metadata table is updated, and future requests are routed to the correct half. HBase also supports merge operations when adjacent regions become too small.
 
-**CockroachDB's range-based approach**: CockroachDB partitions data into ranges (default 512MB target). Ranges automatically split when they exceed the threshold and merge when they shrink below half. The split point is chosen at the key that best divides the range's data by size. This is coupled with an automatic leaseholder transfer mechanism: the node with the most recent data for a range holds the lease and serves reads directly.
+**CockroachDB's range-based approach**: CockroachDB partitions data into ranges (default 512MB target). Ranges automatically split when they exceed the threshold, and small adjacent ranges are merged back together. The split point is chosen at the key that best divides the range's data by size. Each range also has a leaseholder: one replica that holds a time-based lease, serves consistent reads directly, and coordinates writes. Leases move between replicas automatically, for example toward where the traffic comes from.
 
 **Auto-splitting on size vs load**: Splitting only on size misses a critical case -- a small partition with a hot key. DynamoDB recognized this and added adaptive capacity, which splits partitions based on throughput pressure, not just storage. If a single partition is throttled because one key receives disproportionate traffic, DynamoDB splits the partition even if it is well under the size limit, isolating the hot key.
 
@@ -160,7 +160,7 @@ MODULAR HASHING (hash(key) % N):
 
 With N = 3 nodes:
   hash("user:1001") = 7842391  →  7842391 % 3 = 1  →  Node 1
-  hash("user:1002") = 2938472  →  2938472 % 3 = 0  →  Node 0
+  hash("user:1002") = 2938476  →  2938476 % 3 = 0  →  Node 0
   hash("user:1003") = 5629103  →  5629103 % 3 = 2  →  Node 2
   hash("user:1004") = 1294857  →  1294857 % 3 = 0  →  Node 0
 ```
@@ -182,7 +182,8 @@ Before (N=3):                         After adding one node (N=4):
   hash("user:1005") % 3 = 1          hash("user:1005") % 4 = 2  ← MOVED
   hash("user:1006") % 3 = 2          hash("user:1006") % 4 = 2  ← same (lucky)
 
-  Result: ~67% of keys moved (in general, (N-1)/N keys move ≈ 100% for large N)
+  Result: 4 of 6 keys moved here. In general, going from N to N+1 nodes moves
+  about N/(N+1) of all keys: 75% for 3 → 4, 99% for 100 → 101.
 ```
 
 With modular hashing, adding one node to a 100-node cluster moves approximately 99% of all keys. If you have 10TB of data distributed across 100 nodes, adding node 101 means shuffling approximately 9.9TB of data across the network. During this reshuffling window, the old location no longer has the data, but the new location has not received it yet -- leading to cache misses, request failures, or requiring a complex dual-read strategy.
@@ -350,7 +351,7 @@ After:  A(50) ── D(120) ──────────── C(200)
 
 ### 3.5 The Math: Why This Is Optimal
 
-With modular hashing (`hash(key) % N`), adding one node to N nodes moves approximately `K * (N-1)/N` keys, where K is the total number of keys. For large N, this approaches K -- nearly every key moves.
+With modular hashing (`hash(key) % N`), adding one node to N nodes moves approximately `K * N/(N+1)` keys, where K is the total number of keys. For large N, this approaches K -- nearly every key moves.
 
 With consistent hashing, adding one node to N existing nodes moves approximately `K/N` keys on average -- only the keys in the new node's arc, which is 1/N of the ring on average.
 
@@ -426,7 +427,7 @@ Result: only 2 of 10 keys moved (20%, close to 1/N = 25% for N=4)
 
 ### 4.1 The Load Imbalance Problem
 
-With only 3 physical nodes on the ring, the arcs are unlikely to be equal. One node might own 50% of the key space while another owns 10%. The standard deviation of load is proportional to `1/sqrt(N)` for N points on the ring, and with N=3, the imbalance is severe.
+With only 3 physical nodes on the ring, the arcs are unlikely to be equal. One node might own 50% of the key space while another owns 10%. With one random point per node, the arc lengths are roughly exponentially distributed: the standard deviation of a node's share is about as large as the average share itself (~100%), and the biggest node typically owns about ln(N) times its fair share. With N=3, the imbalance is severe.
 
 ```
 IMBALANCE WITH FEW PHYSICAL NODES:
@@ -436,7 +437,7 @@ IMBALANCE WITH FEW PHYSICAL NODES:
   0 ───── A(50) ────────────────────────── B(800) ── C(900) ── 999
 
   Node A: (900, 50]   = 150 positions (15% of ring)
-  Node B: (50, 800]   = 750 positions (75% of ring)  ← 5x overloaded!
+  Node B: (50, 800]   = 750 positions (75% of ring)  ← 2.25x its fair 33%!
   Node C: (800, 900]  = 100 positions (10% of ring)
 
   Node B handles 75% of all traffic. This defeats the purpose of sharding.
@@ -469,9 +470,10 @@ scattered around the ring. The total load per physical node is the sum
 of its arcs, which converges toward 1/3 each as V increases.
 
 Distribution of ring space (approximate):
-  Node A: 70+70+50+70 = 260 positions (26%)
-  Node B: 80+60+120+90 = 350 positions (35%)
-  Node C: 80+70+150+70 = 370 positions (37%)
+  (each vnode owns the arc ending at its position)
+  Node A: 70+70+50+70  = 260 positions (26%)   [A-3 980, A-0 50, A-1 350, A-2 700]
+  Node B: 70+90+60+120 = 340 positions (34%)   [B-0 120, B-3 440, B-1 500, B-2 820]
+  Node C: 80+80+150+90 = 400 positions (40%)   [C-0 200, C-3 280, C-1 650, C-2 910]
 
 Better than the 15/75/10 split without vnodes, though V=4 is still
 too few for excellent balance. V=150+ is needed in production.
@@ -479,35 +481,36 @@ too few for excellent balance. V=150+ is needed in production.
 
 ### 4.3 How V Affects Balance
 
-The standard deviation of load per physical node is inversely proportional to the square root of the number of virtual nodes:
+The relative standard deviation of load per physical node is inversely proportional to the square root of the number of virtual nodes per node. Each node's share is the sum of V random arcs, so the noise averages out like 1/sqrt(V). The number of physical nodes N barely matters for the relative spread.
 
 ```
 LOAD BALANCE vs VIRTUAL NODE COUNT:
 
-  std_dev(load) ∝ 1 / sqrt(V × N)
+  std_dev(load) / mean(load) ≈ 1 / sqrt(V)
 
-  where V = virtual nodes per physical node, N = physical nodes
+  where V = virtual nodes per physical node (random token placement)
 
-  For N = 10 physical nodes:
-  ┌──────────┬─────────────────────────────┬──────────────────────┐
-  │ V (vnodes│ Total points on ring        │ Approx max load      │
-  │ per node)│                             │ imbalance (%)        │
-  ├──────────┼─────────────────────────────┼──────────────────────┤
-  │    1     │    10                       │  ±50-100%            │
-  │   10     │   100                       │  ±15-25%             │
-  │   50     │   500                       │  ±8-12%              │
-  │  150     │  1500                       │  ±3-5%               │
-  │  256     │  2560                       │  ±2-3%               │
-  │ 1000     │ 10000                       │  ±1-2%               │
-  └──────────┴─────────────────────────────┴──────────────────────┘
+  For N = 10 physical nodes (simulated, random tokens):
+  ┌──────────┬──────────────┬───────────────────┬─────────────────────────┐
+  │ V (vnodes│ Total points │ Std dev of a      │ Busiest node vs average │
+  │ per node)│ on ring      │ node's load       │ (typical)               │
+  ├──────────┼──────────────┼───────────────────┼─────────────────────────┤
+  │    1     │    10        │  ~90-100%         │  ~+190% (almost 3x)     │
+  │   10     │   100        │  ~30%             │  ~+50%                  │
+  │   50     │   500        │  ~14%             │  ~+23%                  │
+  │  150     │  1500        │  ~8%              │  ~+13%                  │
+  │  256     │  2560        │  ~6%              │  ~+10%                  │
+  │ 1000     │ 10000        │  ~3%              │  ~+5%                   │
+  └──────────┴──────────────┴───────────────────┴─────────────────────────┘
 
-  Diminishing returns: going from V=150 to V=256 improves balance by ~1%,
-  but doubles the metadata size of the ring.
+  Diminishing returns: going from V=150 to V=256 improves the std dev only
+  from ~8% to ~6%, but makes the ring ~1.7x larger. Smarter (non-random)
+  token allocation gets good balance with far fewer tokens.
 ```
 
 ### 4.4 Practical V Values in Production Systems
 
-- **Cassandra**: Default 256 vnodes per node (configurable via `num_tokens` in cassandra.yaml). Cassandra 4.0 introduced a more sophisticated token allocation algorithm that achieves good balance with fewer tokens.
+- **Cassandra**: `num_tokens` in cassandra.yaml. The default was 256 vnodes per node before 4.0. Cassandra 3.0 added a token allocation algorithm that places tokens deliberately, and 4.0 changed the default to 16 tokens with that allocator turned on.
 - **Redis Cluster**: Uses a fixed 16,384 hash slots (effectively a pre-allocated set of virtual nodes). Each physical node owns a subset of these slots. This is a fixed-partition scheme rather than true vnodes, but the effect is similar.
 - **Riak**: Default 64 vnodes per ring (not per node -- the total ring size is fixed, and vnodes are distributed across nodes).
 - **DynamoDB**: Internal implementation, but automatic partition splitting means the system effectively manages its own "virtual" partitions.
@@ -537,10 +540,10 @@ More virtual nodes means:
 - **Better load balance** (the primary benefit).
 - **Larger routing table**: With 100 physical nodes and V=256, the ring has 25,600 entries. Each entry is a token + node_id, typically 20-30 bytes, so the full ring is ~500KB-750KB. This must be stored and transmitted to every node and client.
 - **More metadata during topology changes**: When a node joins or leaves, more vnode assignments change, generating more metadata updates.
-- **Slower streaming during bootstrap**: A new node joining a Cassandra cluster with V=256 must stream data from up to 256 different source ranges, potentially from many different nodes. This was a significant operational pain point, leading Cassandra 4.0 to default to fewer tokens with a smarter allocation algorithm.
+- **Slower streaming during bootstrap**: A new node joining a Cassandra cluster with V=256 must stream data from up to 256 different source ranges, potentially from many different nodes. This was a significant operational pain point, leading Cassandra 4.0 to default to 16 tokens with a smarter allocation algorithm.
 - **More repair overhead**: Repair operations in Cassandra must process each vnode range independently.
 
-The sweet spot for most systems is V=128-256 per physical node, balancing load uniformity against operational complexity.
+With random token placement, V=128-256 per physical node is a common balance point. With a deliberate allocator (Cassandra 4.0+), 8-16 tokens per node is enough.
 
 ---
 
@@ -598,9 +601,9 @@ Only keys whose winner was C are affected. All other assignments stable.
 - O(1) memory per node (no ring structure).
 - Minimal disruption: removing a node moves only that node's keys.
 - Simple to implement and reason about.
-- Naturally handles weighted nodes: multiply the hash by a weight factor.
+- Handles weighted nodes: score each node with `-weight / ln(h)`, where `h` is the hash scaled to (0, 1). Simply multiplying the hash by the weight does NOT give proportional shares.
 
-**Used in**: Microsoft's CRUSH algorithm (Ceph) is a generalization. Rendezvous hashing is common in load balancers and DNS-based routing.
+**Used in**: CRUSH (the placement algorithm in Ceph, from UC Santa Cruz) uses a related "straw" selection. Rendezvous hashing is common in load balancers, CDNs, and DNS-based routing.
 
 ### 5.3 Maglev Hashing (Google, 2016)
 
@@ -623,7 +626,8 @@ Lookup table (size M = 7, N = 3 backends):
   Owner:   A    C    C    A    A    C    A
 
   Only B's slots changed (slots 1 and 4). A and C absorbed them.
-  Disruption ≈ 1/N of the table.
+  Disruption ≈ 1/N of the table. (Real Maglev is near-minimal: a few
+  extra slots owned by surviving backends can also change.)
 ```
 
 **Properties**:
@@ -690,14 +694,14 @@ K = total key count, N = node count
 
 - **Kafka**: Topic partition count is set at creation. Adding partitions is possible but breaks key ordering guarantees and is rarely done. Partitions are assigned to brokers and rebalanced by moving whole partitions.
 - **Redis Cluster**: Fixed 16,384 hash slots. Slots are assigned to nodes and can be migrated, but the slot count never changes.
-- **Riak**: Fixed ring size (default 64 or 256 partitions). The ring is divided at creation and partitions are redistributed among nodes.
+- **Riak**: Fixed ring size (default 64 partitions, set by `ring_creation_size`). The ring is divided at creation and partitions are redistributed among nodes.
 
-The key design decision for fixed-partition systems: **choose the partition count correctly at creation time**. Too few partitions limit your scaling ceiling. Too many waste resources and increase metadata overhead. The rule of thumb: set partition count to several times your maximum expected node count (e.g., 10x). Kafka's recommendation is: start with `max(expected_throughput / partition_throughput, expected_node_count * partitions_per_node)`.
+The key design decision for fixed-partition systems: **choose the partition count correctly at creation time**. Too few partitions limit your scaling ceiling. Too many waste resources and increase metadata overhead. The rule of thumb: set partition count to several times your maximum expected node count (e.g., 10x). A common Kafka sizing rule: partitions ≥ `max(T / P, T / C)`, where T is the target throughput, P is what one partition can take from producers, and C is what one consumer can process from one partition.
 
 **Dynamic partitioning**: Partitions split and merge automatically based on size and load.
 
 - **DynamoDB**: Partitions split automatically when they exceed 10GB or their provisioned throughput limits. Splits are transparent to the application.
-- **CockroachDB**: Ranges split at 512MB (default) and merge when adjacent ranges are both below 256MB. This is fully automatic.
+- **CockroachDB**: Ranges split at 512MB (default) and small adjacent ranges are merged automatically.
 - **HBase**: Regions split when they exceed a configurable size threshold (default 10GB). Splits require a brief unavailability window for the splitting region.
 
 ```
@@ -767,7 +771,7 @@ Phase 4: CLEANUP
   Node A: deletes its copy of partition P (after a safety period)
 ```
 
-**Redis Cluster's MIGRATING/IMPORTING approach**: During slot migration from Node A to Node B, the slot is marked as MIGRATING on A and IMPORTING on B. Requests for keys already migrated are redirected to B with an ASK redirect. New writes can go to either node depending on key migration status. This allows key-by-key migration without a full copy phase.
+**Redis Cluster's MIGRATING/IMPORTING approach**: During slot migration from Node A to Node B, the slot is marked as MIGRATING on A and IMPORTING on B. If the key is still on A, A serves it. If it is not on A (already moved, or a brand-new key), A answers with an ASK redirect to B. This allows key-by-key migration without a full copy phase.
 
 ### 6.4 The Hot Partition Problem
 
@@ -938,7 +942,7 @@ CENTRALIZED METADATA:
   Authoritative, consistent, but adds a dependency on the coordinator.
 ```
 
-- **Kafka**: Uses ZooKeeper (or KRaft in newer versions) to store partition leader assignments. Clients fetch metadata from any broker.
+- **Kafka**: Stores partition leader assignments in its KRaft controller quorum (older versions used ZooKeeper; Kafka 4.0 removed ZooKeeper support). Clients fetch metadata from any broker.
 - **Redis Cluster**: Uses gossip (the CLUSTER protocol) -- no external dependency.
 - **MongoDB**: Config servers (a replica set) hold the chunk-to-shard mapping.
 
@@ -1028,7 +1032,7 @@ Third follower catches up asynchronously.
 
 ### 8.3 The Dynamo Replica Placement Model
 
-Amazon's Dynamo (the design paper behind DynamoDB, Riak, and Cassandra) places replicas on the consistent hash ring. For a key, the N replicas are placed on the next N **distinct physical nodes** clockwise from the key's position.
+Amazon's Dynamo (the 2007 paper that inspired Riak and Cassandra; the DynamoDB service shares the name but uses a different, leader-based design) places replicas on the consistent hash ring. For a key, the N replicas are placed on the next N **distinct physical nodes** clockwise from the key's position.
 
 ```
 DYNAMO REPLICA PLACEMENT (N=3):
@@ -1209,13 +1213,13 @@ Anti-pattern: Partition key = date ("2024-01-15")
 
 ### 10.2 Cassandra
 
-**Partitioning scheme**: Consistent hashing with virtual nodes (Murmur3 hash function). Each node owns `num_tokens` (default 256) tokens on the ring. The Murmur3 partitioner hashes the partition key to a 64-bit value, which is mapped to the ring.
+**Partitioning scheme**: Consistent hashing with virtual nodes (Murmur3 hash function). Each node owns `num_tokens` tokens on the ring (default 16 in 4.0+, 256 before). The Murmur3 partitioner hashes the partition key to a 64-bit value, which is mapped to the ring.
 
 **Token assignment**: When a node joins the cluster, it is assigned `num_tokens` random positions on the ring (or computed positions using the new token allocation algorithm in Cassandra 4.0+). The gossip protocol propagates the updated token ring to all nodes.
 
 **Replication**: Controlled by the replication strategy. `SimpleStrategy` places replicas on the next N distinct nodes clockwise on the ring. `NetworkTopologyStrategy` places a specified number of replicas per datacenter, walking the ring and selecting nodes in distinct racks.
 
-**Consistency levels**: Per-query tunable. `ONE` (fast, eventual), `QUORUM` (W/2+1 replicas), `ALL` (strong but slow), `LOCAL_QUORUM` (quorum within the local datacenter).
+**Consistency levels**: Per-query tunable. `ONE` (fast, eventual), `QUORUM` (floor(RF/2)+1 replicas, e.g. 2 of 3), `ALL` (strong but slow), `LOCAL_QUORUM` (quorum within the local datacenter).
 
 ```
 CASSANDRA TOKEN RING:
@@ -1254,7 +1258,7 @@ Master B (+ Replica B'): slots 5461-10922
 Master C (+ Replica C'): slots 10923-16383
 
   GET mykey
-  → CRC16("mykey") = 50839 → 50839 % 16384 = 1687 → slot 1687 → Master A
+  → CRC16("mykey") = 63839 → 63839 % 16384 = 14687 → slot 14687 → Master C
 
   SET {order:123}.items "..."
   SET {order:123}.total 42.50
@@ -1373,8 +1377,8 @@ Inference request: "Recommend items for user U42"
     item_features(I789) → entity_id = "item:I789"
 
   Feature Store (Redis Cluster):
-    CRC16("user:U42") % 16384 = slot 3821 → Node B → HGETALL "user:U42"
-    CRC16("item:I789") % 16384 = slot 9100 → Node C → HGETALL "item:I789"
+    CRC16("user:U42") % 16384 = slot 3953 → Node A → HGETALL "user:U42"
+    CRC16("item:I789") % 16384 = slot 8870 → Node B → HGETALL "item:I789"
 
   Two point lookups, two different partitions, parallel execution.
   Total latency: max(lookup_1, lookup_2) ≈ 1-3ms each.
@@ -1408,7 +1412,7 @@ Query: "Find 10 nearest neighbors of query vector q"
 **HNSW partitioning**: HNSW graphs do not partition naturally. Options:
 - **Replicate the full index**: If it fits in memory on one node, replicate it for read throughput. Simple, but capped by single-node memory.
 - **Shard by entity range**: Split the corpus (e.g., by entity_id range) and build independent HNSW indexes per shard. Query all shards and merge. This is what Elasticsearch / OpenSearch does with its vector search across shards.
-- **Hybrid**: Use IVF for coarse partitioning (which cluster), then HNSW within each cluster for fine search. This is the approach used by Milvus and Pinecone internally.
+- **Hybrid**: Use IVF for coarse partitioning (which cluster) and a graph index such as HNSW to find the nearest centroids or to search inside clusters. FAISS, for example, supports IVF indexes with an HNSW coarse quantizer.
 
 **Recall vs partition count trade-off**: More partitions means each partition's HNSW graph is smaller (faster) but the scatter-gather has more overhead, and boundary effects reduce recall (nearest neighbors may be in adjacent partitions). Typical target: 10-100 partitions for most production vector search systems.
 
@@ -1586,27 +1590,30 @@ Storage:
 
 Partition strategy: Redis Cluster (hash partitioning)
   16,384 hash slots.
-  Target: 10-50 GB per node (Redis is memory-bound).
-  Nodes: 6.3 TB / 30 GB per node ≈ 210 nodes (with Redis memory overhead).
+  Redis Cluster usually runs 1 master + 1 replica per shard (RF=2),
+  so in-memory data = 2.1 TB × 2 = 4.2 TB (not the RF=3 figure above).
+  Target: ~30 GB of data per Redis process (Redis is memory-bound).
+  Masters: 2.1 TB / 30 GB = 70 masters, plus 70 replicas = 140 processes.
 
   But also constrained by QPS:
-    2.2M reads / 210 nodes ≈ 10,500 reads/node/sec → easily within Redis capacity.
+    2.2M reads / 70 masters ≈ 31,400 reads/master/sec → within Redis capacity
+    (and replicas can take reads too).
 
   Hotspot: top 0.1% items (50K items) get 50% of item reads = 1M QPS.
-    These 50K items span 50K / (50M / 16,384) ≈ 16 slots.
-    Per slot: 1M / 16 ≈ 62,500 reads/sec → hot but manageable with replicas.
+    Hashing scatters these 50K items over all 16,384 slots (~3 per slot),
+    so the hot SET is spread out: 1M / 70 masters ≈ 14,300 extra reads/master.
+    The real danger is a single viral item: if one item gets 5% of item
+    reads, that is 100K reads/sec on ONE slot → needs replicas or a local cache.
 
   Final architecture:
-    210 Redis nodes (masters), 210 replicas (RF=2 for Redis Cluster).
-    16,384 slots distributed evenly (~39 slots per master).
+    70 masters + 70 replicas, ~234 slots per master (16,384 / 70).
     Read replicas serve read traffic for hot slots.
-    Total memory: ~6.3 TB + overhead ≈ 8 TB across 420 instances.
-    Instance type: r6g.2xlarge (64 GB RAM) → 420 / 8 ≈ 53 instances minimum.
-    With 64 GB RAM, each instance runs ~8 Redis processes (one per slot group).
+    Instance type: r6g.2xlarge (64 GB RAM) → 2 Redis processes of ~30 GB
+    each, leaving room for overhead and fork-based snapshots → 70 instances.
 
-  COST ESTIMATE (AWS, on-demand):
-    53 × r6g.2xlarge × $0.4032/hr ≈ $21.37/hr ≈ $15,400/month.
-    With reserved instances (1-year): ~$9,200/month.
+  COST ESTIMATE (AWS, on-demand, illustrative):
+    70 × r6g.2xlarge × $0.4032/hr ≈ $28.22/hr ≈ $20,600/month (730 h).
+    Reserved instances or savings plans typically cut this by roughly a third or more.
 ```
 
 ---
@@ -1622,11 +1629,13 @@ NODE FAILURE SCENARIO:
 
 Cluster: 5 nodes, 12 partitions, RF=3
 
-  Node 1: P1(L) P3(F) P5(F) P7(L) P9(F)  P11(F)
-  Node 2: P1(F) P4(L) P6(F) P8(L) P10(F) P12(F)
+  Node 1: P1(L) P3(F) P4(F) P5(F) P7(L) P9(F)  P10(F) P11(F)
+  Node 2: P1(F) P4(L) P5(F) P6(F) P8(L) P10(F) P12(F)
   Node 3: P2(L) P4(F) P6(L) P9(L) P11(L) P12(F)
-  Node 4: P2(F) P3(L) P5(L) P8(F) P10(L) P12(L)
-  Node 5: P1(F) P2(F) P3(F) P7(F) P9(F)  P11(F)
+  Node 4: P2(F) P3(L) P5(L) P6(F) P7(F) P8(F)  P10(L) P12(L)
+  Node 5: P1(F) P2(F) P3(F) P7(F) P8(F) P9(F)  P11(F)
+
+  (36 replicas = 12 partitions × 3, spread 8/7/6/8/7 over the nodes)
 
 Node 3 crashes.
 
@@ -1640,17 +1649,19 @@ RECOVERY STEPS:
 
   2. Leader election for affected partitions:
      - P2: followers on Node 4 and Node 5. Promote Node 4 (most caught up).
-     - P6: follower on Node 2. Promote Node 2.
+     - P6: followers on Node 2 and Node 4. Promote Node 2.
      - P9: followers on Node 1 and Node 5. Promote Node 1.
      - P11: followers on Node 1 and Node 5. Promote Node 1.
 
   3. Post-election: all partitions have leaders again.
-     P4 and P12 now have only 2 replicas (below RF=3).
+     Every partition that had a replica on Node 3 -- P2, P4, P6, P9, P11,
+     P12 (six of 12) -- now has only 2 replicas (below RF=3).
 
-  4. Re-replication: the cluster creates new replicas for P4 and P12
-     on surviving nodes to restore RF=3.
-     - P4 new follower on Node 5 (was on Nodes 2, 3; Node 3 dead → add Node 5).
-     - P12 new follower on Node 1.
+  4. Re-replication: the cluster creates new replicas for those six
+     on surviving nodes that do not already hold them, to restore RF=3.
+     - P2 (Nodes 4, 5) → add Node 1.    - P4 (Nodes 2, 1) → add Node 5.
+     - P6 (Nodes 2, 4) → add Node 5.    - P9 (Nodes 1, 5) → add Node 2.
+     - P11 (Nodes 1, 5) → add Node 4.   - P12 (Nodes 4, 2) → add Node 1.
 
   5. Data streaming: the new followers receive a full snapshot of the partition
      data from the leader, then catch up on the write-ahead log.
@@ -1719,15 +1730,17 @@ A cluster of 50 nodes, 10,000 partitions, 50 TB of data.
 Operator adds 10 new nodes simultaneously for capacity expansion.
 
 WHAT HAPPENS:
-  Rebalancing starts: each new node must receive ~1/6 of the data (since
-  the cluster is growing from 50 to 60 nodes, each new node should get
-  50/60 × 200 partitions ≈ 167 partitions).
+  Rebalancing starts: the 10 new nodes together must receive ~1/6 of the
+  data (10 of 60 nodes). Each new node should get 10,000 / 60 ≈ 167
+  partitions. Each partition holds 50 TB / 10,000 = 5 GB.
 
-  Total data movement: 10 nodes × 167 partitions × 1 GB/partition ≈ 1.67 TB.
+  Total data movement: 10 nodes × 167 partitions × 5 GB/partition ≈ 8.3 TB
+  (= 50 TB / 6).
 
   If all 10 nodes start rebalancing simultaneously:
-    - Network: 1.67 TB flowing across the cluster network at once.
-      At 10 Gbps per node, this takes ~13 minutes of network saturation.
+    - Network: 8.3 TB flowing across the cluster network at once.
+      Each new node receives ~835 GB; at 10 Gbps (1.25 GB/s) per node that
+      is ~11 minutes of full NIC saturation, and much longer in practice.
     - Disk: source nodes reading partition data while serving production traffic.
       Disk I/O contention increases read latency.
     - CPU: checksumming, compressing, and transferring data consumes CPU.
@@ -1764,7 +1777,7 @@ HOT PARTITION CASCADE:
 3. Upstream services (API gateway, ML inference) have a 50ms timeout.
    - Requests to P-hot start timing out.
    - Clients retry (standard retry policy: 3 retries).
-   - Effective load on P-hot: 100x × 3 retries = 300x normal.
+   - Effective load on P-hot: 100x × up to 4 attempts (1 + 3 retries) = up to 400x normal.
 
 4. The node hosting P-hot also hosts 50 other partitions.
    - Those 50 partitions share the same CPU, network, and memory.
@@ -1783,7 +1796,7 @@ HOT PARTITION CASCADE:
 
 MITIGATION:
   a. Per-partition resource isolation: CPU and memory cgroups per partition
-     (CockroachDB's admission control does this at the request level).
+     (CockroachDB's admission control does something similar at the request level).
   b. Backpressure: reject requests for an overloaded partition with a
      429 (Too Many Requests) instead of queuing them.
   c. Circuit breaker (see Ch. 33): stop retrying to P-hot after N failures.
@@ -1851,7 +1864,7 @@ Partitioning a global user table by `country_code`. The US partition gets 40% of
 "We'll add a secondary index and query by city." If the primary partition key is user_id, a query for "all users in NYC" must scatter to every partition. With 10,000 partitions, that is 10,000 network round-trips. Fix: if this query is frequent, use a global secondary index partitioned by city, or maintain a denormalized table partitioned by city.
 
 **Mistake 3: Assuming uniform distribution without checking.**
-"We hash user_id so it is uniform." The hash distribution is uniform, but the access pattern may not be. If 1% of users generate 50% of traffic, the partitions holding those users are 50x hotter than average, regardless of hash uniformity.
+"We hash user_id so it is uniform." The hash spreads *users* evenly, not *traffic*. If 1% of users generate 50% of traffic, each of those users is about 99x busier than a typical user (50%/1% vs 50%/99%). A partition that happens to hold several of the heaviest users can be many times hotter than average, regardless of hash uniformity.
 
 **Mistake 4: Not accounting for replication in capacity math.**
 "10TB of data across 10 nodes, 1TB each." With RF=3, you need 30TB of raw storage -- 3TB per node if evenly distributed, meaning you actually need 30 nodes at 1TB each (or 10 nodes at 3TB each).
@@ -1935,13 +1948,13 @@ These are the constants and rules of thumb you should have at your fingertips:
 NUMBERS TO KNOW:
 
 Consistent hashing:
-  - Keys moved on node addition: K/N (vs K×(N-1)/N for modular hash)
-  - Virtual nodes for good balance: 128-256 per physical node
-  - Load std dev with V vnodes: proportional to 1/sqrt(V × N)
+  - Keys moved on node addition: ~K/(N+1) (vs ~K×N/(N+1) for modular hash)
+  - Virtual nodes for good balance: 128-256 per node (random tokens); 8-16 with a smart allocator
+  - Relative load std dev with V vnodes: about 1/sqrt(V) (V=256 → ~6%)
 
 Production systems:
   - Redis Cluster hash slots: 16,384
-  - Cassandra default vnodes: 256 (num_tokens)
+  - Cassandra default vnodes (num_tokens): 16 in 4.0+, 256 before
   - DynamoDB partition size limit: 10 GB
   - DynamoDB partition throughput limit: 3000 RCU / 1000 WCU
   - CockroachDB default range size: 512 MB
@@ -1953,7 +1966,7 @@ Capacity planning rules of thumb:
   - Partition count: 10x expected max node count (for static partition systems)
   - Replication factor: 3 (standard), 5 (high-durability use cases)
   - Hot partition threshold: > 5x average QPS → investigate
-  - Rebalancing bandwidth limit: 200 Mbps per node (default in many systems)
+  - Rebalancing bandwidth limit: e.g. 200 Mbps per node (Cassandra's long-time streaming default)
 
 Failure timing:
   - Node failure detection: 10-30 seconds (tunable)

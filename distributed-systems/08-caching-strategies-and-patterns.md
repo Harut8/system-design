@@ -25,6 +25,89 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 
 ---
 
+## Start here — the whole chapter in plain words
+
+**The problem.** Databases are slow and expensive compared with memory. Many apps ask the database
+the same question over and over: "what is the price of product 42?" A cache keeps a copy of recent
+answers in fast memory so most requests never reach the database. The hard parts are keeping the copy
+fresh, surviving the moment a popular copy expires, choosing what to throw out when memory is full,
+and staying up when the cache itself breaks.
+
+**A real-world example.** An e-commerce site shows product pages. It gets 20,000 product reads/s and
+about 200 price/stock updates/s (a 100:1 read-to-write ratio). One database query takes about 10 ms,
+and the database handles about 5,000 such queries/s before it slows down.
+
+- **No cache**: 20,000 queries/s hit a database that can do 5,000. Queues build, pages time out.
+- **Cache-aside with Redis** (§2.1): the app checks Redis first (0.5 ms). With a 95% hit rate, only
+  5% of reads reach the database: 20,000 x 0.05 = 1,000 queries/s. Average read latency is
+  0.95 x 0.5 ms + 0.05 x (0.5 + 10) ms = 1.0 ms instead of 10 ms.
+- **Invalidation** (§3): when a price changes, a change-data-capture event deletes `product:42`
+  from Redis within milliseconds. A 5-minute TTL is the safety net: even if the event is lost, a
+  wrong price lives at most 5 minutes.
+- **Stampede protection** (§4): a flash-sale item gets 5,000 reads/s and takes 200 ms to rebuild.
+  When its key expires, every read in those 200 ms misses: 5,000 x 0.2 = 1,000 identical queries.
+  Singleflight cuts this to 1 query per app server (40 servers → at most 40); early refresh (XFetch)
+  rebuilds it before it expires, so usually only 2-3 queries happen.
+- **Eviction and sizing** (§5, §10): 2 million products x ~1,625 bytes (key + value + Redis
+  overhead) = 3.25 GB; with 1 replica and 20% headroom, about 7.8 GB. When memory is full, the
+  eviction policy (LRU/LFU) throws out the items least likely to be read again.
+- **Failure and monitoring** (§11, §12): if the hit rate drops from 95% to 80%, database load goes
+  from 1,000 to 4,000 queries/s -- four times higher from a "small" 15-point drop. Watch hit rate
+  first. If Redis dies, a circuit breaker skips it quickly and the database sheds excess load
+  instead of collapsing.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Cache | a fast copy of data that lives somewhere slower | the sticky note with your wifi password instead of the router manual |
+| Hit / miss | the answer was / was not in the cache | the book is on your desk / you walk to the library |
+| Hit rate | share of requests answered from the cache | how often the book is already on your desk |
+| TTL | how long a copy is trusted before it expires | a "best before" date on milk |
+| Cache-aside | the app checks the cache, and on a miss loads the DB and fills the cache | you look in the fridge; if empty, you shop and restock it |
+| Write-through / write-behind | on write, update the cache and DB together / cache now, DB later | paying at the till now / running a tab you settle later |
+| Invalidation | deleting a copy because the real data changed | crossing out an old phone number in your address book |
+| Stale data | a cached copy older than the real data | yesterday's newspaper |
+| Stampede (thundering herd) | many requests miss at once and all hit the DB | the whole office rushing to one coffee machine at 9:00 |
+| Singleflight | one request fetches, the others wait for its result | one person goes to buy lunch for the team |
+| Eviction (LRU / LFU) | throwing items out when memory is full: least recently / least often used | clearing your closet of clothes you haven't worn lately / wear rarely |
+| Admission (TinyLFU) | only let a new item in if it looks more popular than the one it replaces | a club bouncer comparing the newcomer with who would have to leave |
+| Consistent hashing | a way to split keys across servers so adding one moves few keys | seating guests by table so a new table only moves a few people |
+| Negative caching | remembering "this does not exist" | a note on the door: "no, we don't sell stamps" |
+| Circuit breaker | stop calling a broken cache for a while | the fuse that cuts power before the wires burn |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| read:write ratio | reads per write for a piece of data | 10:1 – 1000:1 | profile read 1,000 times per edit |
+| QPS | requests (queries) per second | 1k – 1M | 20,000 product reads/s |
+| hit rate `h` | `hits / (hits + misses)` | 80 – 99% | 19,000 hits of 20,000 reads = 95% |
+| miss rate | `1 - h`; the share that reaches the DB | 1 – 20% | 5% of 20,000 = 1,000 DB queries/s |
+| `t_hit`, `t_miss` | time to serve from cache / from DB after a miss | 0.5 ms / 10 ms | average = `h x t_hit + (1-h) x (t_hit + t_miss)` = 1.0 ms at 95% |
+| p50 / p99 | half / 99% of requests are faster than this | Redis: <1 ms / <5 ms | p99 = 4 ms: 1 in 100 reads is slower than 4 ms |
+| RTT | network round-trip time to the cache | 0.1 – 1 ms | 100 GETs x 0.5 ms = 50 ms without pipelining |
+| TTL (`ttl`, `EX`) | seconds until a cached entry expires | 30 s – 1 h | `SET key v EX 300` = 5 minutes |
+| jitter | random seconds added to each TTL | 10 – 20% of TTL | `300 + random(0, 60)` |
+| `stale_ttl` | how long a stale value may still be served (§3.5) | 2x TTL | fresh 300 s, servable until 600 s |
+| `lock_ttl` | how long a rebuild lock lives before auto-release (§4.2) | 5 – 10 s | `SET lock:k 1 NX EX 10` |
+| `expiry` | absolute time the entry expires (§4.3) | — | stored_at + 300 s |
+| `delta` | how long the last rebuild took (§4.3) | 10 ms – 2 s | the trending query took 0.2 s |
+| `beta` | XFetch eagerness; >1 refreshes earlier | 1.0 | beta = 2 doubles the average look-ahead |
+| `rand()` | uniform random number in (0, 1] | — | `-ln(rand())` averages 1 |
+| `N` (items) | number of unique cached items | 1M – 1B | 10 million user profiles |
+| `key_size`, `value_size` | average bytes per key / value | 20 – 50 B / 100 B – 10 KB | `user:profile:12345` = 18 B |
+| overhead | Redis bookkeeping bytes per key | ~80 – 100 B | 100 B on a 500 B profile |
+| replication factor | copies of each item (primary + replicas) | 1 – 2 | 6.25 GB x 2 = 12.5 GB |
+| headroom | spare memory kept free | 20% | 12.5 GB x 1.2 = 15 GB |
+| `N` (nodes) | number of cache servers when sharding (§8) | 3 – 100 | `hash(key) % N` |
+| vnodes | points per server on the hash ring | 100 – 200 | 150 vnodes: each of 3 nodes gets ~32–34% |
+| hash slots | Redis Cluster's fixed key buckets | 16,384 | `CRC16(key) % 16384` |
+| `maxmemory-samples` | keys Redis samples per eviction | 5 | pick the oldest of 5 random keys |
+| eviction rate | keys thrown out per second for lack of memory | ~0 when healthy | 1,000/s sustained → cache too small |
+
+If a section below gets too technical, read its **In plain words** box first.
+
+---
+
 ## 1. Mental Models
 
 ### 1.1 Cache Is a Bet
@@ -65,6 +148,10 @@ READ-TO-WRITE RATIO AND CACHE VALUE:
 ---
 
 ## 2. Caching Strategies -- The Big Five
+
+> **In plain words.** There are only a few ways to wire a cache to a database. Either the app fills the cache itself on a miss (cache-aside), or the cache does it (read-through). On writes, you update both at once (write-through), update the cache and the DB later (write-behind), or refresh popular items before they expire (refresh-ahead).
+>
+> **Real-world example.** A chat app caches user profiles with cache-aside: 50,000 profile reads/s, 95% hits, so only 2,500/s reach the DB. The same app counts message views with write-behind: 100 view increments are batched into 1 DB write, cutting DB writes 100x at the risk of losing a few seconds of counts on a crash.
 
 There are five fundamental patterns for how a cache interacts with the backing data store. Every production caching system is one of these, or a hybrid. You must know all five, their tradeoffs, and when to reach for each.
 
@@ -262,6 +349,10 @@ REFRESH-AHEAD:
 
 ## 3. Cache Invalidation
 
+> **In plain words.** A cached copy goes out of date the moment the real data changes. Invalidation is how you get rid of old copies: let them expire after a time (TTL), delete them when a change event arrives, or change the key so old copies are never read again.
+>
+> **Real-world example.** A bank app caches account settings for 10 minutes. A user changes their phone number; a change event deletes `settings:42` within ~50 ms. If that event is lost, the 10-minute TTL still guarantees the old number disappears within 10 minutes.
+
 Phil Karlton famously said there are only two hard things in computer science: cache invalidation and naming things. He was right about the first one. Invalidation is where caching systems break, and it is the part interviewers probe deepest.
 
 ### 3.1 TTL-Based Invalidation
@@ -416,6 +507,10 @@ This is what most production systems at scale use. The event-based path keeps da
 ---
 
 ## 4. Thundering Herd and Cache Stampede
+
+> **In plain words.** When a very popular cached item expires, hundreds of requests miss at the same moment and all ask the database for the same thing. The fixes: let only one request rebuild it (lock or singleflight), or rebuild it a little early, before it expires.
+>
+> **Real-world example.** A video platform caches the "trending" list. It gets 2,000 reads/s and takes 0.5 s to rebuild. On expiry, 2,000 x 0.5 = 1,000 identical queries hit the database. With singleflight on 20 servers, at most 20 queries run; with early refresh, usually 1-3.
 
 ### 4.1 The Problem
 
@@ -649,6 +744,10 @@ async def get_user(user_id: int):
 
 ## 5. Cache Eviction Policies
 
+> **In plain words.** Memory is limited, so when the cache is full something must go. LRU throws out what was used longest ago. LFU throws out what is used least often. TinyLFU adds a doorman: a new item only gets in if it looks more popular than the one it would push out.
+>
+> **Real-world example.** An e-commerce cache holds 1 million products, but 20 million exist. A nightly report reads all 20 million once. With plain LRU, that scan pushes out the popular items and the hit rate drops sharply the next morning. With LFU or TinyLFU, the one-time reads never beat the popular items, so the hit rate barely moves.
+
 When the cache is full and a new entry must be inserted, the eviction policy decides which existing entry to remove. The choice of eviction policy has a significant impact on hit rate, which is the single most important cache metric.
 
 ### 5.1 LRU (Least Recently Used)
@@ -671,20 +770,20 @@ Evict the entry with the lowest access count. Entries that are accessed often su
 
 ### 5.3 ARC (Adaptive Replacement Cache)
 
-Maintains two LRU lists -- one for items accessed once ("recency") and one for items accessed more than once ("frequency") -- and dynamically adjusts the partition between them based on the observed workload. Patented by IBM.
+Maintains two LRU lists -- one for items accessed once ("recency") and one for items accessed more than once ("frequency") -- plus two "ghost" lists that remember only the keys of recently evicted items. A hit in a ghost list tells ARC which side was too small, and it shifts the partition toward that side. Invented at IBM (Megiddo and Modha, FAST 2003) and patented by IBM.
 
 **Strengths**: Adapts to workload changes. Handles both recency-biased and frequency-biased access patterns. Scan-resistant.
 
-**Weaknesses**: More complex to implement. Patent encumbered (though the patent has expired in some jurisdictions). Higher per-operation overhead than simple LRU.
+**Weaknesses**: More complex to implement. The IBM patent kept some open-source projects away from it for years (PostgreSQL briefly shipped ARC in 8.0, then replaced it). Higher per-operation overhead than simple LRU.
 
 ### 5.4 TinyLFU (The Modern Standard)
 
 The key insight of TinyLFU is to separate the **admission policy** from the **eviction policy**. It uses a frequency sketch (Count-Min Sketch) to cheaply estimate access frequencies, and only admits a new item to the cache if its estimated frequency exceeds that of the item it would replace.
 
 W-TinyLFU (Windowed TinyLFU), used in Caffeine (Java's best in-process cache), combines:
-1. **Window cache** (1% of capacity, LRU): Admits all new entries, giving them a chance to build up frequency.
-2. **Main cache** (99% of capacity, segmented LRU): An item from the window cache is only promoted to the main cache if TinyLFU's frequency sketch says it is more popular than the main cache's eviction candidate.
-3. **Count-Min Sketch**: A space-efficient probabilistic data structure that estimates item frequencies using 4 hash functions and a compact array. Periodically halved (aging) to adapt to changing access patterns.
+1. **Window cache** (starts at 1% of capacity, LRU): Admits all new entries, giving them a chance to build up frequency. Caffeine adapts the window size at runtime (hill climbing) for recency-heavy workloads.
+2. **Main cache** (the other ~99%, segmented LRU: a "probation" segment and a "protected" segment of about 80% of the main cache): An item evicted from the window is only admitted to the main cache if TinyLFU's frequency sketch says it is more popular than the main cache's eviction candidate; the loser is evicted.
+3. **Count-Min Sketch**: A space-efficient probabilistic data structure that estimates item frequencies using 4 hash functions and small 4-bit counters. When the total number of recorded accesses reaches a sample size (about 10x the cache capacity), every counter is halved (aging), so old popularity fades.
 
 ```
 W-TinyLFU ARCHITECTURE (Caffeine):
@@ -703,12 +802,12 @@ W-TinyLFU ARCHITECTURE (Caffeine):
   Frequency estimation: Count-Min Sketch (4 hash functions, periodic aging)
 ```
 
-**Why TinyLFU beats pure LRU for most workloads**: Real-world cache access patterns follow power-law distributions (Zipfian). A small number of items are accessed very frequently, and a long tail of items are accessed rarely. LRU wastes cache space on long-tail items that happen to be accessed recently. TinyLFU's admission filter keeps these out, reserving cache space for genuinely popular items. In benchmarks, Caffeine with W-TinyLFU consistently outperforms LRU, LFU, and ARC across diverse workloads, often by 10-30% in hit rate.
+**Why TinyLFU beats pure LRU for most workloads**: Real-world cache access patterns follow power-law distributions (Zipfian). A small number of items are accessed very frequently, and a long tail of items are accessed rarely. LRU wastes cache space on long-tail items that happen to be accessed recently. TinyLFU's admission filter keeps these out, reserving cache space for genuinely popular items. In the published trace benchmarks (Einziger, Friedman, Manes, "TinyLFU", ACM ToS 2017, and Caffeine's simulator), W-TinyLFU matches or beats LRU, LFU, and ARC on most traces; the size of the gain depends heavily on the workload and cache size.
 
 ### 5.5 Other Policies
 
 - **FIFO (First In, First Out)**: Evict the oldest entry. Simple but ignores access patterns entirely. Useful only when all entries are equally likely to be accessed (rare in practice).
-- **Random**: Evict a random entry. Surprisingly competitive with LRU for uniform access patterns and much simpler to implement. Used in some CPU cache designs.
+- **Random**: Evict a random entry. Surprisingly competitive with LRU for uniform access patterns and much simpler to implement. Used in some CPU cache designs. A scan does not flush the whole cache at once (each scanned item only has a small chance of pushing out a hot one), but it is not truly scan-resistant.
 - **TTL-based eviction**: Evict entries closest to expiry. Not a standalone eviction policy -- usually combined with LRU/LFU as a secondary signal.
 
 ### 5.6 Eviction Policy Comparison
@@ -718,20 +817,25 @@ W-TinyLFU ARCHITECTURE (Caffeine):
 │ Policy   │ Hit Rate     │ Scan         │ Implementation │ Used In            │
 │          │ (typical)    │ Resistant?   │ Complexity     │                    │
 ├──────────┼──────────────┼──────────────┼────────────────┼────────────────────┤
-│ LRU      │ Good         │ No           │ Low            │ Redis, Memcached   │
+│ LRU      │ Good         │ No           │ Low            │ Redis (approx.),   │
+│          │              │              │                │ Memcached          │
 │ LFU      │ Good         │ Yes          │ Medium         │ Redis (since 4.0)  │
-│ ARC      │ Very good    │ Yes          │ High           │ ZFS, PostgreSQL    │
+│ ARC      │ Very good    │ Yes          │ High           │ ZFS (PG 8.0 only)  │
 │ TinyLFU  │ Excellent    │ Yes          │ High           │ Caffeine (Java)    │
 │ FIFO     │ Poor         │ N/A          │ Very low       │ Simple buffers     │
-│ Random   │ Fair         │ Yes          │ Very low       │ CPU caches (some)  │
+│ Random   │ Fair         │ Partly       │ Very low       │ CPU caches (some)  │
 └──────────┴──────────────┴──────────────┴────────────────┴────────────────────┘
 ```
 
-**Interview guidance**: Know LRU (it is the default everywhere), know why TinyLFU is better (admission filtering based on frequency estimation), and know ARC exists for completeness. If asked "which eviction policy would you use?", the answer is: LRU for a remote cache (Redis default), TinyLFU/Caffeine for an in-process cache (Java/JVM), and LRU with manual hot-key pinning for everything else.
+**Interview guidance**: Know LRU (it is the default everywhere), know why TinyLFU is better (admission filtering based on frequency estimation), and know ARC exists for completeness. If asked "which eviction policy would you use?", the answer is: LRU or LFU for a remote cache (in Redis set `maxmemory-policy allkeys-lru` or `allkeys-lfu` -- the default is `noeviction`), TinyLFU/Caffeine for an in-process cache (Java/JVM), and LRU with manual hot-key pinning for everything else.
 
 ---
 
 ## 6. Redis as a Cache -- Deep Dive
+
+> **In plain words.** Redis is the most common cache server. It keeps everything in RAM, offers data types beyond plain strings (hashes, sorted sets, counters), and can be split across many servers (Cluster) or given automatic failover (Sentinel). A few settings decide whether it behaves as a good cache.
+>
+> **Real-world example.** A ride-hailing app stores driver locations and trip state in Redis. A fresh Redis install has `maxmemory-policy noeviction`: when memory fills up, writes start failing instead of old keys being evicted. Setting `allkeys-lru` makes Redis evict old keys and keep accepting writes.
 
 Redis is the dominant cache technology in production systems. Interviewers expect you to know it beyond "it's a key-value store."
 
@@ -741,7 +845,7 @@ Redis is not just key-value. It is a data structure server, and choosing the rig
 
 - **String**: The basic type. `SET key value EX ttl`. Up to 512MB. Use for simple cached values (JSON blobs, serialized objects). Memory-efficient for values under 44 bytes (embedded encoding).
 
-- **Hash**: A map of field-value pairs under a single key. `HSET user:42 name "Bob" email "bob@x.com"`. Use when you need to read/update individual fields without deserializing the entire value. Memory-efficient for small hashes (<128 fields, <64 byte values) via ziplist encoding.
+- **Hash**: A map of field-value pairs under a single key. `HSET user:42 name "Bob" email "bob@x.com"`. Use when you need to read/update individual fields without deserializing the entire value. Memory-efficient for small hashes (<=128 fields, <=64-byte values by default) via the compact listpack encoding (called ziplist before Redis 7.0).
 
 - **Sorted Set (ZSet)**: An ordered set where each member has a score. `ZADD leaderboard 9500 "player:42"`. O(log N) insert and range queries. The go-to structure for leaderboards, rate limiters (sliding window), and any ranked data.
 
@@ -772,7 +876,7 @@ EVICTION POLICIES (maxmemory-policy):
   volatile-ttl      Evict key with shortest remaining TTL
 ```
 
-**Recommendation**: Use `allkeys-lru` or `allkeys-lfu` for cache workloads. The `volatile-*` policies only evict keys with an explicit TTL, which means keys without TTL are never evicted -- dangerous if any cache population path forgets to set a TTL. The `allkeys-lfu` policy is better when access patterns are highly skewed (a few hot keys dominate), which is most real-world workloads.
+**Recommendation**: Use `allkeys-lru` or `allkeys-lfu` for cache workloads. Note that Redis LRU/LFU are *approximate*: on each eviction Redis samples a few keys (`maxmemory-samples`, default 5) and evicts the best candidate among them, rather than keeping an exact global list. The `volatile-*` policies only evict keys with an explicit TTL, which means keys without TTL are never evicted -- dangerous if any cache population path forgets to set a TTL. The `allkeys-lfu` policy is better when access patterns are highly skewed (a few hot keys dominate), which is common in real-world workloads.
 
 **Memory overhead per key**: Every Redis key carries metadata overhead beyond the value itself.
 
@@ -784,16 +888,16 @@ APPROXIMATE MEMORY OVERHEAD PER KEY (Redis 7.x):
             expiry (if set), LRU/LFU metadata
 
   Example: storing a 100-byte JSON string with a key name of 20 bytes
-    Key name (SDS):     20 + 9 bytes (SDS header + null terminator) = ~29 bytes
-    Value (SDS):        100 + 9 bytes = ~109 bytes
+    Key name (SDS):     20 + ~4 bytes (small SDS header + null terminator) = ~24 bytes
+    Value (SDS):        100 + ~4 bytes = ~104 bytes
     dict entry:         ~24 bytes (3 pointers)
     robj (key):         ~16 bytes
     robj (value):       ~16 bytes
     Expiry:             ~16 bytes (if TTL is set)
     jemalloc alignment: rounds up to allocation class boundaries
 
-    Total: ~240-280 bytes for a 100-byte value
-    Overhead ratio: ~1.5-1.8x for small values, approaches 1x for large values
+    Total: ~200-260 bytes for 120 bytes of key + value (after allocator rounding)
+    Overhead ratio: ~1.7-2.2x for small values, approaches 1x for large values
 
   Rule of thumb: budget 2x the raw data size for small values (<1KB),
                  1.3x for medium values (1-10KB), 1.1x for large values (>10KB).
@@ -821,13 +925,13 @@ For caches that exceed a single node's memory or throughput, Redis Cluster provi
 
 **Replication**: Each master has one or more replicas. If a master fails, a replica is promoted (automatic failover). Replication is asynchronous, so recently written data may be lost on failover.
 
-**Multi-key operations**: Commands that operate on multiple keys (MGET, pipeline) require all keys to be on the same node. Use hash tags `{user:42}:profile` and `{user:42}:sessions` to force related keys to the same slot.
+**Multi-key operations**: Multi-key commands (MGET, MSET), MULTI/EXEC transactions, and Lua scripts require all keys to be in the same hash slot, or Redis returns a `CROSSSLOT` error. (Pipelines are fine: cluster-aware clients split them per node.) Use hash tags `{user:42}:profile` and `{user:42}:sessions` to force related keys to the same slot.
 
 ### 6.5 Redis Sentinel (High Availability)
 
 For single-master deployments that need automatic failover without the complexity of Redis Cluster.
 
-Sentinel is a separate process that monitors Redis instances, detects master failure, promotes a replica to master, and notifies clients of the topology change. Requires a quorum of Sentinel instances (typically 3) to agree on a failover to prevent split-brain.
+Sentinel is a separate process that monitors Redis instances, detects master failure, promotes a replica to master, and notifies clients of the topology change. Run at least 3 Sentinels: a configurable quorum must agree the master is down, and a majority of Sentinels must authorize the failover, which prevents two conflicting promotions.
 
 **Sentinel vs. Cluster**: Use Sentinel when your dataset fits on a single node and you only need HA. Use Cluster when you need to shard across multiple nodes.
 
@@ -852,6 +956,10 @@ results = pipe.execute()  # All 100 results returned at once
 ---
 
 ## 7. Distributed Caching Architecture
+
+> **In plain words.** Caches come in layers: the browser, the CDN near the user, memory inside each app server, a shared cache server like Redis, and finally the database. Each layer is faster but smaller and harder to keep fresh than the one behind it.
+>
+> **Real-world example.** A news site serves images from a CDN (95% hits, ~20 ms), keeps site config in each app server's memory (~5 microseconds), and stores article bodies in Redis (~1 ms). Only about 1 in 50 article reads reaches the database (~15 ms).
 
 ### 7.1 The Four Cache Layers
 
@@ -952,7 +1060,7 @@ A dedicated cache service (Redis or Memcached) accessible by all application ins
 
 Recommendation: Redis for almost everything. Memcached only when you need
 multi-threaded performance for simple key-value workloads at extreme scale
-(Facebook's TAO-era Memcache fleet is the canonical example).
+(Facebook's Memcache deployment, described in "Scaling Memcache at Facebook", NSDI 2013, is the canonical example).
 ```
 
 ### 7.4 L1 + L2: The Two-Level Pattern
@@ -1013,6 +1121,10 @@ Content Delivery Networks cache responses at edge locations geographically close
 
 ## 8. Consistent Hashing
 
+> **In plain words.** With several cache servers, each key must live on one of them. The simple rule `hash(key) % N` moves almost every key when you add a server, which is like emptying the whole cache. Consistent hashing moves only about 1/N of the keys.
+>
+> **Real-world example.** A chat app has 3 cache servers and adds a 4th. With `% N`, 75% of keys move and the database sees a flood of misses. With a hash ring and 150 virtual nodes per server, about 25% of keys move (we measured 24%), and the rest stay warm.
+
 ### 8.1 The Problem: Cache Sharding
 
 When a cache is distributed across multiple nodes, you need a way to determine which node holds a given key. The naive approach -- `node = hash(key) % N` -- works until a node is added or removed. When N changes, `hash(key) % N` produces a different result for nearly every key, causing a mass cache miss (effectively a full cache flush) and a thundering herd to the database.
@@ -1062,22 +1174,26 @@ A problem with basic consistent hashing: with a small number of physical nodes, 
 ```
 VIRTUAL NODES:
 
-  Without vnodes (3 physical nodes, uneven distribution):
-    Node A: 45% of keys  (owns large arc)
-    Node B: 35% of keys
-    Node C: 20% of keys  (owns small arc)
+  Measured with the §8.5 code (MD5, 200,000 keys, nodes redis-1..3):
+
+  Without vnodes (1 point per node):
+    redis-1: 25.7% of keys
+    redis-2: 50.5% of keys  (owns a large arc -- twice its fair share)
+    redis-3: 23.8% of keys
 
   With 150 vnodes per physical node:
-    Node A: ~33.2% of keys
-    Node B: ~33.5% of keys
-    Node C: ~33.3% of keys   (approximately uniform)
+    redis-1: 31.6% of keys
+    redis-2: 34.2% of keys
+    redis-3: 34.2% of keys   (within ~2 points of the ideal 33.3%)
+
+  Spread shrinks roughly like 1/sqrt(vnodes): more vnodes, more even.
 ```
 
 **Typical vnode count**: 100-200 per physical node. Higher counts give better distribution but increase the ring metadata size and lookup cost.
 
 ### 8.4 Jump Consistent Hash
 
-An alternative to ring-based consistent hashing. Jump consistent hash (Lamport and Thaler, 2014) maps a key to one of N buckets using a fast, zero-memory algorithm. It achieves perfectly uniform distribution and moves the minimum number of keys when N changes.
+An alternative to ring-based consistent hashing. Jump consistent hash (Lamping and Veach, Google, 2014) maps a key to one of N buckets using a fast, zero-memory algorithm. It achieves perfectly uniform distribution and moves the minimum number of keys when N changes.
 
 ```go
 // Jump consistent hash — the entire algorithm
@@ -1092,7 +1208,7 @@ func JumpConsistentHash(key uint64, numBuckets int) int {
 }
 ```
 
-**Pros**: O(ln N) time, zero memory. Perfect key distribution. Minimal key movement.
+**Pros**: O(ln N) time, zero memory. Near-perfectly uniform key distribution. Minimal key movement (going from N to N+1 buckets moves 1/(N+1) of keys).
 
 **Cons**: Only supports sequential bucket IDs (0 to N-1). Cannot name or remove specific nodes -- you can only grow or shrink the bucket count from the end. This makes it unsuitable for clusters where arbitrary nodes can fail.
 
@@ -1155,7 +1271,7 @@ ring = ConsistentHash(["redis-1", "redis-2", "redis-3"])
 node = ring.get_node("user:42")       # → "redis-2"
 node = ring.get_node("session:abc")    # → "redis-1"
 
-# Adding a node remaps only ~1/N keys
+# Adding a node remaps only ~1/N keys (measured: 3 -> 4 nodes moved ~24% of keys)
 ring.add_node("redis-4")
 node = ring.get_node("user:42")       # Probably still "redis-2"
 ```
@@ -1167,6 +1283,10 @@ The Ketama algorithm is the specific consistent hashing implementation used by l
 ---
 
 ## 9. Cache in System Design Interviews
+
+> **In plain words.** This section is the interview section of this chapter. It shows the caching patterns interviewers expect for common designs: news feeds, sessions, rate limiters, leaderboards, ML features, API responses, and precomputed counts. For each, know the key format, the data type, the TTL, and what happens on a miss.
+>
+> **Real-world example.** Asked to design Twitter's timeline, say: "feed:{user_id} is a Redis list of the latest 200 post IDs, TTL 15 minutes, filled by fan-out on write, except for accounts with millions of followers, which we merge in at read time."
 
 Caching appears in nearly every system design interview. Here are the concrete patterns you should be ready to apply.
 
@@ -1234,6 +1354,9 @@ SLIDING WINDOW RATE LIMITER:
 
     ZADD key now request_id               (add this request)
     EXPIRE key 61                          (auto-cleanup)
+
+  Run these steps as one Lua script (or MULTI/EXEC): otherwise two
+  concurrent requests can both read count = limit-1 and both get through.
 ```
 
 ### 9.4 Leaderboard
@@ -1322,6 +1445,10 @@ EXAMPLES:
 
 ## 10. Capacity Planning
 
+> **In plain words.** Sizing a cache is simple multiplication: number of items x bytes per item (key + value + Redis overhead) x number of copies, plus spare room. Then estimate the hit rate, because the misses are what the database still has to handle.
+>
+> **Real-world example.** 10 million user profiles x 625 bytes = 6.25 GB. With 1 replica and 20% headroom, 15 GB total. At 10,000 reads/s and a 90% hit rate, the database still sees 1,000 queries/s -- size the database for that, and for what happens if the cache is empty.
+
 ### 10.1 Memory Sizing Formula
 
 ```
@@ -1331,7 +1458,7 @@ MEMORY CALCULATION:
 
   Where:
     N                  = number of unique cached items
-    key_size           = average key length in bytes (e.g., "user:profile:12345" = 19 bytes)
+    key_size           = average key length in bytes (e.g., "user:profile:12345" = 18 bytes)
     value_size         = average serialized value size in bytes
     overhead           = Redis per-key overhead (~80-100 bytes for Redis 7.x)
     replication_factor = 1 (no replicas) to 2 (1 replica per shard)
@@ -1347,7 +1474,7 @@ MEMORY CALCULATION:
     With replication (1 replica): 6.25 GB × 2 = 12.5 GB
     With 20% headroom: 12.5 GB × 1.2 = 15 GB
 
-    → 2 Redis nodes × 8GB each, or 1 node with 16GB
+    → 1 primary + 1 replica, each with ~8 GB (6.25 GB x 1.2 = 7.5 GB per node)
 ```
 
 ### 10.2 Hit Rate Estimation
@@ -1392,14 +1519,15 @@ BREAK-EVEN ANALYSIS:
     Without cache: 10,000 DB queries/sec
     With 90% hit rate: 1,000 DB queries/sec + 10,000 cache reads/sec
 
-    DB cost: RDS db.r6g.xlarge = $0.48/hr = ~$350/month
-    Cache cost: ElastiCache r6g.large (13GB) = $0.17/hr = ~$125/month
+    Illustrative on-demand prices (check current AWS pricing; they vary by region):
+    DB cost: RDS db.r6g.xlarge ≈ $0.48/hr ≈ $350/month
+    Cache cost: ElastiCache cache.r6g.large (~13 GB) ≈ $0.17-0.21/hr ≈ $125-150/month
 
     With cache: DB load reduced 90%, can use smaller DB instance → net savings.
     Cache cost is almost always lower than the DB cost it replaces.
 
   Memory cost:
-    Redis (AWS ElastiCache): ~$13/GB/month (on-demand)
+    Redis (AWS ElastiCache): ~$10-13/GB/month (on-demand, illustrative)
     Database (RDS SSD): ~$0.10/GB/month (storage) + compute for queries
     The expensive part of DB queries is compute, not storage.
 ```
@@ -1420,6 +1548,10 @@ When discussing cache capacity in an interview, walk through this checklist:
 ---
 
 ## 11. Failure Modes and Resilience
+
+> **In plain words.** Caches fail in a few typical ways: many keys expire at once, attackers ask for keys that don't exist, one very popular key expires, or the cache server dies or splits in two. Each has a standard defense, and the golden rule is that a broken cache must never take the whole site down.
+>
+> **Real-world example.** A payments dashboard caches merchant summaries with exactly 1 hour TTL, all loaded at 09:00 during a deploy. At 10:00 all 500,000 keys expire in the same moment and the next requests all miss together. Adding random jitter (1 h + 0-10 min) spreads the rebuilds over 10 minutes: about 500,000 / 600 s ≈ 830 per second instead of one giant burst.
 
 Caches fail. Understanding how they fail and how to handle each failure mode is what separates production-grade caching from textbook caching.
 
@@ -1470,7 +1602,7 @@ BLOOM FILTER DEFENSE:
 
 ### 11.4 Redis Failover Lag
 
-When a Redis master fails and a replica is promoted, there is a window (typically 10-30 seconds with Sentinel, shorter with Cluster) during which:
+When a Redis master fails and a replica is promoted, there is a window during which the shard is unavailable or inconsistent. Its length is set mostly by failure detection: Sentinel's `down-after-milliseconds` (30 s in the sample config) or Redis Cluster's `cluster-node-timeout` (default 15 s), plus a few seconds for election and client reconnection. During that window:
 - Writes to the old master may be lost (async replication).
 - Reads may fail or return stale data from an unsynced replica.
 - Clients may be sending requests to the wrong node until topology updates propagate.
@@ -1522,6 +1654,10 @@ CIRCUIT BREAKER FOR CACHE:
 ---
 
 ## 12. Monitoring
+
+> **In plain words.** Watch hit rate first: a small drop in hit rate means a big rise in database load. Then watch memory use, evictions, latency, and connections. Alert on changes, not only on fixed limits.
+>
+> **Real-world example.** At 20,000 reads/s, a hit rate falling from 98% to 90% looks small, but database queries go from 400/s to 2,000/s -- five times more. An alert on "hit rate < 90% for 10 minutes" catches it before the database does.
 
 ### 12.1 The Essential Metrics
 
@@ -1575,7 +1711,8 @@ redis_memory_used_bytes / redis_memory_max_bytes * 100
 # Eviction rate (keys evicted per second)
 rate(redis_evicted_keys_total[5m])
 
-# Command latency P99 (using Redis latency tracking)
+# Command latency P99 -- needs a latency histogram; the metric name depends on
+# your exporter and version (client-side histograms are often more reliable)
 histogram_quantile(0.99, rate(redis_commands_duration_seconds_bucket[5m]))
 
 # Connection pool utilization

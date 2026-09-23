@@ -65,14 +65,14 @@ Three processing models, each with different latency and throughput characterist
 | Throughput | Very high (optimized for bulk) | High | High (but per-event overhead) |
 | State management | Implicit (re-read from source) | Managed per micro-batch | Continuous, incremental |
 | Fault tolerance | Rerun the batch | Rerun the micro-batch | Checkpoint-based recovery |
-| Windowing | Natural (data is already bounded) | Approximate (batch boundaries) | Native, event-time precise |
+| Windowing | Natural (data is already bounded) | Event-time windows + watermarks; results emitted once per micro-batch | Native, event-time precise |
 | Exactly-once | Natural (idempotent rerun) | Within micro-batch boundary | Checkpoint + 2PC sinks |
 
-**Spark Structured Streaming** deserves special mention because it is the most common alternative to Flink in the ML ecosystem. It processes data in micro-batches -- small, scheduled batch jobs that run every 100ms to several seconds. This is simpler to reason about (each micro-batch is a small DataFrame operation) and integrates naturally with Spark's batch APIs. The tradeoff: you cannot achieve sub-100ms latency, and windowing semantics are less precise because events are grouped by processing-time micro-batch boundaries rather than true event time. For many ML feature computation workloads, this tradeoff is acceptable. For real-time fraud detection or session-level recommendation, it is not.
+**Spark Structured Streaming** deserves special mention because it is the most common alternative to Flink in the ML ecosystem. It processes data in micro-batches -- small, scheduled batch jobs that run every 100ms to several seconds. This is simpler to reason about (each micro-batch is a small DataFrame operation) and integrates naturally with Spark's batch APIs. The tradeoff: in the default micro-batch mode you cannot get much below ~100ms latency (an experimental continuous-processing mode goes lower but supports far fewer operations). Spark does support event-time windows and watermarks; the difference is that results are produced once per micro-batch rather than per event. For many ML feature computation workloads, this tradeoff is acceptable. For real-time fraud detection or session-level recommendation, it is not.
 
 ### 1.3 The Streaming Duality: Tables and Streams
 
-One of the most powerful mental models in stream processing is the **table-stream duality**, first articulated clearly in the Kafka ecosystem.
+One of the most powerful mental models in stream processing is the **table-stream duality**, an old database idea (the transaction log) that the Kafka ecosystem popularized for streaming.
 
 **A stream is a changelog of a table.** Every INSERT, UPDATE, and DELETE to a database table can be captured as a stream of change events (CDC). Given the stream from the beginning of time, you can reconstruct the current table state by replaying all events.
 
@@ -83,9 +83,9 @@ STREAM-TABLE DUALITY:
 
 Stream (changelog):                    Table (materialized state):
   t=1: INSERT user_123, name="Alice"     ┌───────────┬──────────┐
-  t=2: INSERT user_456, name="Bob"       │ user_123  │ "Alice"  │  (current state
-  t=3: UPDATE user_123, name="Alicia"    │ user_456  │ "Bob"    │   at t=4)
-  t=4: DELETE user_456                   └───────────┴──────────┘
+  t=2: INSERT user_456, name="Bob"       │ user_123  │ "Alicia" │  (current state
+  t=3: UPDATE user_123, name="Alicia"    └───────────┴──────────┘   at t=4;
+  t=4: DELETE user_456                                              user_456 gone)
                 │                                  ▲
                 │    replay all events             │
                 └──────────────────────────────────┘
@@ -137,7 +137,7 @@ In a distributed system, events arrive out of order for multiple reasons:
 
 3. **Multi-partition joins**: Events from two Kafka partitions have independent ordering. When a Flink operator joins streams from partition 0 and partition 1, the interleaving is non-deterministic.
 
-4. **Producer retries**: A Kafka producer retries a failed send. The retry succeeds, but the original send also eventually succeeds (it was delayed, not lost). Now the same event appears twice, and the retry may arrive before other events that were produced after the original send.
+4. **Producer retries**: A Kafka producer retries a failed send. The retry succeeds, but the original send also eventually succeeds (it was delayed, not lost). Now the same event appears twice, and the retry may arrive before other events that were produced after the original send. (Kafka's idempotent producer, on by default since Kafka 3.0, removes these duplicates and keeps per-partition order; older or misconfigured producers still show this.)
 
 5. **Clock skew**: Different producers have slightly different system clocks. Producer A's clock is 3 seconds ahead of producer B's. Events from A appear to be "from the future" relative to B's events.
 
@@ -211,7 +211,8 @@ Physical plan (with chaining):
   [Source → Map](p=3)  ──shuffle──>  [Window+Aggregate → Sink](p=3)
        chain 1                              chain 2
 
-  Chain 1 runs in 3 slots, chain 2 in 3 slots = 6 slots total.
+  6 subtasks in total (3 per chain). With default slot sharing, one subtask of
+  each chain can share a slot, so the job needs only 3 slots (= max parallelism).
   Within each chain, data passes as Java objects (no serialization).
   Between chains, data is serialized, shuffled by key, and deserialized.
 ```
@@ -288,7 +289,7 @@ Flink supports three deployment modes, each with different lifecycle and isolati
 | Mode | Description | Use Case |
 |:---|:---|:---|
 | **Session cluster** | Long-running cluster, multiple jobs share TMs | Development, small jobs, cost optimization |
-| **Per-job cluster** | One cluster per job, dedicated resources | Production, resource isolation between jobs |
+| **Per-job cluster** | One cluster per job, dedicated resources (deprecated in Flink 1.15, removed in 2.0) | Legacy YARN setups; use application mode instead |
 | **Application mode** | main() runs on the cluster, not the client | Production on K8s, avoids client-side bottleneck |
 
 In Kubernetes deployments (the dominant production pattern as of 2025), **application mode** is standard. The Flink job's JAR is baked into a Docker image, the main() method runs inside the cluster, and the Flink Kubernetes Operator manages lifecycle (deploy, upgrade, savepoint, rollback).
@@ -297,9 +298,9 @@ In Kubernetes deployments (the dominant production pattern as of 2025), **applic
 
 The state backend determines where Flink stores operator state during processing:
 
-**HashMapStateBackend** (formerly MemoryStateBackend): State lives as Java objects on the JVM heap. Fast (no serialization during access) but limited by available heap memory. Suitable for jobs with small state (< 5-10 GB per TM). Checkpoints serialize the entire heap state to the checkpoint storage.
+**HashMapStateBackend** (replaced MemoryStateBackend and FsStateBackend in Flink 1.13): State lives as Java objects on the JVM heap. Fast (no serialization during access) but limited by available heap memory. Suitable for jobs with small state (< 5-10 GB per TM). Checkpoints serialize the entire heap state to the checkpoint storage.
 
-**EmbeddedRocksDBStateBackend** (formerly RocksDBStateBackend): State is stored in an embedded RocksDB instance on local disk. State can grow far beyond JVM heap (limited only by disk). State access involves serialization/deserialization per read/write, adding ~10-50us overhead per access compared to heap. Supports **incremental checkpointing**: only the RocksDB SST files that changed since the last checkpoint are uploaded, dramatically reducing checkpoint size for large state.
+**EmbeddedRocksDBStateBackend** (formerly RocksDBStateBackend): State is stored in an embedded RocksDB instance on local disk. State can grow far beyond JVM heap (limited only by disk). State access involves serialization/deserialization per read/write, adding roughly microseconds to tens of microseconds per access compared to heap (more when the read misses the block cache and hits disk). Supports **incremental checkpointing**: only the RocksDB SST files that changed since the last checkpoint are uploaded, dramatically reducing checkpoint size for large state.
 
 ```
 STATE BACKEND DECISION:
@@ -417,7 +418,7 @@ When a watermark passes a window's end time, the window fires. But what about ev
 
 Flink provides three mechanisms:
 
-1. **Allowed lateness**: After a window fires, keep it open for an additional duration. Late events that arrive within the allowed lateness period trigger a re-fire of the window with updated results. After the allowed lateness expires, the window state is purged and any subsequent events are dropped.
+1. **Allowed lateness** (default 0; event-time windows only): After a window fires, keep it open for an additional duration. Late events that arrive within the allowed lateness period trigger a re-fire of the window with updated results. After the allowed lateness expires, the window state is purged and any subsequent events are dropped.
 
 2. **Side outputs**: Events that arrive after the allowed lateness period can be redirected to a side output stream for separate processing (logging, reconciliation, a secondary slower pipeline).
 
@@ -487,7 +488,7 @@ WatermarkStrategy
     .withTimestampAssigner((event, timestamp) -> event.getEventTime());
 ```
 
-This says: "Events can arrive up to 10 seconds late. The watermark trails the maximum observed event time by 10 seconds." If the highest event time seen so far is 14:03:30, the watermark is 14:03:20.
+This says: "Events can arrive up to 10 seconds late. The watermark trails the maximum observed event time by 10 seconds." If the highest event time seen so far is 14:03:30, the watermark is 14:03:20 (precisely, Flink emits `max - delay - 1 ms`, i.e. 14:03:19.999, so an event stamped exactly 14:03:20 is still on time).
 
 **Punctuated watermarks**: Watermarks are emitted in response to specific events in the stream -- special marker events that indicate progress. Used when the event source provides explicit progress markers (e.g., "end of batch" markers from a mobile device flush).
 
@@ -704,7 +705,7 @@ When state grows large (tens of GB to TBs), these strategies keep the pipeline o
 | Bloom filter | Set membership (seen this event?) | ~10 bits/element | False positives only |
 | T-Digest | Quantile estimation (p99 latency) | ~5-10 KB | ~1% at extreme quantiles |
 
-**Example**: Computing `unique_visitors_last_24h` over 500M users with exact count would require ~4 GB of state (HashSet of user IDs). With HyperLogLog, it requires 12 KB with 0.8% error. For feature computation in ML, this accuracy is usually more than sufficient.
+**Example**: Computing `unique_visitors_last_24h` over 500M users with exact count would require at least ~4 GB of state (500M 8-byte user IDs; a real HashSet costs several times more). With HyperLogLog, it requires 12 KB with 0.8% error. For feature computation in ML, this accuracy is usually more than sufficient.
 
 ---
 
@@ -712,7 +713,7 @@ When state grows large (tens of GB to TBs), these strategies keep the pipeline o
 
 ### 6.1 The Chandy-Lamport Algorithm (Adapted for Flink)
 
-Flink's checkpointing is based on the Chandy-Lamport distributed snapshot algorithm, adapted for the streaming dataflow model. The key insight: by injecting special markers (checkpoint barriers) into the data stream, each operator can take a consistent snapshot of its state without stopping processing.
+Flink's checkpointing is based on the Chandy-Lamport distributed snapshot algorithm, adapted for the streaming dataflow model. The key insight: by injecting special markers (checkpoint barriers) into the data stream, each operator can take a consistent snapshot of its state without stopping the whole job. Flink's variant is called Asynchronous Barrier Snapshotting (Carbone et al., 2015). The difference from classic Chandy-Lamport: Chandy-Lamport also records the messages in flight on each channel; Flink's *aligned* checkpoints wait for barriers on all inputs instead, so no in-flight data needs to be saved. *Unaligned* checkpoints (6.2) go back to saving in-flight data, which is closer to the original algorithm.
 
 The algorithm proceeds in four phases:
 
@@ -725,7 +726,7 @@ The algorithm proceeds in four phases:
 - It continues processing events from input channels whose barrier has not yet arrived.
 - When barrier `n` arrives from ALL input channels, the operator snapshots its state.
 
-**Phase 4: State snapshot.** Once aligned, the operator asynchronously writes its state to durable storage (S3, HDFS). When all operators have acknowledged their snapshot, the JobManager marks checkpoint `n` as complete.
+**Phase 4: State snapshot.** Once aligned, the operator takes a quick local snapshot, forwards barrier `n` to all its outputs, and resumes processing; the snapshot is uploaded asynchronously to durable storage (S3, HDFS). When all operators have acknowledged their snapshot, the JobManager marks checkpoint `n` as complete.
 
 ```
 CHECKPOINT BARRIER PROPAGATION:
@@ -765,10 +766,10 @@ CHECKPOINT BARRIER PROPAGATION:
 
 ### 6.2 Unaligned Checkpoints (Flink 1.11+)
 
-Barrier alignment has a problem: when there is backpressure, the barrier from a fast input channel may be blocked behind buffered data from a slow channel. The operator buffers data from the fast channel while waiting, which exacerbates backpressure and increases checkpoint duration. In extreme cases, checkpoints time out.
+Barrier alignment has a problem: barriers travel in line with data, so under backpressure a barrier sits behind full network buffers and can take minutes to arrive. Meanwhile the operator has paused the inputs whose barrier already arrived, which adds to backpressure and stretches checkpoint duration. In extreme cases, checkpoints time out.
 
 **Unaligned checkpoints** solve this by NOT waiting for barrier alignment. Instead:
-1. When barrier `n` arrives from ANY input channel, the operator immediately snapshots its state.
+1. When barrier `n` arrives from ANY input channel, the operator immediately snapshots its state, and the barrier overtakes the queued data (it is forwarded to the front of the output buffers).
 2. All in-flight data (events in network buffers and internal queues) between the arrived barrier and the not-yet-arrived barriers are included in the snapshot.
 3. On recovery, these in-flight records are replayed, restoring the exact pre-checkpoint state.
 
@@ -794,11 +795,11 @@ Unaligned:
                 NO buffering. NO stall.
 ```
 
-**Tradeoff**: Unaligned checkpoints produce larger snapshots (they include in-flight data) but complete faster under backpressure. Use them when checkpoint timeouts are a recurring problem.
+**Tradeoff**: Unaligned checkpoints produce larger snapshots (they include in-flight data) but complete faster under backpressure. They work only with exactly-once checkpointing mode. Use them when checkpoint timeouts are a recurring problem. A middle ground (Flink 1.14+) is `execution.checkpointing.aligned-checkpoint-timeout`: start aligned, and switch to unaligned only if alignment takes longer than the timeout.
 
 ### 6.3 Exactly-Once End-to-End
 
-**The critical distinction**: Flink's checkpointing provides exactly-once **within the Flink pipeline** -- each event is processed exactly once, and state reflects this. But end-to-end exactly-once (from source to sink) requires cooperation from the external systems.
+**The critical distinction**: Flink's checkpointing provides exactly-once **within the Flink pipeline** -- after a failure some events are physically processed again, but the restored state reflects each event exactly once ("exactly-once state", not "exactly-once execution"). But end-to-end exactly-once (from source to sink) requires cooperation from the external systems.
 
 ```
 END-TO-END EXACTLY-ONCE:
@@ -818,32 +819,33 @@ END-TO-END EXACTLY-ONCE:
 
 **Sink exactly-once via Two-Phase Commit (2PC)**:
 
-The `TwoPhaseCommitSinkFunction` (or the newer `SinkV2` with `TwoPhaseCommittingSink`) implements:
+The legacy `TwoPhaseCommitSinkFunction` (or the newer Sink V2 API: `TwoPhaseCommittingSink` in Flink 1.15-1.18, `SupportsCommitter` from 1.19) implements:
 
 1. **Pre-commit**: During normal processing, the sink writes output to the external system inside a transaction (e.g., a Kafka transaction, a database transaction). It does NOT commit.
 
-2. **Checkpoint**: When the sink receives a checkpoint barrier, it flushes its current transaction and starts a new one. The old transaction is "pre-committed" -- all data is written but not visible to consumers.
+2. **Checkpoint**: When the sink receives a checkpoint barrier, it flushes its current transaction and starts a new one. The old transaction is "pre-committed" -- all data is written but not visible to consumers that read with `isolation.level=read_committed` (Kafka's default, `read_uncommitted`, would see it early -- downstream consumers must set this).
 
 3. **Commit**: When the JobManager notifies the sink that the checkpoint completed successfully, the sink commits the pre-committed transaction. Data becomes visible to downstream consumers.
 
-4. **Abort**: If the checkpoint fails or the job restarts, the sink aborts the pre-committed transaction. Data is discarded.
+4. **Abort or recover**: If the checkpoint fails, the sink aborts the pre-committed transaction and the data is discarded. If the job crashes *after* the checkpoint completed but *before* the commit went through, the transaction handle is in the checkpoint, so recovery **re-commits** it (commits must therefore be idempotent). This is also why end-to-end latency with 2PC is at least one checkpoint interval.
 
 ```
 TWO-PHASE COMMIT TIMELINE:
 
-  Checkpoint n-1          Checkpoint n            Checkpoint n+1
-  complete                triggered               complete
+  barrier n-1            barrier n               barrier n+1
+  (pre-commit T0,        (pre-commit T1,         (pre-commit T2,
+   start T1)              start T2)               start T3)
      │                       │                       │
      ▼                       ▼                       ▼
   ┌──────────────────────┬──────────────────────┬────────────┐
   │   Transaction T1     │   Transaction T2     │  Txn T3    │
   │   (write events)     │   (write events)     │  (write...)│
-  │                      │                      │            │
-  │   COMMIT T0          │   PRE-COMMIT T1      │  COMMIT T2 │
-  │   (previous txn)     │   (flush, start T2)  │            │
   └──────────────────────┴──────────────────────┴────────────┘
+     ▲                       ▲                       ▲
+  ckpt n-1 complete       ckpt n complete         ckpt n+1 complete
+  → COMMIT T0             → COMMIT T1             → COMMIT T2
 
-  If checkpoint n fails: ABORT T1, replay events from checkpoint n-1.
+  If checkpoint n fails: ABORT T1, restore checkpoint n-1, replay.
   Events in T1 were never committed, so no duplicates.
 ```
 
@@ -870,7 +872,7 @@ Checkpoint configuration:
 # Checkpoint every 60 seconds
 execution.checkpointing.interval: 60000
 
-# Minimum pause between checkpoints (prevents overlapping)
+# Minimum pause between the end of one checkpoint and the start of the next
 execution.checkpointing.min-pause: 30000
 
 # Checkpoint timeout (abort if not complete in time)
@@ -891,18 +893,17 @@ state.backend.incremental: true
 |:---|:---|:---|
 | Trigger | Automatic (periodic) | Manual (CLI, REST API) |
 | Purpose | Failure recovery | Planned operations |
-| Format | Optimized (can be incremental) | Canonical, portable |
+| Format | State-backend native (can be incremental) | Canonical, portable across backends (native format optional since 1.15) |
 | Retained | Last N, auto-cleaned | Kept until manually deleted |
 | Use case | Crash recovery | Job upgrade, A/B test, migration |
-| State compatibility | Same job only | Can change parallelism, add operators |
+| State compatibility | Rescaling works; code/topology changes not guaranteed | Officially supports rescaling, code upgrades, adding/removing operators (set operator `uid`s) |
 
 **Savepoint workflow for job upgrades**:
-1. Trigger savepoint: `flink savepoint <job-id> s3://savepoints/`
-2. Stop the job: `flink cancel <job-id>`
-3. Deploy new code version
-4. Resume from savepoint: `flink run -s s3://savepoints/<savepoint-path> new-job.jar`
+1. Stop the job with a savepoint in one step: `flink stop --savepointPath s3://savepoints/ <job-id>` (taking a savepoint and then cancelling separately lets the job keep processing, and emitting to non-transactional sinks, in between)
+2. Deploy new code version
+3. Resume from savepoint: `flink run -s s3://savepoints/<savepoint-path> new-job.jar`
 
-Savepoints enable zero-downtime upgrades of streaming pipelines -- a requirement for production ML feature stores that cannot tolerate hours-long state rebuilds.
+Savepoints enable upgrades without losing state -- a short pause (seconds to minutes) instead of an hours-long state rebuild, which production ML feature stores cannot tolerate. It is not zero downtime: no output is produced between stop and restart.
 
 ---
 
@@ -951,13 +952,13 @@ KafkaSink<FeatureUpdate> sink = KafkaSink.<FeatureUpdate>builder()
     .build();
 ```
 
-**Critical detail**: Kafka's `transaction.timeout.ms` on the broker (default 15 minutes) must be greater than the checkpoint interval plus the maximum checkpoint duration. If a Kafka transaction times out before the checkpoint completes, the transaction is aborted and data is lost.
+**Critical detail**: The producer's `transaction.timeout.ms` (set to 15 minutes above) must be greater than the checkpoint interval plus the maximum checkpoint duration plus the longest expected restart downtime, and must not exceed the broker's `transaction.max.timeout.ms` (default 15 minutes) or the producer is rejected. If a pre-committed Kafka transaction times out before Flink commits it (e.g., the job stays down for 20 minutes), the broker aborts it and that data is lost.
 
 ### 7.3 Consumer Group Semantics
 
 Flink does NOT use Kafka consumer groups in the traditional sense. The `group.id` is set for compatibility but Flink manages offsets internally:
-- Offsets are stored in Flink's state (checkpoints), not committed to Kafka's `__consumer_offsets`.
-- Flink can optionally commit offsets to Kafka for monitoring purposes (lag monitoring via Burrow or Kafka's consumer group describe) but these committed offsets are not used for recovery.
+- The offsets used for recovery are stored in Flink's state (checkpoints).
+- By default (when a `group.id` is set) KafkaSource also commits offsets back to Kafka's `__consumer_offsets` when each checkpoint completes (`commit.offsets.on.checkpoint`). These are for monitoring (Burrow, `kafka-consumer-groups --describe`) and are not used for recovery from a checkpoint.
 - Partition assignment is handled by Flink's source split assigner, not Kafka's consumer group protocol.
 
 ### 7.4 Partition Discovery
@@ -971,11 +972,11 @@ KafkaSource.builder()
     .build();
 ```
 
-New partitions are assigned to source subtasks, and reading begins from the configured starting offset (usually earliest or latest).
+New partitions are assigned to source subtasks. By default a partition discovered after startup is read from its earliest offset, so no records in it are missed.
 
 ### 7.5 Kafka Topic to Flink Parallelism Mapping
 
-The Kafka source's parallelism should match or be a multiple of the number of Kafka partitions. If Flink parallelism > partitions, some source subtasks will be idle (waste resources). If Flink parallelism < partitions, each subtask reads from multiple partitions (fine, but increases per-subtask load).
+The number of Kafka partitions should equal, or be a multiple of, the Kafka source's parallelism. If Flink parallelism > partitions, some source subtasks will be idle (waste resources). If Flink parallelism < partitions, each subtask reads from multiple partitions (fine, but increases per-subtask load).
 
 **Recommended**: Set the Kafka source parallelism equal to the number of partitions. Downstream operators can have different parallelism based on their computational needs (with a keyBy shuffle in between).
 
@@ -1007,7 +1008,7 @@ SLIDING WINDOW FEATURE COMPUTATION:
 However, a 30-day window sliding every hour creates 720 window panes per key. With 100M users, that is 72 billion active panes. Even with 16 bytes per accumulator, this is ~1.1 TB of state. Strategies:
 - Use `ReduceFunction` or `AggregateFunction` to minimize per-pane state.
 - Use RocksDB state backend with incremental checkpoints.
-- Consider a `ProcessFunction` with custom sliding aggregation using a circular buffer (O(slide_count) per key instead of O(panes)).
+- Consider a `ProcessFunction` with custom sliding aggregation using a circular buffer of 720 hourly buckets per key. State is about the same size, but each event updates 1 bucket instead of being added to 720 windows, and one timer per key replaces 720 window timers.
 
 ### 8.2 Sessionization for Recommendation
 
@@ -1065,7 +1066,8 @@ DUAL-WRITE PATTERN:
                                     └────────────┘
 
   Exactly-once to Redis:  Idempotent SET with version/timestamp
-    SET user:123:avg_purchase $39 NX_OR_GT_VERSION 42
+    SET user:123:avg_purchase $39 NX_OR_GT_VERSION 42   (pseudo-command: Redis has
+    no such flag; implement "write only if version is newer" with a Lua script)
 
   Exactly-once to Kafka:  Kafka transactions (2PC with checkpoint)
 ```
@@ -1173,7 +1175,7 @@ Flink uses a **credit-based flow control** mechanism between operators:
 2. The upstream operator sends data only when it has credits.
 3. When the downstream operator processes a buffer and frees a slot, it sends a credit back upstream.
 
-This is more efficient than TCP-level flow control because it operates at the Flink buffer level (32 KB default) rather than the TCP window level, and credits are piggybacked on data messages to reduce overhead.
+This is better than relying on TCP flow control because many logical channels share one TCP connection between two TaskManagers: with TCP alone, one slow channel would block all the others on that connection. Credits work per channel at the Flink buffer level (32 KB default), and the sender piggybacks its backlog size on data buffers so the receiver can grant more credits.
 
 ### 9.3 Detecting Backpressure
 
@@ -1182,7 +1184,7 @@ This is more efficient than TCP-level flow control because it operates at the Fl
 - `inPoolUsage` (input buffer pool usage): High on the bottleneck operator itself.
 - `busyTimeMsPerSecond`: Time the operator is busy processing (in ms per second). If 1000, the operator is fully saturated.
 
-**Flink Web UI**: The backpressure tab shows per-operator backpressure status (OK, LOW, HIGH) based on thread stack sampling.
+**Flink Web UI**: The backpressure tab shows per-subtask status (OK, LOW, HIGH). Since Flink 1.13 it is based on the `backPressuredTimeMsPerSecond` / `busyTimeMsPerSecond` task metrics; older versions used thread stack sampling.
 
 ### 9.4 Common Causes and Solutions
 
@@ -1257,7 +1259,7 @@ CHECKPOINT-BASED RECOVERY:
 |:---|:---|:---|:---|
 | **Fixed-delay** | Restart after fixed delay, up to N attempts | delay=10s, attempts=3 | Simple jobs |
 | **Failure-rate** | Allow N failures within a time interval | failures=5, interval=10min, delay=10s | Production |
-| **Exponential-backoff** | Increasing delay between restarts | initial=1s, max=60s, multiplier=2, reset=1h | Transient failures |
+| **Exponential-delay** | Increasing delay between restarts (default when checkpointing is on, Flink 1.19+) | initial=1s, max=60s, multiplier=2, reset=1h | Transient failures |
 | **No restart** | Job fails permanently on first error | N/A | Development/testing |
 
 **Production recommendation**: Use failure-rate restart with generous parameters:
@@ -1273,28 +1275,29 @@ This tolerates up to 10 failures in any 10-minute window, with 15 seconds betwee
 
 ### 10.3 Regional Restart (Flink 1.9+)
 
-In a complex pipeline with multiple independent branches, a failure in one branch does not need to restart the entire job. Regional restart identifies the **failover region** (the set of operators connected by pipelined data exchanges) and restarts only that region.
+Region failover (the default strategy since Flink 1.10) restarts only the **failover region** that contains the failed task: the set of tasks connected by pipelined data exchanges. In a streaming job every edge is pipelined, so any all-to-all edge (`keyBy`, `rebalance`, `broadcast`) joins everything on both sides into one region. Regions only split when parts of the job are not connected at all, or are connected only by forward (one-to-one) edges.
 
 ```
 REGIONAL RESTART:
 
-  Source A → Map → KeyBy → Agg → Sink A     (Region 1)
-                     │
-                     └───> Filter → Sink B   (Region 2)
+  Job 1:  Source → Map → KeyBy → Agg → Sink        (p=4)
+          keyBy connects all 4 subtasks to all 4 → ONE region.
+          Any failure restarts the whole job.
 
-  If Sink B fails, only Region 2 is restarted.
-  Region 1 continues processing uninterrupted.
-  State for Region 2 is restored from checkpoint.
+  Job 2:  Source → Map → Filter → Sink             (p=4, forward edges only)
+          4 independent pipelines → FOUR regions.
+          If subtask 2 fails, only pipeline 2 restarts;
+          pipelines 0, 1, 3 keep running.
 ```
 
-This significantly reduces the blast radius of failures and recovery time for large, multi-branch pipelines.
+This reduces the blast radius for embarrassingly parallel jobs (e.g., per-partition ETL). It does not help typical keyed feature pipelines, where one failure restarts all tasks.
 
 ### 10.4 Recovery Time
 
 Recovery time = time_to_restore_state + time_to_replay_lag
 
-- **State restoration**: Download checkpoint from S3 + rebuild state (RocksDB SST file download). For a 100 GB state on S3 with 500 MB/s bandwidth: ~200 seconds. With incremental checkpoints, typically the last few SST files: ~10-30 seconds.
-- **Replay lag**: Reprocess events from the checkpoint to the current position. If checkpoint interval is 60 seconds and throughput is 100K events/sec: replay 6M events. At 50K events/sec processing speed: ~120 seconds.
+- **State restoration**: Download checkpoint from S3 + rebuild state (RocksDB SST file download). For a 100 GB state on S3 with 500 MB/s bandwidth: ~200 seconds. Incremental checkpoints make *writing* cheap, but a restore still needs every SST file the checkpoint references, i.e. the full state. Restores drop to ~10-30 seconds only with **local recovery** (`state.backend.local-recovery: true`), where tasks that restart on a surviving TaskManager reuse the local copy.
+- **Replay lag**: Reprocess events from the checkpoint to the current position. If checkpoint interval is 60 seconds and throughput is 100K events/sec: up to 6M events to replay. New events keep arriving at 100K/sec, so if the job can process 150K events/sec it drains the backlog at 150K - 100K = 50K events/sec: 6M / 50K = ~120 seconds. (If processing capacity is not above the input rate, the job never catches up.)
 
 **Total**: Typical production recovery in 30 seconds to 5 minutes, depending on state size and lag.
 
@@ -1306,17 +1309,16 @@ Recovery time = time_to_restore_state + time_to_replay_lag
 
 Changing a Flink job's parallelism requires a stop-and-restart cycle:
 
-1. Trigger a savepoint: `flink savepoint <job-id>`
-2. Cancel the job
-3. Restart with new parallelism: `flink run -s <savepoint> -p <new-parallelism> job.jar`
+1. Stop with a savepoint: `flink stop --savepointPath <dir> <job-id>`
+2. Restart with new parallelism: `flink run -s <savepoint> -p <new-parallelism> job.jar`
 
-This is operationally expensive (minutes of downtime) but necessary because keyed state must be redistributed across the new number of subtasks.
+This is operationally expensive (minutes of downtime) but necessary because keyed state must be redistributed across the new number of subtasks. Newer options (the adaptive scheduler's rescale API in Flink 1.18+, and the Flink Kubernetes Operator autoscaler) automate the cycle, but each rescale is still a restart from a checkpoint or savepoint.
 
 ### 11.2 Reactive Scaling (Flink 1.13+)
 
-In reactive mode, Flink automatically adjusts the job's parallelism to match the number of available TaskManager slots. When new TMs are added (e.g., Kubernetes HPA scales up the TM deployment), Flink takes a savepoint, restarts with the new parallelism, and resumes.
+In reactive mode, Flink automatically adjusts the job's parallelism to match the number of available TaskManager slots. When new TMs are added (e.g., Kubernetes HPA scales up the TM deployment), Flink restarts the job from its latest completed checkpoint with the new parallelism and resumes. Reactive mode is only available for standalone application-mode deployments.
 
-This enables elastic scaling: scale up during traffic spikes, scale down during quiet periods. However, each rescale involves a savepoint + restart, so it is not instant (typically 30-60 seconds of processing pause).
+This enables elastic scaling: scale up during traffic spikes, scale down during quiet periods. However, each rescale involves a restart from a checkpoint, so it is not instant (typically 30-60 seconds of processing pause).
 
 ### 11.3 Key Group Assignment
 
@@ -1344,11 +1346,11 @@ KEY GROUP REDISTRIBUTION:
     Subtask 6: key groups [96-111]
     Subtask 7: key groups [112-127]
 
-  Each key maps to a key group via: keyGroup = hash(key) % max_parallelism
+  Each key maps to a key group via: keyGroup = murmurHash(key.hashCode()) % max_parallelism
   Key groups are the unit of state redistribution, not individual keys.
 ```
 
-**Important**: `max_parallelism` is set at job creation and cannot be changed without discarding state. Set it to a reasonable upper bound (default 128, increase for large jobs). It must be a multiple of the expected parallelism values.
+**Important**: `max_parallelism` is set at job creation and cannot be changed without discarding state. Set it to a reasonable upper bound. If you do not set it, Flink derives it from the first parallelism (roughly 1.5x parallelism rounded up to a power of two, minimum 128, maximum 32,768), so set it explicitly. It does not have to be a multiple of the parallelism, but if it is, key groups split evenly (with 128 key groups and parallelism 5, some subtasks get 26 key groups and others 25).
 
 ### 11.4 Resource Configuration
 
@@ -1357,24 +1359,26 @@ Flink's TaskManager memory model:
 ```
 TASKMANAGER MEMORY MODEL:
 
-  Total Process Memory (e.g., 8 GB)
-  ├── Flink Memory (7.2 GB)
+  Total Process Memory (8 GB = 8,192 MB, Flink default fractions)
+  ├── Flink Memory (~7,117 MB)
   │   ├── Framework Heap (128 MB)         -- Flink runtime overhead
-  │   ├── Task Heap (3 GB)                -- user code objects
-  │   ├── Managed Memory (2.8 GB)         -- RocksDB, sorting, caching
+  │   ├── Task Heap (~3,302 MB)           -- user code objects (the remainder)
+  │   ├── Managed Memory (~2,847 MB)      -- RocksDB, sorting, caching
+  │   │   │                                  fraction: 0.4 of Flink memory
   │   │   └── RocksDB uses this for:
   │   │       - Block cache (read cache)
   │   │       - Write buffers
   │   │       - Index/filter blocks
-  │   ├── Network Memory (1 GB)           -- shuffle buffers
-  │   │   └── Min 64MB, Max 1GB, fraction: 0.1
+  │   ├── Network Memory (~712 MB)        -- shuffle buffers
+  │   │   └── Min 64MB, Max 1GB, fraction: 0.1 of Flink memory
   │   └── Framework Off-Heap (128 MB)     -- Flink internal off-heap
-  └── JVM Overhead (800 MB)               -- metaspace, stack, GC overhead
-      └── Fraction: 0.1 of total
+  ├── JVM Metaspace (256 MB)              -- class metadata
+  └── JVM Overhead (~819 MB)              -- thread stacks, GC, native
+      └── Fraction: 0.1 of total (min 192 MB, max 1 GB)
 ```
 
 **Tuning for ML feature pipelines** (large state, moderate computation):
-- Increase managed memory for RocksDB (40-50% of Flink memory).
+- Keep or raise managed memory for RocksDB (default 40% of Flink memory; 40-50% is typical).
 - Monitor RocksDB block cache hit ratio. If < 90%, increase managed memory.
 - Ensure network buffers are sufficient for high-parallelism shuffles.
 
@@ -1388,7 +1392,7 @@ TASKMANAGER MEMORY MODEL:
 
 **Strengths**: Unified batch and streaming API (same DataFrame/SQL), excellent for teams already using Spark, large ecosystem (MLlib, GraphX), simpler operational model.
 
-**Weaknesses**: Minimum latency ~100ms (micro-batch boundary), no true event-time session windows (approximated), state management less mature than Flink's, no native CEP.
+**Weaknesses**: Minimum latency ~100ms (micro-batch boundary), fewer low-level controls than Flink (per-key timers and custom state exist via `flatMapGroupsWithState` / `transformWithState`, but are less flexible), no native CEP. Native event-time session windows exist since Spark 3.2, and a RocksDB state store since 3.2 lets state grow beyond heap.
 
 **When to choose**: Your team already uses Spark for batch, latency requirements are > 1 second, and you value API unification over streaming features.
 
@@ -1398,7 +1402,7 @@ TASKMANAGER MEMORY MODEL:
 
 **Strengths**: No cluster to operate (deploy as regular app instances), exactly-once via Kafka transactions, tight Kafka integration, simple deployment (scale by adding instances).
 
-**Weaknesses**: Limited to Kafka as source/sink, single JVM processing (no distributed shuffle), state size limited by local disk, harder to manage for complex topologies.
+**Weaknesses**: Limited to Kafka as source/sink, no network shuffle of its own (re-keying writes to internal Kafka repartition topics, which adds latency and broker load), state size limited by local disk, harder to manage for complex topologies.
 
 **When to choose**: Simple transformations close to Kafka, microservice teams that do not want to operate a Flink cluster, state fits on a single node per partition.
 
@@ -1424,10 +1428,10 @@ TASKMANAGER MEMORY MODEL:
 
 | Feature | Flink | Spark SS | Kafka Streams | Beam/Dataflow |
 |:---|:---|:---|:---|:---|
-| **Latency** | ~ms | ~100ms+ | ~ms | ~ms (Dataflow) |
+| **Latency** | ~ms | ~100ms+ | ~ms | sub-second to seconds (Dataflow) |
 | **Exactly-once** | Yes (2PC) | Yes (micro-batch) | Yes (Kafka txn) | Yes (runner) |
-| **Max state size** | TBs (RocksDB) | 10s GB (heap) | 100s GB (local) | TBs (managed) |
-| **Session windows** | Native | Approximate | Via DSL | Native |
+| **Max state size** | TBs (RocksDB) | 10s GB (heap); more with RocksDB store (3.2+) | 100s GB (local) | TBs (managed) |
+| **Session windows** | Native | Native (3.2+) | Native (DSL) | Native |
 | **Operational complexity** | High | Medium | Low | None (managed) |
 | **Batch+Stream unified** | Yes (1.12+) | Excellent | No | Yes |
 | **CEP** | Native library | No | No | No |
@@ -1463,7 +1467,8 @@ total_state = num_keys * state_per_key * concurrent_windows + overhead
 Example: User click feature store
   num_keys = 500M users (active in the last 30 days)
   state_per_key = 200 bytes (3 features: count, sum, list of 10 categories)
-  concurrent_windows = 4 (tumbling 1h, sliding 24h by 1h: 24 panes, etc.)
+  concurrent_windows = 4 (e.g., four tumbling windows -- 1h, 1d, 7d, 30d --
+                        one pane each; a sliding 24h/1h window alone would add 24)
   
   Naive: 500M * 200B * 4 = 400 GB
   
@@ -1490,15 +1495,17 @@ CHECKPOINT SIZING:
   Checkpoint interval: 60 seconds
   Overhead: 5s / 60s = 8.3% of time spent checkpointing
   
-  Recovery time:
-    State restore: ~5s (download last incremental)
-    Replay lag: 60s * 1M events/sec = 60M events
-    At 500K events/sec replay speed: 120 seconds
+  Recovery time (with local recovery; without it, the full 128 GB must be
+  downloaded: 128 GB / 500 MB/s = ~256 s extra):
+    State restore: ~5s (local copy on surviving TaskManagers)
+    Replay lag: 60s * 1M events/sec = 60M events (worst case)
+    Capacity 1.5M events/sec while 1M/sec keeps arriving
+      → backlog drains at 500K events/sec: 60M / 500K = 120 seconds
     Total: ~125 seconds
   
   If checkpoint interval = 30 seconds:
     Overhead: 5s / 30s = 16.7% (higher)
-    Recovery replay: 30M events = 60 seconds
+    Recovery replay: 30M events / 500K per sec = 60 seconds
     Total recovery: ~65 seconds (faster recovery, higher overhead)
 ```
 
@@ -1549,8 +1556,9 @@ CAPACITY PLAN:
     Per-user state: 5 features * 64 bytes accumulator = 320 bytes
     Windows: tumbling 1h (1) + sliding 24h/1h (24) + session (avg 2 active)
              + sliding 7d/1d (7) + sliding 30d/1d (30) = 64 concurrent accumulators
-    Total: 50M * 320B * 64 / 5 features ... simplified:
-           50M users * ~4 KB per user (all features, all windows) = 200 GB
+    Total: 64 accumulators per user (across all 5 features' windows)
+           * 64 B = ~4 KB per user
+           50M users * ~4 KB per user = ~205 GB, call it 200 GB
     Backend: RocksDB with incremental checkpoints
     
   TaskManagers:
@@ -1563,7 +1571,9 @@ CAPACITY PLAN:
     Interval: 60 seconds
     Incremental size: ~2% * 200 GB = 4 GB
     Duration: 4 GB / (12 TMs * 100 MB/s each) = ~3.3 seconds
-    Storage: S3, retain last 3 checkpoints = 12 GB
+    Storage: S3, retain last 3 checkpoints. Incremental checkpoints share
+             files, so this is ~200 GB of base SST files + recent deltas
+             (~210 GB), not 3 * 4 GB = 12 GB
     
   Sinks:
     Redis: 48 parallel writers, async I/O, batch SET (pipeline 100 commands)
@@ -1587,7 +1597,7 @@ CAPACITY PLAN:
 **What happens**:
 1. JobManager detects the TM heartbeat timeout (default 50 seconds, configurable).
 2. Checkpoint 42 is aborted (incomplete -- TM 3 never acknowledged).
-3. Regional restart initiates for the operators that ran on TM 3.
+3. Failover starts. Because `keyBy` connects every subtask to every other, the failover region is the whole job, so all tasks restart (not just those on TM 3).
 4. ResourceManager requests a new TM (or existing TM has spare slots).
 5. Operators are redeployed and state is restored from checkpoint 41 (last completed).
 6. Kafka source seeks to offsets from checkpoint 41.
@@ -1595,21 +1605,21 @@ CAPACITY PLAN:
 
 **Data loss**: None. Checkpoint 41 is consistent. Replayed events are deduplicated by exactly-once mechanisms.
 
-**Duration**: TM heartbeat timeout (50s) + new TM provisioning (30-120s on K8s) + state restore (5-30s) + replay (seconds to minutes) = typically 2-5 minutes.
+**Duration**: TM heartbeat timeout (up to 50s; often faster if the TCP connection drops) + new TM provisioning (30-120s on K8s) + state restore (5-30s with local recovery) + replay (seconds to minutes) = typically about 1.5-5 minutes.
 
 ### 14.2 Kafka Broker Outage
 
 **Scenario**: One of three Kafka brokers goes down. Some partitions lose their leader.
 
 **What happens**:
-1. Kafka elects new leaders for affected partitions (seconds, depends on `unclean.leader.election.enable`).
+1. Kafka elects new leaders for affected partitions from the in-sync replicas (seconds; depends mostly on how fast the controller notices the dead broker).
 2. Flink's Kafka source experiences temporary read failures on those partitions.
 3. Source retries with backoff. During retry, no events flow from those partitions.
-4. Backpressure propagates from the source: downstream operators slow down.
+4. Downstream operators receive fewer events from those partitions (this is starvation, not backpressure).
 5. Watermark stalls on affected partitions (if `withIdleness()` is set, watermark advances from other partitions after the idle timeout).
-6. Once Kafka elects new leaders, Flink resumes reading from the last committed offset.
+6. Once Kafka elects new leaders, Flink resumes reading from where it left off (its current in-memory offset; no job restart needed).
 
-**Data loss**: None. Kafka's replication ensures no data loss (assuming RF >= 2 and min.insync.replicas >= 2). Flink replays from the last good offset.
+**Data loss**: None. Kafka's replication ensures no data loss, assuming the usual durable settings: replication factor 3, `min.insync.replicas=2`, producers using `acks=all`, and unclean leader election disabled. Flink replays from the last good offset.
 
 **Duration**: Kafka leader election (1-30 seconds) + Flink reconnect (seconds) = typically < 1 minute.
 
@@ -1619,14 +1629,14 @@ CAPACITY PLAN:
 
 **What happens**:
 1. Checkpoint attempts fail (S3 upload timeout).
-2. The Flink job continues processing normally -- checkpoints are async and do not block processing.
-3. No new checkpoints complete. The last completed checkpoint ages.
+2. The Flink job continues processing -- checkpoints are async and do not block processing -- provided `execution.checkpointing.tolerable-failed-checkpoints` is high enough. If it is 0, the first failed checkpoint triggers a job failover, and the job cannot restore either while S3 is down.
+3. No new checkpoints complete. The last completed checkpoint ages. With a 2PC Kafka sink, nothing is committed either: `read_committed` consumers see no new output, and once the outage passes `transaction.timeout.ms` the pending transactions are aborted and that output is lost.
 4. If the job crashes during the S3 outage, recovery rolls back to the last completed checkpoint (potentially far behind). The replay lag could be very large.
 5. When S3 recovers, the next checkpoint completes successfully.
 
 **Risk**: This is the most dangerous failure mode. A long S3 outage followed by a job crash means replaying hours of data, which could take hours itself and produce a feature staleness incident.
 
-**Mitigation**: Monitor checkpoint age. Alert if the latest checkpoint is older than 3x the checkpoint interval. Consider dual checkpoint storage (S3 + HDFS) for critical pipelines.
+**Mitigation**: Monitor checkpoint age. Alert if the latest checkpoint is older than 3x the checkpoint interval. Flink writes checkpoints to a single location, so choose a highly available bucket and plan (in a runbook) how to restart from the latest savepoint or checkpoint copy if the region stays down.
 
 ### 14.4 Data Skew Causing OOM
 
@@ -1713,7 +1723,7 @@ INTERVIEW ANSWER STRUCTURE:
 
 3. **Side outputs**: Events arriving after the allowed lateness period are routed to a side output for separate handling -- log them for monitoring, feed them into a reconciliation batch job, or drop them with a metric.
 
-**Quantify**: "In our pipeline, 99.5% of events arrive within the watermark delay. The allowed lateness catches another 0.4%. The remaining 0.1% goes to side outputs and is reconciled in a daily batch job. This gives us sub-minute latency for 99.9% of events while still maintaining data completeness."
+**Quantify** (illustrative numbers): "In a typical pipeline, 99.5% of events arrive within the watermark delay. The allowed lateness catches another 0.4%. The remaining 0.1% goes to side outputs and is reconciled in a daily batch job. This gives us sub-minute latency for 99.9% of events while still maintaining data completeness."
 
 ### 15.3 "How Do You Guarantee Exactly-Once?"
 
@@ -1739,7 +1749,7 @@ INTERVIEW ANSWER STRUCTURE:
 | "Watermark delay of 0" | No tolerance for out-of-order events. Many events will be late. |
 | "Watermark delay of 1 hour" | Unnecessary latency. Use minutes for mobile, seconds for server events. |
 | Ignoring state size | Always estimate state: keys x state_per_key x windows. 500M users with large state needs RocksDB. |
-| "Just increase parallelism" | Requires savepoint + restart. State redistribution takes time. Also increases checkpoint size. |
+| "Just increase parallelism" | Requires a restart from a savepoint or checkpoint. State redistribution takes time. More subtasks also mean more checkpoint files and more Kafka transactions. Parallelism cannot exceed max parallelism. |
 | Forgetting idle sources | One idle Kafka partition stalls all watermarks. Always configure withIdleness(). |
 
 ### 15.5 Quick Reference: Connecting to Other Chapters

@@ -259,18 +259,18 @@ Production systems guard against this with a minimum timeout floor:
 timeout = max(T_min, mean + k * stddev)
 ```
 
-Where `T_min` is a hard floor (e.g., 2x the heartbeat interval). Cassandra enforces a minimum phi threshold regardless of computed variance. etcd uses a minimum election timeout of 10x the heartbeat interval.
+Where `T_min` is a hard floor (e.g., 2x the heartbeat interval). Akka enforces a floor on the standard deviation (`min-std-deviation`, default 100 ms) and adds a fixed grace period (`acceptable-heartbeat-pause`). etcd's defaults keep the election timeout at 10x the heartbeat interval (100 ms heartbeat, 1000 ms election timeout).
 
 ### Production Tuning Heuristics
 
 | System | Heartbeat Interval | Default Timeout / Detector | Tuning Notes |
 |:---|:---|:---|:---|
-| **Cassandra** | Gossip round: 1s | Phi accrual, threshold = 8 | Raise to 12 on cloud/VM deployments |
-| **Akka Cluster** | 1s | Phi accrual, threshold = 8 | Threshold 12 for cross-DC |
-| **etcd** | 100ms (tick interval) | 10 ticks = 1s election timeout | Increase for high-latency networks |
-| **ZooKeeper** | `tickTime` (2000ms default) | `syncLimit * tickTime` for follower sessions | `tickTime` must exceed max GC pause |
-| **Consul** | Gossip: 200ms (LAN), 500ms (WAN) | SWIM-based with suspicion | `gossip_interval` tunable per DC |
-| **Kubernetes** | kubelet: 10s | 40s node-not-ready timeout | `--node-status-update-frequency` |
+| **Cassandra** | Gossip round: 1s | Phi accrual (exponential model), `phi_convict_threshold` = 8 | Commonly raised to 10–12 on cloud/VM deployments |
+| **Akka Cluster** | 1s | Phi accrual (normal model), threshold = 8, plus 3s `acceptable-heartbeat-pause` | Akka docs suggest 12 on cloud platforms such as EC2 |
+| **etcd** | 100ms heartbeat | 1000ms election timeout (10x) | Increase both for high-latency networks |
+| **ZooKeeper** | `tickTime` (2000ms in the sample config) | Session timeout, bounded to 2–20 x `tickTime` | Session timeout must exceed the worst GC pause |
+| **Consul** | Probe: 1s (LAN), 5s (WAN); gossip: 200ms (LAN), 500ms (WAN) | SWIM + Lifeguard with suspicion | Tunable per datacenter |
+| **Kubernetes** | kubelet status/lease: 10s | `node-monitor-grace-period` 40s (50s in newer releases) | `--node-status-update-frequency` |
 
 ---
 
@@ -337,11 +337,11 @@ $$F(t) = \frac{1}{2}\left[1 + \text{erf}\left(\frac{t - \mu}{\sigma\sqrt{2}}\rig
 
 Let $t_{\text{now}}$ be the current time and $t_{\text{last}}$ be the time the last heartbeat arrived. The elapsed time since the last heartbeat is $\Delta t = t_{\text{now}} - t_{\text{last}}$.
 
-The probability that a heartbeat should have arrived by now (given the distribution) is $F(\Delta t)$. The probability that the node has crashed (i.e., no heartbeat is coming) is approximated by $1 - Q(\Delta t)$, where $Q$ is the survival function.
+The probability that the next heartbeat of a *live* node would have arrived by now is $F(\Delta t)$. The probability that a live node's heartbeat would arrive even *later* than now is $P_{\text{later}}(\Delta t) = 1 - F(\Delta t)$ (the survival function, or tail). The smaller this tail, the harder it is to explain the silence with normal delay.
 
 Phi is defined as:
 
-$$\varphi = -\log_{10}(1 - F(\Delta t))$$
+$$\varphi = -\log_{10}\big(P_{\text{later}}(\Delta t)\big) = -\log_{10}(1 - F(\Delta t))$$
 
 Equivalently:
 
@@ -349,7 +349,7 @@ $$\varphi = -\log_{10}\left(\frac{1}{2}\left[1 - \text{erf}\left(\frac{\Delta t 
 
 ### Interpreting Phi Values
 
-The logarithmic scale means phi maps directly to a probability of being wrong if you declare the node dead:
+The logarithmic scale means phi maps directly to $P_{\text{later}} = 10^{-\varphi}$: the chance that a live node, behaving as the model predicts, would be this late. That is the chance of being wrong if you declare the node dead right now (the paper calls it the mistake likelihood):
 
 | $\varphi$ Value | $P(\text{false positive})$ | Interpretation |
 |:---|:---|:---|
@@ -358,9 +358,9 @@ The logarithmic scale means phi maps directly to a probability of being wrong if
 | 3 | 0.1% | Strong suspicion. |
 | 4 | 0.01% | Very strong suspicion. |
 | 8 | $10^{-8}$ (1 in 100 million) | Cassandra/Akka default. Extremely confident. |
-| 12 | $10^{-12}$ | Recommended for cross-datacenter or cloud environments. |
+| 12 | $10^{-12}$ | Often suggested for cloud environments with noisier networks. |
 
-In practice, $\varphi = 8$ means: "if the heartbeat distribution is truly normal, there is a 1 in 100,000,000 chance that this node is alive and we just have not received its heartbeat yet." That is a strong guarantee, which is why it works well as a default.
+In practice, $\varphi = 8$ means: "if heartbeat delays truly followed the fitted model, a live node would be this late only 1 time in 100,000,000." Real delays have heavier tails than the model (GC pauses, congestion), so the true false-suspicion rate is much higher than $10^{-8}$. Treat phi as a well-calibrated *scale* for picking thresholds, not a literal guarantee.
 
 ### Phi Computation Visualized
 
@@ -385,11 +385,12 @@ In practice, $\varphi = 8$ means: "if the heartbeat distribution is truly normal
                                         │  (elapsed since last heartbeat)
                                         ▼
                                   ┌─────────┐
-                                  │ φ ≈ 3.6 │  P(false positive) ≈ 0.025%
+                                  │ φ ≈ 4.5 │  P_later ≈ 0.003% (z = 4)
                                   └─────────┘
 
-         If Δt = 1500ms → φ ≈ 52    (node is almost certainly dead)
-         If Δt = 1050ms → φ ≈ 0.8   (normal variation, node is fine)
+         If Δt = 1500ms → φ ≈ 23    (z = 10; node is almost certainly dead)
+         If Δt = 1300ms → φ ≈ 9.0   (z = 6; crosses a threshold of 8)
+         If Δt = 1050ms → φ ≈ 0.8   (z = 1; normal variation, node is fine)
 ```
 
 ### Why a Normal Distribution — and When That Breaks
@@ -398,7 +399,7 @@ The original paper assumes inter-arrival times are normally distributed. This is
 
 The assumption breaks in several important cases:
 
-**Bimodal distributions from GC pauses.** JVM-based systems (Cassandra, Kafka, Elasticsearch) exhibit a bimodal distribution of inter-arrival times: most arrivals cluster tightly around `T_hb`, but occasional GC pauses create a second mode at `T_hb + T_gc`. A normal distribution underestimates the probability of the GC mode, causing phi to spike higher than warranted during GC pauses. This is a leading cause of false positives in Cassandra clusters.
+**Bimodal distributions from GC pauses.** JVM-based systems (Cassandra, Kafka, Elasticsearch) exhibit a bimodal distribution of inter-arrival times: most arrivals cluster tightly around `T_hb`, but occasional GC pauses create a second mode at `T_hb + T_gc`. A normal distribution underestimates the probability of the GC mode, causing phi to spike higher than warranted during GC pauses. GC pauses are a common cause of false positives in JVM clusters.
 
 ```
 Bimodal Distribution (GC-affected system):
@@ -415,21 +416,29 @@ Bimodal Distribution (GC-affected system):
         Normal heartbeats    After GC pause
 ```
 
-**Long-tailed distributions.** Network congestion events, disk I/O stalls, and container throttling produce heavy-tailed distributions where extreme delays are more likely than a Gaussian predicts. Here the normal approximation overestimates phi during tails, which is actually conservative (fewer false negatives but more false positives).
+**Long-tailed distributions.** Network congestion events, disk I/O stalls, and container throttling produce heavy-tailed distributions where extreme delays are more likely than a Gaussian predicts. Here the normal approximation overestimates phi during tails: it suspects too early, which means more false positives (and fewer false negatives).
 
-Cassandra mitigates the normal distribution limitation by using a relatively large window ($W = 1000$) that absorbs GC spikes and by recommending a higher threshold ($\varphi = 12$) for deployments with known GC pressure. Some implementations (Akka) offer an option to use an exponential distribution instead, which better models the purely network-jitter case.
+Implementations work around the normal model in different ways. **Cassandra** does not use the normal model at all: it uses an **exponential** model, which needs only the mean $\mu$ of the window. Then $P_{\text{later}}(\Delta t) = e^{-\Delta t/\mu}$ and $\varphi = \Delta t / (\mu \ln 10) \approx 0.434\,\Delta t/\mu$. This grows linearly with silence and is far more tolerant of occasional long gaps. **Akka** keeps the normal model but adds a fixed grace period (`acceptable-heartbeat-pause`) to the mean and a floor on the standard deviation. Operators with known GC pressure raise the threshold (10–12).
+
+**Worked comparison** (python-checked). Heartbeats every 1 s, silence $\Delta t$ since the last one:
+
+| Model | Parameters | Silence needed to reach $\varphi = 8$ |
+|:---|:---|:---|
+| Normal (paper) | $\mu$ = 1000 ms, $\sigma$ = 50 ms | ≈ 1.28 s ($z \approx 5.61$) |
+| Akka (normal + grace) | mean = 1 s + 3 s pause = 4 s, $\sigma$ = 100 ms floor | ≈ 4.55 s |
+| Cassandra (exponential) | $\mu$ = 1 s | $8 \ln 10 \approx$ 18.4 s |
 
 ### How Cassandra Implements the Phi Accrual Detector
 
 Cassandra's implementation lives in `org.apache.cassandra.gms.FailureDetector`:
 
-1. Each node gossips a heartbeat generation counter to peers every second.
-2. When a gossip message arrives from node X, the `FailureDetector` records the arrival timestamp in a bounded `ArrivalWindow` (default 1000 samples).
-3. On query ("is node X alive?"), it computes phi from the arrival window's mean and variance against the elapsed time since the last arrival.
+1. Each node bumps its heartbeat version about once per second and gossips it (one gossip round per second to a random peer).
+2. When a newer heartbeat for node X is learned, the `FailureDetector` records the arrival time in a bounded `ArrivalWindow` (1000 samples).
+3. On query ("is node X alive?"), it computes phi from the window's **mean only** (exponential model, see above) against the elapsed time since the last arrival.
 4. If $\varphi > \text{phi\_convict\_threshold}$ (default 8), the node is convicted and marked DOWN in the gossip state.
 5. The convict threshold is configurable in `cassandra.yaml` via `phi_convict_threshold`.
 
-Key implementation detail: Cassandra caps the inter-arrival time stored in the window at `MAX_LOCAL_PAUSE_IN_NANOS` (default: no cap, but configurable). This prevents a single extreme outlier (e.g., a 30-second GC pause) from permanently distorting the window statistics.
+Key implementation details: intervals longer than a maximum (the `cassandra.fd_max_interval_ms` system property, by default about 2x the gossip interval) are not added to the window, so one extreme outlier (e.g., a 30-second partition) does not distort the mean. Separately, if the *local* node itself was paused for longer than `cassandra.max_local_pause_in_ms` (default 5 s, e.g. its own GC), it skips convicting peers for that round, because the silence was probably its own fault.
 
 ### How Akka Implements It
 
@@ -439,7 +448,9 @@ Akka Cluster's `PhiAccrualFailureDetector` is configured with:
 - `max-sample-size`: sliding window capacity (default 1000)
 - `min-std-deviation`: floor on standard deviation to prevent over-sensitivity (default 100ms)
 - `acceptable-heartbeat-pause`: additional grace period added to the expected interval (default 3s, critical for GC-heavy systems)
-- `first-heartbeat-estimate`: used before enough samples exist (default 1s)
+- `heartbeat-interval`: how often heartbeats are sent (default 1s); also used as the first-heartbeat estimate before real samples exist
+
+In Akka's formula the effective mean is $\mu + \text{acceptable-heartbeat-pause}$ and the effective deviation is $\max(\sigma, \text{min-std-deviation})$. It evaluates the normal tail with a fast logistic approximation instead of `erf`.
 
 The `min-std-deviation` floor is Akka's solution to the over-sensitivity problem described in Section 3. Even if observed variance drops to near zero, the detector never tightens below `min-std-deviation`, preventing false positives from unrealistically tight confidence intervals.
 
@@ -447,9 +458,9 @@ The `min-std-deviation` floor is Akka's solution to the over-sensitivity problem
 
 When a node first joins the cluster or first contacts a new peer, there are no samples in the arrival window. The phi calculation requires at least mean and variance estimates. Approaches:
 
-1. **Seed with synthetic samples.** Akka inserts a single synthetic sample at the expected heartbeat interval (`first-heartbeat-estimate`). This gives a starting point that quickly gets overwritten by real data.
-2. **Use a fixed timeout until sufficient samples accumulate.** Cassandra falls back to a fixed initial timeout until the arrival window has enough entries for meaningful statistics (a few tens of samples).
-3. **Use the configured heartbeat interval as the initial mean.** Set $\mu_0 = T_{hb}$ and $\sigma_0 = T_{hb} / 4$ as priors, then let Bayesian updating refine the estimates.
+1. **Seed with synthetic samples.** Akka seeds the window with two synthetic intervals, $T_{hb} - T_{hb}/4$ and $T_{hb} + T_{hb}/4$, which gives a starting mean $\mu_0 = T_{hb}$ and standard deviation $\sigma_0 = T_{hb}/4$ (1000 ms and 250 ms with defaults). Real samples then dominate as the window fills.
+2. **Seed with a conservative initial interval.** Cassandra puts an initial interval (by default about 2x the gossip interval) into a new arrival window, so a fresh peer starts with a lenient mean.
+3. **Use a fixed timeout until sufficient samples accumulate.** Some custom implementations ignore phi until a few tens of samples exist and use a plain timeout meanwhile.
 
 ---
 
@@ -492,7 +503,7 @@ SWIM Probe Cycle (node A, period T):
        Result: B is alive (reached via E)
 ```
 
-SWIM achieves $O(1)$ message load per node per period (each node sends one probe per period), with failure detection completeness spread across the cluster. The expected time to detect a failure is $O(\log N)$ protocol periods.
+SWIM achieves $O(1)$ expected message load per node per period (each node sends one probe per period, plus at most $k$ ping-reqs), with failure detection spread across the cluster. Because every live node picks a random target each period, the expected time until *some* node first probes a crashed member is constant: about $e/(e-1) \approx 1.58$ protocol periods for large $N$, independent of cluster size. Spreading the news to everyone by gossip (infection-style dissemination) then takes $O(\log N)$ periods. Picking targets in a shuffled round-robin order also bounds the worst case: every member is probed by a given node within $2N-1$ periods.
 
 ### Suspicion Subprotocol with Incarnation Numbers
 
@@ -506,15 +517,15 @@ The incarnation number is the key mechanism: it allows a healthy-but-temporarily
 
 ### Lifeguard Extensions
 
-The Lifeguard paper (Hashicorp, 2018) identified a systematic problem with SWIM: under network stress or high load, the false positive rate increases precisely when the cluster is least able to handle unnecessary evictions. Lifeguard introduces three extensions:
+The Lifeguard paper (Dadgar, Phillips, and Currey at HashiCorp, 2018) identified a systematic problem with SWIM: under network stress or high load, the false positive rate increases precisely when the cluster is least able to handle unnecessary evictions. Lifeguard introduces three extensions:
 
 1. **Local Health Multiplier (LHM).** Each node tracks its own responsiveness. If a node is slow to respond to incoming pings (because it is overloaded), it increases a local health multiplier that extends its own suspicion and probe timeouts. A node that knows it is slow gives itself and others more grace.
 
 2. **Dynamic suspicion timeout.** Instead of a fixed suspicion timeout, Lifeguard scales the timeout with the number of independent confirmations: more nodes that independently suspect the same target increase confidence, so the timeout decreases. Conversely, a single suspicion with no corroboration gets a long timeout.
 
-3. **Buddy system.** When a node is suspected, its "buddies" (nodes that recently successfully communicated with it) proactively probe it and disseminate alive messages if they reach it, accelerating refutation.
+3. **Buddy system.** When a node pings a member that it currently suspects, it tells that member about the suspicion inside the ping itself. The suspected member learns right away (instead of waiting for gossip to reach it) and can refute by bumping its incarnation number.
 
-Consul uses Lifeguard in production. The result is a 4-8x reduction in false positive rates compared to vanilla SWIM under the same network conditions.
+Consul (through HashiCorp's `memberlist` library) uses Lifeguard in production. HashiCorp's experiments reported a large reduction in false positives compared to vanilla SWIM under the same stress conditions.
 
 ### Two-Phase Detection
 
@@ -534,8 +545,8 @@ Phase 1: SUSPECT                    Phase 2: CONFIRM
 
 This pattern is used in:
 - **Consul**: SWIM suspicion period before conviction.
-- **Kubernetes**: `NodeNotReady` condition triggers a grace period (`pod-eviction-timeout`, default 5 minutes) before pods are evicted.
-- **MongoDB**: A replica set member goes into `RECOVERING` state before being marked `DOWN`, and the primary election requires agreement from a majority.
+- **Kubernetes**: a node is marked `NotReady`/`Unknown` after `node-monitor-grace-period`, and pods are then evicted only after their toleration for the `not-ready`/`unreachable` taints runs out (300 seconds by default; older versions used `--pod-eviction-timeout`, also 5 minutes).
+- **MongoDB**: replica set members heartbeat each other every 2 seconds; only after the primary has been unreachable for `electionTimeoutMillis` (10 seconds by default) does a secondary call an election, and winning it requires votes from a majority.
 
 ### Byzantine Failure Detection Challenges
 
@@ -578,7 +589,7 @@ Weak completeness can be transformed into strong completeness by gossiping suspi
 
 ### The Minimum Needed for Consensus
 
-Chandra and Toueg proved that **$\Diamond\mathcal{W}$ (eventually weak) is the weakest failure detector class sufficient to solve consensus** in an asynchronous system with crash failures and reliable channels. This result is profound:
+Chandra and Toueg showed that **$\Diamond\mathcal{W}$ (eventually weak) is sufficient to solve consensus** in an asynchronous system with crash failures and reliable channels, as long as a majority of processes are correct. Chandra, Hadzilacos, and Toueg (1996) then proved it is also the **weakest** such class. This result is profound:
 
 - You do not need a perfect failure detector. You do not even need one that is always right. You only need one that, after some point in the execution, permanently trusts at least one correct process.
 - $\Diamond\mathcal{S}$ (eventually strong) is sufficient and more practical: after some point, no correct process is falsely suspected, and all crashed processes are suspected. Most practical failure detectors target $\Diamond\mathcal{S}$.
@@ -587,7 +598,7 @@ Chandra and Toueg proved that **$\Diamond\mathcal{W}$ (eventually weak) is the w
 
 **Raft's election timeout** implements a $\Diamond\mathcal{S}$ detector. After GST (network stabilization), the timeout correctly identifies leader crashes and does not falsely suspect the leader. Before GST, false positives cause unnecessary elections, but safety is preserved by term numbers.
 
-**Cassandra's phi accrual detector** targets $\Diamond\mathcal{P}$ with a high threshold. With $\varphi = 8$, the probability of a false positive is $10^{-8}$ per check -- not zero, but close enough for practical purposes. The detector also achieves strong completeness: a crashed node's heartbeat counter stops advancing, causing phi to grow without bound at all observers.
+**Cassandra's phi accrual detector** aims to behave like $\Diamond\mathcal{P}$ in practice by using a high threshold. With $\varphi = 8$, the *model* says a live node would be this late with probability $10^{-8}$ -- the real rate is higher because real delays have heavy tails, which is why operators still see occasional false DOWN marks. The detector also achieves strong completeness: a crashed node's heartbeat counter stops advancing, causing phi to grow without bound at all observers.
 
 **SWIM with Lifeguard** provides strong completeness (the random probe cycle ensures every crashed node is eventually probed and suspected by everyone) and eventual strong accuracy (the suspicion/incarnation mechanism and Lifeguard extensions eliminate false positives once the network stabilizes).
 
@@ -605,7 +616,7 @@ This is the single most common source of false positives in JVM-based distribute
 4. The paused node wakes up, finds itself evicted from the cluster, and attempts to rejoin.
 5. Rejoining triggers data streaming/rebalancing, which increases load on remaining nodes, which increases their GC pressure, which can trigger their pauses.
 
-Mitigations: (a) Tune GC to minimize worst-case pause time (use ZGC or Shenandoah for sub-millisecond pauses, or G1 with `-XX:MaxGCPauseMillis` set well below the heartbeat timeout). (b) Increase the phi threshold or timeout to accommodate expected GC pauses. (c) Use a dedicated heartbeat thread pinned to a CPU core that is excluded from GC stop-the-world pauses (possible with some JVM configurations but fragile). (d) Move to a non-GC language for the critical path (this is why ScyllaDB rewrote Cassandra in C++, and one of the reasons etcd uses Go, whose GC pauses are typically under 1ms).
+Mitigations: (a) Tune GC to minimize worst-case pause time (use ZGC or Shenandoah for sub-millisecond pauses, or G1 with `-XX:MaxGCPauseMillis` set well below the heartbeat timeout). (b) Increase the phi threshold or timeout to accommodate expected GC pauses. (c) Use a dedicated heartbeat thread pinned to a CPU core that is excluded from GC stop-the-world pauses (possible with some JVM configurations but fragile). (d) Move to a runtime with short or no GC pauses for the critical path (ScyllaDB, a C++ reimplementation of Cassandra, cites GC-free operation as a benefit; Go's collector, used by etcd, typically stops the world for well under 1ms).
 
 ### Network Partitions vs Process Failures
 
@@ -630,7 +641,7 @@ Mitigation: dedicate CPU cores to critical system threads using `isolcpus` or cg
 
 ### Clock Skew and Timeout Calculations
 
-Failure detectors that use wall-clock timestamps for inter-arrival time calculation are vulnerable to clock adjustments. If `ntpd` or `chrony` steps the clock forward by 500ms, the next inter-arrival time appears 500ms shorter than actual. If the clock steps backward, the next interval appears longer, potentially triggering a false positive.
+Failure detectors that use wall-clock timestamps for inter-arrival time calculation are vulnerable to clock adjustments. If `ntpd` or `chrony` steps the clock forward by 500ms, the current gap since the last heartbeat instantly appears 500ms longer than it really is, which can push phi over the threshold and trigger a false positive. If the clock steps backward, the next interval appears shorter (even negative), corrupting the window statistics and making the detector too tight later.
 
 Mitigation: use monotonic clocks (`CLOCK_MONOTONIC` on Linux, `System.nanoTime()` on JVM) for all interval measurements. Monotonic clocks are immune to NTP adjustments, leap seconds, and daylight saving time changes. Every modern failure detector implementation uses monotonic time internally, but custom implementations frequently make this mistake.
 
@@ -769,7 +780,9 @@ Leader A (epoch=5)               Storage              Leader B (epoch=6)
 2. Chandra, T. D., & Toueg, S. (1996). *Unreliable Failure Detectors for Reliable Distributed Systems.* Journal of the ACM, 43(2), 225-267.
 3. Fischer, M. J., Lynch, N. A., & Paterson, M. S. (1985). *Impossibility of Distributed Consensus with One Faulty Process.* Journal of the ACM, 32(2), 374-382.
 4. Das, A., Gupta, I., & Motivala, A. (2002). *SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol.* IEEE DSN.
-5. Lifeguard: Local Health Awareness for More Accurate Failure Detection. (2018). Hashicorp Research.
+5. Dadgar, A., Phillips, J., & Currey, J. (2018). *Lifeguard: Local Health Awareness for More Accurate Failure Detection.* HashiCorp (IEEE DSN Workshops).
 6. Huang, P., Guo, C., Zhou, L., Lorch, J. R., Dang, Y., Chintalapati, M., & Yao, R. (2017). *Gray Failure: The Achilles' Heel of Cloud-Scale Systems.* HotOS.
 7. Jacobson, V. (1988). *Congestion Avoidance and Control.* ACM SIGCOMM.
 8. Kleppmann, M. (2017). *Designing Data-Intensive Applications.* O'Reilly Media. Chapter 8: The Trouble with Distributed Systems.
+9. Chandra, T. D., Hadzilacos, V., & Toueg, S. (1996). *The Weakest Failure Detector for Solving Consensus.* Journal of the ACM, 43(4), 685-722.
+10. Paxson, V., Allman, M., Chu, J., & Sargent, M. (2011). *RFC 6298: Computing TCP's Retransmission Timer.* IETF.

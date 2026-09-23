@@ -25,10 +25,98 @@ Prerequisites: familiarity with distributed system models from the `README.md` r
 14. [Distributed Locking Patterns for ML/AI Systems](#14-distributed-locking-patterns-for-mlai-systems)
 15. [Failure Modes and Debugging](#15-failure-modes-and-debugging)
 16. [Interview Patterns](#16-interview-patterns)
+17. [Real-world cases — incidents with numbers](#17-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** Many systems need several machines to agree on one thing: who the leader is, who
+holds a lock, what the current config is, what order writes happened in. Machines crash, networks
+split, and a process can freeze for seconds without knowing it. If two machines both believe "I am
+in charge", they both act, and you get double payments, lost writes, or corrupted data. This chapter
+covers Raft (the standard way a small group of servers agrees), and locks built on top of it, and
+how they still fail if you use them carelessly.
+
+**A real-world example.** A payments company runs a nightly "send payouts" job. Three worker
+machines can run it, but only one may run it at a time, or sellers get paid twice.
+
+- **No coordination.** Each worker checks a flag in a database row, sees "nobody is running", and
+  starts. Two workers start within the same 50 ms. 8,000 sellers are paid twice.
+- **One lock server (a single Redis).** The workers take a lock with a 15 s expiry. It works until
+  the Redis machine dies at 02:00; now no one can take the lock, or (after a failover that lost the
+  last write) two workers get the "same" lock.
+- **A Raft cluster (etcd, 5 servers).** The lock lives in a store that copies every change to a
+  majority (3 of 5) before saying "done". Two servers can die and the lock still works. If the
+  leader server dies, the other 4 notice after about 1 s (the *election timeout*) and elect a new
+  leader; the lock record is not lost.
+- **Still broken: the frozen worker.** Worker A holds the lock, then freezes for 20 s (a garbage
+  collection pause). Its 15 s lock expires; worker B takes it. A wakes up and keeps paying. The lock
+  service did its job; A just doesn't know it lost the lock.
+- **Fencing tokens fix it.** Every time the lock is granted, the lock service hands out a bigger
+  number: A got 41, B got 42. The payouts database remembers the biggest number it has seen and
+  rejects any write carrying a smaller one. A's late write with 41 is refused. No double payment.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Consensus | a group of servers agreeing on the same list of changes, in the same order | a committee that only acts on motions a majority voted for |
+| Majority / quorum | more than half the servers: 2 of 3, 3 of 5 | "need 3 of 5 board members to sign" |
+| Leader | the one server that accepts writes and tells the others what to copy | the meeting chair who writes the minutes |
+| Follower / candidate | a server that copies the leader / a server asking to become leader | committee members / a member running for chair |
+| Term | an election round number; higher always wins | the "2026 board" overrides anything the "2025 board" says |
+| Log / log entry | the ordered list of changes every server keeps | numbered lines in the meeting minutes |
+| Committed | stored on a majority, so it can never be lost | minutes signed by most members |
+| Election timeout | how long a follower waits without hearing from the leader before calling an election | "if the chair hasn't spoken for 1 minute, someone else takes over" |
+| Heartbeat | small "I'm still here" message from the leader | the chair tapping the microphone every few seconds |
+| Split brain | two servers both acting as leader | two people both think they are driving the car |
+| Lease | a lock that expires by itself unless renewed | a parking ticket valid for 2 hours |
+| Fencing token | an ever-growing number handed out with each lock grant; storage rejects older numbers | numbered tickets at a deli counter: number 41 can't be served after 42 |
+| Learner | a new server that copies data but doesn't vote yet | a new hire who shadows before getting a vote |
+| ReadIndex / lease read | ways for the leader to answer reads safely without writing a log entry | the chair checking "am I still chair?" before answering |
+| Ephemeral node (ZooKeeper) / lease-attached key (etcd) | a record that disappears when its owner disconnects | a "seat taken" jacket that leaves with its owner |
+| Watch | subscribe and be told when a key changes | a doorbell instead of checking the door every minute |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `N` (cluster size) | number of voting servers | 3 or 5 (etcd advises against more than 7) | Kubernetes etcd with 3 servers |
+| majority `⌊N/2⌋ + 1` | votes / copies needed to elect or commit | 2 of 3, 3 of 5 | a write is done once 3 of 5 have it |
+| `f`, "2f+1 nodes" | failures tolerated; `2f+1` servers tolerate `f` crashes (§16 writes this as 2N+1) | f = 1 or 2 | 5 servers survive 2 crashes; 4 servers survive only 1 |
+| term | election round number, only goes up | 1, 2, 3 … | node sees term 8 while it is on 7 → steps down |
+| index | position of an entry in the log | 1, 2, 3 … | entry 7 = "y=9" |
+| `lastLogIndex`, `lastLogTerm` | index and term of a candidate's last entry, sent with a vote request | — | (47, 2): "my log ends at 47, written in term 2" |
+| `prevLogIndex`, `prevLogTerm` | the entry just before new entries; follower must have it to accept | — | "do you have entry 5 from term 3?" |
+| `commitIndex` / `leaderCommit` | highest entry known to be committed / the leader's value sent to followers | — | commitIndex = 6 → entries 1–6 are safe |
+| `nextIndex` | per follower: next entry the leader will send | — | follower lags → nextIndex = 6 |
+| `readIndex` | commitIndex recorded at the moment a read arrives | — | read waits until entries up to 47 are applied |
+| `heartbeat-interval` | how often the leader pings followers | etcd default 100 ms | 10 pings per second |
+| `election-timeout` | silence before a follower starts an election | Raft paper 150–300 ms; etcd default 1000 ms | leader dies → new election ~1 s later |
+| `broadcastTime` | time for one round of RPCs to all followers | 0.5–20 ms | same-datacenter round trip ≈ 1 ms |
+| MTBF | mean time between server failures | months | one server fails every ~6 months |
+| clock drift bound | how much faster one clock may run than another | 1.001 (0.1%) | 1000 ms lease → trust only 999 ms |
+| `lease_duration` | time a leader may serve reads without checking | `election_timeout / drift_bound` | 1000 / 1.001 ≈ 999 ms |
+| TTL | lifetime of a lease or lock unless renewed | 10–30 s, renew at TTL/3 to TTL/2 | TTL 15 s, renew every 5 s |
+| fencing token | increasing number per lock grant | etcd `create_revision`, ZooKeeper sequence number | A = 33, B = 34 → 33 rejected |
+| `create_revision` / `mod_revision` | etcd's global counter value when a key was created / last changed | grows with every write | lock key created at revision 1042 |
+| `NX`, `PX 30000` | Redis: set only if missing; expire after 30,000 ms | — | `SET lock id NX PX 30000` |
+| `T1`, `T2`, clock_drift | Redlock: start / end time of acquiring on all instances; allowance for clock error | — | TTL 30 s, took 0.2 s → valid ≈ 29.8 s minus drift |
+| `C_old`, `C_new`, `C_old,new` | old, new, and joint cluster configurations | — | 3 servers → 5 servers |
+| RTT | network round-trip time | 0.5 ms in a datacenter, 20–80 ms across regions | ReadIndex costs 1 RTT |
+| fsync latency | time to force a write to disk | < 10 ms p99 recommended for etcd WAL | slow cloud disk: 200 ms → elections |
+| p99 | 99% of operations are faster than this | — | fsync p99 = 5 ms |
+| etcd DB size | total stored data | 2 GB default quota, 8 GB suggested max | — |
+| range / region size | chunk of keys with its own Raft group (CockroachDB / TiKV) | 512 MB (CockroachDB); TiKV smaller, version-dependent | 1,000 ranges → 1,000 Raft groups |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Why Consensus Exists
+
+> **In plain words.** Several servers must agree on one answer even when some crash or the network splits. Without a rule like "only a majority can decide", two halves of a split cluster both keep working and later disagree.
+>
+> **Real-world example.** A bank ledger runs on 5 servers. A switch failure splits them 2 and 3. With a majority rule, only the side with 3 keeps accepting transfers; the side with 2 refuses, so no account is debited twice.
 
 ### 1.1 The Core Problem
 
@@ -55,7 +143,7 @@ Network partition splits a 5-node cluster:
 
 ### 1.2 FLP Impossibility
 
-Fischer, Lynch, and Paterson (1985) proved that no deterministic consensus algorithm can guarantee termination in a fully asynchronous system with even one crash failure. Every practical consensus algorithm (Raft, Paxos, Zab) circumvents FLP by using timeouts (partial synchrony) — they assume the network will eventually deliver messages within some bound, even if that bound is unknown.
+Fischer, Lynch, and Paterson (1985) proved that no deterministic consensus algorithm can guarantee termination in a fully asynchronous system with even one crash failure. Practical consensus algorithms such as Raft, Multi-Paxos, and Zab work around FLP by relying on timeouts (partial synchrony): they are always safe (never disagree), but they only make progress when the network eventually delivers messages within some bound, even if that bound is unknown. (Randomization is the other known way around FLP.)
 
 ### 1.3 Consensus vs. Coordination
 
@@ -67,15 +155,19 @@ Fischer, Lynch, and Paterson (1985) proved that no deterministic consensus algor
 | Service discovery | Agreeing on which services are alive and where | Built on consensus + health checks |
 | Configuration management | Agreeing on the current system configuration | Built on consensus |
 
-All of these are built on top of consensus. That's why etcd (Raft-based) and ZooKeeper (Zab-based) serve as the foundation for Kubernetes, Kafka, and most distributed systems.
+All of these are built on top of consensus. That's why etcd (Raft-based) and ZooKeeper (Zab-based) have served as the coordination layer for Kubernetes, Kafka (before KRaft), and many other distributed systems.
 
 ---
 
 ## 2. Raft Fundamentals
 
+> **In plain words.** Raft splits the job into three parts: pick one leader, have the leader copy every change to the others, and make sure a change that was confirmed is never lost. Every server is a follower, a candidate, or the leader, and an ever-growing *term* number tells everyone which leader is the current one.
+>
+> **Real-world example.** A ride-hailing dispatch service keeps driver assignments in a 3-server Raft store. Server A is leader in term 4. If A dies and B wins term 5, any late message from A still stamped "term 4" is ignored.
+
 ### 2.1 Design Goal: Understandability
 
-Raft was designed by Diego Ongaro and John Ousterhout (2014) as an alternative to Paxos that is easier to understand, implement, and reason about. The key design decision: decompose consensus into three independent subproblems:
+Raft was designed by Diego Ongaro and John Ousterhout ("In Search of an Understandable Consensus Algorithm", USENIX ATC 2014) as an alternative to Paxos that is easier to understand, implement, and reason about. The key design decision: decompose consensus into three independent subproblems:
 
 ```
 Raft decomposition:
@@ -148,6 +240,10 @@ Properties:
 
 ## 3. Raft Leader Election
 
+> **In plain words.** If followers stop hearing the leader's heartbeat, one of them waits a random short time, then asks the others for votes. It wins with a majority, but only voters whose own log is not newer than its log will vote for it. Random waits stop everyone from running at once and splitting the vote.
+>
+> **Real-world example.** etcd defaults: leader heartbeat every 100 ms, election timeout 1000 ms. The leader of a 5-server cluster crashes; about 1 s later one follower starts an election, gets 3 votes (itself + 2) within a few ms, and writes resume after roughly 1–2 s in total.
+
 ### 3.1 Election Mechanism
 
 ```
@@ -214,7 +310,7 @@ With randomization (timeout between 150-300ms):
 
 ### 3.3 Pre-Vote Extension
 
-A partition-isolated node keeps incrementing its term and calling elections. When the partition heals, it has a very high term number that forces the entire cluster to step down momentarily (disrupting the healthy leader). The Pre-Vote extension (added in etcd) prevents this:
+A partition-isolated node keeps incrementing its term and calling elections. When the partition heals, it has a very high term number that forces the entire cluster to step down momentarily (disrupting the healthy leader). The Pre-Vote extension (described in Ongaro's 2014 PhD dissertation and implemented in etcd's Raft library, usually together with CheckQuorum) prevents this:
 
 ```
 Without Pre-Vote:
@@ -233,7 +329,9 @@ With Pre-Vote:
   Before incrementing term, candidate sends PreVote RPC:
     "Would you vote for me IF I started an election?"
   
-  Nodes that can still reach the current leader respond NO.
+  Nodes refuse if they heard from a live leader within the last election
+  timeout (or if the asker's log is behind). A minority side can never
+  collect a majority of pre-votes.
   Node4's PreVote gets rejected → does not increment term.
   Partition heals: Node4 quietly rejoins with its original term.
   No disruption.
@@ -256,14 +354,21 @@ Production settings (etcd):
   
   Why 1000ms and not 150ms?
   - Datacenter networks have occasional latency spikes
-  - GC pauses in Java-based systems (ZooKeeper) can exceed 200ms
+  - Disk fsync stalls (and GC pauses in JVM-based systems like ZooKeeper)
+    can exceed 200ms
   - Too-aggressive timeout → unnecessary elections → instability
-  - etcd recommends election-timeout = 10 × heartbeat-interval
+  - etcd's tuning guide: heartbeat ≈ 0.5-1.5 × average RTT between members,
+    election timeout at least 10 × RTT; the defaults (100ms / 1000ms)
+    keep a 10× ratio between them
 ```
 
 ---
 
 ## 4. Raft Log Replication
+
+> **In plain words.** The leader numbers each change and sends it to every follower along with "the entry just before this one". A follower only accepts if it has that previous entry, so logs can never silently diverge. Once a majority has stored an entry from the leader's current term, it is committed and can be applied.
+>
+> **Real-world example.** An e-commerce checkout writes "order 881 = paid" to a 5-server cluster. The leader and 2 followers store it within 3 ms; that is 3 of 5, so the client gets "OK". The 2 slow followers catch up on the next heartbeat.
 
 ### 4.1 The Replicated Log
 
@@ -325,7 +430,8 @@ Consistency check:
   Follower checks: "Do I have an entry at index 5 with term 3?"
   YES → append entries 6 and 7, respond success=true
   NO  → respond success=false
-       Leader decrements prevLogIndex and retries (log repair)
+       Leader decrements nextIndex for this follower (so prevLogIndex
+       moves back by one) and retries (log repair)
 ```
 
 ### 4.3 Log Repair (Conflicting Entries)
@@ -369,8 +475,8 @@ An entry is committed when the leader has replicated it to a majority of servers
 ```
 Commit process for a 5-node cluster (majority = 3):
 
-1. Client sends command "x=5" to Leader
-2. Leader appends to its log: index=7, term=3, cmd="x=5"
+1. Client sends command "y=9" to Leader
+2. Leader appends to its log: index=7, term=3, cmd="y=9" (as in §4.1)
 3. Leader sends AppendEntries to all followers in parallel
 
    Node1 (leader):  stored at index 7  ✓
@@ -379,8 +485,9 @@ Commit process for a 5-node cluster (majority = 3):
    Node4:           slow, not yet      ✗
    Node5:           slow, not yet      ✗
 
-4. Leader advances commitIndex to 7 (majority have it)
-5. Leader applies "x=5" to state machine
+4. Leader advances commitIndex to 7 (majority have it, and it is
+   from the leader's current term)
+5. Leader applies "y=9" to state machine
 6. Leader responds to client: success
 7. Next heartbeat tells followers about new commitIndex
 8. Followers apply committed entries to their state machines
@@ -394,6 +501,10 @@ Critical safety rule:
 ---
 
 ## 5. Raft Safety Guarantees
+
+> **In plain words.** Raft promises that a confirmed change is never lost or replaced, even across leader changes. The trick: a server only votes for a candidate whose log is at least as up to date as its own, and any two majorities share at least one server, so every new leader already has every confirmed change.
+>
+> **Real-world example.** In a 5-server cluster, a transfer is stored on servers 1, 2, 3. To win, a new leader needs 3 votes, so at least one of 1, 2, 3 must vote, and that server refuses anyone missing the transfer.
 
 ### 5.1 The Five Raft Guarantees
 
@@ -453,13 +564,18 @@ Why this works:
 DANGEROUS scenario without the commitment rule:
 
   Term 1: Node1 is leader, replicates entry at index 2 to Node2 only (2/5)
-  Term 2: Node1 crashes. Node5 becomes leader (did not have index 2)
+  Term 2: Node1 crashes. Node5 becomes leader (did not have index 2),
+          accepts a client entry at index 2 in term 2, then crashes
+          before replicating it
   Term 3: Node1 recovers, becomes leader again
   
-  Can Node1 now commit the entry at index 2 by replicating it to Node3?
+  Can Node1 now commit its term-1 entry at index 2 by replicating it
+  to Node3?
   
-  NO! Even though 3/5 nodes now have it, if Node5 becomes leader again,
-  it could overwrite that entry (it won election without it).
+  NO! Even though 3/5 nodes now have it, Node5 can still win a later
+  election: its last log term (2) beats their last log term (1), so
+  Node2/3/4 would vote for it. Node5 would then overwrite index 2
+  with its own term-2 entry. (This is Figure 8 of the Raft paper.)
   
   SAFE rule: Leader only commits entries from its current term.
   When a current-term entry is committed, all previous entries
@@ -473,6 +589,10 @@ DANGEROUS scenario without the commitment rule:
 ---
 
 ## 6. Raft Membership Changes
+
+> **In plain words.** Adding or removing servers is risky because for a moment some servers use the old member list and some the new one, and each group might elect its own leader. Raft avoids this either by changing one server at a time or by a two-step "joint" phase where decisions need a majority of both lists.
+>
+> **Real-world example.** Growing a chat app's metadata cluster from 3 to 5 servers: add server D as a non-voting learner, wait until it has copied all 2 GB, promote it (now 4 voters), then repeat for E.
 
 ### 6.1 The Problem with Direct Switchover
 
@@ -515,7 +635,7 @@ Phase 2: Transition to C_new
 
 ### 6.3 Single-Node Membership Changes (etcd's Approach)
 
-A simpler alternative used by etcd: change one node at a time. Adding or removing a single node from any majority-based cluster is safe because the old and new majorities always overlap:
+A simpler alternative, described in Ongaro's dissertation and used by etcd's member add/remove API: change one node at a time. (etcd's Raft library also supports joint consensus.) Adding or removing a single node from any majority-based cluster is safe because the old and new majorities always overlap:
 
 ```
 Single-node change safety proof:
@@ -540,6 +660,10 @@ Single-node change safety proof:
     Step 2: 4 → 5 (add Node E)
     
   Each step is safe. Two separate Raft log entries.
+
+  Caveat (found after publication, fixed in etcd and other libraries):
+  a new leader must commit an entry in its own term before it starts
+  a configuration change, and only one change may be in progress at a time.
 ```
 
 ### 6.4 Learner Nodes
@@ -570,6 +694,10 @@ With learner phase:
 
 ## 7. Raft Read Optimizations
 
+> **In plain words.** Reading from the leader is only safe if it is still the leader; a leader cut off by a partition might return old data. Running each read through the log is safe but as slow as a write. ReadIndex checks leadership with one heartbeat round; lease reads skip even that by trusting clocks.
+>
+> **Real-world example.** A config service handles 50,000 reads/s. Logging each read would need a disk sync per read; ReadIndex costs one ~0.5 ms network round trip, shared by all reads that arrive during that round, and needs no disk write.
+
 ### 7.1 The Problem: Linearizable Reads Are Expensive
 
 A naive linearizable read must go through the Raft log (propose a read command, replicate to majority, then read). This is the same cost as a write — unacceptable for read-heavy workloads.
@@ -596,6 +724,8 @@ ReadIndex optimization:
 
   Client → Leader: read(key="x")
   
+  0. (Once per term) leader must have committed an entry in its current
+     term, e.g. the no-op from §5.3, so its commitIndex is up to date
   1. Leader records current commitIndex as readIndex
   2. Leader sends heartbeat to all followers
   3. Majority of followers respond (confirms leader is still leader)
@@ -617,13 +747,16 @@ If the leader holds a time-based lease, it can skip even the heartbeat round and
 Lease read optimization:
 
   Leader sends heartbeats every 100ms.
-  After majority of followers respond, leader starts a lease:
-    lease_start = now()
+  Leader records start = now() BEFORE sending a heartbeat round.
+  After a majority of followers respond, the lease runs from that start
+  (not from when the replies arrive):
+    lease_start = start
     lease_duration = election_timeout / clock_drift_bound
                    = 1000ms / 1.001 ≈ 999ms
   
-  During the lease period, no other node can become leader
-  (followers won't time out and start an election).
+  During the lease period, no other node can become leader: followers
+  that heard from the leader recently refuse to vote (this needs
+  CheckQuorum / leader stickiness to hold).
   
   Leader can serve reads directly from local state machine:
     if now() < lease_start + lease_duration:
@@ -637,8 +770,10 @@ Lease read optimization:
   If the leader's clock runs fast, it might think the lease is valid
   when followers have already timed out and elected a new leader.
   
-  CockroachDB uses this with clock uncertainty bounds.
-  etcd uses ReadIndex by default (safer, 1 RTT overhead).
+  CockroachDB uses a related idea (range leases held by a leaseholder)
+  that depends on a configured maximum clock offset between nodes.
+  etcd uses ReadIndex by default (safer, 1 RTT overhead); its Raft
+  library also offers a lease-based read option.
 ```
 
 ### 7.4 Follower Reads
@@ -659,16 +794,22 @@ Follower read:
   Cost: 1 RTT to leader + leader's heartbeat RTT = 2 RTTs
   
   Benefit: distributes read load across all nodes.
-  CockroachDB and TiKV use this for follower reads.
+  TiKV's Follower Read works this way. CockroachDB's follower reads are
+  different: they return slightly stale data at a "closed timestamp"
+  without contacting the leaseholder.
 ```
 
 ---
 
 ## 8. Raft in Production: etcd, CockroachDB, TiKV
 
+> **In plain words.** etcd runs one Raft group for a small, critical dataset (Kubernetes' state). Databases like CockroachDB and TiKV cut the data into many small ranges and run a separate Raft group for each, so leadership and load are spread across machines.
+>
+> **Real-world example.** A 10-node CockroachDB cluster holding 5 TB in ranges of at most 512 MB has at least 10,000 ranges; with 3 copies each, every node takes part in at least 3,000 Raft groups.
+
 ### 8.1 etcd
 
-etcd is the most widely deployed Raft implementation. It is the metadata store for Kubernetes (every pod, service, configmap, secret is an etcd key).
+etcd is one of the most widely deployed Raft implementations. It is the metadata store for Kubernetes (every pod, service, configmap, secret is an etcd key).
 
 ```
 etcd architecture:
@@ -701,7 +842,7 @@ Key design decisions:
   - Watch API: clients subscribe to key changes (Kubernetes informers)
   - Lease API: time-bounded key ownership (distributed locks, leader election)
   - Default: 3 or 5 nodes. More than 7 is not recommended.
-  - Max recommended DB size: 8 GB
+  - Default storage quota 2 GB; suggested maximum 8 GB
   - Not designed for high-throughput data storage — it's a coordination service
 ```
 
@@ -740,8 +881,8 @@ TiKV architecture:
   │   TiKV-1    │     │   TiKV-2    │     │   TiKV-3    │
   │             │     │             │     │             │
   │  Region 1*  │     │  Region 1   │     │  Region 1   │
-  │  Region 4   │     │  Region 2*  │     │  Region 3   │
-  │  Region 5*  │     │  Region 4*  │     │  Region 3*  │
+  │  Region 2   │     │  Region 2*  │     │  Region 2   │
+  │  Region 3   │     │  Region 3   │     │  Region 3*  │
   │             │     │             │     │             │
   │  RocksDB    │     │  RocksDB    │     │  RocksDB    │
   │  (Raft log) │     │  (Raft log) │     │  (Raft log) │
@@ -749,17 +890,24 @@ TiKV architecture:
   │  (State)    │     │  (State)    │     │  (State)    │
   └─────────────┘     └─────────────┘     └─────────────┘
   
-  Two RocksDB instances per node:
+  Historically two RocksDB instances per node (newer TiKV versions
+  default to a purpose-built "Raft Engine" for the log instead):
     1. Raft log engine (sequential writes, periodic compaction)
     2. State machine engine (actual key-value data)
+  * = Raft leader of that region. Each region has 3 replicas.
   
   PD (Placement Driver): central coordinator that tracks region locations,
-  triggers splits/merges/rebalancing. Similar to CockroachDB's gossip layer.
+  triggers splits/merges/rebalancing. CockroachDB has no such central
+  component; it spreads this information via gossip and meta ranges.
 ```
 
 ---
 
 ## 9. Distributed Locking Fundamentals
+
+> **In plain words.** A distributed lock is "only one worker may do this at a time". The hard part: a worker can freeze or lose the network and not know its lock has expired. A lock alone can't stop that stale worker; the storage it writes to must reject it, using a fencing token.
+>
+> **Real-world example.** A video platform's transcoding job holds a 10 s lock. The worker freezes for 15 s; another worker takes the lock (token 34) and starts. The first worker wakes and writes with token 33; the storage sees 33 < 34 and refuses.
 
 ### 9.1 Why Distributed Locks Are Hard
 
@@ -830,11 +978,12 @@ Lease lifecycle:
   Time 5s:  renew(lease_id=12345) → TTL reset to 10s
   Time 10s: renew(lease_id=12345) → TTL reset to 10s
   Time 15s: (client crashes, no renewal)
-  Time 25s: lease expires, lock released automatically
+  Time 20s: lease expires (10s after the last renewal at 10s),
+            lock released automatically
   
   Key property: no manual "unlock" required.
   Even if the lock holder crashes permanently, the lock
-  is eventually released. Deadlock is impossible.
+  is eventually released. A crashed holder cannot block others forever.
 
   Trade-off: TTL must balance between:
     - Too short (1s): healthy clients lose the lock during transient issues
@@ -845,6 +994,10 @@ Lease lifecycle:
 ---
 
 ## 10. Lock Service Implementations
+
+> **In plain words.** Three common ways to build a lock: etcd (a key tied to a lease, queue ordered by revision), ZooKeeper (ephemeral sequential nodes that vanish when the client disappears), and Redis (`SET ... NX PX`, simple and fast but weaker guarantees).
+>
+> **Real-world example.** An IoT firmware-rollout job uses an etcd lock with a 15 s lease renewed every 5 s. If the rollout machine dies, the lock frees itself within at most 15 s and a standby takes over.
 
 ### 10.1 etcd Distributed Lock
 
@@ -940,12 +1093,18 @@ Simple Redis lock (single instance):
     sees it belongs to B, and does nothing.
 
   Limitation: single Redis instance is a single point of failure.
-  If Redis crashes, the lock is lost.
+  If Redis crashes, the lock is lost. Adding a replica does not fully
+  fix this: replication is asynchronous, so a failover can promote a
+  replica that never saw the lock, and a second client can acquire it.
 ```
 
 ---
 
 ## 11. ZooKeeper Coordination Primitives
+
+> **In plain words.** ZooKeeper stores small records in a folder-like tree. Records can vanish automatically when their owner disconnects (ephemeral) and can get automatic increasing numbers (sequential). From those two features you build leader election, locks, service discovery, and config updates.
+>
+> **Real-world example.** A payments service has 12 instances; each creates `/services/payment/instance-NNN` as an ephemeral node. When one crashes, its node disappears once its session times out, and the load balancer's watch fires, removing it from rotation.
 
 ### 11.1 ZooKeeper Data Model
 
@@ -976,6 +1135,7 @@ Node types:
   Ephemeral:             automatically deleted when client session expires
   Persistent Sequential: persistent + auto-incrementing suffix
   Ephemeral Sequential:  ephemeral + auto-incrementing suffix (used for locks, queues)
+  (ZooKeeper 3.5+/3.6+ also adds Container and TTL node types)
 ```
 
 ### 11.2 Key ZooKeeper Primitives
@@ -1014,22 +1174,26 @@ Node types:
 
 | Feature | ZooKeeper | etcd |
 |---|---|---|
-| Consensus | Zab (Paxos-derived) | Raft |
+| Consensus | Zab (atomic broadcast; Paxos-like) | Raft |
 | Language | Java | Go |
 | Data model | Hierarchical (tree) | Flat key-value with prefix ranges |
-| Watch mechanism | One-time watches (must re-register) | Persistent watches (stream of events) |
+| Watch mechanism | One-time watches (must re-register); persistent and recursive watches since 3.6 | Long-lived watch streams |
 | Session model | Client sessions with heartbeats | Leases with TTL |
 | Ephemeral nodes | Yes (auto-delete on session expire) | Via lease attachment |
 | Sequential nodes | Native | Must implement with revision numbers |
-| Max data per node | 1 MB (default) | No per-key limit (8 GB total) |
-| Linearizable reads | Yes (leader serves all reads by default) | Yes (ReadIndex or lease reads) |
+| Max data per node | ~1 MB (default `jute.maxbuffer`) | ~1.5 MiB per request by default (`--max-request-bytes`); 2 GB default DB quota, 8 GB suggested max |
+| Linearizable reads | No by default: any server answers reads from its local copy, which may lag; call `sync()` first for an up-to-date read. Writes are linearizable | Yes by default (ReadIndex); serializable local reads optional |
 | MVCC | No (current state only) | Yes (revision history, compact-able) |
-| Used by | Kafka (legacy), HBase, Hadoop, Solr | Kubernetes, CoreDNS, Vitess, CockroachDB |
+| Used by | Kafka (before KRaft), HBase, Hadoop, Solr | Kubernetes, CoreDNS, Vitess (CockroachDB and TiKV reuse etcd's Raft library, not etcd itself) |
 | Operational complexity | High (JVM tuning, GC pauses) | Lower (single binary, Go runtime) |
 
 ---
 
 ## 12. etcd Coordination Primitives
+
+> **In plain words.** etcd gives you two main tools: watches (a live stream of changes to keys, which can resume after a disconnect) and small transactions ("if this key is unchanged, then write X, else read Y"), which make compare-and-swap operations safe.
+>
+> **Real-world example.** Kubernetes' API server watches etcd; when a pod record changes at revision 1042, every interested controller hears about it within milliseconds instead of polling.
 
 ### 12.1 Watch API
 
@@ -1049,11 +1213,14 @@ etcd watch:
   Key properties:
   - Persistent: watch remains active, no re-registration needed
   - Resumable: if client disconnects, reconnect with last-seen revision
+    (unless that revision was already compacted; then re-list)
   - Ordered: events arrive in the order they were committed to Raft
   - Multiplexed: many watches share one gRPC stream
 
-  Kubernetes informer pattern:
-  1. List all pods (GET /registry/pods/, returns revision=1000)
+  Kubernetes informer pattern (the kube-apiserver watches etcd;
+  controllers list+watch the apiserver, whose resourceVersion is the
+  etcd revision):
+  1. List all pods (returns revision=1000)
   2. Cache all pods in memory
   3. Watch from revision 1000 (get all changes since the list)
   4. Apply each watch event to the in-memory cache
@@ -1090,13 +1257,18 @@ etcd mini-transaction:
   Use cases:
   - Leader election: CAS on leader key
   - Lock acquisition: CAS on lock key with lease
-  - Atomic counter: read value, CAS with value+1
+  - Atomic counter: read value and mod_revision, write value+1 only if
+    mod_revision is unchanged
   - Configuration update: CAS with expected revision
 ```
 
 ---
 
 ## 13. The Redlock Controversy
+
+> **In plain words.** Redlock tries to make a safer Redis lock by taking it on a majority of 5 independent Redis servers. Critics showed it still breaks if a client freezes or a clock jumps, and it can't hand out fencing tokens. Use it at most to avoid duplicate work, not to protect data.
+>
+> **Real-world example.** Lock TTL 30 s; acquiring on 3 of 5 instances took 200 ms, so the client may trust the lock for about 29.8 s minus a clock-drift allowance. If one Redis server's clock jumps 30 s forward, its copy expires early and another client can grab 3 of 5.
 
 ### 13.1 How Redlock Works
 
@@ -1149,13 +1321,17 @@ Kleppmann's arguments:
 
   3. IF YOU NEED CORRECTNESS: use a proper consensus system (etcd, ZooKeeper).
      IF YOU ONLY NEED EFFICIENCY: a single Redis instance is simpler and
-     just as good (both fail if Redis crashes; N instances only helps
-     if crashes are independent, which clock skew violations break).
+     just as good: an occasional double run is acceptable for efficiency,
+     so running 5 Redis masters buys little.
 
 Sanfilippo's response:
   - Redlock does not depend on synchronized clocks, only on "roughly correct"
-    time passing (bounded clock drift)
-  - Process pauses are bounded in practice
+    time passing (bounded clock drift); admins should avoid clock steps
+  - A pause AFTER the lock is acquired hurts every lease-based lock,
+    not just Redlock; the time check in step 4 covers pauses during
+    acquisition
+  - If the storage can check a fencing token, it can equally check the
+    lock's unique random value with a compare-and-set
   - The algorithm is safe under these assumptions
 
 Practical conclusion:
@@ -1167,6 +1343,10 @@ Practical conclusion:
 ---
 
 ## 14. Distributed Locking Patterns for ML/AI Systems
+
+> **In plain words.** ML platforms use the same locks: one model rollout at a time, one worker per training trial, one writer per feature table, one active scheduler. Each still needs a lease (so crashes free the lock) and a fencing check where data is written.
+>
+> **Real-world example.** A recommendation model deploy holds a 300 s lease renewed every 60 s. The deployer crashes mid-rollout; within 300 s the lease expires and the next deploy starts, and the model registry rejects the dead deployer's older token.
 
 ### 14.1 Model Deployment Lock
 
@@ -1239,6 +1419,8 @@ Pattern: prevent concurrent writes to the same feature group
     Fencing: online store checks write timestamp.
     If a stale writer tries to swap after lock expiry,
     the store rejects writes older than the current table.
+    (Wall-clock timestamps are a weak fence because clocks skew;
+    prefer the lock's etcd revision as the token.)
 ```
 
 ### 14.4 Singleton Service Pattern
@@ -1270,6 +1452,10 @@ Pattern: ensure exactly one instance of a service runs cluster-wide
 ---
 
 ## 15. Failure Modes and Debugging
+
+> **In plain words.** Most Raft failures cost a short pause (about one election timeout), not data loss. Most lock failures come from the holder losing the lock without knowing. The etcd and ZooKeeper tools below show who is leader, how many elections happened, and how slow the disk is.
+>
+> **Real-world example.** An on-call engineer sees 30 leader changes in an hour on a 3-node etcd. `etcd_disk_wal_fsync_duration_seconds` p99 is 400 ms (target: under 10 ms). The disk, not the network, is the cause.
 
 ### 15.1 Raft Failure Scenarios
 
@@ -1333,6 +1519,7 @@ Pattern: ensure exactly one instance of a service runs cluster-wide
    
    Fix 1: fencing tokens (storage rejects stale tokens)
    Fix 2: keep critical section shorter than half the TTL
+          (reduces the chance, does not remove it)
    Fix 3: heartbeat-based renewal (detects stale lock faster)
 
 4. NETWORK PARTITION FROM LOCK SERVICE:
@@ -1366,20 +1553,27 @@ etcd:
 ZooKeeper:
   echo stat | nc localhost 2181    # server statistics
   echo mntr | nc localhost 2181    # monitoring data
+                                   # (3.5+: four-letter words must be
+                                   #  allowed in 4lw.commands.whitelist)
   zkCli.sh ls /locks               # list lock nodes
   zkCli.sh get /locks/my-lock      # read lock data
   
-Raft metrics (Prometheus):
-  raft_leader_changes_total        # leader elections count
-  raft_proposals_committed_total   # committed proposals
-  raft_proposals_failed_total      # failed proposals (leader not found)
-  etcd_server_leader_changes_seen  # etcd-specific leader changes
-  etcd_disk_wal_fsync_duration_seconds  # WAL write latency
+etcd Raft metrics (Prometheus):
+  etcd_server_has_leader                   # 1 if this member sees a leader
+  etcd_server_leader_changes_seen_total    # leader changes seen
+  etcd_server_proposals_committed_total    # committed proposals
+  etcd_server_proposals_failed_total       # failed proposals
+  etcd_disk_wal_fsync_duration_seconds     # WAL fsync latency (p99 < 10ms)
+  etcd_disk_backend_commit_duration_seconds  # backend commit latency
 ```
 
 ---
 
 ## 16. Interview Patterns
+
+> **In plain words.** Interviewers want three things: you know a majority quorum prevents split brain, you know a lock can be lost without the holder noticing, and you add fencing or idempotency at the data layer. Give one number ("5 nodes, tolerates 2 failures") and one trade-off.
+>
+> **Real-world example.** "Our job scheduler elects a leader through etcd with a 15 s lease; every job write carries the leader's revision as a fencing token, so a paused old leader's writes are rejected."
 
 ### 16.1 Pattern: "How do you prevent split-brain in your system?"
 
@@ -1448,8 +1642,9 @@ Architecture:
     7. Operator monitors: GET /health?config_version=42 on all instances
 
   vs. polling-based (inferior):
-    - 1000 instances × 1 poll/second = 1000 QPS on config service
-    - Average delay: half the poll interval (5s average for 10s interval)
+    - 1000 instances polling every 1s = 1000 QPS, average delay 0.5s
+    - 1000 instances polling every 10s = 100 QPS, average delay 5s
+      (average delay = half the poll interval)
     - etcd watch: 0 QPS steady-state, ~100ms propagation
 ```
 
@@ -1462,7 +1657,7 @@ Architecture:
 
   1. CENTRALIZED (Redis):
      All gateway instances check/increment a Redis counter.
-     Lua script: MULTI/EXEC atomic increment + expiry.
+     Lua script (or MULTI/EXEC): atomic INCR + EXPIRE.
      Problem: Redis is a SPOF. If Redis fails, no rate limiting.
      Problem: network latency to Redis on every request (1-2ms).
 
@@ -1479,7 +1674,8 @@ Architecture:
      Lock: etcd lock during rebalancing to prevent double-allocation
      Fencing: each allocation includes a revision number
      
-     Tradeoff: ~10% accuracy loss vs 0ms additional latency
+     Tradeoff: some accuracy loss (illustratively ~10%, depends on
+     the rebalance interval) vs 0ms additional latency
 ```
 
 ### 16.5 Quick-Reference: When to Use What

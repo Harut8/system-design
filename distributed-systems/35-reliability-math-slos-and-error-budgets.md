@@ -8,6 +8,7 @@ Reliability engineering is fundamentally a mathematical discipline. Gut feelings
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Reliability as a Mathematical Framework](#1-reliability-as-a-mathematical-framework)
 2. [Core Reliability Metrics](#2-core-reliability-metrics)
 3. [The Nines of Availability](#3-the-nines-of-availability)
@@ -18,10 +19,96 @@ Reliability engineering is fundamentally a mathematical discipline. Gut feelings
 8. [Redundancy and Replication Math](#8-redundancy-and-replication-math)
 9. [Capacity Planning for Reliability](#9-capacity-planning-for-reliability)
 10. [Production Reliability Architecture Patterns](#10-production-reliability-architecture-patterns)
+11. [Interview Questions — Reliability Math, SLOs and Error Budgets](#11-interview-questions--reliability-math-slos-and-error-budgets)
+12. [Real-world cases — incidents with numbers](#12-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** Every system fails sometimes. The questions that matter are: how much failure is
+acceptable, how do you measure it, and what do you do when you are close to the limit? This chapter
+turns "we want high availability" into numbers: a measurement (SLI), a target (SLO), an allowance
+for failure (error budget), and alerts that fire when that allowance is being used up too fast. It
+also shows how to multiply availabilities through a chain of services and how redundancy helps
+only when copies fail independently.
+
+**A real-world example.** An e-commerce checkout gets 1,000 requests per minute, which is
+43,200,000 requests in a 30-day window. The team sets an SLO of 99.9% successful requests.
+
+- **Error budget (§6):** 0.1% of 43.2M = **43,200 failed requests** allowed per 30 days (the same as
+  43.2 minutes of total outage).
+- **Serial chain (§3):** checkout calls gateway (99.95%) → cart (99.9%) → payment (99.9%) → order DB
+  (99.95%). Multiplied: 0.9995 x 0.999 x 0.999 x 0.9995 = **99.70%**. That is about 129 minutes of
+  expected failure per 30 days, 3x the budget, before a single bad deploy. The team must remove or
+  harden links (caching, async writes, redundancy) before the SLO is even possible.
+- **A bad deploy:** a release makes 5% of checkouts fail. Burn rate = 5% / 0.1% = **50x**: the whole
+  30-day budget would be gone in 30 / 50 = 0.6 days (14.4 hours).
+  - **Without SLO alerts:** nobody notices until customer complaints arrive 3 hours later.
+    180 min x 1,000 x 5% = **9,000 failed checkouts = 20.8% of the month's budget**.
+  - **With a multi-window burn-rate alert (§5)** (page when the error rate is above 14.4 x 0.1% =
+    1.44% over both the last 1 hour and the last 5 minutes): the 1-hour average passes 1.44% after
+    about 17 minutes, so the page fires having spent **864 failures = 2% of budget**. Automatic
+    rollback 10 minutes later brings the total to 1,364 failures, about **3.2%** of budget.
+- **Error budget policy (§6):** with 97% of the budget left, the team keeps shipping, but adds a
+  canary step so the next bad release hits 1% of traffic instead of 100%.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Availability | share of time (or of requests) the service works | share of days the bus actually runs |
+| Nines | 99.9% = "three nines"; each nine cuts allowed downtime 10x | a stricter and stricter punctuality promise |
+| MTBF | average time between failures | how many months between car breakdowns |
+| MTTR | average time to get back to working | how long the car is in the garage each time |
+| MTTD | average time until someone notices the failure | how long before you notice a flat tyre |
+| SLI | the thing you measure: good events / all events | share of trains that arrive within 5 minutes of schedule |
+| SLO | your internal target for the SLI over a window | "95% of trains on time, each month" |
+| SLA | a contract with customers, with money back if missed | a refund if your parcel is late |
+| Error budget | failure allowed by the SLO (1 - SLO) | a monthly allowance you are allowed to spend |
+| Burn rate | how fast you spend the budget compared with the steady rate | spending your monthly allowance in 2 days |
+| Serial dependency | request needs A **and** B **and** C | a relay race: one dropped baton loses the race |
+| Parallel redundancy | request needs A **or** B | a spare tyre |
+| Correlated failure | one cause breaks all the copies at once | the spare tyre is flat too, for the same reason |
+| Quorum | a majority of replicas must agree | a committee needs more than half its members present to vote |
+| Headroom | spare capacity kept for spikes and failures | not booking every seat on a plane, in case a flight is cancelled |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `A` | availability, 0 to 1 (or %) | 0.999 – 0.9999 | 0.999 = 99.9% |
+| `A_1 ... A_n` | availabilities of individual components | 0.999 each | 3 services at 0.999 in series → 0.997 |
+| `MTBF` | mean time between failures (here: mean uptime) | hours to months | 730 h ≈ one failure a month |
+| `MTTF` | mean time to failure (strict name for mean uptime) | same as above | — |
+| `MTTR` | mean time to recovery | minutes to hours | 1.5 h per incident |
+| `MTTD` | mean time to detect | 1 – 30 min | 7.6 min average, 3 min median |
+| `λ` (lambda) | failure rate = 1 / MTBF | per hour | MTBF 730 h → λ = 0.00137/h |
+| `t` | length of a time period | hours | 168 h = one week |
+| `R(t)` | chance of no failure during `t` = e^(-λt) | 0 – 1 | R(720 h) = 37% for MTBF 730 h |
+| `e` | Euler's number, 2.718... | — | e^(-1) = 0.37 |
+| SLI | good events / total events | 0 – 1 | 998,500 / 1,000,000 = 99.85% |
+| SLO | target for the SLI over a window | 99% – 99.99% | 99.9% over 30 days |
+| Error budget | 1 - SLO | 0.1% for 99.9% | 43.2 min or 10,000 of 10M requests per 30 days |
+| Burn rate | observed error rate / (1 - SLO) | 1x = on track | 1.44% errors on a 99.9% SLO → 14.4x |
+| Long / short window | the two look-back periods an alert checks | 1 h / 5 min, 6 h / 30 min, 3 d / 6 h | page only if both windows are above the threshold |
+| `n` | number of replicas or components | 2 – 7 | 5 replicas |
+| `p` | probability one component is down | 0.001 | a 99.9% server has p = 0.001 |
+| `C(n,k)` | number of ways to pick `k` of `n` | — | C(4,2) = 6 |
+| `Q` | quorum size = floor(n/2) + 1 | — | n = 5 → Q = 3 |
+| N+1, N+2 | capacity for load (N) plus 1 or 2 spares | — | need 4, run 5 |
+| RF | replication factor (copies of each piece of data) | 3 | RF=3: three copies |
+| p50 / p95 / p99 / p99.9 | latency that 50% / 95% / 99% / 99.9% of requests beat | ms | p99 = 300 ms |
+| Utilization | how busy a resource is (0 – 100%) | keep CPU ≤ 60 – 70% | 1,750 of 2,500 req/s = 70% |
+| Month (in tables) | 30 days for error budgets; 30.44 days in the nines table | — | 99.9%: 43.2 min vs 43.8 min |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Reliability as a Mathematical Framework
+
+> **In plain words.** Saying "we want high availability" does not help anyone decide anything. Put a number on it, such as 99.9% of requests succeed, and you can decide how much to spend, when to ship and when to stop. 100% is never the right goal, because it would mean never changing anything.
+>
+> **Real-world example.** A video platform promises 99.9% uptime. That allows about 43 minutes of failure per 30 days. The team can see that a 10-minute risky migration fits in that allowance, while a plan to go multi-region (for 99.99%, about 4 minutes) would cost far more than the few extra minutes are worth to viewers.
 
 ### Why Reliability Must Be Quantified
 
@@ -36,7 +123,7 @@ Reliability without math produces two pathological outcomes. Teams either over-e
 
 ### The Exponential Cost of Each Nine
 
-Each additional nine of availability roughly 10x the engineering cost. This is not hyperbole; it is an empirical pattern observed across the industry.
+Each additional nine of availability costs much more than the previous one. A common rule of thumb says "each nine costs about 10x"; the illustrative chart below uses a gentler doubling. The exact multiplier varies by system and is not a law, but the direction is consistent: every nine is harder than the last.
 
 ```
 Cost vs. Availability (Approximate Industry Pattern)
@@ -77,6 +164,10 @@ Feature velocity and reliability are in direct tension. Every code change carrie
 ---
 
 ## 2. Core Reliability Metrics
+
+> **In plain words.** Two numbers describe most outages: how often things break (MTBF) and how long they stay broken (MTTR). Availability is uptime divided by total time. Cutting the time to recover is usually cheaper than preventing every failure.
+>
+> **Real-world example.** A payments API fails about every 200 hours and takes 1 hour to fix: 200 / 201 = 99.50% available. To reach 99.9% they could make failures 5x rarer (every ~1,000 hours), or make recovery 5x faster (12 minutes) with automatic rollback. The second is usually much easier.
 
 ### MTBF: Mean Time Between Failures
 
@@ -143,7 +234,7 @@ Consider two strategies for improving availability from 99.5% to 99.9%:
 - Target 99.9%: Need MTTR = MTBF(1-A)/A = 200(0.001)/0.999 = 0.2h (12 minutes)
 - You must 5x your recovery speed. Automated rollback alone can achieve this.
 
-Strategy B is almost always cheaper and more tractable. You cannot prevent all failures, but you can detect and recover from them faster. This is why Google, Amazon, and Netflix invest heavily in observability and automated remediation rather than trying to eliminate all failure modes.
+Strategy B is almost always cheaper and more tractable. You cannot prevent all failures, but you can detect and recover from them faster. This is why large operators invest heavily in observability and automated remediation rather than trying to eliminate all failure modes.
 
 ### MTTD: Mean Time To Detect
 
@@ -173,6 +264,8 @@ Availability = ──────────── = ────────�
 - MTBF = 720 hours (a failure roughly every month)
 - MTTR = 0.5 hours (30-minute recovery)
 - A = 720 / (720 + 0.5) = 720 / 720.5 = 99.931%
+
+Note on definitions: in this formula "MTBF" means the average *uptime* between failures (strictly, MTTF — mean time to failure). Some texts define MTBF = MTTF + MTTR, in which case A = MTTF / MTBF. When MTTR is tiny compared with MTBF, the difference is negligible.
 
 This system achieves roughly three nines. To reach four nines with the same MTBF, you would need MTTR = 720 * 0.0001 / 0.9999 = 0.072 hours = 4.3 minutes. Possible with automated detection and rollback.
 
@@ -205,6 +298,10 @@ This means: even a system with 30-day MTBF only has a 37% chance of making it th
 
 ## 3. The Nines of Availability
 
+> **In plain words.** "Three nines" (99.9%) means the service may be down 0.1% of the time. Each extra nine cuts the allowed downtime by 10x. When a request passes through several services one after another, their availabilities multiply and the total gets worse; when you run copies side by side, it gets better.
+>
+> **Real-world example.** A checkout goes through 3 services at 99.9% each: 0.999^3 = 99.7%, about 2.2 hours down per month instead of 43 minutes. Run two copies of one service instead of one: 1 - 0.001^2 = 99.9999% for that step, if the copies fail independently.
+
 ### The Complete Availability Table
 
 | Availability | Common Name | Downtime/Year | Downtime/Month | Downtime/Week | Downtime/Day | Typical Systems |
@@ -213,9 +310,11 @@ This means: even a system with 30-day MTBF only has a 37% chance of making it th
 | 99.5% | Two-and-a-half | 1d 19h 48m | 3h 39m | 50m 24s | 7m 12s | Non-critical web apps |
 | 99.9% | Three Nines | 8h 45m 36s | 43m 50s | 10m 5s | 1m 26s | SaaS products, APIs |
 | 99.95% | Three-and-a-half | 4h 22m 48s | 21m 55s | 5m 2s | 43s | E-commerce, user-facing services |
-| 99.99% | Four Nines | 52m 36s | 4m 23s | 1m 0.5s | 8.6s | Financial APIs, core infrastructure |
+| 99.99% | Four Nines | 52m 34s | 4m 23s | 1m 0.5s | 8.6s | Financial APIs, core infrastructure |
 | 99.999% | Five Nines | 5m 15.6s | 26.3s | 6s | 0.86s | Telecom switches, payment rails |
 | 99.9999% | Six Nines | 31.5s | 2.6s | 0.6s | 0.086s | Pacemakers, flight control |
+
+How the columns are computed: year = 365 days; month = 1/12 of a 365.25-day year = 30.44 days (730.5 hours). That is why 99.9% gives 43m 50s (43.8 min) per month here but **43.2 min** in the error-budget tables of Section 6, which use a 30-day window. Both are correct; always state which window you mean.
 
 ### Architecture Requirements at Each Level
 
@@ -321,6 +420,10 @@ To prevent serial multiplication from destroying availability in microservice ar
 
 ## 4. SLIs: Service Level Indicators
 
+> **In plain words.** An SLI is the thing you measure: good events divided by all events, for example "requests that succeeded in under 300 ms" divided by "all requests". The hard part is deciding what counts as good and what counts at all. Measure latency with percentiles, not averages.
+>
+> **Real-world example.** A chat app serves 1,000,000 messages a day and 998,500 are delivered in under 1 second: SLI = 99.85%. If load-balancer health checks were counted as requests too, the number would look better than what users feel.
+
 ### Definition
 
 An **SLI** (Service Level Indicator) is a quantitative measure of a specific aspect of service quality, expressed as a ratio:
@@ -399,6 +502,10 @@ Both have ~50-60ms "average" latency. Service B is a disaster for 1% of users.
 
 ## 5. SLOs: Service Level Objectives
 
+> **In plain words.** An SLO is the target for an SLI over a time window, such as "99.9% of requests succeed, measured over the last 30 days". Set it from what users need, not from what the system happens to do today. Alerts should fire when you are using up the allowed failures too fast, not on every blip.
+>
+> **Real-world example.** A 99.9% SLO allows 0.1% errors. If errors jump to 1.44%, you are failing 14.4x faster than allowed and would use a month's allowance in about 2 days. That deserves a page. A 5-minute blip at 0.2% does not.
+
 ### Definition
 
 An **SLO** is a target value or range for an SLI, over a defined time window. It is an *internal* commitment that drives engineering decisions.
@@ -469,6 +576,8 @@ If current error rate = 1.44%:
 | Ticket (medium) | 3x | 1 day | 2 hours | 10% in 1 day | Chronic issue emerging |
 | Ticket (low) | 1x | 3 days | 6 hours | 10% in 3 days | Slow sustained degradation |
 
+Budget consumed = burn rate x long window / SLO window, e.g. 14.4 x 1h / 720h = 2%, 6 x 6h / 720h = 5%, 1 x 72h / 720h = 10%. The short window is 1/12 of the long window. The Google SRE Workbook (Chapter 5, "Alerting on SLOs") recommends the three rows 14.4x (1h/5m, page), 6x (6h/30m, page) and 1x (3d/6h, ticket); the 3x / 1-day row is an optional extra tier built with the same rule.
+
 **Why you need both long and short windows**: The long window determines if enough budget has been consumed to warrant attention. The short window confirms the problem is ongoing right now (not a resolved blip still inside the long window).
 
 ```
@@ -506,6 +615,10 @@ Remaining
 ---
 
 ## 6. Error Budgets: The Key Innovation
+
+> **In plain words.** The error budget is the amount of failure the SLO allows: 1 minus the SLO. Teams spend it on risky changes. While budget is left, ship; when it runs out, stop feature work and fix reliability.
+>
+> **Real-world example.** An e-commerce site with a 99.9% SLO and 10M requests per 30 days may fail 10,000 requests (or be fully down about 43 minutes). A bad deploy already caused 8,300 failures this month, so 83% is spent: the team freezes risky deploys until the window rolls forward.
 
 ### Definition and Calculation
 
@@ -593,6 +706,10 @@ The error budget aligns incentives between product and engineering:
 
 ## 7. Failure Mode Analysis
 
+> **In plain words.** List how things can break, how often, and what else breaks with them. Most big outages start with a change (a deploy or a config push), and a single shared cause can take down all your "redundant" copies at once.
+>
+> **Real-world example.** Two database replicas at 99.9% each should give 99.9999% together. But if the same bad config is pushed to both, the chance of both failing is close to the chance of one failing: about 99.9%, a 1,000x difference in downtime.
+
 ### Identifying Failure Modes
 
 Every system has a finite (though large) set of ways it can fail. Categorizing them:
@@ -608,13 +725,13 @@ Every system has a finite (though large) set of ways it can fail. Categorizing t
 
 ### Human Error Dominance
 
-Studies consistently show that 60-80% of production outages involve human error. Google's published incident data, Amazon's COE (Correction of Error) reports, and Microsoft Azure's RCAs all confirm this pattern.
+A large share of production outages start with a change made by people. The Google SRE book estimates that roughly 70% of outages are due to changes in a live system. Published postmortems from many providers show the same pattern: config pushes and deploys, not hardware, cause most big incidents.
 
-The top human-error categories:
+The most common change-related categories (order varies by organization):
 
-1. **Configuration changes** (40%+): YAML typo, wrong feature flag value, incorrect connection string.
-2. **Failed deployments** (25%+): Untested code path, incompatible schema migration, missing environment variable.
-3. **Operational procedures** (15%+): Wrong runbook, wrong cluster, misread dashboard.
+1. **Configuration changes**: YAML typo, wrong feature flag value, incorrect connection string.
+2. **Failed deployments**: Untested code path, incompatible schema migration, missing environment variable.
+3. **Operational procedures**: Wrong runbook, wrong cluster, misread dashboard.
 
 Implication: invest in deployment safety (canary, progressive rollout, automated rollback) and configuration validation (schema validation, dry-run, diff review) before investing in hardware redundancy.
 
@@ -676,6 +793,10 @@ Rather than waiting for failures to happen, systematically imagine them. For eac
 ---
 
 ## 8. Redundancy and Replication Math
+
+> **In plain words.** Extra copies help only if the system can actually switch to them and they do not fail for the same reason. Quorum systems (Raft, etcd, ZooKeeper) need a majority alive, so where you place replicas matters as much as how many you have.
+>
+> **Real-world example.** A bank ledger runs 3 replicas: 2 in Region A, 1 in Region B. If Region A goes down, 1 of 3 is left, which is not a majority, so the ledger stops. Spreading them 1+1+1 across three regions lets it survive any single region outage.
 
 ### Active-Active vs. Active-Passive
 
@@ -754,24 +875,37 @@ Scenario analysis:
   P(any single replica down) = 0.001
   P(Region A down, taking out 2 replicas) = 0.0001
 
-  P(system down) = P(Region A down) x P(Region B replica down)     [both regions]
-                 + P(2+ individual replicas fail independently)      [no region outage]
+  Trap: Region A holds 2 of the 3 replicas. If Region A goes down, only
+  1 replica is left, and 1 of 3 is NOT a quorum. So a Region A outage
+  alone takes the whole system down.
 
-  = 0.0001 x 0.001                    [both regions fail]
-  + C(3,2)(0.001)^2(0.999)            [2 independent replica failures]
-  + (0.001)^3                          [all 3 replicas fail independently]
+  P(system down) ≈ P(Region A down)                                  [loses 2 replicas]
+                 + P(Region B down) x P(any Region A replica down)  [loses 1 + 1]
+                 + P(2+ replicas fail independently, regions up)
 
-  = 0.0000001 + 0.000002997 + 0.000000001
-  = 0.000003098
+  ≈ 0.0001
+  + 0.0001 x 0.002
+  + C(3,2)(0.001)^2(0.999) + (0.001)^3
 
-  A = 1 - 0.000003098 = 99.9997%   (roughly 4.5 nines)
+  ≈ 0.0001 + 0.0000002 + 0.000003
+  ≈ 0.000103     (exact enumeration of all cases: 0.0001032)
+
+  A ≈ 1 - 0.000103 = 99.990%   (four nines — no better than one region)
+
+  A naive calculation that forgets the region holding the majority
+  (only counting "both regions fail" + independent replica failures)
+  gives 99.9997%, which is about 30x too optimistic on downtime.
 ```
 
-For five nines, you would need at least 2 replicas in each of 2+ independent regions, ensuring no single region failure loses quorum.
+With two regions, **no** placement survives the loss of the region that holds the majority. To survive any single region outage you need a third region: for example 1+1+1 replicas across 3 regions. With the same numbers (replica 99.9%, region 99.99%), 1+1+1 gives about 99.9996%, because now two things must fail at once to lose quorum.
 
 ---
 
 ## 9. Capacity Planning for Reliability
+
+> **In plain words.** A service that is 95% busy on a normal day has nothing left when a server dies or traffic spikes. Plan so that peak traffic still fits after losing one server, with spare room on each one.
+>
+> **Real-world example.** An IoT ingest service must handle 10,000 messages/s at peak. Each server can do 2,500/s but should run at most 70% busy (1,750/s). That needs 6 servers, plus 1 spare for failures: 7, not the naive 4.
 
 ### Headroom Rules
 
@@ -831,6 +965,10 @@ The right target is where the cost curve's slope exceeds the business value of a
 
 ## 10. Production Reliability Architecture Patterns
 
+> **In plain words.** Each availability target implies a certain architecture, monitoring setup and deploy process. Work out the critical path, multiply the availabilities, and remove or harden the weakest links until the product meets the target.
+>
+> **Real-world example.** A ride-hailing dispatch path with gateway 99.95%, matching 99.99%, pricing 99.99% and trip DB 99.95% multiplies to about 99.88%, short of a 99.95% goal. Making pricing a soft dependency (fall back to a cached fare estimate) and adding a DB standby moves it closer.
+
 ### Summary: Reliability Target to Architecture
 
 | Target | Architecture Requirements | Monitoring | Deploy Strategy | Approximate Cost Multiplier |
@@ -851,7 +989,7 @@ The right target is where the cost curve's slope exceeds the business value of a
 | AWS RDS Multi-AZ | 99.95% | Automated failover between AZs |
 | Google Cloud Compute | 99.99% | Multi-zone |
 | Azure VMs (Availability Zones) | 99.99% | Across zones |
-| Stripe API | 99.999% (target) | Achieved through extensive redundancy |
+| Payment processor APIs (typical) | Often advertise 99.99%–99.999% | Advertised uptime targets, not always contractual SLAs; check the vendor's status page and contract |
 
 Note: published SLAs are contractual minimums with financial credits. Actual performance is typically better. Your system's availability is bounded by the *worst* of your dependencies' *actual* availability (not their SLA), multiplied serially.
 
@@ -884,7 +1022,13 @@ Step 4: Add redundancy where serial dependencies remain.
   - Payment Service: 2 active-active instances, circuit breaker → 99.999%
   - Order DB: Multi-AZ RDS with automated failover → 99.95% (per AWS SLA)
 
-  Result: 0.999999 x 0.99999 x 0.9995 = 0.99949 ≈ 99.95%  ✓
+  Result: 0.999999 x 0.99999 x 0.9995 = 0.999489 ≈ 99.949%
+
+  This is just UNDER the 99.95% target: the Order DB alone, at its SLA
+  of 99.95%, uses the whole budget. Either rely on the DB's measured
+  (usually better) availability, or remove it from the synchronous path
+  (e.g., accept the order into a durable queue and write to the DB async).
+  The lesson: a dependency whose SLA equals your SLO leaves you zero room.
 ```
 
 ---
@@ -899,7 +1043,7 @@ Step 4: Add redundancy where serial dependencies remain.
 
 4. **Correlated failures destroy redundancy math.** The formula `1 - (1-p)^n` assumes independence. Shared infrastructure, shared software, and shared configuration create correlation. Design for independent failure domains.
 
-5. **Each nine costs roughly 10x more.** Set your availability target based on business value, not engineering pride. Over-engineering reliability is as wasteful as under-engineering it.
+5. **Each nine costs much more than the last** (rule of thumb: up to ~10x). Set your availability target based on business value, not engineering pride. Over-engineering reliability is as wasteful as under-engineering it.
 
 6. **The math keeps you honest.** Intuition about reliability is consistently wrong. A 30-day MTBF means a 37% chance of surviving the month. Five three-nines services in series yield only two-and-a-half nines. Run the numbers.
 
@@ -909,7 +1053,7 @@ Step 4: Add redundancy where serial dependencies remain.
 
 - Beyer, B., Jones, C., Petoff, J., Murphy, N.R. (2016). *Site Reliability Engineering: How Google Runs Production Systems*. O'Reilly.
 - Beyer, B., Murphy, N.R., Rensin, D., Kawahara, K., Thorne, S. (2018). *The Site Reliability Workbook*. O'Reilly.
-- Sloss, B. (2017). "SLOs, SLIs, SLAs, oh my!" — Google Cloud Blog.
+- "SLOs, SLIs, SLAs, oh my — CRE life lessons." Google Cloud Blog (2017).
 - Tene, G. "How NOT to Measure Latency." Strange Loop 2015.
 - Google Cloud Architecture Framework: Reliability Pillar (2024).
 - AWS Well-Architected Framework: Reliability Pillar (2024).
