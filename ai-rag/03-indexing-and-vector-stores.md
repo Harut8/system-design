@@ -43,7 +43,7 @@
 8. [Updates, deletes, and index drift](#8-updates-deletes-and-index-drift)
 9. [Where the bytes live: RAM, SSD, object storage](#9-where-the-bytes-live-ram-ssd-object-storage)
 10. [pgvector versus a dedicated store](#10-pgvector-versus-a-dedicated-store)
-11. [The 2026 landscape, as axes rather than a leaderboard](#11-the-2026-landscape-as-axes-rather-than-a-leaderboard)
+11. [The 2026 landscape — what each store actually offers, and how to pick](#11-the-2026-landscape--what-each-store-actually-offers-and-how-to-pick)
 12. [Cost model for the index layer](#12-cost-model-for-the-index-layer)
 13. [Anti-patterns](#13-anti-patterns)
 14. [Mental models — the compressed set](#14-mental-models--the-compressed-set)
@@ -1451,50 +1451,132 @@ from the artifacts you kept (`02` §2).
 
 ---
 
-## 11. The 2026 landscape, as axes rather than a leaderboard
+## 11. The 2026 landscape — what each store actually offers, and how to pick
 
-A ranked list of vector databases is stale in a quarter. The axes are stable, and once you can place
-a system on them you can evaluate next year's entrant without a blog post.
+Vendor rankings go stale within months, and each vendor's own benchmark favours its defaults (§3.3).
+This section gives you three durable tools instead: a feature matrix, a decision flow with numeric
+thresholds, and a one-week bake-off protocol. Check feature rows against the current docs of the
+version you'll deploy; they move every release.
 
-| Axis | Options you'll see | Why it decides things |
-|---|---|---|
-| **Index family** | HNSW; IVF; DiskANN/Vamana; hybrid; brute-force-with-SIMD | sets the recall–latency curve and the update story (§4, §8) |
-| **Quantization** | none; fp16; scalar/int8; PQ; binary; RaBitQ/TurboQuant; statistical BQ | sets bytes/vector and whether §5.2 fits (§6) |
-| **Residency** | RAM; mmap/SSD; object storage + cache | sets cost and p99 shape (§9) |
-| **Filter strategy** | post-filter; pre-filter scan; in-graph traversal; label-aware graph; iterative scan; partitioning | decides whether real queries work (§7) |
-| **Sparse/hybrid** | none; BM25 built in; learned sparse; server-side fusion (RRF) | decides how much of `04` is your code |
-| **Multi-tenancy primitive** | namespace/collection; partition key; partial index; nothing | decides §7.6's escape hatch and `16`'s isolation story |
-| **Consistency & durability** | WAL-backed; eventual; read-your-writes options | decides §8.3's freshness promise |
-| **Update model** | in-place; segment + compaction; rebuild-only | decides operational burden over months (§8.2) |
-| **Operational surface** | embedded library; extension; single binary; distributed cluster; managed | decides who carries the pager |
+### 11.1 The nine properties that actually differ between stores
 
-Coarse placements as of 2026, stated at a level that will age acceptably:
+| Property | Options you'll see | What it decides | Where in this chapter |
+|---|---|---|---|
+| **Index family** | flat; IVF; HNSW; DiskANN/Vamana; IVF + graph | recall–latency curve, build time, update behaviour | §2, §4 |
+| **Quantization** | fp16; int8; 4/2/1-bit; PQ; RaBitQ-style | bytes/vector → whether it fits in RAM | §2.5, §6 |
+| **Residency** | RAM; mmap/SSD; object storage + NVMe cache | p50/p99, cold start, $/GB | §9 |
+| **Filtering** | post-filter; pre-filter scan; filter-aware graph; iterative scan | whether `WHERE`-filtered queries return correct results | §7 |
+| **Hybrid / sparse** | none; built-in BM25; sparse vectors; server-side fusion (RRF) | how much of `04`'s hybrid retrieval you write yourself | `04` §5 |
+| **Multi-tenancy** | collection/namespace per tenant; partition key; partial index | small-tenant recall and isolation | §7.3, `16` |
+| **Write path** | synchronous indexing; buffered; async; WAL + segments | read-your-writes, ingest throughput | §8.3 |
+| **Update model** | in-place graph; segments + compaction; rebuild-only | behaviour after months of deletes | §8 |
+| **Operations** | library; Postgres extension; single binary; distributed cluster; managed SaaS | who is on call, and for what | §10 |
 
-- **pgvector (+ pgvectorscale / VectorChord)** — HNSW and IVFFlat in Postgres; fp16/binary via type
-  primitives; RAM/shared-buffers residency; iterative scans and partial indexes for filtering;
-  Postgres everything else. Extensions add DiskANN-family indexes, better BQ, and label-based
-  filtering.
-- **Qdrant** — HNSW; broad quantization menu including TurboQuant and multi-bit binary; filterable
-  HNSW via payload-index-derived edges; collections as the tenancy primitive; single binary,
-  straightforward to operate.
-- **Milvus / Zilliz** — the widest index menu including `IVF_RABITQ`; distributed by design;
-  segment-based with explicit compaction; the most moving parts, and the most headroom.
-- **Weaviate** — HNSW with quantization; modules and built-in hybrid search; opinionated schema
-  model.
-- **Elasticsearch / OpenSearch** — Lucene HNSW alongside a mature lexical engine; server-side RRF
-  (`04` §5); the strongest choice when you already run it and hybrid is the point.
-- **LanceDB** — columnar/embedded, object-storage-friendly, strong for analytical access over
-  embeddings and for local development.
-- **turbopuffer / object-storage-native** — the tier-three architecture in §9, aimed at
-  many-namespace workloads with uneven access.
-- **Pinecone and other managed services** — the operational-surface axis taken to its conclusion;
-  evaluate on §3's methodology and on cost per query, since the internals are deliberately opaque.
+### 11.2 Feature matrix (verify against current docs before deciding)
 
-**Do not choose from this list.** Choose by writing down your row of the axes table — your chunk
-count from `02` §12, your dimension count from `01`, your selectivity distribution from §7.4, your
-namespace count, your freshness promise — and then seeing which systems can express it. Usually two
-or three can, and the decision collapses to operational preference, which is a much easier argument
-to have.
+| System | Deployment | Index types | Quantization | Filtering | Hybrid / sparse | Tenancy primitive | License |
+|---|---|---|---|---|---|---|---|
+| **pgvector** | Postgres extension | HNSW, IVFFlat | `halfvec` (fp16), `bit` + `binary_quantize`, `sparsevec` | SQL `WHERE`; iterative scan (0.8+); partial indexes | Postgres full-text + your own RRF in SQL | table partitions, partial indexes, row-level security | PostgreSQL |
+| **pgvectorscale** | Postgres extension (on pgvector) | StreamingDiskANN | statistical binary quantization | label-based filtered DiskANN | same as Postgres | same as Postgres | PostgreSQL |
+| **Qdrant** | single binary; distributed mode; managed cloud | HNSW (+ exact search) | scalar int8, binary (1/1.5/2-bit), product; TurboQuant | filterable HNSW via payload indexes (create before ingest) | sparse vectors; Query API fusion (RRF, DBSF) | payload-based tenant partitioning or collection per tenant | Apache 2.0 |
+| **Milvus / Zilliz** | Lite (embedded), standalone, distributed on Kubernetes; managed (Zilliz) | FLAT, IVF_FLAT, IVF_SQ8, IVF_PQ, HNSW, DISKANN, SCANN, IVF_RABITQ, GPU indexes | SQ8, PQ, RaBitQ | boolean expressions; partition key | sparse index; built-in BM25 (2.5+) | partition key, partitions, collections, databases | Apache 2.0 |
+| **Weaviate** | single node or cluster; managed | HNSW, flat, dynamic (flat → HNSW as it grows) | PQ, BQ, SQ | filtered HNSW with inverted index | built-in BM25 + vector hybrid with fusion | native multi-tenancy (one shard per tenant, can be offloaded) | BSD-3 |
+| **Elasticsearch** | cluster; managed | Lucene HNSW, flat | int8, int4, BBQ (better binary quantization) | Lucene filters applied during HNSW search | best-in-class BM25; RRF retriever | index per tenant or filtered alias | Elastic / SSPL / AGPL |
+| **OpenSearch** | cluster; managed (AWS) | HNSW, IVF (Lucene, Faiss engines) | fp16, int8, binary, PQ (Faiss) | efficient filtering (engine-dependent) | BM25 + hybrid query with score normalization | index per tenant or filters | Apache 2.0 |
+| **LanceDB** | embedded library; managed | IVF_PQ, IVF + HNSW variants | PQ, SQ | SQL-like prefilter / postfilter | full-text search index | table per tenant | Apache 2.0 |
+| **turbopuffer** | managed only | centroid-based ANN on object storage | (internal) | attribute filters | BM25 full-text + vector | namespace (cheap, many) | proprietary |
+| **Pinecone** | managed only (serverless) | proprietary | proprietary | metadata filters | sparse-dense vectors | namespace | proprietary |
+| **Redis** | in-memory; managed | HNSW, FLAT | fp16 / (version-dependent) | tag/numeric filters | full-text in Query Engine | key prefix / index per tenant | RSAL / SSPL / AGPL |
+| **FAISS** | library (C++/Python), not a database | Flat, IVF, IVF-PQ, HNSW, CAGRA on GPU | SQ, PQ, OPQ, binary | ID selector only | none | none — you build it | MIT |
+
+How to read it: every product can do "vector search". They differ in the last five columns, and
+those columns are what your requirements from §5, §7 and §9 will actually test.
+
+### 11.3 Decision flow with numbers
+
+```
+START: compute N (chunks, from 02 §12), d (dims), selectivity distribution (§7.4),
+       tenant count and tenant-size distribution, QPS, freshness promise (§8.3)
+
+1. Is N (or every tenant's N) < ~100K?
+      yes → brute force. pgvector without an HNSW index, or any store's exact mode.
+            Recall 1.0, a few ms, nothing to tune. Stop.
+
+2. Do you already run Postgres, and is N < ~10–50M and d ≤ 4,000 (halfvec)?
+      yes → pgvector (HNSW, halfvec). Filters in SQL, ACLs joined in the same transaction.
+            Add pgvectorscale if memory is tight (DiskANN) or filters are selective.
+            Leave only when a §10.4 trigger fires.
+
+3. Do you already run Elasticsearch/OpenSearch, and is hybrid (BM25 + vector) the main need?
+      yes → use its kNN (HNSW + int8/BBQ) with RRF. One system, best lexical engine.
+
+4. Many tenants (thousands+), most of them small and idle?
+      yes → namespace-native stores: turbopuffer / Pinecone serverless (object storage, pay per
+            use) or Weaviate/Qdrant multi-tenancy. Measure cold-start latency (§9.2, Case 7).
+
+5. Single large corpus, N > ~100M, or you need GPU/DiskANN/IVF-PQ choices?
+      yes → Milvus/Zilliz (widest index menu, distributed) or a DiskANN-based design (§2.4).
+
+6. Otherwise (10M–100M, dedicated store, strong filtering needs):
+      → Qdrant or Weaviate. Pick by team familiarity and managed-offering pricing after the
+        bake-off in §11.5.
+```
+
+The thresholds are orders of magnitude, not hard lines: 10–50M vectors in Postgres works fine on a
+large box if the vectors aren't fighting the OLTP working set for RAM.
+
+### 11.4 Real-world scenarios
+
+| Scenario | Numbers | Choice | Why |
+|---|---|---|---|
+| Internal wiki / support search for one company | 500K chunks × 1024 dims; 5 QPS; ACL filter per user group | **pgvector**, HNSW, `halfvec` | ~1.2 GB index; ACLs are a SQL join in the same transaction; zero new infrastructure |
+| B2B SaaS, 3,000 tenants, power-law sizes | 60M chunks total; median tenant 8K; top 10 tenants 50% | **Postgres partitioned by tenant** (exact scan for small tenants, HNSW on large partitions), or **Qdrant** with tenant-partitioned payload index | small tenants get recall 1.0 via brute force; large tenants get their own graph (§17 Case 2) |
+| E-commerce product search, hybrid is critical | 20M products; SKU and brand exact matches matter; 500 QPS | **Elasticsearch/OpenSearch**, BM25 + kNN + RRF | lexical precision on SKUs, facets and aggregations already there |
+| "Chat with your files" consumer app | 2M users × ~2K chunks; each user active a few times a week | **turbopuffer / Pinecone serverless / LanceDB on S3** | 98% of namespaces idle at any moment; object storage cost ≪ RAM; pre-warm on session start (§17 Case 7) |
+| Web-scale semantic search / dedup | 1B+ vectors × 768 dims; batch + online | **Milvus** (IVF_PQ / DISKANN / GPU) or **FAISS** in a custom service | fp32 in RAM would be ~3.4 TB; needs PQ/DiskANN and sharding (§16.2) |
+| Prototype / notebook / edge device | < 1M vectors, no server | **FAISS / LanceDB / pgvector in Docker** | embedded, zero ops; migrate later from the persisted artifacts (`02` §2) |
+
+### 11.5 The one-week bake-off protocol
+
+Vendor benchmarks and leaderboards measure their data at their defaults. Run this on yours:
+
+```
+Day 1  Data: 1–5M real chunks (or 10% of prod), real embeddings, 500 real queries,
+       the real filter distribution (§7.4). Compute exact ground truth (§3.1), unfiltered AND filtered.
+Day 2  Load into each candidate (2–3 max). Record: load time, build time, RAM, disk.
+Day 3  Tune each to the SAME recall target (e.g. recall@10 ≥ 0.95) — sweep ef/nprobe/oversampling.
+       Record p50/p99 at that recall, single-client and at target concurrency.
+Day 4  Filtered: recall + latency per selectivity band. Hybrid if you need it.
+Day 5  Operations: delete 20% and re-measure recall; kill a node; restore from backup;
+       upgrade a version; measure time-to-searchable for a new document.
+       Price: monthly cost at your size × replicas (§12), managed vs self-hosted.
+```
+
+Score with explicit weights decided **before** Day 1 so the result can't be argued backwards:
+
+| Criterion | Example weight | Measured as |
+|---|---:|---|
+| Filtered recall at target latency | 30% | traffic-weighted recall (Lab 5) at p99 ≤ budget |
+| Monthly cost at 12-month projected size | 25% | §12 four-line model |
+| Operational fit | 20% | team already runs it? backup/restore, upgrades, on-call knowledge |
+| Freshness / write path | 10% | seconds from upsert to searchable; read-your-writes support |
+| Hybrid & features | 10% | BM25, sparse, fusion, multi-tenancy primitive |
+| Lock-in / exit cost | 5% | open source? export path? |
+
+### 11.6 Questions to ask any vendor
+
+1. At our N and d, how much RAM per replica at fp32, and with your recommended quantization?
+2. What happens to filtered recall at 0.1% selectivity, and which filter strategy do you use?
+3. Are deletes tombstones? How does compaction work, and what does it cost at query time?
+4. How long until an upserted vector is searchable? Is read-your-writes available?
+5. Which query-time knobs are exposed (`ef`, oversampling, exact mode for ground truth)?
+6. Can we export all vectors and payloads in bulk? In what format?
+7. What does a cold namespace/collection cost in first-query latency?
+8. Pricing: what dimension is billed (storage, read units, write units, pods), and what does *our*
+   traffic cost?
+
+A vendor that can't answer 2, 3 and 7 with numbers hasn't run those experiments. That means you
+will have to run them yourself.
 
 ---
 
