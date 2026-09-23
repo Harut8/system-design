@@ -34,6 +34,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Thesis — an LLM pipeline is a data system](#1-thesis--an-llm-pipeline-is-a-data-system)
 2. [The pipeline as dataflow](#2-the-pipeline-as-dataflow)
 3. [The index is a materialized view over the corpus](#3-the-index-is-a-materialized-view-over-the-corpus)
@@ -50,10 +51,242 @@
 14. [Anti-patterns](#14-anti-patterns)
 15. [Mental models — the compressed set](#15-mental-models--the-compressed-set)
 16. [Lab exercises](#16-lab-exercises)
+17. [Interview questions and system design prompts](#17-interview-questions-and-system-design-prompts)
+18. [Real-world cases — incidents with numbers](#18-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A RAG system ("retrieval-augmented generation") answers questions about *your*
+documents. It first finds the few passages that probably contain the answer, then hands them to a
+language model and asks it to write the answer from them. A demo of this takes two weeks. Making it
+right on real questions is the hard part, because when the answer is wrong, you can't see which
+step failed. This chapter splits the system into steps, gives each step a number you can measure,
+and gives you a short test that tells you which step broke. Every later chapter goes deep on one
+of those steps.
+
+### One question, all the way through the pipeline
+
+The scenario: an **HR help bot** for a company with 5,000 employees. It answers questions from
+**2,000 HR documents** (policies, handbooks, benefit PDFs), about **3 million tokens** of text in
+total. (A *token* is a piece of a word; 1,000 tokens is roughly 750 English words.) An employee
+types:
+
+> "How many vacation days do I get in my first year?"
+
+The true answer, which sits in a table in `leave-policy-2026.pdf`, is "15 days, prorated from your
+start date". Here is what happens to that question at each step. All numbers are illustrative but
+consistent with each other.
+
+**Ingest time — done once, before anyone asks anything:**
+
+1. **Parse** (chapter `02`). Turn each PDF, web page and Word file into clean text. The leave
+   policy has a table: "Year 1 → 15 days, Year 2–5 → 20 days". A good parser keeps it as a table.
+   *Without care:* the PDF is a scan, the parser returns an empty page, and the answer is lost
+   before anything else runs. No later step can recover it.
+2. **Chunk** (`02`). Cut the text into passages of about **500 tokens** with **50 tokens of
+   overlap**, so each chunk starts 450 tokens after the previous one. 3,000,000 ÷ 450 ≈ **6,700
+   chunks**. Each chunk keeps metadata: source file, section title, page. *Without care:* a cut
+   lands between the table header "Vacation days by year of service" and the row "Year 1 → 15",
+   so the chunk with the number no longer says what the number is.
+3. **Embed** (`01`). Send every chunk to an embedding model, which turns it into a list of
+   **1,536 numbers** (a *vector*) that describes its meaning. Texts with similar meaning get
+   similar vectors. Cost: 6,700 chunks × 500 tokens = 3.35M tokens × $0.02 per million =
+   **about 7 cents**, paid once.
+4. **Index** (`03`). Store the 6,700 vectors (6,700 × 1,536 × 4 bytes ≈ **41 MB**) in a vector
+   index, plus a keyword index (BM25) over the same text. The index is a precomputed shortcut,
+   like a library catalogue. *Without care:* someone edits the leave policy next month and the
+   index still holds the old version (a *stale* index).
+
+**Query time — done on every question, while the employee waits:**
+
+5. **Embed the query** (`01`). The 12-token question becomes one vector with the *same* model.
+   Cost: 12 × $0.02/M ≈ $0.00000024. About 30 ms.
+6. **Retrieve** (`04`). Two searches run side by side: the vector index returns the **50** chunks
+   whose vectors are closest to the question's; BM25 returns the **50** chunks that share the most
+   words. The policy says "annual leave" and the employee said "vacation days", so the vector search
+   ranks the right chunk only **37th**. BM25 matches the words "first year" and ranks it **9th**.
+   Either list alone would leave it far outside the top 5. About 15 ms.
+7. **Fuse** (`04`). Merge the two lists into one (for example with RRF, which rewards chunks that
+   rank high in either list). The right chunk now sits around **12th** of ~80 unique candidates,
+   because it did reasonably well in both lists. About 1 ms.
+8. **Rerank** (`04`). A slower, more accurate model (a *cross-encoder*) reads the question and each
+   of the top 50 fused candidates together and scores them. The leave-policy table moves from 12th
+   to **2nd**. Keep the top **5**. About 120 ms.
+9. **Assemble the prompt** (`06`). Build the text the model will read: instructions (≈300 tokens)
+   + 5 chunks (≈2,500 tokens) + the question (12 tokens) ≈ **2,800 input tokens**. Each chunk gets a
+   label like `[leave-policy-2026 §1]` so the answer can cite it. *Without a budget:* someone
+   pastes in 40 chunks "to be safe": the prompt grows from ~2,800 to ~20,300 tokens, input cost
+   goes up about 7×, and the model gets distracted.
+10. **Generate** (`07`). The language model reads the prompt and writes: "You get 15 vacation days
+    in your first year, prorated from your start date [leave-policy-2026 §1]." About **150 output
+    tokens**. First word appears after ~600 ms (*TTFT*); the full answer streams in over ~3 s.
+    Cost with an illustrative price of $3/M input and $15/M output tokens: 2,812 × $3/M + 150 ×
+    $15/M ≈ **$0.011** per question, about **$320 a month** at 1,000 questions a day. The
+    generator's input tokens are most of that bill.
+
+**After the fact — how you know it works:**
+
+11. **Evaluate** (`08`). Write a *golden set*: 50 real employee questions, each with the chunk that
+    holds the answer. Run all 50:
+    - The right chunk is in the top 5 for **43 of 50** questions → **recall@5 = 0.86**.
+    - The final answer is correct for **40 of 50** → **accuracy 0.80**.
+    - Of the 43 questions where the chunk *was* found, 40 were answered correctly → the model used
+      the evidence well **93%** of the time (40 ÷ 43). And 0.86 × 0.93 = 0.80: retrieval caps the
+      whole system (§4).
+    - For the 10 wrong answers, paste the right chunk into the prompt by hand (the
+      *oracle-context test*, §6). **7** become correct → those were retrieval failures. **3** stay
+      wrong → those were generation failures.
+    - For the 7 retrieval failures, search deeper (top 50 instead of top 5): **1** is never found
+      because the scanned PDF parsed to nothing (class (a), §5), **2** are never found because of
+      wording mismatch (class (b)), and **4** are found at rank 6–50 but cut before the prompt
+      (class (c)).
+
+    So the next week of work goes into the reranker and the context budget (4 questions), the
+    parser (1) and hybrid search or query rewriting (2), not into the prompt (3). That split,
+    computed from your own failures, is the main tool this chapter gives you.
+
+```
+ INGEST (once)                        QUERY (every question)                    AFTER
+ parse → chunk → embed → index   ═►   embed query → retrieve → fuse → rerank    evaluate:
+ 2,000 docs  6,700   1,536-dim  41 MB  12 tokens    50 + 50    ~80   top 5     recall@5 0.86
+ 3M tokens   chunks  vectors    index               candidates             →   accuracy 0.80
+                                       → assemble prompt → generate → answer    oracle test:
+                                         ~2,800 tokens     ~150 tokens  +cite   7 retrieval,
+                                                                                3 generation
+```
+
+### Key terms in this chapter
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| RAG (retrieval-augmented generation) | find relevant passages first, then let the model answer from them | an open-book exam: look it up, then write the answer |
+| Corpus | all the documents the system can answer from | the whole library |
+| Ingest time vs query time | work done once in advance vs work done on every question | cooking in a restaurant: prep in the morning vs cooking each order |
+| Index | a precomputed structure that makes search fast | the library catalogue |
+| Materialized view | stored results of a computation, which go stale when the source changes | a printed train timetable: fast to read, wrong after the schedule changes |
+| Stale / staleness | the index no longer matches the current documents | an old map that still shows a closed road |
+| Reindex / full rebuild | recompute every vector and rebuild the index | reprinting every page of the catalogue |
+| Recall ceiling | the system can't be more right than the share of questions where it found the evidence | a detective can't solve a case from clues nobody collected |
+| Failure classes (a)–(d) | the four places a wrong answer can come from: not in corpus, not findable, found but cut, shown but misused | a missing parcel: never sent, lost in the warehouse, left off the truck, or delivered and ignored |
+| Oracle-context test | give the model the correct passage by hand and see if it answers correctly | give the student the right page; if they still fail, the problem is reading, not finding |
+| Recall@k sweep | measure recall at k = 1, 5, 10, 20, 50 to see where the answer sits | checking the first page of results, then the second, then the fifth |
+| Two-stage retrieval | a cheap broad search, then an expensive careful one on the few survivors | a CV screen, then interviews for the shortlist |
+| Latency budget | how many milliseconds each step may spend | a travel plan: 20 min to the station, 2 h on the train, 10 min walk |
+| Cost model | a formula for money per question and per corpus | a phone bill: one-time setup fee + per-minute charges |
+| Agentic retrieval | the model decides by itself whether and what to search, maybe several times | a researcher who keeps looking until they have enough sources |
+| Trace / span | a timed record of each step for one request | a parcel's tracking history, one line per depot |
+
+### Glossary — every core term used across this track
+
+Use this table as a lookup. The chapter number says where each term is covered in depth.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Token | a word or word-piece; models read, write and bill in tokens | syllables: "unbelievable" = un-believ-able |
+| Context window | the maximum number of tokens a model can read at once (`06`) | the size of the desk you can spread papers on |
+| LLM (generator) | the language model that writes the final answer (`07`) | the writer who drafts the reply |
+| Parsing | turning PDFs, HTML, scans into clean text and tables (`02`) | typing up handwritten notes |
+| OCR | reading text from an image or scan (`02`) | someone reading a photo of a page aloud |
+| Chunk | one passage of a document, the unit you search and paste (`02`) | an index card with one idea on it |
+| Chunk size / overlap | how long each chunk is, and how much neighbours share (`02`) | cutting a long roll of paper into sheets, with each sheet repeating the last line of the previous one |
+| Metadata | facts about a chunk: source, date, section, owner, permissions (`02`) | the label on a folder |
+| Contextual retrieval | an LLM writes a short note placing each chunk in its document before embedding (`02`, `01`) | a sticky note on a photocopy: "from the 2026 leave policy, section 1" |
+| Embedding / vector | a list of numbers that captures what a text means (`01`) | GPS coordinates for meaning |
+| Dimension (`d`) | how many numbers are in one vector: 384, 768, 1,536, 3,072 (`01`) | how many questions a survey asks about each item |
+| Cosine similarity | a score for how closely two vectors point the same way (`01`, `03`) | two arrows: same direction = similar |
+| Asymmetric embedding | the model encodes questions and documents slightly differently (`01`) | a question and its answer look different but belong together |
+| Matryoshka (MRL) | embeddings you can shorten (keep the first 256 numbers) and still use (`01`) | a thumbnail of a photo |
+| Quantization | storing numbers with less precision to save memory (`01`, `03`) | rounding prices to the nearest euro |
+| ANN (approximate nearest neighbour) | a fast search that finds *almost* the closest vectors (`03`) | asking locals for directions instead of checking every street |
+| HNSW / IVF | the two most common ANN index designs: a graph of neighbours / buckets of similar items (`03`) | friends-of-friends / supermarket aisles |
+| Vector store / vector database | the system that stores vectors and runs ANN search (`03`) | a warehouse organised for fast picking |
+| Dense retrieval | search by vector similarity (meaning) (`04`) | "find me something like this" |
+| Sparse retrieval / BM25 | search by shared words, weighted by how rare they are (`04`) | Ctrl+F that knows rare words matter more |
+| Hybrid search | run dense and sparse together and combine (`04`) | asking two experts and merging their lists |
+| RRF (reciprocal rank fusion) | merge ranked lists by adding `1/(60 + rank)` from each list (`04`) | a league table combining points from two tournaments |
+| Reranker / cross-encoder | a slower model that reads question + passage together and scores relevance (`04`) | the final interview after a CV screen |
+| Bi-encoder | the embedding model: encodes question and passage separately (`01`, `04`) | judging two CVs without meeting the people |
+| Top-k / candidate set | the k best results kept after a step (`04`) | the shortlist |
+| Filter / ACL | only search chunks this user may see, or that match a condition (`03`, `04`, `17`) | "nearest pharmacy that is open now" |
+| Query rewriting / HyDE / decomposition | improve the question before searching: rephrase, draft a fake answer to search with, split into parts (`05`) | a librarian who rephrases your question into catalogue terms |
+| Prompt / prompt template | the full text sent to the model: instructions + chunks + question (`06`) | the brief you hand a contractor |
+| Context budget | how many tokens you allow for retrieved chunks (`06`) | a suitcase weight limit |
+| Lost in the middle | models use facts at the start and end of a long prompt better than in the middle (`06`) | the middle of a long meeting that everyone forgets |
+| Context rot | answer quality drops as the prompt gets longer, even with relevant text (`00` §11, `06`) | the more pages in the pile, the more likely you misread one |
+| Prompt caching | the provider reuses an identical prompt prefix at a lower price (`06`) | a coffee shop remembering your usual order |
+| Structured output | forcing the model to answer in a fixed format such as JSON (`07`) | a form with fixed fields instead of a free letter |
+| Hallucination | the model states something not supported by the evidence (`07`, `08`) | a witness filling gaps with guesses |
+| Faithfulness / groundedness | does the answer only say what the retrieved chunks support (`08`) | a report that only cites what's in the file |
+| Citation | the answer points to the chunk that supports each claim (`06`, `07`) | footnotes |
+| Golden set | a fixed list of test questions with known correct answers and chunks (`08`) | the answer key for an exam |
+| Recall@k | share of test questions whose correct chunk appears in the top k (`08`) | the right book was on the first shelf you checked |
+| Precision@k / MRR / nDCG | other ranking scores: how many top results are right, how high the first right one is (`08`) | how early in the list the right answer shows up |
+| LLM-as-judge | using a model to grade answers automatically (`08`) | a teaching assistant marking papers with a rubric |
+| Bootstrap CI | a range showing how much a score could move by chance (`08`) | "72% ± 4%" in a poll |
+| TTFT (time to first token) | how long until the first word of the answer appears (§8) | how long before the waiter brings anything to the table |
+| p50 / p95 / p99 latency | the time that 50% / 95% / 99% of requests are faster than (§8) | "99 of 100 buses arrive within 12 minutes" |
+| Trace / span / OTEL | per-request timing records per step, in the OpenTelemetry standard (§13) | a parcel's tracking history |
+| Guardrails | checks on inputs and outputs: PII, unsafe content, policy (`17`) | a security check at the door and at the exit |
+| Prompt injection | text in a question or document that tries to override the model's instructions (`17`) | a forged note slipped into a stack of real memos |
+| Tool calling | the model asks the program to run a function (search, API call) and uses the result (`24`) | an assistant who can pick up the phone |
+| Agent / agent loop | a model that plans, calls tools, looks at results, repeats until done (§12, `22`) | a researcher working through a to-do list |
+| LangChain / LangGraph | popular libraries for chaining LLM steps and building agent graphs with state (`20`, `21`) | a kit of plumbing parts / a flowchart that runs |
+| Memory / state | what a chatbot or agent remembers between turns or sessions (`25`) | notes from the last meeting |
+| Model gateway | one service in front of many LLM providers: routing, fallback, cost limits (`23`) | a switchboard |
+
+### Symbols and parameters used in this chapter
+
+This chapter has few formulas, but they use short names. Here is each one.
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `P(correct answer)` | chance the final answer is right | 0.6 – 0.95 | 40 of 50 right → 0.80 |
+| `P(evidence retrieved)` | chance the chunk with the answer reaches the prompt (recall at the k you ship) | 0.6 – 0.98 | 43 of 50 → 0.86 |
+| `P(model uses it correctly \| retrieved)` | chance the model answers right *when* it has the evidence (faithfulness) | 0.85 – 0.98 | 40 of 43 → 0.93 |
+| `≤`, `×` | "at most" and "multiplied by" | — | 0.86 × 0.93 = 0.80, so accuracy is at most 0.80 |
+| (a) (b) (c) (d) | the four failure classes of §5 | — | scanned PDF parsed empty = (a) |
+| `k` | how many results a step keeps | 5 – 200 | rerank 50, keep 5 |
+| generous k vs shipped k | a large k used only for diagnosis (e.g. 50) vs the k that really reaches the prompt (e.g. 5) | 50 vs 5 – 10 | found at rank 30 but only top 5 shipped → class (c) |
+| `recall@k` | share of test questions whose answer chunk is in the top k | 0.7 – 0.98 | recall@5 = 0.86 |
+| k ∈ {1, 5, 10, 20, 50} | the k values to sweep; `∈` means "is one of" | — | run the same 50 questions 5 times |
+| MRR | mean reciprocal rank: average of 1 ÷ (rank of first right chunk) | 0.3 – 0.9 | right chunk at rank 2 → 0.5 for that question |
+| τ (tau) | coverage threshold in a hit rule: how much of the labelled text a chunk must contain to count (§16) | 0.5 – 1.0 | τ = 0.8 → chunk must hold 80% of the answer span |
+| `N_tokens_corpus` | total tokens you embed at ingest (including overlap and context notes) | 1M – 1T | 6,700 × 500 = 3.35M |
+| `price_embed`, `p_embed` | price of the embedding model per million tokens | $0.02 – $0.13 /M | `text-embedding-3-small` = $0.02/M |
+| `C_ingest` | one-time cost to embed the corpus | cents to thousands of $ | 3.35M × $0.02/M ≈ $0.07 |
+| `C_query` | cost of answering one question | $0.001 – $0.05 | ≈ $0.011 in the HR example |
+| `q_tokens` | tokens in the user's question | 5 – 50 | 12 |
+| `rerank_cost` | reranker cost per question (price per candidate × candidates) | often under $0.001 per query when hosted | 50 candidates |
+| `prompt_tokens` | tokens sent to the generator: instructions + chunks + question | 1,000 – 20,000 | ≈ 2,800 |
+| `output_tokens` | tokens the generator writes | 50 – 1,000 | ≈ 150 |
+| `p_in`, `p_out` | generator price per million input / output tokens | varies by provider; output costs several times input | illustrative $3 / $15 per M |
+| $/M | dollars per million tokens | — | $0.02/M → 1M tokens cost 2 cents |
+| `Σ_stages` | "add up over all stages" | — | cost = embed + retrieve + rerank + generate |
+| `t_embed_q` | time to embed the question | 5 – 50 ms | 30 ms |
+| `t_ann`, `t_sparse` | time for vector search / keyword search | 1 – 50 ms | 15 ms (run in parallel) |
+| `t_fuse` | time to merge result lists | < 1 – 2 ms | 1 ms |
+| `t_rerank` | time for the reranker | 30 – 300 ms | 120 ms for 50 candidates |
+| `t_assemble` | time to build the prompt | 1 – 10 ms | 5 ms |
+| `t_ttft` | time to first token from the generator | 200 ms – 2 s | 600 ms |
+| `t_decode` | time to write the rest of the answer | 1 – 10 s | 150 tokens at 50 tokens/s = 3 s |
+| p50 / p95 / p99 | latency that 50% / 95% / 99% of requests beat | ms or s | p99 = 4 s → 1 request in 100 is slower |
+| `efSearch`, `M`, `nprobe` | HNSW / IVF index knobs: search width, links per node, buckets searched (`03`) | 40 – 400, 16, 1 – 5% of buckets | higher = more accurate, slower |
+| `input_type` | embedding API flag for "query" vs "document" on asymmetric models (`01`) | `query` / `document` | wrong flag quietly lowers recall |
+| `O(candidates)` | work grows in proportion to the number of candidates | — | 2× candidates → 2× fusion work |
+| `concurrency=8` | how many oracle tests run at once in the §6 harness | 4 – 32 | 8 calls in flight to the model API |
+| CI | confidence interval: the range a measured number could plausibly be in | ±0.02 – 0.10 on 50 – 500 questions | recall 0.72, 95% CI [0.66, 0.78] |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. Thesis — an LLM pipeline is a data system
+
+> **In plain words.** A RAG system is not just a clever prompt. It is a pipeline of steps, like a factory line, and a wrong answer can come from any step. Treat it like any other data system: split it into steps, measure each one, and fix the step that is actually broken.
+>
+> **Real-world example.** The HR bot from Start here answers 40 of 50 test questions correctly. Rewriting the prompt for a week moves that to 41. Measuring each step shows 7 of the 10 failures happen before the model ever sees the evidence, so the prompt was never the main problem.
 
 Start with the two-week version, because you need to see it clearly in order to see past
 it. You take a corpus of documents. You split them into chunks. You call an embedding API
@@ -62,8 +295,7 @@ time you embed the user's question, ask the vector database for the nearest neig
 paste those chunks into a prompt template, and call a chat completion endpoint. It works
 on the first try, on the three example queries you tried, and it feels like magic. This is
 not a criticism — it is genuinely the fastest path to a working demo of anything in this
-folder, and every tutorial, cookbook and framework quickstart on the internet stops
-approximately here.
+folder, and most tutorials, cookbooks and framework quickstarts stop approximately here.
 
 The problem is that "it works on the three example queries" is not an engineering claim.
 It's an anecdote. The moment you put that system in front of real queries at real volume,
@@ -78,7 +310,7 @@ This is the same shape of problem you already know from databases: a slow query 
 missing index, a bad plan, lock contention, or a cold cache, and "the query is slow" tells
 you nothing about which. Nobody would accept "just add caching" as a diagnosis for a slow
 query without first running `EXPLAIN`. Yet "just improve the prompt" is exactly this move,
-applied to a RAG pipeline, and it is the default reflex industry-wide. The reason is that a
+applied to a RAG pipeline, and it is a very common reflex. The reason is that a
 RAG pipeline *looks* like an application concern — a clever prompt, an API call — when it
 is structurally a data pipeline with a probabilistic reader at the end: ingestion,
 transformation, storage, retrieval, ranking, and a consumption stage that happens to be a
@@ -93,7 +325,7 @@ Treating it as a data system buys you three things, in order:
    build the index (amortized, paid once per corpus version), and what does it cost to
    answer one query (paid on every request, forever). Conflating these — treating a
    one-time ingestion cost like it recurs, or treating a per-query cost like it's sunk — is
-   the single most common cost-reasoning error in this space (§9).
+   a common cost-reasoning error in this space (§9).
 3. **A way to know when you're done.** "Better" stops being a feeling about output quality
    and becomes a number, on a versioned dataset, with a stated method of computation — the
    same discipline `../python-mastery/31-measurement-methodology.md` insists on for
@@ -107,6 +339,10 @@ builds the vocabulary and the diagnostic procedure. The chapters after it build 
 ---
 
 ## 2. The pipeline as dataflow
+
+> **In plain words.** There are two separate systems. One runs once, ahead of time: it reads the documents, cuts them into chunks, turns them into vectors and builds the index. The other runs on every question: search, rerank, build the prompt, generate. They only meet at the index.
+>
+> **Real-world example.** Embedding 6,700 HR chunks costs about 7 cents, once. Generating one answer costs about 1 cent, every time. At 1,000 questions a day the per-question side costs about $320 a month, so a one-time ingest step that makes each prompt smaller is usually worth it.
 
 Draw the whole thing as one diagram before splitting it into stages, because the shape of
 the diagram is the first thing that's usually wrong in people's heads: they think of it as
@@ -180,13 +416,18 @@ Stage-by-stage table — this is the reference you'll come back to when somethin
 | Generate | Prompt | Response tokens | Query-time | $/M input + output tokens, TTFT + decode latency | Model ignores retrieved evidence, hallucinates past it, or mixes stale and fresh chunks without flagging conflict |
 | Observe | Every stage above | Spans, metrics, sampled records | Both | Storage + query cost of the telemetry backend itself | No stage-level breakdown, no trace↔eval join, sampling that drops the interesting requests |
 
-Nine stages, two time domains, one shared interface between them. Everything that follows
-is about making that interface — the index — and the diagnostic path through these nine
-rows precise enough to actually use under pressure.
+Nine pipeline stages plus observation (which spans both time domains) — ten rows, two time
+domains, one shared interface between them. Everything that follows is about making that
+interface — the index — and the diagnostic path through these rows precise enough to
+actually use under pressure.
 
 ---
 
 ## 3. The index is a materialized view over the corpus
+
+> **In plain words.** The index is a copy of your documents in a searchable form, built ahead of time. Like any copy, it goes out of date when the originals change, and it must be rebuilt completely if you change how it was made (for example, a new embedding model).
+>
+> **Real-world example.** HR updates the leave policy from 15 to 18 first-year days on 1 March. If the index is refreshed weekly, the bot can give the old answer for up to 7 days. If HR deletes an old policy PDF and nobody removes its chunks, the bot keeps quoting it indefinitely.
 
 This is the load-bearing framing of the whole chapter, so take it slowly: **a vector index
 (or a hybrid dense+sparse index) is a materialized view over the corpus, computed once at
@@ -294,6 +535,10 @@ database you happened to pick.
 
 ## 4. Where correctness actually lives: the recall ceiling
 
+> **In plain words.** The model can only answer from what you show it. If the right passage never reaches the prompt, even a perfect model can't give the right answer from your documents. So measure whether search finds the evidence before you touch the prompt.
+>
+> **Real-world example.** Search finds the right chunk for 43 of 50 questions (0.86). The model answers 40 of those 43 correctly (0.93). 0.86 × 0.93 = 0.80. A better prompt can at best move 0.93 toward 1.0, which gives at most 0.86 overall. Better search can move both numbers.
+
 Here is the chain argument, stated as a formula because a formula is harder to weasel out
 of than a paragraph:
 
@@ -309,9 +554,10 @@ model, the probability it reads it correctly, doesn't contradict it, and doesn't
 distracted by an irrelevant chunk sitting next to it. The product is an upper bound on
 end-to-end correctness, and it's an upper bound for a reason worth sitting with: **if the
 supporting chunk never makes it into the context, no amount of prompt engineering,
-few-shot examples, chain-of-thought, or model upgrade can recover it.** The generator is
-mathematically incapable of producing a correct answer from evidence it was never shown.
-This isn't a claim about how good current models are; it holds for a perfect generator too
+few-shot examples, chain-of-thought, or model upgrade can recover it.** For a fact that
+exists only in your corpus (a private policy, a customer's contract — the case RAG exists
+for), the generator cannot produce a correct answer from evidence it was never shown; it can
+only guess, or answer from general training knowledge that happens to match. This isn't a claim about how good current models are; it holds for a perfect generator too
 — a perfect reader of an empty book still can't answer a question the book doesn't
 contain.
 
@@ -350,6 +596,10 @@ not recall at some generous k that never makes it into the real prompt.
 ---
 
 ## 5. The four irreducible failure classes
+
+> **In plain words.** Every wrong answer comes from one of four places: (a) the answer is not in the documents the system has, (b) it is there but search can't find it, (c) search found it but it was cut before reaching the prompt, or (d) the model had it and still got it wrong. All four look the same to the user.
+>
+> **Real-world example.** Of the HR bot's 10 wrong answers: 1 is a scanned PDF that parsed to nothing (a), 2 use "vacation" where the policy says "annual leave" (b), 4 were found at rank 6–50 but only the top 5 reach the prompt (c), and 3 had the right chunk in the prompt and still went wrong (d). Four different fixes.
 
 Every "the RAG system gave a wrong answer" report factors into exactly one of four classes.
 The classes are irreducible in the sense that they map onto disjoint stages of the pipeline
@@ -433,6 +683,10 @@ actually distinguishing them on a real failing query.
 ---
 
 ## 6. Diagnosis: attributing a failure to a stage
+
+> **In plain words.** Two simple tests tell you which of the four classes you have. First, paste the correct passage into the prompt by hand. If the answer becomes right, search was the problem. Then check how deep in the result list the passage sits, to tell "never found" from "found but cut".
+>
+> **Real-world example.** 10 wrong answers, oracle test on each: 7 become right, 3 stay wrong. For the 7, check the top 50: 4 are there (ranked 6–50, so ranking or budget), 3 are not. Search the raw text for those 3: 1 isn't in the corpus at all, 2 are. Total time: an afternoon, not a week of prompt tweaks.
 
 Two instruments do almost all of the work: the **oracle-context test** separates (a)+(b)+(c)
 from (d), and the **recall@k sweep** separates (a) from (b) from (c). Run them in that
@@ -561,12 +815,15 @@ Run both instruments over your whole golden set, not one query at a time by hand
 get exactly the split §16's exercises ask you to report: what percentage of failures are
 retrieval versus generation, and within retrieval, what percentage are (a) versus (b)
 versus (c). That percentage split, computed from real failures on your corpus, is worth
-more than any leaderboard number in §1 of the fact sheet this chapter draws from — it's
-*your* failure distribution, not a vendor's.
+more than any leaderboard number — it's *your* failure distribution, not a vendor's.
 
 ---
 
 ## 7. Two-stage retrieval is classical IR
+
+> **In plain words.** Search in two rounds. A fast, rough search picks about 50–200 candidates from the whole collection. A slow, careful model then scores only those candidates. Never run the careful model on everything.
+>
+> **Real-world example.** The HR bot has 6,700 chunks. At an illustrative ~2 ms per chunk, a cross-encoder over all of them would take about 13 seconds per question. Over 50 candidates from the fast search it takes about 100–120 ms.
 
 Strip away the LLM and RAG's retrieval half is a textbook information retrieval system:
 a **recall-oriented candidate generation stage** followed by a **precision-oriented
@@ -625,6 +882,10 @@ and with the reranking-specific budget math in `04-retrieval-hybrid-and-rerankin
 
 ## 8. The latency budget
 
+> **In plain words.** Every step takes time, and the user waits for the sum. Write down how many milliseconds each step may use. The number users feel most is the time until the first word appears (TTFT), because the rest streams in.
+>
+> **Real-world example.** Embed 30 ms + search 15 ms + fuse 1 ms + rerank 120 ms + prompt 5 ms + TTFT 600 ms = 771 ms until the first word. The remaining 150 tokens take about 3 more seconds but arrive while the user is already reading.
+
 Every query-time stage in §2's dataflow spends latency, and the sum of them is what the
 user waits for. Write the budget down as a table with symbolic placeholders — you fill in
 real numbers by measuring your own system, per §16's exercises, never by copying someone
@@ -673,11 +934,15 @@ users abandon a query.
 
 ## 9. The cost model
 
+> **In plain words.** There are two bills. Building the index is paid once per version of your documents. Answering questions is paid on every request, forever. The biggest part of the per-question bill is usually the text you paste into the prompt, so sending fewer, better chunks saves money as well as improving answers.
+>
+> **Real-world example.** HR bot: ingest ≈ $0.07 once. Per question ≈ $0.011, almost all of it the ~2,800 prompt tokens and 150 output tokens (illustrative $3/M and $15/M prices). Cutting the prompt from 5 chunks to 3 saves 1,000 input tokens, about $0.003 per question or about $90 a month at 1,000 questions a day.
+
 Same discipline as §2's time-domain split, applied to money instead of milliseconds:
 **ingest cost is paid once per corpus version and amortizes over every future query;
 query cost is paid on every single request and multiplies by volume.** Conflating the two
 — reasoning about a one-time ingestion expense as if it recurred per query, or the
-reverse — is the most common cost-modeling mistake in this space, and it's an easy one to
+reverse — is a common cost-modeling mistake in this space, and it's an easy one to
 avoid once the two formulas are written down separately.
 
 **Ingest cost**, symbolically:
@@ -719,7 +984,7 @@ examined (API-metered if hosted, GPU-time if self-hosted) — this is exactly th
 `cost_per_candidate × candidates_examined` term from §7, now expressed in dollars instead
 of latency. The last term — `prompt_tokens × p_in + output_tokens × p_out` — is where the
 money actually goes, and it's worth stating as the chapter's one unambiguous cost claim:
-**the dominant per-query cost in almost every real RAG system is generator input tokens,
+**the dominant per-query cost in most RAG systems is generator input tokens,
 i.e. how much retrieved context you stuffed into the prompt.** Input-token pricing applies
 to every chunk you assembled into context, whether the model needed it or not, and that
 volume is routinely an order of magnitude larger than the query itself or the reranking
@@ -769,17 +1034,24 @@ is why precision work is a cost lever and not just a quality one.
 
 ## 10. Reindex cost as a coupling constraint
 
+> **In plain words.** Changing the embedding model means re-embedding every chunk and rebuilding the index, because vectors from different models can't be compared. For a small collection that is trivial. For a huge one it takes days to weeks, so choosing the embedding model becomes a long-term decision.
+>
+> **Real-world example.** 6,700 HR chunks re-embed in minutes for under 10 cents. 500 million chunks at 500 tokens each is 250 billion tokens: about $5,000 at $0.02/M, but roughly 17 days of wall-clock time at an illustrative 10 million tokens per minute rate limit, with two indexes running side by side the whole time.
+
 §3 stated that swapping the embedding model forces a full rebuild because it's a schema
 change to the materialized view, not a config edit. Here's the consequence that follows
 mechanically from that fact, and why it deserves to be called out as a *coupling
 constraint* rather than just an annoyance: **the choice of embedding model gets coupled to
 corpus size, because the cost of changing your mind scales with `N_tokens_corpus`.** A
-10,000-chunk internal wiki can be re-embedded on a whim, in minutes, for a few dollars — the
-`C_ingest` formula from §9 applied to a small corpus barely registers. A 500-million-chunk
-production corpus re-embedded at even OpenAI's cheapest published rate ($0.02/M tokens for
-`text-embedding-3-small`) is a five-, six-, or seven-figure decision depending on average
-chunk length, plus the operational cost of running two indexes in parallel during cutover,
-plus the eval work to confirm the new model is actually better before you commit the
+10,000-chunk internal wiki can be re-embedded on a whim, in minutes, for about ten cents
+(10,000 × 500 tokens × $0.02/M) — the `C_ingest` formula from §9 applied to a small corpus
+barely registers. A 500-million-chunk production corpus at 500 tokens per chunk is 250
+billion tokens: about $5,000 at OpenAI's cheapest published rate ($0.02/M for
+`text-embedding-3-small`), about $32,500 at $0.13/M for `text-embedding-3-large`, and more
+for longer chunks or pricier models. The API bill is often the smaller part. The larger costs
+are wall-clock time (at an illustrative rate limit of 10M tokens per minute, 250 billion
+tokens take about 17 days), the operational cost of running two indexes in parallel during
+cutover, and the eval work to confirm the new model is actually better before you commit the
 corpus to it (§16 builds exactly that eval harness). Vectors from two models are never
 comparable — there is no cosine similarity worth computing between embeddings from
 different training runs, different objectives, different dimensionalities — so there is no
@@ -813,6 +1085,10 @@ methodology for choosing a model under this switching-cost constraint gets built
 
 ## 11. When NOT to RAG
 
+> **In plain words.** Search is not always needed. If the question is about one document that fits in the model's context window, just give the model the whole document. Use retrieval when the collection is big, changes often, has per-user permissions, or when cost per question must stay low.
+>
+> **Real-world example.** Summarising one 40-page contract: paste the contract (~20,000 tokens), no index needed. Answering questions over 2,000 HR documents (3M tokens) that change weekly and differ by country: retrieval, because pasting 3M tokens into every question is impossible or very expensive.
+
 Retrieval is a tool for a specific shape of problem, not a default. The honest framing,
 straight from the 2026 architectural-context material (secondary, blog-grade sources —
 flagged as such below): the question isn't "RAG or long context," it's which one — or what
@@ -835,7 +1111,8 @@ semantically close to the current turn — a tool-call result from three turns a
 up the current state is exactly the thing pure similarity search is liable to rank low.
 
 The degradation that makes "just always use long context" a bad default even where context
-windows are enormous is **context rot** — the accepted name for the fact that model quality
+windows are enormous is **context rot** — the common name (popularized by Chroma's 2025 technical report
+*Context Rot*) for the fact that model quality
 degrades as the context you stuff in grows, even when every added token is nominally
 relevant, purely from the load of more content to attend over ("A Survey of Context
 Engineering for LLMs," arXiv 2507.13334 — secondary source, cited here as the term-of-art
@@ -858,6 +1135,10 @@ retrieve so generously that the model can no longer make good use of what you ga
 ---
 
 ## 12. The 2026 shape: from pipeline to loop
+
+> **In plain words.** Newer systems let the model decide when to search, what to search for, and when it has enough. That turns a straight line into a loop. The loop needs hard limits (maximum searches, maximum cost), and you now have to check the whole sequence of steps, not only the final answer.
+>
+> **Real-world example.** "Compare my parental leave with the Berlin office's policy" needs two searches: one for the employee's country and one for Germany. An agent does 2 searches and stops. A badly limited agent does 14 searches, spends 14× the retrieval cost and still answers from the wrong country's policy.
 
 Everything in §2 through §11 assumes a linear dataflow: one retrieval pass, one context
 assembly, one generation call, done. That assumption is already breaking down in the
@@ -920,6 +1201,10 @@ them applied per hop, inside a loop with a budget, instead of once per request.
 ---
 
 ## 13. Observability as a design constraint, not an add-on
+
+> **In plain words.** Record what every step did for every request: which chunks it returned, how long it took, how many tokens it used. Give each request one ID that also appears in your quality scores and your cost records. Without that, you can't investigate a bad answer after it happened.
+>
+> **Real-world example.** A user reports a wrong answer from yesterday at 14:02. With traces, you look up request `r-81f2`, see the rerank step dropped the leave-policy chunk to rank 7, and know it is class (c) in two minutes. Without traces, you can only guess, and the same query today may behave differently.
 
 §6's diagnostic procedure — oracle-context test, recall@k sweep — works by hand on one
 failing query at a time. It does not scale to production volume unless every stage in §2's
@@ -1017,9 +1302,10 @@ one, or the reverse (§2, §9). Do instead: keep the two formulas from §9 separ
 and label every cost line item with which one it belongs to.
 
 **Adding a reranker without a latency budget.** Tempting because "add a reranker" is a
-one-line integration and the quality lift (Anthropic's contextual-retrieval numbers, §5 of
-the fact sheet, show reranking as the single biggest lever in their eval — 5.7%→1.9%
-failure rate) is well documented. Costs you a latency regression nobody budgeted for,
+one-line integration and the quality lift is well documented (in Anthropic's
+contextual-retrieval eval, adding reranking on top of contextual embeddings + contextual BM25
+cut the top-20 retrieval failure rate from 2.9% to 1.9%; the full stack together took it from
+5.7% to 1.9%). Costs you a latency regression nobody budgeted for,
 discovered in production when p99 blows past the SLO. Do instead: write the latency table
 from §8 first, put a number in the `t_rerank` row, and confirm the total still fits the SLO
 before shipping.
@@ -1039,8 +1325,8 @@ time (§16, exercise 2).
    engineering properties of the pipeline's design, not something a better prompt can
    retrofit onto a broken stage.
 2. **Ingest-time and query-time are different systems that share one interface: the
-   index.** Reasoning about their costs and latencies as one undifferentiated blob is the
-   most common category error in this space.
+   index.** Reasoning about their costs and latencies as one undifferentiated blob is a
+   common category error in this space.
 3. **The index is a materialized view.** Staleness, invalidation, write amplification, and
    "schema changes force full rebuilds" all follow mechanically from that one framing —
    they are not separate ad hoc RAG problems.

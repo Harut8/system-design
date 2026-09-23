@@ -32,25 +32,26 @@
 > [`25-memory-and-state-management.md`](25-memory-and-state-management.md) (§9 here is the
 > interface; `25` is the implementation).
 >
-> **THESIS:** The context window is a **fixed budget**, and context engineering is **resource
+> **Core idea:** The context window is a **fixed budget**, and context engineering is **resource
 > allocation under constraint**. Every token spent on retrieved context is a token not available for
 > instructions, chain-of-thought, conversation history, or output. The retrieval team optimizes for
 > recall; the context engineer optimizes for *information density per token in the window*. These
 > are different objectives, and the tension between them — not the retrieval quality — is where
-> most production RAG systems actually break.
+> many production RAG systems actually break.
 >
 > The question is never "did we retrieve the right chunks" — that is `04`'s job. The question is:
 > **given what we retrieved, what goes into the prompt, in what order, and what gets cut.** A
-> pipeline that retrieves ten perfect chunks and stuffs them all into a 4K-token budget alongside
-> a 2K system prompt, a 1K conversation history, and a 500-token output reservation has zero
-> tokens left for chain-of-thought and will produce worse answers than one that retrieved five
-> mediocre chunks and left room to think. The retrieval team sees a recall regression; the context
+> pipeline that retrieves ten perfect chunks (~4K tokens) and stuffs them all into an 8K-token
+> window alongside a 2K system prompt, a 1K conversation history, and a 500-token output
+> reservation has only ~500 tokens left for chain-of-thought and can produce worse answers than one
+> that retrieved five mediocre chunks and left room to think. The retrieval team sees a recall regression; the context
 > engineer sees arithmetic. The arithmetic wins.
 
 ---
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [The context window as a resource budget](#1-the-context-window-as-a-resource-budget)
 2. [Anatomy of a RAG prompt](#2-anatomy-of-a-rag-prompt)
 3. [Token counting and budget allocation](#3-token-counting-and-budget-allocation)
@@ -70,10 +71,111 @@
 17. [Anti-patterns](#17-anti-patterns)
 18. [Mental models — the compressed set](#18-mental-models--the-compressed-set)
 19. [Lab exercises](#19-lab-exercises)
+20. [Interview questions and system design prompts](#20-interview-questions-and-system-design-prompts)
+21. [Real-world cases — incidents with numbers](#21-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A language model can read only a fixed number of tokens at once (a token is
+roughly three quarters of an English word). Everything has to fit in that space: your
+instructions, the documents your search found, the chat so far, the user's question, and the
+model's answer. Search can find the right documents and the answer can still be wrong, because
+the documents were cut to make room, pushed into the part of the prompt the model reads worst, or
+crowded out by a long chat. This chapter is about deciding what goes into the prompt, in what
+order, and what gets cut.
+
+**A real-world example: an HR policy bot.** Employees ask questions like "How many weeks of
+parental leave do I get in Germany?". The bot runs on a model with a 16,000-token window.
+
+1. **The fixed costs.** System instructions 2,000 tokens, question 200, room kept for the answer
+   2,000, safety margin 800 (5%). That leaves **11,000 tokens** for chat history plus documents.
+2. **Turn 1.** History is 400 tokens, so 10,600 tokens are free. Search returns 10 chunks of 400
+   tokens (4,000 total). Everything fits and the answer is right.
+3. **Turn 20, no history management.** At 400 tokens per turn the history is now 8,000 tokens.
+   Only 3,000 tokens are left for documents: 7 chunks. The chunk about German parental leave was
+   ranked 8th, so it is dropped. The bot answers with the general policy, confidently and wrongly.
+4. **Turn 30.** History is 12,000 tokens, 1,000 more than the whole 11,000-token allowance.
+   Depending on the code, the request fails with a "context too long" error or the answer is cut
+   off mid-sentence.
+
+What each technique in this chapter does to that story:
+
+- **Budget in code (§1, §3, §4).** Compute the free room on every request instead of assuming
+  it. The failure at turn 30 becomes a planned trim instead of an error.
+- **History summarization (§8).** Replace turns 1–25 with a 300-token summary and keep the last 5
+  turns word for word (2,000 tokens). History drops from 12,000 to 2,300 tokens; documents get
+  8,700 tokens, so all 10 chunks fit with 4,700 to spare.
+- **Ordering (§5, §6).** Models read the start and the end of a prompt best. Putting the best
+  chunk first and the second-best last ("sandwich" order) keeps the key facts out of the weak
+  middle.
+- **Compaction (§7).** Shrink chunks when they still do not fit: a 120-token paragraph can become a
+  35-token fact line.
+- **Citations (§10).** The bot writes "[Source 3]" after each claim, so an employee (or an
+  automated checker) can see which policy page it came from.
+- **Prompt caching (§12).** The 2,000-token instructions are the same on every request, so the
+  provider can bill them at a large discount.
+- **Cost arithmetic (§14).** Without history management a 20-turn chat bills 84,000 history
+  tokens in total; keeping 5 turns bills 36,000, 57% less.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Token | the unit the model reads and bills by, about 3/4 of a word | syllables on a phone plan billed per syllable |
+| Context window | the maximum number of tokens the model can read in one request | the size of one desk: everything you work with must fit on it |
+| Context budget | how the window is split between instructions, documents, history, question, answer | a monthly household budget split between rent, food, savings |
+| Retrieval budget | the room left for documents after everything else is paid for | what is left for fun after the bills |
+| Output reservation | tokens kept free for the answer (`max_tokens`) | leaving blank space at the bottom of a form for the signature |
+| Safety margin | extra room kept free because token counts are estimates | leaving 10 minutes early for a train in case of traffic |
+| Lost in the middle | models use the start and end of a long prompt better than the middle | you remember the first and last items of a shopping list best |
+| Sandwich ordering | best chunks at the start and end, weaker ones in the middle | putting the strongest points at the start and end of a speech |
+| Compaction | making chunks shorter while keeping the facts | turning a long email into three bullet points |
+| Map-reduce summarization | summarize each chunk separately, then combine the summaries | each team member summarizes one chapter, then one person writes the overview |
+| Sliding window (history) | keep only the last N turns of the chat | a whiteboard where you wipe the oldest notes to make room |
+| Memory | facts from outside this chat (preferences, past sessions) | a doctor's file on you, read before the visit |
+| Prompt caching | the provider reuses work on an unchanged start of the prompt and charges less | a coffee shop that keeps your usual order ready |
+| Citation fidelity | share of citations that really support the claim they are attached to | footnotes that actually say what the essay claims they say |
+| Chain-of-thought (CoT) | the model's step-by-step reasoning before the final answer | working on scrap paper before writing the final answer |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `K` after a number | thousand tokens | 8K – 1M | a "16K model" reads up to ~16,000 tokens at once |
+| `model_window` | total tokens the model can handle in one request (input + output) | 16,000 – 1,000,000 | 16,000 in most worked examples here |
+| `system_prompt_tokens` | tokens in the fixed instructions | 500 – 4,000 | 2,000 |
+| `conversation_history_tokens` | tokens of earlier turns sent again with each request | 0 – 12,000+ | 20 turns × 400 = 8,000 |
+| `user_query_tokens` | tokens in the current question | 20 – 500 | 200 |
+| `output_format_tokens` | tokens describing how the answer should look | 200 – 1,000 | 300 |
+| `output_reservation` / `max_tokens` | tokens kept free for the model's answer | 256 – 4,096 | 2,000 |
+| `safety_margin`, `safety_margin_pct` | extra free room for counting errors and hidden tokens | 5–10% of the window | 5% of 16,000 = 800 |
+| `context_budget`, `available_for_retrieval` | room left for documents after all the above | 0 – most of the window | 16,000 − 2,000 − 200 − 2,000 − 800 = 11,000 before history; 10,600 at turn 1 |
+| `k`, chunk count | how many chunks go into the prompt | 3 – 20 | 10 chunks × 400 tokens = 4,000 |
+| `N` (turns) | number of turns in a conversation | 1 – 30+ | a 20-turn chat |
+| `N*(N+1)/2` | total turns billed over an N-turn chat when full history is resent | — | 20 turns → 210 turn-bills |
+| `recall@10` | share of the relevant chunks found in the top 10 search results | 0.8 – 0.95 | 9 of 10 relevant chunks found → 0.9 |
+| pp | percentage points: the plain difference between two percentages | — | 75% → 45% is a 30 pp drop |
+| `x` (as in 3.4x) | "times": a ratio | — | 120 tokens → 35 tokens is 3.4x shorter |
+| TTFT | time to first token: wait before the answer starts appearing | 0.5 s – 90 s | 4K-token prompt ≈ 0.5–1 s |
+| $ / 1M tokens | price per million tokens, separate for input and output | $0.15 – $15 | $3.00 input, $15.00 output |
+| `cached_tokens`, `cache_hit_rate` | tokens served from the provider's cache; share of requests that hit it | 0 – 0.95 | 10,000 cached tokens, 85% hits |
+| TTL | how long a cached prefix is kept | 5 minutes (default) | a request 6 minutes later misses |
+| `context_recall` (§16) | chunks put in the prompt ÷ chunks retrieved | target 1.0 | 4 of 10 made it in → 0.4 |
+| `window_utilization` | input tokens ÷ window size | alert above 0.85–0.90 | 14,000 / 16,000 = 0.875 |
+| `history_fraction` | history tokens ÷ all input tokens | alert above 0.60 | 8,000 / 12,000 = 0.67 |
+| `citation_fidelity` | citations that support their claim ÷ all citations | target > 0.85 | 170 / 200 = 0.85 |
+| compaction ratio | original tokens ÷ compacted tokens | 1.5 – 5 | 400 → 100 tokens = 4 |
+| ROI | savings ÷ cost of the thing that produced them | > 1 to be worth it | $0.009 saved / $0.0076 spent ≈ 1.2 |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. The context window as a resource budget
+
+> **In plain words.** The model can read only a fixed number of tokens at once: the context window. Your instructions, the documents you found, the chat so far, the question and the answer all share that space. Give more to one part and another part gets less.
+>
+> **Real-world example.** An HR bot on a 16K model uses 2,000 tokens of instructions, 4,000 of documents (10 chunks × 400), 1,500 of chat history, 200 for the question, 300 for the format rules, 2,000 kept free for the answer and 800 as a safety margin: 10,800 in total. After 8 turns the history is 4,000 tokens, the total is 13,300, and only 2,700 tokens of the window are still free.
 
 The context window is not a container. It is a **budget**. The distinction matters because a
 container has a capacity and either fits or doesn't, while a budget has competing claimants and
@@ -161,19 +263,24 @@ retrieval team's recall@10 looks excellent. Now place it in a prompt:
     User query:             200 tokens
     Output format:          300 tokens
     Output reservation:   2,000 tokens
-    Safety margin:          640 tokens   (= 5% of a 12,800-token window)
+    Safety margin:          800 tokens   (= 5% of a 16,000-token window)
     ─────────────────────────────────
-    Total:               10,640 tokens
+    Total:               10,800 tokens
 ```
 
-This fits in a 16K window. But if the conversation grows to 8 turns (4,000 tokens of history),
-you now need 13,140 tokens — and on a 16K model, you are 2,860 tokens from the edge with
-chain-of-thought getting nothing. The retrieval team changed nothing; the context engineer
-has a crisis.
+This fits in a 16K window with 5,200 tokens to spare. But if the conversation grows to 8 turns
+(4,000 tokens of history), you now need 13,300 tokens — only 2,700 tokens from the edge of a 16K
+window. Any chain-of-thought beyond the 2,000-token output reservation has to fit in those
+2,700 tokens, and about five more 500-token turns use them up completely. The retrieval team
+changed nothing; the context engineer has a crisis.
 
 ---
 
 ## 2. Anatomy of a RAG prompt
+
+> **In plain words.** A RAG prompt has the same parts in the same order every time: rules, found documents, chat history, the question, then room for the answer. Each part carries hidden extras, such as a label on every chunk and formatting tokens around every message.
+>
+> **Real-world example.** Each chunk carries a label like `[Source 3] (document: "Q4 2024 Financial Report", page: 14 ...)` of about 26 tokens. With 10 chunks that is 260 tokens of labels, 6.5% of a 4,000-token document budget, spent on no content at all.
 
 Understanding what goes into a prompt — and in what order — is prerequisite to budgeting it. This
 section defines the anatomy as a concrete template with byte-level annotations.
@@ -284,24 +391,29 @@ Every provider wraps messages in a chat template that adds tokens invisible to y
 
 | Provider format | Added tokens per message | Per 10-message conversation |
 |---|---|---|
-| ChatML (`<|im_start|>`, role, `<|im_end|>`) | ~4 | ~40 |
+| ChatML (`<\|im_start\|>`, role, `<\|im_end\|>`) | ~4 | ~40 |
 | Llama-style (`[INST]`, `[/INST]`) | ~3–5 | ~30–50 |
 | Anthropic Messages API | ~3 | ~30 |
 
 These are small per message but compound across conversation history. A 30-turn conversation
-with a ChatML model carries ~120 invisible tokens of template overhead — roughly one chunk's
-worth of context that appears nowhere in your token budget arithmetic until you measure it.
+(60 messages) with a ChatML model carries ~240 invisible tokens of template overhead — over half
+a 400-token chunk's worth of context that appears nowhere in your token budget arithmetic until you measure it.
 
 ---
 
 ## 3. Token counting and budget allocation
+
+> **In plain words.** Count tokens with the same tokenizer the model uses. A different counter can be off by 10–15%. Then work out the room for documents on every request as "whatever is left" after everything else.
+>
+> **Real-world example.** 16K model, 2,000-token system prompt, 200-token question, 2,000 kept for the answer, 800 safety margin. At turn 1 there are 11,000 tokens for documents. At turn 10 (6,000 tokens of history) there are 5,000. At turn 20 there is nothing left.
 
 You cannot allocate what you cannot measure, and token counting is both more important and more
 subtle than it appears.
 
 ### 3.1 Tokenizer mismatches are silent budget errors
 
-Different models use different tokenizers. The same text produces different token counts:
+Different models use different tokenizers. The same text produces different token counts (the
+counts below are illustrative; run each tokenizer on your own text to get real ones):
 
 | Text | GPT-4 (cl100k) | Claude (claude) | Llama 3 (tiktoken-compatible) |
 |---|---|---|---|
@@ -493,6 +605,10 @@ break on exactly the queries that need the most back-and-forth to resolve.
 
 ## 4. Context window utilization patterns
 
+> **In plain words.** There are four ways to decide how many documents go in: always the same number, fill whatever is left, fill by priority, or reserve a fixed slice for documents and let history take the rest.
+>
+> **Real-world example.** A support bot always sends 5 chunks (about 2,000 tokens). At turn 15 of the §3.4 example only 1,800 tokens are free, so the fixed rule goes 200 tokens over budget and eats into the safety margin. The "fill what is left" rule sends 4 chunks and stays inside the budget.
+
 There are four canonical patterns for allocating the retrieval budget. Each trades off simplicity
 against information density.
 
@@ -591,7 +707,7 @@ priorities getting whatever remains:
 The key insight is that **conversation history is often lower priority than retrieved context**.
 Users expect accurate answers more than they expect the system to remember turn 3 of a 15-turn
 conversation. A system that sacrifices retrieval to preserve history is optimizing for the wrong
-thing — and it is the default behavior of most frameworks, which prepend full history and then
+thing — and it is a common default in simple chat pipelines, which prepend full history and then
 cram context into whatever remains.
 
 ### 4.4 Sliding window with context reservation
@@ -629,6 +745,10 @@ potentially aggressive history trimming. It is the right pattern for retrieval-h
 
 ## 5. The lost-in-the-middle problem
 
+> **In plain words.** Models read the start and the end of a long prompt best and the middle worst. Move the same passage from the first slot to the middle and the answer gets worse, even though nothing else changed.
+>
+> **Real-world example.** In Liu et al.'s test with 20 passages, one model answered correctly about 75% of the time when the right passage came first, about 45% when it was 10th, and about 72% when it was last (rounded numbers).
+
 This is the single most important empirical finding for context engineering, and it changes how
 you order, trim, and structure everything in the window.
 
@@ -646,7 +766,8 @@ doi:10.1162/tacl_a_00638)
 
 The experiment was clean: place a single gold passage among 19 distractor passages, vary the
 position of the gold passage, and measure whether the model can answer a question that requires
-it. The result:
+it. The result (rounded numbers that show the shape; exact values differ by model and by
+position of the gold passage):
 
 ```
     Accuracy (%) vs. position of gold passage in a 20-document context
@@ -707,18 +828,25 @@ higher-relevance chunk into the middle.
 
 Several follow-up studies have confirmed and refined the finding:
 
-- **Anthropic's internal evaluations** have noted that models show improved-but-not-eliminated
-  position sensitivity even in models specifically trained with longer contexts.
+- **Tang et al. (2023; NAACL 2024)** ("Found in the Middle: Permutation Self-Consistency Improves
+  Listwise Ranking in Large Language Models") showed that shuffling the order of the passages,
+  running the model several times, and aggregating the results reduces position bias in listwise
+  ranking — at the cost of multiple LLM calls.
 
-- **Hsieh et al. (2024)** ("Found in the Middle: Permutation Self-Consistency Improves Listwise
-  Ranking in Large Language Models") showed that permuting context order and aggregating can
-  partially mitigate the effect, at the cost of multiple LLM calls.
+- **Hsieh et al. (2024)** ("Found in the Middle: Calibrating Positional Attention Bias Improves
+  Long Context Utilization") linked the U-shape to a positional bias in the model's attention
+  and showed that calibrating that bias away improves use of mid-context passages in RAG-style
+  question answering.
 
-- **Google's Gemini team** has reported that their 1M-context models show reduced but not zero
-  position sensitivity, particularly on tasks requiring precise extraction from specific passages.
+- **Hsieh et al. (2024)** ("RULER: What's the Real Context Size of Your Long-Context Language
+  Models?") found that models which pass the simple single-needle test still degrade sharply as
+  context grows on harder tasks — multiple needles, multi-hop tracing, aggregation. Only about
+  half of the models they tested that claimed 32K+ windows held up satisfactorily at 32K.
 
-The practical upshot: **design as if the middle 40% of your context has 50% lower effective
-recall, and verify on your specific model.**
+The practical upshot: a longer advertised window does not remove the problem. **Assume the middle
+of your context is used noticeably worse than the edges, and measure how much on your own model
+(Lab 2).** A conservative rule of thumb, not a measured constant: treat the middle ~40% of a long
+context as if it had roughly half the effective recall.
 
 ### 5.5 Mitigation strategies
 
@@ -726,7 +854,7 @@ The following strategies are ordered by implementation cost, lowest first:
 
 | Strategy | Mechanism | Cost | Effectiveness |
 |---|---|---|---|
-| **Place best chunks first and last** | Exploit the U-curve directly | Zero — ordering change only | High — 15–25pp on affected queries |
+| **Place best chunks first and last** | Exploit the U-curve directly | Zero — ordering change only | High on models with a strong U-curve — measure it (Lab 2) |
 | **Reduce total context** | Fewer chunks = shorter middle = less loss | Token savings | Moderate — the curve still exists over shorter contexts |
 | **Interleave with instructions** | Break up the middle with formatting | Slight prompt overhead | Low-to-moderate — model-dependent |
 | **Chunk-level section headers** | Give each chunk a prominent marker | Metadata overhead | Moderate — helps the model "find" passages |
@@ -739,6 +867,10 @@ and should be the default in every system. §6 develops the ordering strategies 
 ---
 
 ## 6. Context ordering strategies
+
+> **In plain words.** Because the middle is read worst, put the strongest chunks at the start and the end and the weaker ones in the middle. Choose the order by the type of question.
+>
+> **Real-world example.** Five chunks with scores 0.94, 0.88, 0.76, 0.71 and 0.65. "Sandwich" order puts 0.94 first and 0.88 last, so the three weakest sit in the middle where the model pays least attention.
 
 Given §5's finding, the order of chunks in the prompt is a design decision with measurable impact
 on answer quality. This section defines the canonical orderings and when each applies.
@@ -767,13 +899,14 @@ If you have 10 chunks, positions 3–7 are in the dead zone.
 ### 6.2 Relevance-first-and-last (the "sandwich" strategy)
 
 Place the highest-relevance chunks at positions 1 and N, with lower-relevance chunks in the middle.
-This directly exploits the U-curve:
+This directly exploits the U-curve. The order below is exactly what `sandwich_order` returns for
+these five chunks:
 
 ```
     [Chunk 5, score 0.94] ← highest, position 1 (primacy)
-    [Chunk 1, score 0.71] ← lowest, position 2 (entering dead zone)
-    [Chunk 3, score 0.65] ← low, position 3 (dead zone)
-    [Chunk 8, score 0.76] ← medium, position 4 (leaving dead zone)
+    [Chunk 8, score 0.76] ← third, position 2 (entering dead zone)
+    [Chunk 1, score 0.71] ← fourth, position 3 (dead zone)
+    [Chunk 3, score 0.65] ← lowest, position 4 (dead zone)
     [Chunk 2, score 0.88] ← second highest, position 5 (recency)
 ```
 
@@ -846,7 +979,7 @@ easier — the model can attribute claims to documents rather than interleaved f
 | Temporal ("What happened after...?") | Chronological | Temporal reasoning requires temporal order |
 | Multi-turn follow-up | Relevance-first | New context should dominate; history provides continuity |
 
-In practice, most production systems use relevance-first as the default and do not vary per query.
+In practice, many production systems use relevance-first as the default and do not vary per query.
 If you adopt only one improvement from this chapter, make it the sandwich ordering — it is a
 zero-cost change with a measurable uplift on multi-chunk queries.
 
@@ -854,13 +987,17 @@ zero-cost change with a measurable uplift on multi-chunk queries.
 
 ## 7. Compaction and summarization
 
+> **In plain words.** When the documents do not fit, make them shorter. You can keep only the most useful sentences (safe, 1.5–2.5x shorter) or have a cheap model rewrite them (3–5x shorter, but it can drop or invent a fact).
+>
+> **Real-world example.** A 120-token revenue paragraph becomes one 35-token line: "Q4 2024 revenue: $4.2B (+12% YoY)...". That is 3.4x shorter, so the same space holds 3.4x as many facts.
+
 When the retrieval budget is insufficient for all retrieved chunks at full length, you have three
 options: drop chunks, truncate chunks, or **compact** them — replace verbose text with a shorter
 representation that preserves the information the model needs.
 
 ### 7.1 The information density argument
 
-A 400-token chunk from a financial report might contain:
+A paragraph from a financial report might read:
 
 ```
     Revenue for the three months ended December 31, 2024 was $4.2 billion,
@@ -1052,6 +1189,10 @@ before touching the retrieved chunks.
 
 ## 8. Conversation history management
 
+> **In plain words.** Chat history grows every turn and takes room away from documents. Keep the last few turns word for word, summarize older ones, and always keep important turns such as "only the EU region".
+>
+> **Real-world example.** At 400 tokens per turn on a 16K model, the room for documents is 10,600 tokens at turn 1, 3,000 at turn 20, and 1,000 tokens below zero at turn 30. Summarizing everything older than 5 turns into 300 tokens brings it back to 8,700.
+
 Conversation history is the budget claimant that grows without bound. Left unmanaged, it
 eventually consumes the entire window — and it does so gradually, so the failure is a slow
 degradation rather than a crash.
@@ -1061,13 +1202,16 @@ degradation rather than a crash.
 Average tokens per conversational turn (user + assistant combined): 200–600, depending on the
 application. In a technical support system with code snippets, average is closer to 500.
 
+Same setup as §3.4: 16K window, 2,000-token system prompt, 200-token query, 2,000-token output
+reservation, 800-token (5%) safety margin — so 11,000 tokens are left before any history.
+
 | Turns | History tokens (at 400/turn) | Remaining for retrieval (16K model) |
 |---|---|---|
-| 1 | 400 | 10,800 |
-| 5 | 2,000 | 9,200 |
-| 10 | 4,000 | 7,200 |
-| 20 | 8,000 | 3,200 |
-| 30 | 12,000 | -800 (overflow) |
+| 1 | 400 | 10,600 |
+| 5 | 2,000 | 9,000 |
+| 10 | 4,000 | 7,000 |
+| 20 | 8,000 | 3,000 |
+| 30 | 12,000 | -1,000 (overflow) |
 
 The model window is not the constraint that breaks first. The **retrieval budget** is — it hits
 zero long before the window is full, because it is the residual after everyone else is served.
@@ -1228,6 +1372,10 @@ the alternative is a system that degrades on every conversation past turn 10.
 
 ## 9. Memory systems for RAG
 
+> **In plain words.** Memory is information from outside this chat: the current task, the user's preferences, facts from past sessions. It competes with documents for the same token budget, so include it on purpose, not by default.
+>
+> **Real-world example.** A request uses 5 chunks (2,000 tokens) plus 10 memories (500 tokens) = 2,500 tokens. Storing "prefers EU data" as a short fact costs about 10 tokens; storing the whole past conversation where the user said it costs 50–200.
+
 Memory extends context beyond the current conversation. Where §8 manages the history of *this*
 conversation, memory systems provide information from *outside* the conversation — prior sessions,
 user preferences, learned facts — that the model would not otherwise have access to.
@@ -1329,6 +1477,10 @@ See `25` §7 and §9 for implementation patterns.
 ---
 
 ## 10. Citation engineering
+
+> **In plain words.** Citations let the user check where each claim came from. Number every chunk, ask the model to cite the numbers, then check that the cited chunk really says what the answer claims.
+>
+> **Real-world example.** 50 answers contain 200 citations. A checker finds that 170 of them point to a chunk that supports the claim, so citation fidelity is 170 / 200 = 0.85.
 
 Citations are where the context assembly becomes visible to the user. A RAG system without
 citations is a system that cannot be verified — the user has no way to distinguish a grounded
@@ -1511,6 +1663,10 @@ Measure both. See `08` §10 for the evaluation methodology.
 
 ## 11. Long-context models: do they replace RAG?
 
+> **In plain words.** New models can read hundreds of thousands of tokens, so why not put every document in the prompt? That works for small collections and low traffic. For large collections or many users it is slow and expensive, and the model still reads the middle poorly.
+>
+> **Real-world example.** At 1,000 questions a day, sending 200K tokens per question costs about $505/day at $2.50 per 1M input tokens. RAG with ~4,000 tokens per question costs about $10/day, 50x less.
+
 The arrival of 128K, 200K, and 1M+ context windows has produced a persistent question: why not
 just stuff everything into the context and skip retrieval entirely? The answer is more nuanced
 than either "yes, obviously" or "no, never" — it depends on corpus size, query type, cost
@@ -1537,7 +1693,7 @@ engineering simplicity is real.
 | Scenario | Why it works | Approximate corpus size |
 |---|---|---|
 | Single-document QA | One document fits in context | <100 pages (~50K tokens) |
-| Small knowledge base | Entire KB fits | <200K tokens (~150 pages) |
+| Small knowledge base | Entire KB fits | <200K tokens (~400 pages) |
 | Code repository analysis | Repo fits in context | <100K tokens (~50 files) |
 | Legal contract review | One contract fits | <80K tokens |
 | Meeting transcript QA | One transcript fits | <30K tokens |
@@ -1561,7 +1717,9 @@ At 1,000 queries per day, the stuff-everything approach at 200K tokens costs rou
 versus $10/day for RAG. That is a 50x cost multiplier for each query. Over a year, the difference
 is ~$180K versus ~$3.6K — not an optimization, a business constraint.
 
-(These are illustrative prices. Check current provider pricing; the ratio is more stable than the
+(These are illustrative prices: $2.50 and $3.00 per 1M input tokens. GPT-4o's window is 128K, and
+some providers charge a higher rate above 200K tokens, so the last two rows are per-token
+illustrations, not real quotes. Check current provider pricing; the ratio is more stable than the
 absolute numbers.)
 
 **Latency.** Time-to-first-token scales with input length. More context means more prefill
@@ -1581,10 +1739,13 @@ processing, it may be fine — but then cost dominates.
 tokens, the middle 100K tokens are in the attention dead zone. You have solved the retrieval
 problem and created an attention problem. The model has the information; it cannot use it.
 
-**Needle-in-a-haystack performance.** Google, Anthropic, and others have published needle-in-a-
-haystack evaluations showing that even purpose-built long-context models show degraded performance
-on precise extraction tasks when the "needle" is buried in long contexts. The degradation is
-task-dependent: summarization holds up well; specific-fact extraction degrades.
+**Needle-in-a-haystack performance.** Recent long-context models score close to perfect on the
+simple test of finding one "needle" sentence in a long document. That test is too easy. RULER
+(Hsieh et al., 2024; see §5.4) added harder variants — several needles, multi-hop tracing,
+aggregating facts spread across the context — and found that performance drops substantially as
+context length grows, even for models with 128K+ advertised windows. The degradation is
+task-dependent: finding one distinctive fact holds up best; tasks that need many facts from many
+places degrade most.
 
 ### 11.4 The crossover analysis
 
@@ -1605,7 +1766,8 @@ maintaining the RAG pipeline:
         + maintenance_cost                     # ongoing: re-indexing, eval
 ```
 
-The crossover point depends heavily on query volume:
+The crossover point depends heavily on query volume (illustrative values; plug in your own
+ingestion, maintenance and per-token costs):
 
 | Queries/month | Crossover (approximate) |
 |---|---|
@@ -1641,6 +1803,10 @@ of a conversation).
 
 ## 12. Prompt caching and context reuse
 
+> **In plain words.** If many requests start with exactly the same text, the provider can reuse its work on that part and charge much less for it. This only works if the start of the prompt is identical, byte for byte.
+>
+> **Real-world example.** A 10,000-token fixed prefix, 10,000 requests a day, 85% cache hits, $3.00 per 1M tokens with a 90% discount on cached reads: about $230/day saved, roughly $6,900/month.
+
 Prompt caching is a provider-level optimization that reduces the cost of repeated context. For RAG
 systems, where the system prompt and often the retrieved context are identical across queries, the
 savings are significant.
@@ -1667,13 +1833,14 @@ The mechanism, as implemented by Anthropic and OpenAI:
     → Full price only for the new tokens (Query 2)
 ```
 
-The savings scale with the length of the shared prefix and the hit rate:
+The savings scale with the length of the shared prefix and the hit rate. At $3.00 per 1M input
+tokens and a 90% discount on cache reads, each cached token saves $2.70 per 1M:
 
-| Scenario | Shared prefix | Savings per request |
+| Scenario | Shared prefix | Savings per cache hit |
 |---|---|---|
-| Same system prompt, different context | 2K tokens | ~$0.002 (small) |
-| Same system prompt + same context | 5K tokens | ~$0.008 (moderate) |
-| Same system prompt + large static context | 50K tokens | ~$0.08 (substantial) |
+| Same system prompt, different context | 2K tokens | ~$0.005 (small) |
+| Same system prompt + same context | 5K tokens | ~$0.014 (moderate) |
+| Same system prompt + large static context | 50K tokens | ~$0.135 (substantial) |
 
 ### 12.2 Cache-aware prompt design
 
@@ -1748,8 +1915,9 @@ response = client.messages.create(
 # response.usage.input_tokens                 — tokens not cached
 ```
 
-Anthropic's cache has a minimum block size (1,024 tokens for Claude Sonnet/Opus) and a TTL
-(typically 5 minutes, extended with each hit). See
+Anthropic's cache has a minimum cacheable prefix length (1,024 tokens for many Sonnet/Opus
+models; higher for some others — check the docs for your model) and a default TTL of 5 minutes,
+refreshed on each hit. A longer 1-hour TTL is available at a higher cache-write price. See
 [`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md) for the full caching
 architecture.
 
@@ -1841,12 +2009,18 @@ The math that determines whether cache-aware design is worth the engineering:
 ```
 
 At 10,000 requests per day with a 10K-token system prompt, prompt caching saves roughly $7K per
-month. That pays for a meaningful amount of engineering time to implement cache-aware prompt
+month. (This ignores the cache-write premium: Anthropic bills the request that writes the cache at
+1.25x the base input price for the 5-minute TTL. With a 15% miss rate that is 1,500 writes/day ×
+10,000 tokens × $0.75/1M = $11.25/day, about $340/month, so net savings are still ~$6,550/month.) That pays for a meaningful amount of engineering time to implement cache-aware prompt
 assembly.
 
 ---
 
 ## 13. Multi-document reasoning
+
+> **In plain words.** Some questions need facts from many documents. The model has to find and combine them, often from the weak middle of the prompt. A safer way: pull the key facts out of each chunk first, then answer from that short list.
+>
+> **Real-world example.** "Compare EMEA and APAC revenue for Q1–Q4 2024" needs 10 chunks = 4,000 tokens. Pulling out a 30-token record per chunk leaves about 300 tokens of clean data for the final answer.
 
 Many queries require synthesizing information from multiple chunks, potentially from different
 documents. This is harder than single-chunk extraction because the model must hold multiple pieces
@@ -1985,6 +2159,10 @@ def estimate_context_need(
 
 ## 14. The cost arithmetic of context
 
+> **In plain words.** You pay for every token. In RAG most of the bill is input tokens, so cutting context is the main cost lever. Cutting the context in half cuts the total bill by about 40%.
+>
+> **Real-world example.** 10,000 input tokens and 500 output tokens on a model priced $3 / $15 per 1M: $0.030 + $0.0075 = $0.0375 per question. Input is 80% of that.
+
 Context size is the primary driver of LLM API cost. This section makes the arithmetic explicit
 so that context engineering decisions can be made on numbers rather than intuition.
 
@@ -1997,7 +2175,7 @@ engineering:
 |---|---|---|---|
 | GPT-4o | $2.50 | $10.00 | 1:4 |
 | Claude Sonnet 4 | $3.00 | $15.00 | 1:5 |
-| Claude Haiku | $0.80 | $4.00 | 1:5 |
+| Claude Haiku 3.5 | $0.80 | $4.00 | 1:5 |
 | GPT-4o mini | $0.15 | $0.60 | 1:4 |
 
 (Prices as of mid-2025. Check current pricing.)
@@ -2024,7 +2202,7 @@ A concrete table for budget conversations:
 |---|---|---|---|---|---|
 | Minimal (3 chunks) | 3,500 | 300 | $0.015 | $150 | $4,500 |
 | Standard (5 chunks) | 5,000 | 400 | $0.021 | $210 | $6,300 |
-| Generous (10 chunks) | 8,000 | 500 | $0.032 | $320 | $9,600 |
+| Generous (10 chunks) | 8,000 | 500 | $0.0315 | $315 | $9,450 |
 | Comprehensive (20 chunks) | 14,000 | 600 | $0.051 | $510 | $15,300 |
 | Stuff-everything (100K) | 102,000 | 600 | $0.315 | $3,150 | $94,500 |
 
@@ -2037,22 +2215,28 @@ question that `08`'s methodology can answer.
 Compaction (§7) costs an LLM call to save tokens in the generation call. When is it worth it?
 
 ```
-    compaction_cost = chunks_to_compact * compaction_tokens_per_chunk * compaction_model_price
+    compaction_cost = chunks_to_compact * (compaction_input_tokens  * compaction_input_price
+                                         + compaction_output_tokens * compaction_output_price)
     tokens_saved    = chunks_to_compact * (original_tokens - compacted_tokens)
     generation_savings = tokens_saved * generation_model_price
 
     ROI = generation_savings / compaction_cost
 
     Example:
-    10 chunks, 400 tokens each, compacted to 100 tokens each using Haiku
-    compaction_cost     = 10 * 500 * $0.80 / 1M  = $0.004   (Haiku input + output)
+    10 chunks, 400 tokens each, compacted to 100 tokens each using Haiku 3.5
+    compaction input    = 10 * 450 (chunk + ~50 prompt) * $0.80 / 1M = $0.0036
+    compaction output   = 10 * 100                       * $4.00 / 1M = $0.0040
+    compaction_cost     = $0.0076
     tokens_saved        = 10 * 300                = 3,000 tokens
     generation_savings  = 3,000 * $3.00 / 1M      = $0.009   (Sonnet input saved)
 
-    ROI = $0.009 / $0.004 = 2.25x
+    ROI = $0.009 / $0.0076 ≈ 1.2x
 
-    Break-even: compaction is profitable when the generation model is
-    more expensive than the compaction model, which it almost always is.
+    Break-even: compaction pays for itself only when the input tokens it
+    saves on the generation model cost more than the compaction call.
+    With Haiku 3.5 compressing for Sonnet the margin is thin (~1.2x);
+    it grows with a pricier generation model, a cheaper compaction model,
+    or when the same compacted chunk is reused across many queries.
 ```
 
 ### 14.4 The cost of conversation history
@@ -2076,9 +2260,10 @@ For a 20-turn conversation at 400 tokens per turn:
     Total tokens billed = 400 * 20 * 21 / 2 = 84,000 tokens
     Without history management: 84,000 * $3.00 / 1M = $0.252
     With sliding window (keep 5 turns):
-        5 turns * 400 tokens * 20 queries  = 40,000 tokens
-        40,000 * $3.00 / 1M               = $0.120
-    Savings: 52%
+        turns billed = (1+2+3+4) + 16 * 5  = 90 turns
+        90 turns * 400 tokens              = 36,000 tokens
+        36,000 * $3.00 / 1M               = $0.108
+    Savings: 57%
 ```
 
 History management is not just a context-quality optimization; it is a cost optimization. See
@@ -2087,6 +2272,10 @@ History management is not just a context-quality optimization; it is a cost opti
 ---
 
 ## 15. Context engineering for agents
+
+> **In plain words.** An agent fills its window with tool descriptions and with the results of every tool it calls. By the last steps of a long task there may be no room left for new documents or for the answer.
+>
+> **Real-world example.** 20 tools × 200 tokens = 4,000 tokens, 25% of a 16K window, used up before the agent has done anything.
 
 Agent systems (`22` and `24`) intensify every context engineering problem because multiple
 components compete for the same window: tool definitions, tool results, scratchpad reasoning,
@@ -2138,8 +2327,8 @@ tokens of context:
     Turn N+3 (tool): document content                                ~800 tokens
 ```
 
-Four turns, ~3,050 tokens. A multi-hop agent that makes 5 tool calls can consume 15,000+ tokens
-of tool-use traces — enough to exhaust a 16K model with no room for retrieved context.
+Four turns, two tool calls, ~3,050 tokens — about 1,500 tokens per call. A multi-hop agent that
+makes 10 such tool calls consumes ~15,000 tokens of tool-use traces — enough to exhaust a 16K model with no room for retrieved context.
 
 ### 15.3 Scratchpad and chain-of-thought patterns
 
@@ -2164,7 +2353,8 @@ tool results with their extracted conclusions. Keep only the facts that matter f
 
 ### 15.4 The agent context budget over time
 
-An agent conversation evolves through three phases, each with different budget pressure:
+An agent conversation evolves through three phases, each with different budget pressure (numbers
+below assume a 20K-token window and ignore the safety margin for simplicity):
 
 ```
     Phase 1 (Planning):
@@ -2182,7 +2372,7 @@ An agent conversation evolves through three phases, each with different budget p
 
     Phase 3 (Synthesis, step 5 of 5):
     ┌───────────────────────────────────────────┐
-    │ System + Tools: 6,000 │ Tool traces: 10,000│ ← BUDGET CRISIS
+    │ System + Tools: 6,000 │ Tool traces: 10,000│ ← 23,200 needed: 3,200 OVER
     │ History: 2,000        │ Scratchpad: 3,000  │
     │ Query: 200            │ Output: 2,000      │
     └───────────────────────────────────────────┘
@@ -2262,6 +2452,10 @@ class AgentContextManager:
 
 ## 16. Failure modes and diagnostics
 
+> **In plain words.** Context problems rarely crash the system. They produce answers that look fine but are worse. Log a few numbers on every request so you can see the cause.
+>
+> **Real-world example.** The dashboard shows history taking 65% of the input (`history_fraction` = 0.65) and only 4 of 10 retrieved chunks making it into the prompt (`context_recall` = 0.4). The chat history is pushing documents out.
+
 Context engineering failures are subtle because the system does not crash — it produces a
 plausible but wrong answer, and the root cause is in the context assembly, not in the retrieval
 or the model.
@@ -2317,9 +2511,10 @@ the problem is dilution, not the instructions. Mitigation: place critical instru
 both the beginning and end of the prompt (exploit the U-curve), reduce context volume, or
 use stronger instruction formatting (XML tags, numbered lists, capitalization).
 
-Research note: Anthropic's internal research and their public documentation on prompt
-engineering recommend placing important instructions at the top of the system prompt and
-repeating critical constraints near the end for long-context scenarios.
+Research note: provider prompting guides (for example, Anthropic's public long-context prompting
+tips) recommend putting long documents near the top of the prompt and the question and key
+instructions at the end, after the documents. Repeating critical constraints near the end is a
+common practice that follows from the same U-curve.
 
 ### 16.4 Context poisoning
 
@@ -2421,8 +2616,9 @@ bad answer should be debuggable by inspecting them.
    every subsequent turn (quadratic total cost), and eventually displaces retrieval entirely.
    Manage it or it manages you.
 
-6. **Compaction is profitable when the generation model is more expensive than the compaction
-   model.** The ROI is typically 2–3x. Use Haiku to compress for Sonnet.
+6. **Compaction is profitable only when the input tokens it saves cost more than the compaction
+   call.** In §14.3's Haiku-for-Sonnet example the ROI is only ~1.2x; it improves with a pricier
+   generation model, a cheaper compactor, or reuse of the compacted text. Do the arithmetic first.
 
 7. **Long-context models do not replace RAG above ~1,000 queries/month on corpora larger than
    50K tokens.** The cost crossover favors RAG at volume. Long-context models *with* RAG — more
@@ -2587,6 +2783,271 @@ numbers.
 its context engineering metrics on its trace span.
 *Time:* ~2 days.
 *Unblocks:* production deployment; P2.
+
+---
+
+## 20. Interview questions and system design prompts
+
+> **In plain words.** In interviews, first say the idea in one plain sentence, then give one number, then name one trade-off. For this chapter the number is almost always a token count: how big the window is, who uses how much of it, and what is left.
+>
+> **Real-world example.** "Why not just use a 1M-token model and skip retrieval?" → "For a small corpus and low traffic, that is fine. At 1,000 questions a day, 200K tokens per question costs about $505/day versus ~$10/day for RAG, answers start seconds later, and the model still reads the middle of the prompt worst."
+
+Each question names the sections it draws from and gives the answer structure an interviewer is
+listening for, not just the facts.
+
+### 20.1 Conceptual questions
+
+**Q: Why is the context window a "budget" and not just a size limit?**
+*Sections: §1.1, §1.2*
+Because several parts compete for it: system instructions, retrieved chunks, history, the query,
+the answer (`max_tokens`) and a safety margin. Write the equation:
+`retrieval = window − system − history − query − format − output_reservation − safety`. The strong
+point: retrieval gets the *residual*, so it shrinks every turn even if nothing about search changes.
+
+**Q: Walk me through the budget for a 16K model.**
+*Sections: §1.3, §3.4*
+2,000 system + 200 query + 2,000 output + 800 safety (5%) = 5,000 fixed, so 11,000 for history and
+documents. At 400 tokens per turn, turn 20 leaves 3,000 for documents (7 chunks of 400); turn 30
+is 1,000 over. Say what you do about it: dynamic allocation plus history summarization.
+
+**Q: What is "lost in the middle" and what do you do about it?**
+*Sections: §5, §6*
+Liu et al. (TACL 2024): with 20 passages, accuracy was highest when the answer passage was first or
+last and lowest in the middle (roughly 75% vs 45% for one model). Mitigations in cost order:
+sandwich ordering (free), fewer chunks, compaction, and permutation ensembles (Tang et al.; several
+LLM calls). Add: measure it on your own model before relying on any published curve.
+
+**Q: Extractive vs abstractive compaction?**
+*Sections: §7.2, §7.3, §14.3*
+Extractive keeps whole original sentences: 1.5–2.5x shorter, cannot invent facts. Abstractive has a
+model rewrite the text: 3–5x shorter, but it can drop the one fact that mattered or add one that is
+not in the source. Mention the cost check: with Haiku 3.5 compressing for Sonnet, §14.3's example
+saves only ~1.2x what it costs.
+
+**Q: How do you manage conversation history in a long chat?**
+*Section: §8*
+Sliding window (simple, breaks references to old turns), summarize old turns (~10x smaller,
+risk of losing a fact), selective keep (keep corrections and preferences). The production answer
+is a hybrid: summary of old turns + key turns + last N turns word for word. Also: full history is
+resent every turn, so its total cost grows with N², not N.
+
+**Q: How does prompt caching change prompt design?**
+*Section: §12*
+The cache matches an exact prefix. So: static content first (instructions, tool definitions,
+fixed reference docs), then per-session content, then per-query chunks, history and question.
+Never put a timestamp or request ID at the top. Measure the cache hit rate.
+
+**Q: When does long context replace RAG?**
+*Section: §11*
+When the whole corpus fits in the window, traffic is low, and a few seconds of extra latency are
+fine. Otherwise RAG wins on cost (roughly proportional to input tokens) and latency (prefill grows
+with input). The good combination is RAG *with* a long-context model: more room, not more stuffing.
+
+### 20.2 System design prompts
+
+**Prompt A: Design context assembly for a customer-support chatbot. 50,000 help articles, a 32K
+model, conversations up to 40 turns, answers must cite sources.**
+
+Structured answer:
+1. **Budget first.** Fixed: system prompt ~2,000, output 2,000, safety 5% (1,600), query ~200.
+   That leaves ~26,200 for history + documents. Decide a floor for documents (say 8,000) so
+   retrieval never starves.
+2. **History.** Keep the last 5 turns word for word, summarize older turns into ≤ 500 tokens with a
+   cheap model, always keep corrections and stated preferences (§8.4).
+3. **Documents.** Retrieve and rerank (`04`), then fill the residual dynamically (§4.2). Order by
+   query type: relevance-first for lookups, sandwich for multi-chunk answers (§6).
+4. **Citations.** Number every chunk, require `[Source N]` after each claim, verify a sample with an
+   NLI model and track citation fidelity (§10).
+5. **Caching.** Put the system prompt and tool definitions first and keep them byte-identical (§12).
+6. **Observability.** Log window utilization, history fraction, chunks retrieved vs admitted,
+   cache hit rate on every request (§16.6).
+
+What interviewers listen for: you compute the budget with real numbers before choosing components;
+you treat history as the thing that grows; you mention the output reservation; you know caching
+needs a stable prefix; you plan how to measure.
+
+**Prompt B: A research agent calls tools for 5–10 steps and "forgets" early findings. Redesign
+its context handling.**
+
+Structured answer: load only the tools needed for the current step (§15.5); summarize each tool
+result into facts before appending; keep a compact scratchpad of findings and drop raw traces for
+finished sub-tasks; track budget pressure and trigger compaction above ~70% of the window; use a
+larger window only as headroom. What interviewers listen for: numbers for trace growth (~1,500
+tokens per tool call in §15.2) and a plan that keeps the final synthesis step inside the window.
+
+### 20.3 Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| What is the output reservation? | Tokens kept free for the answer (`max_tokens`); forgetting it truncates answers | §1.1 |
+| Typical safety margin? | 5% minimum, 10% common | §1.1 |
+| Why not count tokens with `chars / 4`? | Can be off by 20%+ on non-English text; use the target model's tokenizer | §3.1 |
+| What does the metadata tax cost? | ~26 tokens per chunk; 10 chunks = 260 tokens, 6.5% of a 4,000-token budget | §2.3 |
+| Where should the best chunk go? | First (and the second-best last) | §6.2 |
+| How does full-history cost grow? | Quadratically: N·(N+1)/2 turns billed over N turns | §14.4 |
+| What breaks prompt caching? | Any change in the prefix, such as a timestamp at the top | §12.2 |
+| Cached-read discount on Anthropic? | Up to 90% off the base input price | §12.1 |
+| Input vs output price ratio? | Output is typically 4–5x input per token | §14.1 |
+| Why do agents run out of context? | Tool definitions + tool results + scratchpad pile up each step | §15 |
+| How do you spot a budget problem in logs? | High window utilization, high history fraction, few retrieved chunks admitted | §16.6 |
+| Does a 1M window remove lost-in-the-middle? | No; RULER shows harder long-context tasks still degrade with length | §5.4, §11.3 |
+
+### 20.4 Debugging prompts
+
+**"Answers are fine at the start of a chat and wrong after about 15 turns."**
+Diagnosis: history is crowding out documents. Check `history_fraction` and chunks admitted vs
+retrieved per turn. Fix: summarize old turns, reserve a minimum document budget (§4.4, §8).
+
+**"About 1 in 50 answers stops mid-sentence."**
+Diagnosis: no or too small output reservation; the prompt fills the window on long requests.
+Check `input_tokens + max_tokens` against the window on the truncated requests. Fix: reserve output
+tokens before assembling context (§1.1, §16.1).
+
+**"The right document is in the retrieved set, but the answer ignores it."**
+Diagnosis: either the chunk was dropped by the budget allocator or it sat in the middle of a long
+prompt. Check its position in the final prompt. Fix: sandwich ordering, fewer chunks, compaction
+(§5, §6, §16.2).
+
+**"Our prompt caching shows a 0% hit rate."**
+Diagnosis: something changes at the start of every prompt (timestamp, user name, request ID, or
+retrieved chunks placed before the static instructions). Fix: move all dynamic content after the
+static prefix (§12.2).
+
+### 20.5 Common mistakes
+
+- Forgetting the output reservation and the safety margin in the budget.
+- Treating the retrieval budget as constant across turns.
+- Counting tokens with a different model's tokenizer.
+- Quoting a published lost-in-the-middle curve as if it applies to every model, instead of
+  measuring your own.
+- Saying "just use a 1M-token model" without the cost and latency numbers.
+- Using the expensive generation model to summarize history or compact chunks.
+- Putting dynamic content at the top of the prompt and then wondering why caching does not work.
+
+---
+
+## 21. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+Quick index: answers get worse in long chats → Case 1; answers cut off → Case 2; right document
+found, wrong answer → Case 3; random "context too long" errors → Case 4; bill grows faster than
+traffic → Case 5; cache never hits → Case 6; agent fails at the last step → Case 7.
+
+### Case 1 — The HR bot that forgets the policy after 20 turns
+
+**Setup.** HR policy bot, 16K window, 2,000-token system prompt, 200-token questions, 2,000 tokens
+reserved for the answer, 800 safety margin. Full chat history resent every turn, ~400 tokens per
+turn. Top-10 chunks of 400 tokens retrieved.
+
+**Symptom.** Short chats get correct answers. In chats longer than ~15 turns, employees get the
+general policy instead of their country's rules.
+
+**Measurement/Diagnosis.** Room for documents = 11,000 − history. At turn 20: 11,000 − 8,000 =
+3,000 tokens, so 7 of 10 chunks fit. The country-specific chunk was usually ranked 8th–10th and
+was cut. At turn 30 the history alone (12,000) exceeds the 11,000 allowance.
+
+**Fix.** Summarize turns older than 5 into a 300-token summary. History at turn 30 goes from 12,000
+to 2,300 tokens; documents get 8,700 tokens, so all 10 chunks (4,000) fit with 4,700 spare.
+
+**Lesson.** The retrieval budget is a residual. Watch it per turn, not per deployment.
+
+### Case 2 — Answers cut off mid-sentence
+
+**Setup.** Internal knowledge bot on an 8,192-token model. Prompt assembly filled the window with
+chunks of ~500 tokens (including labels) until it ran out, with no output reservation.
+
+**Symptom.** Long answers stop mid-sentence, mostly on questions with many retrieved chunks.
+
+**Measurement/Diagnosis.** A typical failing request: system 2,000 + history 700 + query 200 +
+10 chunks (5,000) = 7,900 input tokens, leaving 8,192 − 7,900 = 292 tokens for an answer that
+needed ~450.
+
+**Fix.** Reserve 1,024 output tokens and a 5% safety margin (409) before adding chunks. Room for
+documents becomes 8,192 − 2,900 − 1,024 − 409 = 3,859 tokens, so 7 chunks (3,500) go in. Truncated
+answers disappear; the 3 dropped chunks were the lowest-ranked ones.
+
+**Lesson.** Reserve the answer's space first. Chunks get what is left.
+
+### Case 3 — The right document was retrieved, and ignored
+
+**Setup.** Policy Q&A that sends 20 reranked chunks in relevance order.
+
+**Symptom.** On a 200-question golden set, 64% correct (128 of 200), even though the gold chunk was
+in the top 20 for 95% of questions.
+
+**Measurement/Diagnosis.** In most failures the gold chunk was ranked 6th–15th, so it sat in the
+middle of the prompt, where the model reads worst (§5).
+
+**Fix.** Cut to 10 chunks and use sandwich ordering. Accuracy rose to 73% (146 of 200) at half the
+retrieved-context tokens.
+
+**Lesson.** More chunks is not free. Position matters as much as presence.
+
+### Case 4 — Random "context too long" errors on German documents
+
+**Setup.** A 16,384-token model. Token counts estimated with `chars / 4` to save a tokenizer call.
+
+**Symptom.** A small share of requests fail with a context-length error, almost all on
+German-language documents.
+
+**Measurement/Diagnosis.** On that text the estimate undercounted by ~15%. A prompt estimated at
+15,000 tokens was really 15,000 × 1.15 = 17,250, over the 16,384 limit. Any request estimated above
+~14,250 tokens was at risk.
+
+**Fix.** Count with the target model's tokenizer (or its token-counting API) and keep a 5% margin.
+Context-length errors dropped to zero.
+
+**Lesson.** Count with the tokenizer of the model you call (§3.1).
+
+### Case 5 — The bill grows faster than the traffic
+
+**Setup.** A chatbot at $3.00 per 1M input tokens, 5,000 conversations a day, average 20 turns of
+400 tokens, full history resent every turn.
+
+**Symptom.** Traffic went up 20%, but the input-token bill went up much more once users started
+having longer chats.
+
+**Measurement/Diagnosis.** A 20-turn chat bills 400 × 20 × 21 / 2 = 84,000 history tokens =
+$0.252, or $1,260/day for history alone. Cost per chat grows with the square of its length.
+
+**Fix.** Sliding window of 5 turns: 90 turns billed instead of 210, so 36,000 tokens = $0.108 per
+chat, $540/day, a 57% cut. Adding a short summary of older turns kept quality at the previous level
+on the team's golden set.
+
+**Lesson.** History cost is quadratic. Manage it for cost, not only for quality.
+
+### Case 6 — Prompt caching that never hits
+
+**Setup.** 10,000-token static instructions and reference text, 10,000 requests a day, $3.00 per
+1M input tokens, caching enabled.
+
+**Symptom.** Usage reports show 0 cache-read tokens. No savings.
+
+**Measurement/Diagnosis.** The first line of the system prompt was `Current time: <timestamp>`, so
+every prefix was different.
+
+**Fix.** Move the timestamp after the static block. Cache hit rate went to 85%, saving 10,000 ×
+$2.70 / 1M × 10,000 × 0.85 = $229.50/day, about $6,900/month before the cache-write premium (§12.5).
+
+**Lesson.** One changing token at the top of the prompt turns caching off.
+
+### Case 7 — The agent that fails at the last step
+
+**Setup.** Research agent on a 20K-token window: 6,000 tokens of system prompt and tool
+definitions, 2,000 output reservation, full tool results appended every step.
+
+**Symptom.** Tasks with 5+ steps produce an incomplete final report or an error at the synthesis
+step.
+
+**Measurement/Diagnosis.** At step 5: 6,000 + 10,000 (tool traces) + 2,000 (history) + 3,000
+(scratchpad) + 200 (query) + 2,000 (output) = 23,200 tokens, 3,200 over the window (§15.4).
+
+**Fix.** Summarize each tool result into its facts before appending (70% smaller). Traces drop from
+10,000 to 3,000 tokens; the total becomes 16,200, leaving 3,800 tokens free.
+
+**Lesson.** Agents need a context budget per step, with compaction built in (§15.5).
 
 ---
 
