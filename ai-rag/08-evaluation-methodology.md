@@ -36,6 +36,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [What an eval is, and the two questions it answers](#1-what-an-eval-is-and-the-two-questions-it-answers)
 2. [The measurement map — every stage, its metric, its label](#2-the-measurement-map--every-stage-its-metric-its-label)
 3. [Labels: the golden set is the load-bearing artifact](#3-labels-the-golden-set-is-the-load-bearing-artifact)
@@ -55,10 +56,130 @@
 17. [Anti-patterns](#17-anti-patterns)
 18. [Mental models — the compressed set](#18-mental-models--the-compressed-set)
 19. [Lab exercises](#19-lab-exercises)
+20. [Interview questions and system design prompts](#20-interview-questions-and-system-design-prompts)
+21. [Real-world cases — incidents with numbers](#21-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** You built a RAG assistant, and now you change something: a new chunk size, a
+reranker, a new prompt. Did it get better or worse? Trying ten questions by hand and saying "looks
+better" is how most teams decide, and it is often wrong. An **eval** is a fixed list of questions
+with known good answers plus a script that scores the system on them. This chapter is about
+building that list, choosing the right score for each part of the pipeline, and knowing when a
+difference in scores is real and when it is noise.
+
+**A real-world example: an HR policy assistant.** A company's HR bot answers employee questions
+from 1,200 policy documents. The team wants to add a reranker and shorten chunks.
+
+1. **Without an eval.** An engineer tries 10 questions, 7 look better, the change ships. A month
+   later employees complain that the bot invents carry-over rules for vacation days. Nobody can say
+   whether the change caused it, because nothing was measured before.
+2. **Build a golden set (§3).** Collect 200 real employee questions. For each one, store the exact
+   quote from the policy that answers it (a *span*), not "chunk #4417", because chunk numbers change
+   when you re-chunk. Add 30 questions the policies do **not** answer, such as "What is the CEO's
+   salary?".
+3. **Score retrieval (§8).** Question: "How many vacation days carry over?" The right passages are
+   D3 and D7. The system returns `D5, D3, D9, D7, D2`.
+   - **recall@5** = found 2 of 2 right passages in the top 5 = **1.0**. recall@3 = 1 of 2 = **0.5**.
+   - **precision@5** = 2 of the 5 returned are right = **0.4**.
+   - **Reciprocal rank** = the first right passage is at position 2 → 1/2 = **0.5**.
+   - **nDCG@5** with grades D3 = 3 (fully answers), D7 = 2 (partly), D5 = 1 (related) = **0.71**.
+     After the reranker the order is `D3, D7, D5, D9, D2`: nDCG@5 = **1.0**, reciprocal rank =
+     **1.0**, and recall@5 stays **1.0**, because a reranker only reorders; it can't find new
+     passages.
+4. **Score the answer (§10).** The bot's answer contains 5 separate claims; 4 are backed by the
+   retrieved text. **Faithfulness** = 4/5 = **0.8**. On the 30 unanswerable questions the bot
+   declines only 9 times and invents an answer 21 times: **abstention recall** = 9/30 = **0.30**.
+   This is the complaint from step 1, now visible as a number.
+5. **Check the grader (§11).** An LLM judge grades 100 answers and says "pass" on all 100. Humans
+   failed 12 of them. The judge's accuracy looks like 88%, but its **Cohen's κ** (agreement beyond
+   luck) is **0**: it never catches a bad answer.
+6. **Is the change real? (§13).** Old and new systems run on the same 200 questions. If the new one
+   wins on 34 questions, loses on 14 and ties on 152, the average gain is +0.10 with a 95%
+   bootstrap interval of about **[+0.04, +0.17]**: real. If it wins 30 and loses 18, the gain is
+   +0.06 with an interval of about **[−0.01, +0.13]**: it might be zero, so don't claim a win yet.
+7. **Gate it (§14).** Put the 200 questions in CI. Every prompt or config change runs them, and the
+   build fails only when the whole interval sits below zero and the loss is at least 0.02.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Eval | fixed questions + known answers + a scoring script | a school exam with an answer key |
+| Golden set | the list of questions and their correct answers | the answer key itself |
+| Span label | the answer stored as an exact quote with its location in the source | "page 12, lines 3–5" instead of "the third photocopy" |
+| Stratum (plural strata) | a group of similar questions, scored separately | grading math and history separately, not just one average |
+| recall@k | share of the right passages that appear in the top k | you needed 2 books; the librarian's 5 included both → 1.0 |
+| precision@k | share of the top k that are right | 2 of the 5 books handed to you were useful → 0.4 |
+| MRR | how high the first right result is, on average | how far down the search page you scroll before a useful link |
+| nDCG | ranking score that rewards very good results placed near the top | a playlist score: best songs first get the most credit |
+| Faithfulness | share of the answer's claims backed by the retrieved text | a report where every sentence has a footnote that really says it |
+| Abstention | saying "I don't know" when the answer isn't there | a doctor saying "I need a test" instead of guessing |
+| LLM judge | a model used to grade answers | a teaching assistant grading exams, who also needs checking |
+| Cohen's κ | agreement between two graders, minus what luck would give | two referees agreeing on calls, counting only agreement beyond chance |
+| Paired comparison | both systems answer the same questions; compare question by question | two runners on the same track, same day |
+| Bootstrap CI | a range for the true difference, from resampling your questions | "the gain is between +4 and +17 points" instead of "+10" |
+| Pooling bias | only results the old system found are labeled, so a new system's finds count as wrong | grading a new student with an answer key made from the old student's answers |
+| Gate | a CI check that blocks a change when quality drops | a smoke alarm that stops the release |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `q` | one test question (query) | — | "How many vacation days carry over?" |
+| `k` | how many top results you score | 1 – 50 | recall@5 → `k = 5` |
+| `R_q` (`relevant`) | the set of passages that really answer `q` | 1 – 5 items | {D3, D7} |
+| `d_1 … d_k` (`ranked`) | the ranked list the system returned | — | D5, D3, D9, D7, D2 |
+| `i` | a position in the ranked list (1 = top) | 1 – k | D3 is at `i = 2` |
+| `g(d)`, `grade` | graded relevance of a passage for a question | 0 – 3 | 3 = fully answers, 0 = irrelevant |
+| recall@k | right passages found in top k ÷ all right passages | 0.5 – 0.95 | 2 of 2 → 1.0 |
+| precision@k | right passages in top k ÷ k | 0.1 – 0.6 | 2 of 5 → 0.4 |
+| success@k | 1 if at least one right passage is in the top k, else 0 | 0 or 1 per query | D3 in top 5 → 1 |
+| RR, MRR | 1 ÷ position of the first right passage; MRR = average over questions | 0.3 – 0.9 | ranks 1, 2 and "none" → (1 + 0.5 + 0) / 3 = 0.5 |
+| AP, MAP | average of precision at each position where a right passage appears; MAP = mean over questions | 0.3 – 0.9 | hits at 2 and 4 → (1/2 + 2/4) / 2 = 0.5 |
+| DCG, IDCG, nDCG@k | score of this ranking; score of the perfect ranking; their ratio | nDCG 0.5 – 0.9 | 6.71 / 9.39 = 0.71 |
+| `2^g − 1`, `log2(i+1)` | gain of a grade; discount for position `i` | — | grade 3 → gain 7; position 2 → divide by 1.58 |
+| bpref | ranking score that ignores unlabeled results | 0 – 1 | used when many results have no label (§3.6) |
+| `judged@k` | share of the top k that has a label | aim ≥ 0.8 | 9 of 10 labeled → 0.9 |
+| `t_e`, `t_r` | tokens in the answer quotes; tokens in the retrieved chunks | — | 40 answer tokens, 2,000 retrieved |
+| token recall, precision, IoU | overlap of `t_e` and `t_r` ÷ `t_e`, ÷ `t_r`, ÷ both combined | recall 0.85–0.92; precision 0.01–0.08 | 40 of 40 found in 2,000 → recall 1.0, precision 0.02 |
+| `Precision_Ω` | best possible token precision for a chunking | 0.05 – 0.35 | small chunks waste fewer tokens |
+| `branch_depth`, `fusion_depth`, `final_k` | results per search branch; results sent to the reranker; results put in the prompt | 100; 50; 10 | recall@`fusion_depth` is the ceiling |
+| `n` | number of questions in the eval | 50 – 1,000 | 200 HR questions |
+| `σ_d` (sigma d) | spread of the per-question difference between two systems | 0.15 – 0.5 | most questions tie, a few flip → small `σ_d` |
+| `α` (alpha) | accepted false-alarm rate for a test | 0.05 | "5% chance of calling noise a win" |
+| power | chance of detecting a real effect of a given size | 0.80 | 80% |
+| `z_a`, `z_b` | normal-distribution constants for α = 0.05 (two-sided) and 80% power | 1.96, 0.84 | used in the MDE formula |
+| MDE | minimum detectable effect: the smallest gain your `n` can reliably see | 0.03 – 0.15 | `n = 60`, `σ_d = 0.25` → 0.09 |
+| `delta` (Δ) | average per-question difference, new minus old | ±0.01 – 0.10 | +0.10 |
+| `n_boot` | number of bootstrap resamples | 10,000 | — |
+| CI95 | 95% confidence interval for Δ | — | [+0.04, +0.17] → real gain |
+| `p` | p-value: chance of a gain this big if there were no real difference | < 0.05 = significant | — |
+| wins / losses / ties | questions where new is better / worse / equal | — | 34 / 14 / 152 |
+| `p_o`, `p_e`, `κ` | observed agreement; agreement expected by chance; `κ = (p_o − p_e) / (1 − p_e)` | κ ≥ 0.7 target | 0.80 and 0.58 → κ = 0.52 |
+| Krippendorff's `α` | agreement for 3+ graders or ordered grades (not the test `α` above) | ≥ 0.67 | — |
+| `m` | number of comparisons in a sweep | 5 – 20 | 10 chunk sizes → Bonferroni α = 0.05 / 10 = 0.005 |
+| faithfulness | supported claims ÷ all claims in the answer | 0.8 – 0.98 | 4 / 5 = 0.8 |
+| tp, fp, fn, tn | true/false positives and negatives of a classifier (abstention, judge) | — | fn = the bot invented an answer |
+| abstention recall / precision, over-refusal | declined-when-should ÷ should-decline; declined-when-should ÷ all declines; declined answerable ÷ answerable | recall ≥ 0.8; over-refusal ≤ 0.05 | 9 / 30 = 0.30 |
+| pass@1, `pass^k` | average single-try pass rate; share of items that pass all `k` repeats | — | 3 repeats, all pass → counts for `pass^3` |
+| ANN recall@k, `efSearch` | index result vs exact search; the HNSW search-width knob | 0.95 – 0.999; 40 – 400 | tune `efSearch` until ANN recall ≈ 0.99 |
+| p50 / p95 / p99 | latency that 50% / 95% / 99% of requests beat | ms | p95 = 300 ms |
+| NED, CER, TEDS, CDM | parser scores for text, characters, tables, formulas | 0 – 1 | table TEDS 0.4 = structure badly broken |
+| Kendall's `τ` (tau) | how well two orderings agree (reading order) | −1 to 1 | 1 = same order |
+| `price_in`, `price_out` | $ per million input / output tokens | $1 – $25 | Opus 5: $5 / $25 |
+| `cache_hit_frac`, `cached_frac_of_input` | share of requests hitting the cache; share of input that is the cached rubric | 0.99; 0.78 | 1,400 of 1,800 tokens = 0.78 |
+| `min_meaningful` | smallest drop worth failing the build for | 0.02 | recall@10 down 0.03 → FAIL if the CI is below 0 |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. What an eval is, and the two questions it answers
+
+> **In plain words.** An eval is a fixed list of questions, the system being tested, and a script that scores each answer. You use it to answer one of two questions: "is version B better than version A?" or "is this good enough to ship?". The first needs a small, hard set run often; the second needs a big, realistic set run rarely.
+>
+> **Real-world example.** A support bot team keeps 80 hard questions (typos, product codes, questions with no answer) that run on every pull request in 10 minutes, and 1,000 questions sampled from real traffic that run once before each release.
 
 An **eval** is: a fixed set of inputs, a system under test, and grading logic that turns each output
 into a score. That is the whole definition. Everything difficult about evaluation is downstream of
@@ -116,6 +237,10 @@ Everything in §13 exists to make that second sentence writable.
 
 ## 2. The measurement map — every stage, its metric, its label
 
+> **In plain words.** Each stage of the pipeline (parse, chunk, embed, index, retrieve, rerank, generate) needs its own score, and the score must be one that stage can actually change. The answer key must also not depend on the stage you are changing.
+>
+> **Real-world example.** Testing a reranker with recall@50 is pointless: the reranker only reorders the same 50 passages, so recall@50 stays at, say, 0.88 whatever it does. Score it with nDCG@10 or recall@10 instead, where it can move 0.61 → 0.70.
+
 This is the spine of the chapter. Each row is a stage; each stage gets a metric it *controls*, and a
 label type that is *invariant* to the thing being changed at that stage (§3.1 explains why that
 second column is load-bearing).
@@ -146,6 +271,10 @@ invalidated by construction and the comparison is meaningless. §3.1.
 ---
 
 ## 3. Labels: the golden set is the load-bearing artifact
+
+> **In plain words.** The golden set (questions plus their correct answers) is the most expensive and most important part of evaluation. Store answers as exact quotes from the source documents, cover every kind of question separately, include questions with no answer, and check that the people labeling agree with each other.
+>
+> **Real-world example.** A legal-search team labels 240 questions with the exact contract clauses that answer them, split into 7 groups (exact clause numbers, paraphrases, multi-document, tables, unanswerable…). Two lawyers label the same 50 first; they agree well (κ = 0.78) only after fixing the rubric twice.
 
 Everything else in this chapter is arithmetic over labels. The labels are the expensive part, the
 part that rots, and the part that decides whether any of the arithmetic means anything.
@@ -235,7 +364,7 @@ for sd in (0.15, 0.25, 0.40):
 ```
 
 Read that output as the design constraint it is. **A 60-query set cannot resolve a 3-point recall
-difference.** It can resolve a 9-to-14-point difference, which is fine — early in a project, changes
+difference.** It can resolve a 5-to-15-point difference (depending on `σ_d`), which is fine — early in a project, changes
 *are* that big, and Anthropic's guidance to start with 20–50 tasks is right for exactly this reason:
 "in early agent development, each change to the system often has a clear, noticeable impact, and this
 large effect size means small sample sizes suffice." Later, when you're chasing 2-point gains, the
@@ -370,8 +499,8 @@ def cohens_kappa(a: list[int], b: list[int]) -> float:
 ```
 
 Rough reading (Landis & Koch, and treat it as rough — κ is sensitive to class balance):
-`<0.20` poor, `0.21–0.40` fair, `0.41–0.60` moderate, `0.61–0.80` substantial, `>0.80` almost
-perfect. **Target ≥0.7 on binary relevance and ≥0.6 on 4-grade relevance before you scale
+`<0` poor, `0.00–0.20` slight, `0.21–0.40` fair, `0.41–0.60` moderate, `0.61–0.80` substantial,
+`0.81–1.00` almost perfect. **Target ≥0.7 on binary relevance and ≥0.6 on 4-grade relevance before you scale
 labeling.** Below that you are paying to add noise.
 
 The protocol that actually gets you there:
@@ -427,6 +556,10 @@ Three rot mechanisms to defend against explicitly:
 ---
 
 ## 4. Evaluating parsing — the stage nobody measures
+
+> **In plain words.** If the parser (the step that turns PDFs and web pages into text) loses a sentence or a table, nothing later can find it. Check directly: for each answer quote in your golden set, is it present in the parsed text at all?
+>
+> **Real-world example.** An insurance bot's golden answers are found in the parsed text 99% of the time for normal paragraphs but only 55% of the time for tables. So 45% of table questions can never be answered, however good the search is.
 
 `02` §3 states the claim: parsing sets the ceiling. This section is how you put a number on the
 ceiling. It is the most-skipped evaluation in RAG and the one with the largest silent losses,
@@ -603,6 +736,10 @@ Normalization has no ground truth; it has *invariants*. Test them as properties:
 
 ## 5. Evaluating chunking
 
+> **In plain words.** Compare chunking methods by giving each the same number of tokens in the prompt, not the same number of chunks, or bigger chunks win just by showing the model more text. Also measure how many of the tokens you send are actually useful.
+>
+> **Real-world example.** At k = 5, 800-token chunks send 4,000 tokens and 200-token chunks send 1,000. Compare both at a 2,000-token budget instead. In Chroma's study, recall differed by only ~6 points across methods, but useful-token share (Precision_Ω) varied about 7× (4.7% to 34%).
+
 `02` §11 owns the chunking-specific reasoning. This section owns the metric definitions it defers
 here, plus the measurement protocol.
 
@@ -723,6 +860,10 @@ Report all of this, per configuration, or you're arguing from one number:
 
 ## 6. Evaluating embeddings
 
+> **In plain words.** To compare embedding models, change only the model. Keep chunking, index settings and the question set exactly the same. Public leaderboards (MTEB) help you pick a shortlist, not the winner.
+>
+> **Real-world example.** A team compares a 512-token model and an 8,192-token model on 1,000-token chunks. The first model silently cuts off half of every chunk, so the comparison measures cut-off text, not model quality. Re-run with chunks that fit both models.
+
 `01` owns model selection. This section owns the measurement protocol, which has one rule that
 subsumes the rest.
 
@@ -796,6 +937,10 @@ a monitor, not from a recall regression three weeks later.
 
 ## 7. Evaluating the index — and the two different things called "recall"
 
+> **In plain words.** "Recall" means two different things here. **Index (ANN) recall**: how many of the true nearest vectors the fast index found, compared with a slow exact search. **Retrieval recall**: how many of the passages humans marked as correct were found. Tune the index until its recall is about 0.99, then stop worrying about it.
+>
+> **Real-world example.** An index with 0.99 ANN recall inside a pipeline with retrieval recall 0.72 costs at most about 1 point. Spending a week to push ANN recall to 0.999 cannot fix the other 27 missing points.
+
 This section exists because of a naming collision that causes real confusion in real design reviews.
 
 ### 7.1 The two recalls
@@ -867,6 +1012,10 @@ which is a spectacular trade you would have rejected on the first column alone.
 
 ## 8. Evaluating retrieval: the metric zoo, with formulas
 
+> **In plain words.** Different scores answer different questions. recall@k: did the right passages make the top k? precision@k: how much of the top k is useful? MRR: how high is the first right one? nDCG: are the best passages near the top? Pick the one that matches what the stage does.
+>
+> **Real-world example.** Right passages {D3, D7}; returned D5, D3, D9, D7, D2. recall@5 = 1.0, precision@5 = 0.4, reciprocal rank = 0.5, and with grades D3 = 3, D7 = 2, D5 = 1, nDCG@5 = 6.71 / 9.39 = 0.71.
+
 ### 8.1 The formulas, stated once
 
 Notation: for query `q`, `R_q` is the set of relevant items (or a grade function `g(d) ∈ {0,1,2,3}`),
@@ -937,8 +1086,8 @@ def ndcg_at_k(ranked, grade, k: int) -> float:
 | **nDCG@k** | Order + grades + position discount | Nothing much — it's the general case | Rerankers; final-stage ranking; anything user-facing |
 
 nDCG correlates better with end-to-end RAG quality than binary metrics do, and it's the one to
-report if you report one — but only if you have graded labels. **nDCG computed over binary labels is
-just a fancy MAP**, and paying its complexity cost without graded labels is a common waste.
+report if you report one — but only if you have graded labels. **nDCG computed over binary labels adds
+little over MAP** (it keeps the position discount but has no grades to weight), and paying its complexity cost without graded labels is a common waste.
 
 ### 8.3 The three depths, again
 
@@ -981,6 +1130,10 @@ the comparison measures your attention allocation.
 ---
 
 ## 9. Evaluating the reranker
+
+> **In plain words.** A reranker takes, say, 50 candidates and picks the best 10. It cannot add a passage that wasn't in the 50. So measure it at the top 10 (recall@10, nDCG@10), and look at which questions it rescued and which it broke.
+>
+> **Real-world example.** With 50 candidates in and 10 out, a reranker might rescue 12% of questions (right passage moved into the top 10), break 3% (pushed it out), keep 55% and miss 30% (the right passage was never in the 50).
 
 ### 9.1 What a reranker can and cannot change
 
@@ -1049,6 +1202,10 @@ less latency.
 ---
 
 ## 10. Evaluating generation
+
+> **In plain words.** The final answer can fail in four separate ways: it says things the sources don't support, it doesn't answer the question, it's simply wrong, or it answers when it should have said "I don't know". Each needs its own score.
+>
+> **Real-world example.** A bank bot's answer makes 5 claims and 4 are in the retrieved text: faithfulness 0.8. On 40 questions with no answer in the documents, it declines only 9 times: abstention recall 9/40 = 0.225, so it invents an answer 78% of the time.
 
 Retrieval metrics stop at "the right passage was in the prompt." Everything after that is this
 section. There are four distinct output failure modes and they need four distinct metrics — a single
@@ -1217,6 +1374,10 @@ suppress**:
 
 ## 11. LLM-as-judge, treated as the classifier it is
 
+> **In plain words.** Using an LLM to grade answers is fine, but the grader itself must be tested against human grades first. Check how often it catches bad answers, not just overall accuracy, and keep the judge model and rubric fixed.
+>
+> **Real-world example.** On 100 answers, 12 are bad according to humans. A judge that says "pass" to everything is 88% accurate and completely useless: it catches 0 of 12 bad answers, and κ = 0.
+
 An LLM judge is a classifier you deployed without measuring. Everything in this section follows from
 taking that sentence literally.
 
@@ -1345,7 +1506,8 @@ Three things in that snippet are the actual engineering:
 
 1. **The rubric is the cached prefix, the item is the suffix.** Prompt caching is a prefix match, so
    the frozen rubric caches across every item in the run and cache reads cost roughly 0.1× of input.
-   Over a 5,000-item eval this is the difference between a $40 run and a $12 one. Watch the minimum
+   On §11.7's 5,000-item Opus 5 example, caching alone takes a synchronous run from ~$64 to ~$33
+   (add the Batch API and it is ~$16). Watch the minimum
    cacheable prefix — it's **512 tokens on Opus 5**, 1024 on Sonnet 5, and **4096 on Haiku 4.5**, so
    a short rubric silently won't cache on the cheap judge, which is exactly the case where you
    expected the savings.
@@ -1376,7 +1538,7 @@ re-check before quoting):
 | Model | Input | Output |
 |---|---|---|
 | Claude Opus 5 | $5.00 | $25.00 |
-| Claude Sonnet 5 | $3.00 | $15.00 |
+| Claude Sonnet 5 | $2.00 | $10.00 |
 | Claude Haiku 4.5 | $1.00 | $5.00 |
 
 Three multipliers stack on top, and together they're worth an order of magnitude:
@@ -1418,6 +1580,10 @@ usually believe evals are expensive because they measured the un-optimized versi
 ---
 
 ## 12. Agentic and multi-hop evaluation
+
+> **In plain words.** An agent takes many steps (search, call tools, search again). Grade mainly the final result, such as "was the ticket really resolved?", and record the steps to help with debugging. Start every test run from a clean environment.
+>
+> **Real-world example.** A cheap agent costs $0.10 per run but succeeds 60% of the time; a costlier one costs $0.30 and succeeds 95%. If each failure needs a $5 human fix, cost per resolved task is (0.10 + 0.4 × 5) / 0.6 = $3.50 vs (0.30 + 0.05 × 5) / 0.95 ≈ $0.58.
 
 `14-agent-evaluation.md` goes deep. This section establishes what carries over from the single-shot
 case and what genuinely changes.
@@ -1486,6 +1652,10 @@ first month by catching a broken grader.
 ---
 
 ## 13. Statistics — making a delta mean something
+
+> **In plain words.** Run both systems on the same questions and compare question by question. Then compute a range (confidence interval) for the difference. If the range includes zero, you haven't shown an improvement yet.
+>
+> **Real-world example.** On 200 questions the new version wins 34, loses 14, ties 152: +0.10, interval about [+0.04, +0.17], a real gain. With 30 wins and 18 losses: +0.06, interval about [−0.01, +0.13], not proven yet.
 
 The whole point of this section is to be able to write the sentence in §1.2.
 
@@ -1585,6 +1755,10 @@ and retire saturated strata to a fast smoke tier while building harder replaceme
 ---
 
 ## 14. From metrics to gates
+
+> **In plain words.** Put the eval in CI in three sizes: a 2-minute smoke test on every commit, a 10–30 minute regression test on every change to prompts or config, and a long run nightly and before release. Fail the build only on drops that are both real and big enough to matter.
+>
+> **Real-world example.** recall@10 drops by 0.03 with interval [−0.05, −0.01]: the whole interval is below zero and the drop exceeds 0.02, so the build fails. A drop of 0.01 with the same kind of interval only warns.
 
 `09` owns the pipeline. This section owns the policy: what to gate on, and at what threshold.
 
@@ -1690,6 +1864,10 @@ the spans for that exact request (`10`). Without it, every eval failure investig
 
 ## 15. Online evaluation and the label flywheel
 
+> **In plain words.** Offline scores predict; real users confirm. Watch signals from production (people rephrasing a question within a minute, thumbs-down, escalations to a human), and turn the failed questions into new golden-set entries.
+>
+> **Real-world example.** A support bot sees 3% of questions rephrased within 60 seconds. The team labels 50 of those each month and adds them to the golden set, so the set keeps covering the questions users actually fail on.
+
 ### 15.1 The offline–online gap is a measurement, not a mystery
 
 Your offline set says +4 points; production says users are unhappier. Both can be true, and the
@@ -1747,6 +1925,10 @@ differs from 2026-Q1 items — which is drift detection for free.
 ---
 
 ## 16. Cost model for the eval layer itself
+
+> **In plain words.** Running evals costs money: LLM judge calls, compute, and human labeling time. Batch API, caching the fixed rubric, and deterministic checks first can make the same eval about 4–10× cheaper.
+>
+> **Real-world example.** Judging 5,000 claims with Opus 5 costs about $64 per run synchronously and about $16 with the Batch API plus a cached rubric. A monthly budget of ~$3,150 (compute plus 6 hours of labeling) is cheaper than one bad release.
 
 The eval layer has a budget and it competes with the thing it measures. Make it explicit, or it gets
 cut in the first cost review.
@@ -1962,6 +2144,299 @@ scheme.
 explain any cache miss you saw.
 *Time:* ~4 hours.
 *Unblocks:* §16; makes the release tier affordable enough to actually run.
+
+---
+
+## 20. Interview questions and system design prompts
+
+> **In plain words.** Interviewers want to see that you can tell a real improvement from noise. For each answer: say what you would measure, on which questions, compared with what, and how you would know the difference is real. Give one number whenever you can.
+>
+> **Real-world example.** "How would you know the new reranker helps?" → "Run old and new on the same 200 labeled questions, compare nDCG@10 question by question, and report the gain with a bootstrap interval, for example +0.08, 95% CI [+0.04, +0.12], with the reranker getting 50 candidates, not 10."
+
+Each question names the sections it draws from and gives the answer structure an interviewer is
+listening for, not just the facts.
+
+### 20.1 Conceptual questions — "explain X"
+
+**Q: Define recall@k, precision@k, MRR and nDCG. When would you use each?**
+*Sections: §8.1, §8.2*
+recall@k = right items in the top k ÷ all right items; precision@k = right items in the top k ÷ k;
+MRR = mean over questions of 1 ÷ rank of the first right item; nDCG@k = DCG ÷ ideal DCG, with
+DCG = Σ (2^g − 1) / log2(i + 1). Work one example out loud: right = {D3, D7}, returned D5, D3, D9,
+D7, D2 → recall@5 = 1.0, precision@5 = 0.4, RR = 0.5, nDCG@5 = 0.71 with grades 3/2/1. Then map
+them to stages: recall for candidate generation (a reranker follows), MRR for single-answer QA,
+nDCG for rerankers and anything ordered. Strong candidates add that nDCG needs graded labels to be
+worth its cost, and that the linear and exponential gain variants give different numbers.
+
+**Q: Why can't a reranker improve recall@fusion_depth? What should you measure instead?**
+*Sections: §2, §9.1*
+It reorders a fixed candidate set, so the set of items in the top `fusion_depth` is unchanged by
+construction. Measure recall@`final_k`, nDCG@`final_k` and MRR@`final_k` at a stated
+`fusion_depth`. The classic mistake: `fusion_depth = final_k`, where the reranker cannot change
+recall@`final_k` either, and the team concludes "reranking doesn't help".
+
+**Q: Why must golden-set labels be character spans rather than chunk IDs?**
+*Section: §3.1*
+Chunk IDs are produced by the chunker. Change the chunker and every label points at a chunk that no
+longer exists, so the comparison you most want to run is the one the labels forbid. Spans
+(`doc_id, start, end`) or exact quotes belong to the source document and survive any chunking,
+embedding or index change. Chunk-level labels are then derived at eval time.
+
+**Q: How many questions does an eval set need?**
+*Section: §3.3*
+It depends on the smallest effect you need to see. For a paired comparison,
+MDE ≈ (1.96 + 0.84) × σ_d / √n. With σ_d = 0.25: n = 60 detects ~0.09, n = 250 detects ~0.044, and
+a 0.03 effect needs ~546 questions. Start with 50–60 real failures while changes are big; measure
+σ_d from your first comparisons; grow the set in the strata where the variance lives.
+
+**Q: What is Cohen's κ, and why not just report percent agreement?**
+*Sections: §3.7, §11.1*
+κ = (p_o − p_e) / (1 − p_e): observed agreement corrected for agreement expected by chance. Example:
+two annotators agree on 80 of 100 items (60 both "yes", 20 both "no"), and each says "yes" 70% of
+the time. p_e = 0.7 × 0.7 + 0.3 × 0.3 = 0.58, so κ = (0.80 − 0.58) / 0.42 ≈ 0.52: only moderate,
+despite 80% agreement. Targets: ≥ 0.7 on binary labels before scaling labeling or letting a judge
+gate anything.
+
+**Q: How do you measure faithfulness, and what does it miss?**
+*Section: §10.2*
+Split the answer into atomic claims; check each against the retrieved context;
+faithfulness = supported ÷ total (4 of 5 → 0.8). It measures support by the context, not truth: an
+answer faithful to an outdated policy scores 1.0. Pair it with answer correctness against references
+and with abstention metrics on unanswerable questions. Pin the decomposition prompt and model,
+because they change the claim count.
+
+**Q: Why a paired bootstrap rather than comparing two means?**
+*Sections: §13.1, §13.2*
+Question difficulty is the biggest source of variance, and pairing (same questions, per-question
+differences) removes it. The bootstrap resamples the per-question differences 10,000 times and
+takes the 2.5th and 97.5th percentiles, which gives an interval without assuming a normal
+distribution. Smucker, Allan & Carterette (CIKM 2007) found bootstrap, permutation and paired t-test
+agree closely on IR data, while Wilcoxon and sign tests behave poorly. Always report wins / losses /
+ties too.
+
+**Q: How do you validate an LLM judge?**
+*Sections: §11.1, §11.2*
+Treat it as a classifier. Label 100–200 items by hand, including hard cases; compute κ and
+per-class precision/recall, especially recall on the "fail" class. Fix the rubric, not the model,
+until κ ≥ 0.7. Swap positions in pairwise judging; use a judge from a different model family than
+the generator; pin the judge model and rubric version; keep 5–10% human review forever.
+
+### 20.2 System design round
+
+**Q: Design the evaluation program for a new RAG support assistant that launches in six weeks.**
+
+A structured answer:
+
+1. **Golden set.** 60 questions from real support tickets in week 1, labeled as spans plus graded
+   relevance on a subset; include an unanswerable stratum (~15%) and strata for exact product codes,
+   paraphrases, tables and multi-step questions. Two annotators on the first 50; κ ≥ 0.7 before
+   splitting work.
+2. **Per-stage metrics.** Answer-span survival for the parser; recall@`fusion_depth` for retrieval;
+   nDCG@10 for the reranker; faithfulness, correctness, citation validity and abstention for
+   generation.
+3. **Oracle-context run** (§8.4) to find out whether retrieval or generation is the bottleneck
+   before tuning either.
+4. **Judge.** Calibrate on 120 human-labeled answers; gate only after κ ≥ 0.7 and fail-class
+   recall ≥ 0.8.
+5. **Statistics and gates.** Paired bootstrap; a minimum meaningful effect agreed with product
+   (e.g. 0.02 recall@10); three CI tiers (smoke on commit, regression on prompt/config PRs, nightly).
+6. **Online.** Rephrase rate, escalation rate, empty-retrieval rate, judge on a 1–5% sample; failed
+   queries go back into the golden set.
+7. **Cost.** Batch API and a cached rubric for nightly runs; print the cost of every run.
+
+*What interviewers listen for:* spans not chunk IDs; the unanswerable stratum; a validated judge;
+paired comparisons with intervals; the oracle ablation; cost as a design input.
+
+**Q: Your team changes prompts and retrieval config several times a day. Design a CI gate that
+catches regressions without flaking.**
+
+1. Trigger the regression tier on prompt files, few-shot examples, retrieval config, model IDs,
+   chunker and parser versions, not only code.
+2. Store one row per (run, question, metric, trial) with dataset version, config hash, judge model
+   and rubric hash (§14.4).
+3. Gate: FAIL only if the whole 95% interval of the paired difference is below zero **and** the
+   drop is ≥ the minimum meaningful effect; WARN if the drop is real but small; hard fail on schema
+   errors, invalid citations, cost or p95 latency over budget.
+4. Repeat generation 3 times per item because sampling can't be pinned on current models (§10.8).
+5. Test the gate: inject a known regression (halve `fusion_depth`) and check it fails; run the same
+   config 10 times and check zero false failures.
+
+*What interviewers listen for:* gating on the difference rather than an absolute threshold;
+significance plus effect size; testing the gate itself; config files as triggers.
+
+### 20.3 Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| ANN recall vs retrieval recall? | Index vs exact search, no labels; pipeline vs human labels | §7.1 |
+| Can a reranker raise recall@fusion_depth? | No, it only reorders the same set | §9.1 |
+| nDCG gain formula? | `(2^g − 1) / log2(i + 1)`, divided by the ideal DCG; say which variant you use | §8.1 |
+| MRR for first hits at ranks 1, 2 and none? | (1 + 0.5 + 0) / 3 = 0.5 | §8.1 |
+| Why compare chunkers at a fixed token budget? | At fixed k, bigger chunks get more context and win unfairly | §5.1 |
+| What is pooling bias? | Unlabeled results count as wrong, so new systems are penalized for new finds | §3.6 |
+| Chance of a false win across 10 tests at α = 0.05? | 1 − 0.95^10 ≈ 0.40 | §13.3 |
+| κ target before trusting labels or a judge? | ≥ 0.7 (binary), ≥ 0.6 on 4-grade | §3.7, §11.1 |
+| Which errors does abstention measure? | Invented answers to unanswerable questions, and refusals of answerable ones | §10.5 |
+| Can you set `temperature=0` on current Claude models? | No, sampling parameters return a 400; repeat runs and measure variance | §10.8 |
+| Cheapest single experiment in RAG eval? | Oracle context: feed the right passages directly | §8.4 |
+| Why a judge from another model family? | Self-preference bias | §11.2 |
+
+### 20.4 Debugging prompts — "here are the symptoms, diagnose"
+
+**Symptoms:** Re-chunking from 800 to 400 tokens drops recall@5 from 0.81 to 0.42 overnight.
+
+**Diagnosis:** Labels are stored as chunk IDs, and most of them now point to chunks that no longer
+exist. Also check that the comparison uses a fixed token budget. Fix: span labels, re-derive
+chunk labels, re-run at a fixed budget (§3.1, §5.1).
+
+**Symptoms:** The faithfulness dashboard jumps from 0.81 to 0.89 on a day with no deploy.
+
+**Diagnosis:** The judge model or rubric changed. Re-score an archive of old outputs with both
+judges and publish the offset before comparing (§11.6).
+
+**Symptoms:** Offline recall@10 is up 4 points, but users rephrase more often.
+
+**Diagnosis:** Offline–online gap: the golden set doesn't match traffic, answers got longer, or
+latency rose. Compare strata with production mix; check answer length and p95 (§15.1).
+
+**Symptoms:** A new reranker shows "no improvement" on recall@10.
+
+**Diagnosis:** Check `fusion_depth`; if it equals `final_k`, the reranker can't change recall@10.
+Also check that the labels are graded; binary labels can't see ordering gains (§9.1, §9.3).
+
+**Symptoms:** A +0.06 gain on 60 questions disappears in the next run.
+
+**Diagnosis:** The set is too small: at σ_d ≈ 0.48 the MDE at n = 60 is ~0.17. Report the CI and
+grow the set (§3.3, §13.2).
+
+### 20.5 Common mistakes
+
+- Reporting a mean with no interval and no wins / losses / ties.
+- Testing a reranker with a metric it can't move.
+- Chunk-ID labels; comparing chunkers at fixed k.
+- An LLM judge nobody compared with human labels; reporting only its accuracy.
+- No unanswerable questions in the eval.
+- Sweeping ten settings and calling the best one "significant".
+- Labeling only what the current system returns (pooling bias).
+- Changing the judge model without re-scoring old results.
+
+---
+
+## 21. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a common way evaluation goes wrong: what the team saw, why, the numbers, and the fix.
+>
+> **Real-world example.** Quick index: reranker "doesn't help" → Case 1; recall collapses after re-chunking → Case 2; judge passes bad answers → Case 3; a win that disappears → Case 4; bot invents answers → Case 5; table questions never answered → Case 6; dashboard jumps with no deploy → Case 7.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+### Case 1 — "The reranker doesn't help"
+
+**Setup.** Support assistant, hybrid retrieval, cross-encoder reranker. `fusion_depth = 10`,
+`final_k = 10`.
+
+**Symptom.** recall@10 is 0.74 with and without the reranker; the team plans to remove it.
+
+**Measurement/Diagnosis.** With 10 candidates in and 10 out, the reranker only reorders the same
+10 passages, so recall@10 cannot change (§9.1). recall@50 of the retriever is 0.88, so better
+passages exist just below the cut.
+
+**Fix.** `fusion_depth = 50`, graded labels on 200 questions. recall@10 after reranking: 0.74 →
+0.83; nDCG@10: 0.61 → 0.70; added p95 latency 90 ms. Movement breakdown: 12% rescued, 3% broke.
+
+**Lesson.** Measure a stage with a metric it can move, and always state `fusion_depth`.
+
+### Case 2 — Recall halves after re-chunking
+
+**Setup.** 240-question golden set labeled as chunk IDs from an 800-token chunker.
+
+**Symptom.** Switching to 400-token chunks drops recall@5 from 0.81 to 0.42.
+
+**Measurement/Diagnosis.** Only 118 of 240 labels (49%) still point to chunks that exist. The
+missing ones are counted as misses. Separately, k = 5 now means 2,000 tokens instead of 4,000.
+
+**Fix.** Convert labels to quotes and resolve them to spans; derive chunk labels per chunker;
+compare at a 2,000-token budget. Result: 0.80 (800-token) vs 0.84 (400-token) at the same budget.
+
+**Lesson.** Labels must not depend on the stage being changed (§3.1), and chunkers are compared at
+a fixed token budget (§5.1).
+
+### Case 3 — The judge that passes everything
+
+**Setup.** An LLM judge gates releases on answer quality; it was never compared with humans.
+
+**Symptom.** Weekly quality score stays at 0.88–0.90 while complaints rise.
+
+**Measurement/Diagnosis.** 100 human-labeled answers: humans fail 12. The judge fails 4, of which
+only 2 are real. Accuracy 0.88, but fail-class recall 2/12 = 0.17 and κ = 0.20.
+
+**Fix.** Rubric with one criterion per question, a worked example per grade, justification before
+verdict, and an "insufficient context" option. Re-test: the judge fails 13, 10 of them real.
+Fail-class recall 10/12 = 0.83, precision 10/13 = 0.77, accuracy 0.95, κ = 0.77.
+
+**Lesson.** Report per-class recall and κ, not accuracy (§11.1).
+
+### Case 4 — A win that disappears
+
+**Setup.** 60-question golden set; a new prompt is compared with the old one.
+
+**Symptom.** Week 1: +0.067 success@5 (9 wins, 5 losses, 46 ties). Week 2, same change: +0.00.
+
+**Measurement/Diagnosis.** Paired bootstrap on week 1 gives a 95% interval of about [−0.05, +0.18]:
+it always included zero. σ_d ≈ 0.48, so the MDE at n = 60 is ≈ 0.17.
+
+**Fix.** Report intervals in every comparison; grow the set to ~730 questions (the n needed to see
+a 0.05 effect at σ_d = 0.48), prioritizing the strata where results flip.
+
+**Lesson.** Compute the MDE before building the set, not after a surprising result (§3.3, §13.2).
+
+### Case 5 — The bot invents answers
+
+**Setup.** HR assistant; faithfulness 0.93 on a 200-question set where every question has an
+answer.
+
+**Symptom.** Employees report confident answers about policies that don't exist.
+
+**Measurement/Diagnosis.** 40 new unanswerable questions: the bot declines 9. Abstention recall
+9/40 = 0.225, so it invents an answer 31/40 = 78% of the time. The old set could not show this.
+
+**Fix.** A retrieval score floor plus an explicit "say you don't know" instruction. Abstention
+recall rises to 32/40 = 0.80; over-refusal on the 200 answerable questions rises from 2 (1%) to 8
+(4%). Product accepts that trade.
+
+**Lesson.** The unanswerable stratum is required, and both error types are reported (§3.4,
+§10.5).
+
+### Case 6 — Table questions never get answered
+
+**Setup.** Insurance documents; 240-question golden set, 28 of them answered by tables.
+
+**Symptom.** Tabular recall@10 is 0.50 after months of retrieval tuning.
+
+**Measurement/Diagnosis.** Answer-span survival: 99% of text spans (210 of 212) but only 15 of 28
+table spans (54%) exist in the parsed text. The best possible recall on the table stratum is 0.54,
+so the tuning was chasing a ceiling it could not pass. Overall ceiling: (210 + 15) / 240 = 0.94.
+
+**Fix.** Table-aware parser for those document types. Table spans surviving: 26/28 = 0.93;
+overall ceiling 236/240 = 0.98.
+
+**Lesson.** Measure the parser's ceiling first; it is an afternoon's work (§4.5).
+
+### Case 7 — The dashboard jumps with no deploy
+
+**Setup.** Faithfulness is tracked daily with an LLM judge.
+
+**Symptom.** The score moves from 0.81 to 0.89 on a day with no code or prompt change.
+
+**Measurement/Diagnosis.** The judge model was upgraded that day. Re-scoring 500 archived outputs:
+old judge 0.81, new judge 0.88, so +0.07 of the jump is the new judge and ~+0.01 is real.
+
+**Fix.** Pin judge model and rubric hash in every result row; on a judge change, re-score the
+archive and publish the offset before switching the dashboard.
+
+**Lesson.** The judge is part of the measuring instrument; changing it breaks the time series
+(§11.6, §14.3).
 
 ---
 
