@@ -35,6 +35,7 @@
 
 ## Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [How to use this appendix](#1-how-to-use-this-appendix)
 2. [What a RAG system actually is, deployment-wise](#2-what-a-rag-system-actually-is-deployment-wise)
 3. [The deployment ladder — Compose to Kubernetes](#3-the-deployment-ladder--compose-to-kubernetes)
@@ -50,10 +51,113 @@
 13. [Anti-patterns](#13-anti-patterns)
 14. [Mental models — the compressed set](#14-mental-models--the-compressed-set)
 15. [Cross-reference map](#15-cross-reference-map)
+16. [Interview questions and system design prompts](#16-interview-questions-and-system-design-prompts)
+17. [Real-world cases — incidents with numbers](#17-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** A RAG system is several different jobs glued together: reading and indexing
+documents (slow, bursty, batch), answering questions (fast, interactive), running AI models
+(expensive hardware), and storing the index (the one part that is hard to move or rebuild). If you
+run them all as one thing, a big indexing job slows every user's question, you buy GPUs you don't
+need, and the bill is dominated by hardware that sits idle. This appendix is about where each part
+runs, how much hardware it needs, and what it costs — with the formulas, so you can redo the math
+with your own numbers.
+
+**A real-world example.** A software company builds a support assistant over **2M pages** of
+manuals and old tickets. Peak traffic is **20 questions/second**. Answers come from a hosted LLM
+API; a reranker (a model that re-scores the top 50 search results) runs on their own GPUs.
+Numbers are illustrative but computed from this appendix's formulas.
+
+1. **Deployment tier (§3).** They start on one box with Docker Compose. That's fine: nothing yet
+   needs Kubernetes.
+2. **Shared pool (§2.1).** On day 3 they run the first full indexing job on the same GPUs that serve
+   the reranker. Question latency (p95) goes from 0.8 s to 40 s. Nothing is "down". Fix: a separate
+   batch pool for indexing. p95 returns to under 1 s.
+3. **Parser cost (§9.3).** Their first plan sends every page to a vision-model parser at $0.03/page:
+   **$60,000**. Routing instead — 80% simple text parser (under $1), 18% layout parser on CPU (~$4),
+   2% vision model (~$1,200) — costs **~$1,200**. Embedding all 1.2B tokens by API costs **$24**.
+4. **GPU count (§7.3).** The reranker reads 50 passages × 512 tokens = 25,600 tokens per question
+   ≈ 14 TFLOP. One L4 does ~3.9 questions/s. 20 ÷ 3.9 = 5.2 → 6 GPUs, × 1.3 headroom → **8 L4s**
+   ≈ **$4,088/month** if they run 24/7.
+5. **Idle cost (§9.5).** Traffic is busy 8 hours a day. Autoscaling on queue length (§5.3) instead
+   of a fixed fleet cuts the average from 8 GPUs to about 4 — roughly half the bill.
+6. **Self-host the LLM? (§9.4).** A 70B model on 2×H100 costs ~$4,380/month for GPUs alone, and
+   with FP16 weights the KV cache leaves room for about one long RAG prompt at a time (§7.2.1). They
+   keep the API.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Write path (ingest) | reading, parsing, chunking, embedding and storing documents | the kitchen's morning prep |
+| Read path (query) | answering a user's question live | serving diners during dinner |
+| Docker Compose | run several containers on one machine from one file | one well-organised food truck |
+| Kubernetes | run containers across many machines with scheduling and autoscaling | a restaurant chain with a central manager |
+| GPU / VRAM | the accelerator chip / its memory, which must hold the model and the KV cache | an oven and how many trays fit in it |
+| KV cache | memory the LLM keeps for every token of every active request | a waiter's notepad: one page per table, longer orders take more pages |
+| Prefill vs decode | reading the whole prompt vs writing the answer token by token | reading the full order vs cooking each dish |
+| Batch size / concurrency | how many requests a model serves at the same time | tables one waiter handles at once |
+| Autoscaling signal | the number that decides when to add or remove servers | calling in extra staff when the queue at the door grows, not when the ovens are warm |
+| Scale-to-zero / cold start | turn servers off when idle / the wait to start one again | closing the kitchen at night and the time to reheat the ovens |
+| Spot / preemptible | cheap machines the cloud can take back at short notice | standby airline tickets |
+| Orchestrator (Airflow, Dagster…) | runs pipeline steps on a schedule, with retries and history | a production schedule on the factory wall |
+| Content hash / idempotent | skip unchanged documents / running a step twice gives the same result | "already done" stamp on a form |
+| Index alias | a name that points to the current index, switched in one step | a "current menu" sign you swap overnight |
+| Utilization | share of paid-for capacity actually used | how full the delivery truck is on each trip |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| `params_B` | model size in billions of parameters | 0.3B (reranker) – 70B (generator) | Llama-3-70B → 70 |
+| `bytes_per_param` | bytes to store one weight | FP16 = 2, FP8/INT8 = 1, INT4 ≈ 0.5 | 70B × 2 = 140 GB |
+| `weights_GB` | GPU memory for the model weights | `params_B × bytes_per_param` | 70B at FP8 → 70 GB |
+| `n_layers`, `n_kv_heads`, `head_dim` | model shape values that set KV cache size | 80, 8, 128 for a 70B | from the model's config file |
+| `bytes_per_element` | bytes per KV cache number | FP16 = 2, FP8 = 1 | FP8 KV halves the cache |
+| `KV_per_token` | KV cache memory per token | `2 × n_layers × n_kv_heads × head_dim × bytes` | 327,680 B ≈ 0.33 MB for a 70B at FP16 |
+| `ctx_len` | tokens per request (prompt + answer) | 2k–8k for RAG | 4,000 in + 500 out |
+| `concurrency` / batch size | requests served at once on one replica | 8–64 | 32 requests × 8k × 0.33 MB ≈ 86 GB |
+| `KV_cache_GB` | total KV memory | `KV_per_token × ctx_len × concurrency / 1e9` | 0.33 MB × 2,048 × 8 ≈ 5.4 GB |
+| `overhead` | activations, CUDA graphs, fragmentation | 15–25% of weights + KV | — |
+| `gpu_memory_utilization` | vLLM: share of VRAM it may use | 0.9 (default) | 160 GB × 0.9 = 144 GB |
+| `max_model_len` | vLLM: longest request it accepts | set to what prompts need | 8,192 instead of 128k |
+| `peak_QPS` | busiest queries per second | 5–500 | 20 QPS |
+| p95 / p99 latency | 95% / 99% of requests are faster than this | seconds for RAG | p95 = 2 s |
+| `required_concurrency` | requests in flight at peak (Little's Law) | `peak_QPS × P95_latency_s` | 30 QPS × 4 s = 120 |
+| `concurrency_per_replica_at_SLO` | in-flight requests one replica handles before latency breaks the target | measured | 10 |
+| `headroom` | spare capacity for failures and scaling lag | 30–50% | × 1.3 |
+| `replicas` | copies of a service | `ceil(required / per_replica) × (1 + headroom)` | ceil(120/10) × 1.3 ≈ 16 |
+| `prefill_FLOPs` | compute to read the prompt | `2 × params × input_tokens` | 2 × 70e9 × 4,000 = 560 TFLOP |
+| TFLOPS (achieved) | compute the GPU really delivers per second | L4 ~55, H100 ~400 (FP16) | 560 / 800 ≈ 0.7 s on 2×H100 |
+| TTFT | time to first token | 0.3–3 s | ≥ 0.7 s prefill floor above |
+| ITL | inter-token latency, time between output tokens | 20–60 ms | — |
+| tokens/s | throughput of an embedding or LLM server | L4 + TEI: 8k–15k tok/s embedding | 3B tokens ÷ 10k tok/s ≈ 83 GPU-hours |
+| TP / PP | tensor / pipeline parallel: split one model over GPUs | TP = 2 for 70B on H100 | — |
+| `$/GPU-hr` | rental price per GPU per hour | L4 ~$0.70, H100 $1.50–$12 | 1 L4 × 730 h = $511/month |
+| 730 | hours in an average month | — | — |
+| 2.628e6 | seconds in an average month (730 × 3,600) | — | 1 QPS ≈ 2.6M queries/month |
+| `utilization` | share of paid capacity actually used | 15–85% | 9 QPS on 46 QPS of capacity ≈ 19% |
+| `$_in`, `$_out` | API price per million input / output tokens | $3 / $15 (frontier, illustrative) | 4,000 × 3/1e6 + 500 × 15/1e6 = $0.0195 |
+| `in_tok`, `out_tok` | tokens per query in / out | 4,000 / 500 | — |
+| `maxReplicaCount`, `listLength` | KEDA: max workers; backlog per worker | 40; 50 | 2,000 queued docs → 40 workers |
+| `terminationGracePeriodSeconds` | time a pod gets to finish work before being killed | 30 (default), 120+ for LLMs | — |
+| `num_requests_waiting` | vLLM queue length: the right scaling signal | 0 at rest | 30 waiting ⇒ add replicas |
+| `gpu_cache_usage_perc` | vLLM: share of KV cache in use | < 90% healthy | 98% ⇒ concurrency-capped |
+| recall@k | share of test questions whose right chunk is in the top `k` | 0.8–0.95 | used as the rollout gate (§12.3) |
+| OCU | OpenSearch Compute Unit (Bedrock default store) | 2 minimum | 2 × $0.24 × 730 ≈ $350/month |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
 ## 1. How to use this appendix
+
+> **In plain words.** This is a map. Read §2 first; then jump to the section that matches your
+> question.
+>
+> **Real-world example.** Your manager asks "how many GPUs do we need for 20 QPS?" Go to §7.2 for
+> the formula and §7.3 for three worked answers (0–2 L4s, ~16 L4s, and ~50–100 H100s plus 16 L4s).
 
 Read §2 always — it is the decomposition everything else depends on, and it is where most
 architectures go wrong. Then jump:
@@ -77,6 +181,14 @@ negotiated rates; the ordering of magnitudes will survive, the absolute values w
 
 ## 2. What a RAG system actually is, deployment-wise
 
+> **In plain words.** A RAG system is four jobs: indexing documents, answering questions, running
+> models, and storing the index. They grow for different reasons and need different machines. Keep
+> indexing and answering on separate hardware so one can't slow the other.
+>
+> **Real-world example.** A nightly job re-embeds 500k changed chunks on the same GPU that serves
+> the reranker. From 01:00 to 03:00, questions take 40 s instead of 0.8 s. On separate GPUs, the job
+> takes the same time and nobody notices.
+
 A RAG system is not one service. It is **four paths with four different scaling laws, four
 different failure modes, and four different hardware profiles**, which people deploy as one thing
 and then cannot operate.
@@ -90,8 +202,8 @@ and then cannot operate.
 
 ### 2.1 The one architectural rule
 
-**Never let the write path and the read path share a compute pool.** This is the most common
-production incident in RAG systems and it has one shape: a backfill starts, embedding jobs saturate
+**Never let the write path and the read path share a compute pool.** This is one of the most common
+production incidents in RAG systems and it has one shape: a backfill starts, embedding jobs saturate
 the workers or the GPU, and query latency goes from 800 ms to 40 s while nothing is technically
 "down." Every autoscaler reacts to the wrong signal because average utilization looks healthy.
 
@@ -125,6 +237,14 @@ not a deployment task.
 ---
 
 ## 3. The deployment ladder — Compose to Kubernetes
+
+> **In plain words.** Start simple: one machine, then managed cloud services, and Kubernetes only
+> when a specific need forces it (several teams sharing GPUs, parts that scale very differently, or
+> a highly available self-hosted index). If your company already runs Kubernetes, using it is cheap.
+>
+> **Real-world example.** An internal HR bot with 300k chunks and 2 QPS runs fine on one 16-core
+> box with Compose for ~$100–400/month. Moving it to Kubernetes would add a control plane, ingress
+> and certificates to run, with no gain in speed or reliability for users.
 
 The honest framing: these are **tiers on a ladder, and you climb it when a specific constraint
 binds — not on schedule and not on aesthetics.** Each rung below names the constraint that pushes
@@ -168,6 +288,14 @@ was already free.
 
 ## 4. Docker Compose in production
 
+> **In plain words.** One machine with Compose is a valid production setup if you add memory and
+> CPU limits, a real queue, backups of the index, health checks that run a real search, and logs
+> sent off the machine. Its limit is one machine: no GPU sharing rules and no zero-downtime upgrades.
+>
+> **Real-world example.** A parser opens a 400 MB scanned PDF and uses 30 GB of RAM. Without
+> `mem_limit`, the whole 64 GB box runs out of memory and search goes down. With `mem_limit: 4g`,
+> only that worker restarts and the PDF goes to the dead-letter queue.
+
 Compose in production is a legitimate, under-defended choice. It is also frequently done badly in
 ways that make people conclude it "doesn't scale" when what didn't scale was the configuration.
 
@@ -179,7 +307,7 @@ The RAG-specific delta:
 
 | Requirement | Why RAG specifically |
 |---|---|
-| **Hard `mem_limit` on ingestion workers** | A parser meeting a 400 MB scanned PDF will take the whole box down with it and kill your query path. This is the #1 Compose RAG outage. |
+| **Hard `mem_limit` on ingestion workers** | A parser meeting a 400 MB scanned PDF will take the whole box down with it and kill your query path. This is a classic Compose RAG outage. |
 | **`cpus` limits on parse workers** | Tier-2 parsers (§9.3) saturate every core they can see and starve the API process. |
 | **Separate worker service, `restart: unless-stopped`, bounded concurrency** | Ingestion is the thing that crashes. It must crash alone. |
 | **A real queue (Redis/RabbitMQ/Postgres `SKIP LOCKED`), not in-process threads** | Restarting the API must not lose in-flight ingestion. |
@@ -216,6 +344,14 @@ Past those, climb to Tier 2 (managed) before Tier 3 (Kubernetes). Managed Postgr
 ---
 
 ## 5. Kubernetes topology for RAG
+
+> **In plain words.** On Kubernetes, give each part the right object type and its own group of
+> machines: normal machines for the API, always-on GPUs for live models, cheap interruptible GPUs
+> for batch jobs. Scale on queue length, not CPU.
+>
+> **Real-world example.** A backlog of 2,000 documents with KEDA `listLength: 50` asks for 40
+> workers — exactly `maxReplicaCount`. If the vector DB accepts only 5k upserts/s, that cap stops
+> 200 workers from flooding it with timeouts and retries.
 
 Assume Tier 3. This section is the workload-by-workload mapping — the part a generic Kubernetes
 guide won't give you.
@@ -300,6 +436,14 @@ If you self-host Qdrant/Weaviate/Milvus:
 
 ## 6. The model-serving layer
 
+> **In plain words.** Serving tools come in layers: an engine that runs the model (vLLM, TEI), a
+> server around it, and an orchestrator that scales it (KServe). You usually use one of each. Turning
+> GPU servers fully off saves money but the first request after that waits minutes.
+>
+> **Real-world example.** A reranker scaled to zero overnight. At 08:00 the first user waits for a
+> new node (~2 min), the image pull (~1.5 min) and model loading (~30 s): about 4 minutes, so the
+> request times out. Keeping one replica on costs about $511/month for an L4.
+
 Three or four models are in a RAG system's hot path: embedding, reranking, generation, and
 sometimes a Tier-2/3 parser model. Each can be an API call or a served process, and mixing is
 normal and correct.
@@ -360,6 +504,14 @@ So the realistic answer:
 ---
 
 ## 7. GPU: what you need, how many, and how to schedule it
+
+> **In plain words.** Many RAG systems need no GPUs: use APIs for embedding and answers, and a CPU
+> or API reranker. If you do self-host, GPU memory must hold the model *and* the KV cache for every
+> active request, and RAG prompts are long, so the KV cache is often the limit.
+>
+> **Real-world example.** A 70B model at FP16 is 140 GB of weights. Each 8k-token RAG request
+> needs ~2.7 GB of KV cache. On 2×H100 (160 GB) that leaves room for about one request at a time
+> under vLLM's defaults. FP8 weights and FP8 KV cache raise that to roughly 47.
 
 This is the section people actually need and the one most guides skip in favor of listing GPU SKUs.
 
@@ -424,8 +576,12 @@ KV_per_token = 2 × 80 × 8 × 128 × 2 B = 327,680 B ≈ 0.33 MB/token
 | 8k tokens | 21 GB | 86 GB | 172 GB |
 | 32k tokens | 86 GB | 344 GB | 688 GB |
 
-With FP16 weights at 140 GB, a 2×H100 (160 GB) node has ~20 GB spare — **enough for concurrency 8
-at 2k context, and nothing else.** The fixes, in order of preference:
+(Table uses 2k = 2,048, 8k = 8,192, 32k = 32,768 tokens.)
+
+With FP16 weights at 140 GB, a 2×H100 (160 GB) node has ~20 GB spare on paper — about 7 concurrent
+8k-token requests before runtime overhead. In practice it is far less: vLLM reserves 90% of VRAM
+by default (`gpu_memory_utilization=0.9` ⇒ 144 GB), which leaves **~4 GB of KV — roughly one 8k
+request at a time.** The fixes, in order of preference:
 
 1. **FP8 weights** (70 GB) — frees 70 GB of KV headroom, minimal quality cost for most models. Measure it.
 2. **FP8/INT8 KV cache** — halves the table above. This is the highest-leverage knob for RAG.
@@ -491,9 +647,9 @@ self-hosted, it is the largest online GPU consumer in a typical RAG system.
 
 | Component | Calculation | Answer |
 |---|---|---|
-| Generator | 4k in / 500 out. Prefill 560 TFLOP/query ⇒ ~1.4 GPU-seconds/query on H100-class. 50 QPS × 1.4 = **70 GPU-seconds/second of prefill alone** | **~8–10× H100** for prefill, plus decode capacity and KV headroom ⇒ 2 nodes of 8×H100, TP=2 per replica |
+| Generator | 4k in / 500 out. Prefill 560 TFLOP/query ⇒ ~1.4 GPU-seconds/query on H100-class (at ~400 TFLOPS achieved FP16). 50 QPS × 1.4 = **70 GPU-seconds/second of prefill alone ⇒ ~70 H100s busy on prefill** | **~70× H100** for prefill at FP16 (~35× with FP8 compute), plus decode capacity and KV headroom ⇒ roughly 10–12 nodes of 8×H100 at FP16, or ~5–6 nodes with FP8; TP=2 per replica |
 | Reranker + embedding | as B | 16× L4 |
-| **Total** | | 16× H100 + 16× L4. This is a **$1M+/year** infrastructure decision — §9.4 exists to make sure it was made deliberately. |
+| **Total** | | ~48–96× H100 + 16× L4. At $3/GPU-hr that is **~$1.3M–2.5M/year** for the H100s alone — §9.4 exists to make sure it was made deliberately. |
 
 The gradient across A→B→C is the real lesson: **the generator is what makes RAG expensive, and it
 is the component you are least likely to need to self-host.**
@@ -514,14 +670,16 @@ Five distinct mechanisms, frequently conflated:
 
 | Mode | Isolation | Failure blast radius | Use for |
 |---|---|---|---|
-| **MIG** (A100/H100 only) | Hardware — separate memory and SM partitions | One slice | Multi-tenant; production online workloads sharing a big GPU. Up to 7 slices. |
+| **MIG** (A100/H100-class and newer; not L4/L40S) | Hardware — separate memory and SM partitions | One slice | Multi-tenant; production online workloads sharing a big GPU. Up to 7 slices. |
 | **Time-slicing** | None — context switching, shared memory | Whole GPU (one OOM kills all) | Dev/staging, bursty low-priority batch. Cheap and simple. |
 | **MPS** | Process-level, shared memory | **Whole GPU — a fatal CUDA error in one client kills the MPS server and every client** | Trusted, same-team, high-throughput concurrent inference |
 | **Whole GPU** | Total | Itself | Any latency-SLO online workload where you can fill the GPU |
 
 Hybrid (MIG slices, time-sliced within a slice) gives the best density and is what large clusters
 converge on. For a RAG system specifically: **MIG your online GPU pool so the reranker and the
-embedding server share hardware without sharing fate; time-slice your batch pool.**
+embedding server share hardware without sharing fate; time-slice your batch pool.** MIG needs a
+MIG-capable data-center GPU (A100, H100 and newer); L4, L40S and A10G do not support it, so on
+those pools use separate GPUs or time-slicing.
 
 Mechanics: NVIDIA GPU Operator, `nvidia.com/gpu.shared` resources, MIG manager. See
 [`../k8s-learn/gpu-platform-tasks.md`](../k8s-learn/gpu-platform-tasks.md).
@@ -613,6 +771,14 @@ Deep coverage exists: [`../gpu-observability/14-llm-inference-observability.md`]
 ---
 
 ## 8. Where pipelines get built
+
+> **In plain words.** "The pipeline" can mean four things: a one-time bulk load, a scheduled
+> update, a near-real-time stream, or the live answer path. Each needs a different tool. Make every
+> step skip unchanged documents and safe to re-run.
+>
+> **Real-world example.** A nightly job over 5M documents where 1% changed: with a content-hash
+> check it processes 50k documents in ~20 minutes; without it, it re-parses all 5M and takes about
+> 9 hours.
 
 ### 8.1 There are four things called "the pipeline"
 
@@ -726,6 +892,13 @@ choosing; most teams discover theirs is "an hour" and save themselves a Kafka cl
 
 ## 9. Compute cost
 
+> **In plain words.** The parser choice decides most of the indexing bill, and idle GPUs decide
+> most of the serving bill. Embedding is cheap. Self-hosting the LLM only pays off at large, steady
+> volume.
+>
+> **Real-world example.** For 1M pages: simple parsing costs under $1, layout parsing ~$11–25,
+> vision-model parsing $10,000–50,000. Embedding all 600M tokens costs ~$12 either way.
+
 ### 9.1 The four cost centers
 
 | Center | Nature | Scales with | Typical share |
@@ -752,8 +925,8 @@ Normalized to **per-GPU-hour**. Verify before quoting — these moved materially
 
 Three structural facts that outlive the numbers:
 
-1. **The spread on identical hardware is ~4×.** Same H100, $1.85 to $7.20+ depending on where you
-   rent it. Provider choice is a bigger cost lever than most engineering optimizations.
+1. **The spread on identical hardware is large.** Same H100, from ~$1.50 to over $12 per GPU-hour
+   in the table above (about 8×), depending on where you rent it. Provider choice is a bigger cost lever than most engineering optimizations.
 2. **Hyperscalers charge a 2–4× premium** over specialist clouds. You are paying for the rest of
    the platform (VPC, IAM, data locality, the compliance story). Sometimes worth it — decide
    deliberately.
@@ -768,7 +941,7 @@ L4 at $0.70/GPU-hour, throughputs from Appendix D §2.1 and the lab's measured p
 
 | Stage | Option | Rate | Compute | **Cost** |
 |---|---|---|---|---|
-| **Parse** | Tier 1 — PyMuPDF | ~0.5–10 ms/page | 0.15–28 CPU-hours | **$0.01 – $1** |
+| **Parse** | Tier 1 — PyMuPDF | ~0.5–10 ms/page | 0.14–2.8 CPU-hours | **< $0.15** |
 | | Tier 2 — Docling on CPU | ~1 page/s/core | 278 CPU-hours | **~$11** |
 | | Tier 2 — Docling on L4 | ~8 pages/s | 35 GPU-hours | **~$25** |
 | | Tier 3 — VLM API | $0.01–0.05/page | — | **$10,000 – $50,000** |
@@ -778,7 +951,8 @@ L4 at $0.70/GPU-hour, throughputs from Appendix D §2.1 and the lab's measured p
 | **Upsert + store** | pgvector, 1024-dim fp32, ~6M chunks | ~25 GB + index | monthly | **~$5–15/mo** |
 
 **The finding: parser tier moves total ingestion cost by three to four orders of magnitude, and
-everything else is rounding error.** Tier 1 → Tier 2 is $1 → $25. Tier 2 → Tier 3 is $25 → $25,000.
+everything else is rounding error.** Tier 1 → Tier 2 is under $1 → $11–25. Tier 2 → Tier 3 is
+$25 → $10,000–50,000.
 
 Three consequences:
 
@@ -789,8 +963,10 @@ Three consequences:
   layout-complex, Tier 3 **only** for the pages that fail a quality gate. A 2% Tier-3 routing rate
   turns $25,000 into $500 and keeps most of the accuracy. Build the router; it pays for itself on
   the first corpus.
-- **For Tier-2 parsing, CPU is usually cheaper and GPU buys wall-clock.** $11 over 12 hours on 24
-  cores, vs $25 over 4 hours on one L4. Pick based on whether you have a deadline or a budget.
+- **For Tier-2 parsing, CPU is usually cheaper and GPU buys wall-clock per machine.** $11 on CPU
+  (~12 hours on one 24-core box), vs $25 on L4 (~35 hours on one L4, or ~4 hours on nine). One L4
+  does the work of ~8 cores at about twice the price per page. Pick based on whether you have a
+  deadline or a budget.
 
 ### 9.4 Serving: self-host vs API break-even
 
@@ -824,8 +1000,9 @@ That number looks temptingly low, and three caveats destroy most of its appeal:
 3. **It omits the engineer.** One engineer maintaining the inference stack is $150k+/year, which is
    3× the GPU bill in this example.
 
-**Therefore:** self-host generation when volume is *large and sustained* (roughly 2–5M tokens/day
-on reserved capacity, at 60%+ utilization), or when data residency makes the API impossible. Not
+**Therefore:** self-host generation when volume is *large and sustained* (the example above breaks
+even at ~34M tokens/day on GPU cost alone and ~130M tokens/day once one engineer is included — and
+only at 60%+ utilization on reserved capacity), or when data residency makes the API impossible. Not
 because per-token math looked good at 3 a.m.
 
 ### 9.5 Idle is the dominant cost
@@ -875,6 +1052,14 @@ FinOps patterns for attributing all of this per-tenant:
 
 ## 10. Managed and serverless alternatives
 
+> **In plain words.** You can buy a ready-made RAG service from a cloud provider. It is fast to set
+> up and fine for standard documents, but it hides parsing and chunking, which limits how much you
+> can fix quality. Keep your own copy of the raw documents.
+>
+> **Real-world example.** Bedrock Knowledge Bases with the default OpenSearch Serverless store has
+> a floor of 2 OCUs ≈ $350/month even with zero traffic — often still cheaper than half an
+> engineer's time.
+
 Building the whole pipeline is not automatically correct. What you get and what you give up:
 
 | Option | You get | You give up | Cost shape |
@@ -903,6 +1088,13 @@ that you will need to take the ingestion half back in-house while keeping the se
 ---
 
 ## 11. Reference architectures
+
+> **In plain words.** Three ready-made starting setups: an internal tool on one box, a SaaS
+> product on Kubernetes with GPUs only for reranking, and a fully self-hosted regulated setup. Each
+> says when to move to the next one.
+>
+> **Real-world example.** A team at 3M vectors and 30 QPS is on the Tier 1 box. When the index no
+> longer fits in its 64 GB RAM, the next step is managed Postgres (Tier 2), not Kubernetes.
 
 ### 11.1 Tier 1 — internal tool
 
@@ -965,6 +1157,14 @@ request routing, or revisit whether the residency requirement truly covers gener
 ---
 
 ## 12. Release and rollout — the RAG-specific hazards
+
+> **In plain words.** Some changes break RAG silently: a new embedding model makes old vectors
+> useless, and a worse retriever returns wrong answers with no errors. Build a new index next to the
+> old one, test both, then switch a pointer. Give LLM servers time to finish answers before shutdown.
+>
+> **Real-world example.** Swapping to a new embedding model with the same 1024 dimensions, in
+> place: no errors, but recall@10 on the test set drops from 0.84 to 0.29. The fix is a new index,
+> an evaluation, then an alias swap.
 
 Standard deployment practice (blue/green, canary, GitOps) transfers unchanged; see
 [`../kubernetes/31-gitops-helm-kustomize.md`](../kubernetes/31-gitops-helm-kustomize.md). These
@@ -1144,6 +1344,201 @@ as "the model gets cut off sometimes" and gets debugged as a model problem for w
 | SLO engineering — for the freshness and retrieval-quality SLOs | [`../sre-observability/13-slo-engineering.md`](../sre-observability/13-slo-engineering.md) |
 | Bounded concurrency, backpressure, cancellation in the workers | [`../python-mastery/29-async-patterns-and-pitfalls.md`](../python-mastery/29-async-patterns-and-pitfalls.md) |
 | Measurement methodology — for every number you replace here | [`../python-mastery/31-measurement-methodology.md`](../python-mastery/31-measurement-methodology.md) |
+
+---
+
+## 16. Interview questions and system design prompts
+
+> **In plain words.** Deployment questions test whether you can size and price a system with a
+> formula, not whether you know tool names. Answer in three steps: the simple idea, one number, one
+> trade-off.
+>
+> **Real-world example.** "How many GPUs for a 70B model at 50 QPS?" A strong answer computes
+> prefill (2 × 70e9 × 4,000 = 560 TFLOP per query ≈ 1.4 H100-seconds), multiplies by 50 QPS
+> (≈ 70 H100s busy), then asks whether an API would do.
+
+### 16.1 Conceptual questions
+
+**Q1. Why separate the ingestion path from the query path?** *Sections: §2.1, §5.2, §7.5*
+Because they compete for the same workers or GPUs. A backfill is a throughput job; queries have a
+latency target. Shared, the backfill takes the GPU and query p95 goes from under 1 s to tens of
+seconds while average utilization looks healthy. Separate pools, queues, autoscalers, and a
+PriorityClass that lets queries preempt batch.
+
+**Q2. How do you estimate GPU memory for serving an LLM?** *Sections: §7.2, §7.2.1*
+Weights = params × bytes per param (70B × 2 = 140 GB at FP16). KV cache = 2 × layers × KV heads ×
+head_dim × bytes × tokens × concurrency (0.33 MB/token for a 70B; 32 requests × 8k ≈ 86 GB). Add
+15–25% overhead. For RAG, the KV cache usually decides the GPU, because prompts are 2k–8k tokens.
+
+**Q3. Why is RAG serving prefill-bound, and what does that change?** *Sections: §7.2.2*
+Inputs are ~4,000 tokens and outputs ~500, so most compute goes into reading the prompt. That makes
+TTFT the pain point: buy compute (FLOPs), enable chunked prefill, and put the fixed system prompt
+first so prefix caching can reuse it.
+
+**Q4. Which metric should autoscale a vLLM deployment?** *Sections: §5.3, §7.6*
+`vllm:num_requests_waiting` (queue length). GPU utilization reads near 100% during a single slow
+decode, and CPU stays flat because generation waits on the GPU.
+
+**Q5. When does self-hosting generation beat an API?** *Sections: §9.4, §9.5*
+Only at large, sustained volume with high utilization, a model that passes your eval, and the
+engineer counted. In §9.4's example the GPU-only break-even is ~225k queries/month, but at that
+volume the GPUs are almost idle, and adding one engineer moves the break-even to ~870k.
+
+**Q6. Why is changing the embedding model dangerous?** *Sections: §12.1*
+Old and new vectors are not comparable. If dimensions match, nothing errors and retrieval silently
+degrades. Build a new index, evaluate both, swap an alias.
+
+### 16.2 System design prompt — "Deploy RAG for a 5M-page SaaS product at 50 QPS"
+
+**Structured answer.**
+1. **Clarify:** freshness target, data residency, self-hosted models or APIs, peak vs average QPS.
+2. **Split the four paths (§2):** API/retrieval (stateless), ingestion workers (batch, spot), model
+   servers, index (managed).
+3. **Size (§7.3 B):** bulk embedding 3B tokens/month ≈ 55–105 L4-hours or ~$60 by API. Reranker
+   50 QPS ÷ ~3.9 QPS per L4 ≈ 13 GPUs, autoscaled on queue depth. Generation by API.
+4. **Tier (§3):** a shared GPU pool with online and batch consumers ⇒ Kubernetes with three node
+   pools, KEDA, PriorityClasses, Kueue quota for batch.
+5. **Pipeline (§8):** Dagster or Airflow for incremental ingest with content hashes; Ray Data for
+   backfills; deletion propagation.
+6. **Cost (§9):** route parsers by document class; spot for batch; scale batch to zero.
+7. **Rollout (§12):** index by alias; recall@k gate on canaries; long grace period on generators.
+
+**What interviewers listen for:** a formula before a tool name; write/read separation; KV cache in
+the memory estimate; a scaling signal other than CPU; the parser as the main ingestion cost; the
+alias swap for model changes.
+
+### 16.3 System design prompt — "Everything on-prem, 70B generator"
+
+**Structured answer.** Prefill 560 TFLOP/query ÷ ~400 TFLOPS per H100 ≈ 1.4 GPU-s; × 50 QPS ≈ 70
+H100s busy at FP16, ~35 with FP8, plus decode and headroom (§7.3 C). TP=2 replicas inside NVLink
+nodes; FP8 weights and KV cache; `max_model_len` capped to real prompt sizes; MIG on the online
+pool; Kueue quotas so batch cannot take serving GPUs.
+
+**What interviewers listen for:** that you get to "tens of H100s" by arithmetic, and that you
+question whether residency really covers generation.
+
+### 16.4 Rapid-fire
+
+| Question | Strong answer | Section |
+|---|---|---|
+| Compose or Kubernetes? | Compose/managed until a GPU fleet with several consumers, very different scaling, or HA on a self-hosted index forces Kubernetes | §3.1 |
+| Does query embedding need a GPU? | No, below ~100 QPS a CPU encoder takes 10–30 ms | §7.1 |
+| Most surprising GPU consumer? | The self-hosted reranker: ~25k tokens per query | §7.1, §7.3 |
+| KV per token for a 70B (80 layers, 8 KV heads, 128 dim, FP16)? | 2 × 80 × 8 × 128 × 2 = 327,680 B ≈ 0.33 MB | §7.2.1 |
+| Highest-leverage KV knob? | FP8/INT8 KV cache: halves it | §7.2.1 |
+| Replica count formula? | ceil(peak_QPS × p95 ÷ per-replica concurrency at SLO) × (1 + headroom) | §7.2 |
+| Scale-to-zero where? | Batch pools, yes; online paths only with measured cold start | §6.3 |
+| MIG on an L4? | Not supported; MIG needs A100/H100-class | §7.4 |
+| Biggest ingestion cost driver? | Parser tier: under $1 vs $10k–50k per 1M pages | §9.3 |
+| Cost per query on one L4 at 0.1 vs 10 QPS? | $0.0019 vs $0.000019: 100× from utilization alone | §9.5 |
+| How do you catch a retrieval regression in a rollout? | Golden-set recall@k gate on the canary | §12.3 |
+| Default 30 s grace period on an LLM pod? | Cuts off streaming answers; use 120 s+ and a preStop hook | §12.4 |
+
+### 16.5 Debugging prompts
+
+1. **"Every night 01:00–03:00, p95 goes from 0.8 s to 40 s. No errors. GPU utilization 100%."**
+   Diagnosis: a batch job shares the online GPUs (§2.1). Check the ingestion schedule; separate
+   pools and PriorityClasses.
+2. **"vLLM shows `gpu_cache_usage_perc` 98%, `num_requests_waiting` 30, TTFT 20 s, GPU util looks
+   fine."** Diagnosis: KV-cache bound (§7.2.1). Cap `max_model_len`, FP8 KV cache, FP8 weights,
+   then add replicas.
+3. **"The first answer each morning times out; later ones are fast."** Diagnosis: scale-to-zero cold
+   start on an online path (§6.3). `minReplicas: 1` or node-local weight cache.
+4. **"Answers are sometimes cut off mid-sentence, only on deploy days."** Diagnosis: the default
+   30 s `terminationGracePeriodSeconds` (§12.4).
+5. **"After the model upgrade, answers got vague. Zero errors, same latency."** Diagnosis: embedding
+   model changed without re-indexing (§12.1).
+
+### 16.6 Common mistakes
+
+- Sizing a generator by weights only and forgetting the KV cache.
+- Autoscaling on CPU or GPU utilization.
+- Proposing Kubernetes before naming the constraint that needs it.
+- Quoting a self-host break-even without utilization or the engineer.
+- Optimizing embedding cost while a vision-model parser runs on every page.
+
+---
+
+## 17. Real-world cases — incidents with numbers
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+**Quick index:** night-time latency spike → 17.1 · LLM queue with free GPU compute → 17.2 · first
+request of the day fails → 17.3 · slow API, low CPU → 17.4 · silent quality drop after upgrade →
+17.5 · high GPU bill, low traffic → 17.6 · parsing bill in the tens of thousands → 17.7
+
+> **In plain words.** Each case: what users saw, the simple reason, the numbers, the fix.
+>
+> **Real-world example.** Case 17.6: same GPUs, same traffic, bill cut from $6,132 to ~$2,725 per
+> month by scaling on the queue.
+
+### 17.1 The backfill that took down search
+
+- **Setup:** 2 L4s serve the reranker and query embedding. A 1.2B-token re-embed runs on the same GPUs.
+- **Symptom:** p95 0.8 s → 40 s for two nights; no alerts.
+- **Diagnosis:** both GPUs at 100% from the embedding job; reranker requests queued behind batches.
+- **Fix:** separate spot `gpu-batch` pool plus `rag-batch` PriorityClass. The re-embed takes ~33
+  L4-hours (~$13 on spot at $0.40/hr); query p95 stays at 0.9 s.
+- **Lesson:** never share a compute pool between the write path and the read path (§2.1).
+
+### 17.2 The 70B that served one user at a time
+
+- **Setup:** 70B at FP16 on 2×H100, vLLM defaults, 8k-token RAG prompts.
+- **Symptom:** TTFT 20 s at 10 QPS; GPU utilization high but throughput low.
+- **Diagnosis:** 0.9 × 160 GB = 144 GB usable; weights 140 GB leave ~4 GB of KV. One 8k request
+  needs 2.7 GB ⇒ ~1 concurrent request. `gpu_cache_usage_perc` 98%, 30 requests waiting.
+- **Fix:** FP8 weights (70 GB) and FP8 KV (1.34 GB per 8k request). ~64 GB for KV after ~10 GB
+  overhead ⇒ ~47 concurrent 8k requests.
+- **Lesson:** for RAG, size by KV cache, not by weights (§7.2.1).
+
+### 17.3 The morning timeout
+
+- **Setup:** online reranker with `minReplicas: 0` to save money.
+- **Symptom:** the first question after a quiet night fails; later ones work.
+- **Diagnosis:** node provisioning ~120 s + image pull ~90 s + weights ~20 s + load ~15 s ≈ 245 s,
+  against a 60 s client timeout.
+- **Fix:** `minReplicas: 1` (one L4 ≈ $511/month) and a pre-pulled image.
+- **Lesson:** scale-to-zero belongs on batch pools (§6.3).
+
+### 17.4 Low CPU, slow answers
+
+- **Setup:** API/generation proxy with HPA on CPU at 70%. Peak 30 QPS, target p95 4 s.
+- **Symptom:** p95 14 s at peak; CPU at 18%; HPA stays at 4 replicas.
+- **Diagnosis:** Little's Law: 30 QPS × 4 s = 120 requests in flight. Measured capacity is 10 per
+  replica at SLO, so ~12 replicas are needed, ~16 with 30% headroom. CPU never rises because the
+  work is waiting on the LLM.
+- **Fix:** KEDA on in-flight requests (10 per replica), 4 → 16 replicas at peak. p95 back under 4 s.
+- **Lesson:** CPU is the wrong autoscaling signal for every RAG component (§5.3).
+
+### 17.5 The silent embedding swap
+
+- **Setup:** team upgrades the query embedding model; same 1024 dimensions; old vectors kept.
+- **Symptom:** vaguer answers; error rate and latency unchanged.
+- **Diagnosis:** golden-set recall@10 fell from 0.84 to 0.29: query vectors from model B searched
+  against document vectors from model A.
+- **Fix:** new index built with model B (1.2B tokens ≈ 33 L4-hours ≈ $23 on-demand), both
+  evaluated, alias swapped. `model_id` now stored on every chunk.
+- **Lesson:** the embedding model and the index are one versioned artifact (§12.1).
+
+### 17.6 The always-on reranker fleet
+
+- **Setup:** 12 L4s fixed for the reranker (12 × $511 = $6,132/month); capacity ~46 QPS; average
+  traffic 9 QPS.
+- **Symptom:** finance flags GPU spend; dashboards show GPUs "busy".
+- **Diagnosis:** utilization 9 ÷ 46 ≈ 19%. Peak needs 12 GPUs only ~8 hours a day.
+- **Fix:** KEDA on queue depth, min 2, max 12. Average (8 h × 12 + 16 h × 2) ÷ 24 ≈ 5.3 GPUs ⇒
+  ~$2,725/month, 56% less.
+- **Lesson:** idle capacity is the dominant GPU cost (§9.5).
+
+### 17.7 The vision-model parsing bill
+
+- **Setup:** 2M pages sent through a VLM parser API at $0.03/page.
+- **Symptom:** $60,000 invoice for one ingestion run.
+- **Diagnosis:** 80% of pages were born-digital text that a Tier-1 parser handles in milliseconds.
+- **Fix:** route: 80% PyMuPDF (under $1), 18% Docling on CPU (~100 CPU-hours ≈ $4), 2% VLM for
+  pages failing a quality gate ($1,200). Total ≈ $1,200, about 50× less.
+- **Lesson:** parser tier dominates ingestion cost; route by document class (§9.3).
 
 ---
 
