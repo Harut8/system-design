@@ -1021,6 +1021,10 @@ which is a spectacular trade you would have rejected on the first column alone.
 
 ### 8.1 The formulas, stated once
 
+[Appendix G](appendix-g-ranking-and-answer-metrics.md) computes every metric below on one ranked
+list and lists the pairs that are easy to confuse (MRR vs MAP, nDCG variants, faithfulness vs
+correctness, RAGAS names, scores vs metrics).
+
 Notation: for query `q`, `R_q` is the set of relevant items (or a grade function `g(d) ∈ {0,1,2,3}`),
 and `d_1..d_k` is the returned ranking.
 

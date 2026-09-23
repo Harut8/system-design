@@ -85,6 +85,7 @@ keeps every claim honest by construction.
 | [`appendix-d-doc-processing-benchmarks.md`](appendix-d-doc-processing-benchmarks.md) | Parser, chunker, embedding, vector store benchmarks and best choices by use case | **written** |
 | [`appendix-e-deployment-and-compute.md`](appendix-e-deployment-and-compute.md) | Compose vs Kubernetes, model serving, GPU sizing and scheduling, pipeline orchestration, compute cost | **written** |
 | [`appendix-f-recall-at-every-layer.md`](appendix-f-recall-at-every-layer.md) | Every "recall" in the pipeline (span survival, token, embedding, ANN, candidate, context, citation, abstention, judge) on one page: what each counts, its answer key, a worked example, and a per-stage leak report | **written** |
+| [`appendix-g-ranking-and-answer-metrics.md`](appendix-g-ranking-and-answer-metrics.md) | Precision, hit rate, MRR, MAP, nDCG variants, faithfulness vs correctness, RAGAS names, scores vs metrics, pp vs %, κ — one worked list, every metric computed, and a per-stage cheat sheet | **written** |
 
 ---
 

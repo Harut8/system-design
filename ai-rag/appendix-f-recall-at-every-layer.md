@@ -11,6 +11,9 @@
 > [`08-evaluation-methodology.md`](08-evaluation-methodology.md), and use the table in §3 as a
 > lookup.
 >
+> **Companion:** [appendix G](appendix-g-ranking-and-answer-metrics.md) does the same for precision,
+> MRR, MAP, nDCG, faithfulness and the other metrics that get mixed up.
+>
 > **Where the full detail lives:** formulas and code in `08` §2 (measurement map), §5 (chunking),
 > §6 (embeddings), §7 (the two recalls), §8 (retrieval metrics), §10 (generation). Index recall in
 > `03` §1 and §3. Candidate recall and the recall ceiling in `04` §1 and §13.
