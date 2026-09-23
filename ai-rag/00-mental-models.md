@@ -1523,6 +1523,322 @@ into a number for your own corpus.
 
 ---
 
+## 17. Interview questions and system design prompts
+
+> **In plain words.** In an interview, explain the idea in one simple sentence first, then give one number, then name one trade-off. The strongest signal for this chapter is that you debug a RAG system step by step instead of reaching for "improve the prompt".
+>
+> **Real-world example.** "Our RAG bot gives wrong answers. What do you do?" → "First I find out which step fails. I paste the right passage into the prompt by hand: if the answer becomes correct, search is the problem. Then I check whether the passage is in the top 50 at all, to tell 'never found' from 'found but cut'. Only failures that survive both tests are prompt or model problems."
+
+Same format as `03` §16 and `04` §18: each question names the sections it draws from and gives
+the answer structure an interviewer is listening for.
+
+### 17.1 Conceptual questions — "explain X"
+
+**Q: Walk me through a RAG pipeline end to end.**
+*Sections: Start here, §2*
+Two systems joined at the index. Ingest time (once per corpus version): parse → chunk → embed →
+index. Query time (every request): embed query → retrieve (dense + sparse) → fuse → rerank →
+assemble prompt → generate, with tracing across both. Give one number per step if you can (e.g. 500-token
+chunks, top 50 candidates, rerank to 5, ~2,800 prompt tokens). The strong half of the answer: say
+what breaks at each step, and that the only thing the two halves share is the index, so the
+embedding model and chunking are part of the index's "schema".
+
+**Q: Why is retrieval quality an upper bound on answer quality?**
+*Sections: §4*
+`P(correct) ≤ P(evidence retrieved) × P(used correctly | retrieved)`. If the chunk never reaches the
+prompt, a perfect model still can't answer a question whose answer exists only in your corpus.
+Example: recall@5 = 0.86 caps accuracy at 0.86 no matter what the prompt says. Add the nuance:
+"retrieved" means *in the prompt at the shipped k*, not somewhere in a top-50 list.
+
+**Q: Name the four failure classes and how you tell them apart.**
+*Sections: §5, §6*
+(a) not in corpus, (b) in corpus but not retrievable, (c) retrieved but ranked out of the budget,
+(d) in the prompt but misused. Instruments: the oracle-context test splits (a/b/c) from (d); the
+recall@k sweep at 1/5/10/20/50 splits (a/b) from (c); grepping the raw corpus splits (a) from (b).
+Each class has a different fix and a different owner.
+
+**Q: What is the oracle-context test and why is it so useful?**
+*Sections: §6*
+Build the prompt by hand with the known-correct chunk, bypassing the retriever, and call the
+model. Correct now → the failure was upstream. Still wrong → generation. It turns "is it search or
+the model?" into a five-minute experiment per query. Mention the trap: run it first with *only*
+the correct chunk, then add realistic distractors as a second pass.
+
+**Q: Why is a vector index like a materialized view? What follows from that?**
+*Sections: §3, §10*
+It is derived data, computed once from the corpus and read many times. So it goes stale, needs an
+invalidation path for deletes, has write amplification (one edited document re-embeds all its
+chunks), and a change to the function that built it (the embedding model) forces a full rebuild,
+because vectors from two models are not comparable.
+
+**Q: Why two-stage retrieval instead of just a better single model?**
+*Sections: §7*
+`cost ≈ Σ (cost per candidate × candidates examined)`. A cross-encoder is accurate but can't be
+precomputed, so running it over 6,700 chunks at ~2 ms each is ~13 s. Run a cheap ANN/BM25 search
+over everything, then the cross-encoder over 50–200 candidates. Same reasoning as "index scan,
+then recheck" in a query planner.
+
+**Q: Where does the money go in a RAG system?**
+*Sections: §9*
+Separate ingest cost (once: `N_tokens_corpus × price_embed`) from query cost (every request:
+`q_tokens × p_embed + rerank_cost + prompt_tokens × p_in + output_tokens × p_out`). In most
+systems the generator's input tokens dominate, so retrieval precision (fewer, better chunks) is a
+cost lever. Example: 40 chunks → 8 chunks cut input tokens from 16,500 to 3,700 per query.
+
+**Q: When would you not use RAG?**
+*Sections: §11*
+A single coherent document that fits in the context window, or exploratory questions where you
+can't anticipate the query. Use retrieval for large, changing, permissioned corpora or when cost
+per query matters. Mention context rot: long prompts are not free even when they fit. The usual
+answer is hybrid: retrieve a generous-but-bounded set, let a long-context model reason over it.
+
+### 17.2 System design round
+
+**Q: Design an internal HR/IT assistant for 50,000 employees over 20,000 documents
+(~60M tokens), 20,000 questions a day, p95 time-to-first-token under 1.5 s, and per-country
+document permissions.**
+
+```
+1. CLARIFY + GOLDEN SET FIRST (§4, §16)
+   - 200 real questions (include reported failures), each labelled with the answer span.
+   - Metrics: recall@k at shipped k, answer accuracy, faithfulness, TTFT p95, $/query.
+
+2. INGEST (§2, §3)
+   - Parse with table-aware + OCR path for scans; store doc_id, country, version, ACL.
+   - Chunk ~500 tokens, 50 overlap → 60M / 450 ≈ 133K chunks.
+   - Embed: 133K × 500 ≈ 67M tokens × $0.02/M ≈ $1.33 one-time.
+   - Index: 133K × 1,536 × 4 B ≈ 0.8 GB vectors → fits one node; add BM25.
+   - Refresh: incremental upsert + soft delete, staleness SLO 24 h, nightly reconciliation
+     against the source system (deleted docs → tombstones).
+
+3. QUERY PATH + LATENCY BUDGET (§7, §8)
+   embed 30 ms + hybrid search with country/ACL filter 20 ms + fuse 1 ms
+   + rerank top 50 → keep 6, 120 ms + assemble 10 ms + TTFT 800 ms ≈ 981 ms < 1,500 ms
+
+4. COST (§9) — illustrative $3/M in, $15/M out
+   3,000 input + 200 output tokens → ≈ $0.012/query × 20,000/day ≈ $240/day.
+
+5. OBSERVABILITY (§13)
+   One span per stage with chunk ids, scores, token counts; one request id shared by
+   trace, eval result and cost row.
+
+6. DEBUG LOOP (§6)
+   Weekly: oracle test + recall@k sweep on new failures → split into (a)/(b)/(c)/(d)
+   → route to parser / chunking+hybrid / reranker+budget / prompt owners.
+```
+
+*What interviewers listen for:* a golden set before any tuning; ingest vs query split with a cost
+for each; permissions enforced at retrieval, not in the prompt; an explicit latency budget with
+the reranker as a line item; a plan for deletes and model changes; and a diagnosis procedure, not
+"we'll improve the prompt".
+
+**Q: The team wants to switch from one embedding model to a newer one. Plan it.**
+*Sections: §3, §10*
+Treat it as a schema migration. (1) Offline eval: embed the golden-set corpus with both models,
+compare recall@k at shipped k with a bootstrap CI. (2) Cost: `N_tokens_corpus × new price`, plus
+wall-clock time under the rate limit. (3) Build a shadow index with the new model; never mix old
+and new vectors in one index. (4) Shadow-read or A/B a slice of traffic, then swap and keep the old
+index for rollback. *What interviewers listen for:* "vectors from two models are not comparable",
+"no gradual chunk-by-chunk migration", and a number for the rebuild.
+
+### 17.3 Rapid-fire questions
+
+| Question | Strong answer | Section |
+|---|---|---|
+| Ingest time vs query time? | Once per corpus version vs every request; they share only the index. | §2 |
+| Why is swapping the embedding model not a config change? | Vectors from different models aren't comparable → full re-embed and rebuild. | §3, §10 |
+| Recall@5 = 0.86, faithfulness = 0.93 — max accuracy? | 0.86 × 0.93 ≈ 0.80. | §4 |
+| Oracle test passes — where is the bug? | Upstream of generation: class (a), (b) or (c). | §6 |
+| Recall@50 = 0.95, recall@5 = 0.74 — which class? | (c): found, then ranked out of the budget. Fix reranker/budget. | §5, §6 |
+| Recall@50 ≈ 0 for a query — next step? | Grep the raw corpus: absent → (a) ingestion; present → (b) representation. | §6 |
+| Which query-time step is usually the slowest before the LLM? | The cross-encoder reranker; cost ∝ candidates scored. | §7, §8 |
+| Which latency number do users feel? | TTFT; set SLOs on TTFT and p95/p99, not the mean. | §8 |
+| Biggest per-query cost line? | Generator input tokens (retrieved context), in most systems. | §9 |
+| Why is `text-embedding-ada-002` a cost bug today? | $0.10/M vs $0.02/M for `3-small`, and lower on OpenAI's own MTEB numbers. | §9 |
+| RAG or long context for one 40-page contract? | Long context: one coherent document that fits. | §11 |
+| What's new when retrieval becomes an agent loop? | Variable number of searches → needs caps, and you evaluate the trajectory. | §12 |
+| Minimum join key for debugging production? | One request id across trace, eval result and cost row. | §13 |
+
+### 17.4 Debugging prompts — "here are the symptoms, diagnose"
+
+**"We spent two weeks on the prompt and accuracy moved from 0.71 to 0.72."**
+Stop editing the prompt. Run the oracle test on the failures: if most pass with the right chunk,
+the problem is upstream. Sweep recall@k: a big gap between recall@50 and recall at the shipped k
+means class (c) → reranker and context budget. See §18 Case 1.
+
+**"The bot quotes a policy we deleted months ago."**
+Invalidation (§3). The source document is gone but its chunks are still in the index. Count chunks
+whose `doc_id` no longer exists in the source system; add soft-delete sync and a reconciliation
+job; set a staleness SLO. See Case 2.
+
+**"Quality collapsed right after we 'just changed the embedding model' in config."**
+Mixed vector spaces: new queries (or new docs) use the new model while old vectors remain. Check
+the model version stored per vector. Fix: full re-embed into a shadow index, then swap. See Case 3.
+
+**"p99 latency doubled after we added a reranker."**
+`t_rerank` scales with candidates scored. Check how many candidates go in (200 instead of 50?),
+batch size, and GPU/API queueing. Sweep candidate count vs recall after rerank; usually 50 keeps
+almost all the quality at a quarter of the time. See Case 4.
+
+**"Offline recall is 0.95 but users complain constantly."**
+The golden set doesn't look like production traffic (only questions that already worked, or
+written by the team). Re-sample from real queries including reported failures. See Case 6.
+
+### 17.5 Common interview mistakes
+
+1. **"Improve the prompt" as the first move.** Without the oracle test you don't know the prompt is
+   the problem (§6).
+2. **Quoting one recall number without k, dataset and hit rule.** "Recall 0.9" is not a fully
+   specified metric (§6, §16).
+3. **Mixing ingest cost and query cost.** A one-time $1 embedding bill and a recurring $0.01/query
+   generation bill are different decisions (§9).
+4. **Enforcing permissions in the prompt.** "Ignore documents you can't see" is not access
+   control; filter at retrieval (§11).
+5. **Adding a reranker with no latency budget.** Put `t_rerank` in the table first (§8).
+6. **Forgetting deletes and model changes.** A freshly built demo index is not what runs after six
+   months (§3, §10).
+
+---
+
+## 18. Real-world cases — incidents with numbers
+
+> **In plain words.** Each case is a kind of problem teams hit in production: what users saw, how it was measured, the fix, and the numbers before and after.
+>
+> **Real-world example.** Quick index: prompt work doesn't help → Case 1; deleted documents still quoted → Case 2; quality collapses after a model change → Case 3; reranker blows latency → Case 4; bill too high → Case 5; offline great, users unhappy → Case 6; a few questions cost 10× → Case 7.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+Quick index: accuracy stuck despite prompt work → Case 1 · deleted policy still quoted → Case 2 ·
+collapse after embedding-model change → Case 3 · p99 blown by reranker → Case 4 · generation bill
+too high → Case 5 · offline recall high, users unhappy → Case 6 · runaway agent loops → Case 7.
+
+### Case 1 — Two weeks of prompt work, +1 point
+
+**Setup.** Customer-support bot over 12,000 help-center articles. Golden set of 200 questions.
+The pipeline ships the top 5 chunks from dense retrieval, no reranker.
+
+**Symptom.** Accuracy 0.71. Two weeks of prompt rewrites → 0.72, and the gain didn't hold on new
+questions.
+
+**Measurement.** 58 wrong answers. Oracle test: 52 become correct with the right chunk → retrieval
+failures; 6 stay wrong → generation. Recall sweep: recall@5 = 0.74 (148 of 200), recall@50 = 0.93.
+Of the 148 questions with the evidence in the prompt, 142 were right (0.96), so 0.74 × 0.96 ≈ 0.71:
+the cap was retrieval. The 0.19 gap between recall@50 and recall@5 is class (c).
+
+**Fix.** Add a cross-encoder over the top 50 and ship the top 8. Recall at shipped k: 0.74 → 0.89
+(178 of 200). Accuracy: 0.71 → 0.84 (168 of 200). Faithfulness dipped slightly (0.96 → 0.94)
+because 8 chunks include more distractors.
+
+**Lesson.** Measure recall at the shipped k before touching the prompt (§4, §6).
+
+### Case 2 — The deleted rate sheet
+
+**Setup.** Bank internal assistant over 38,000 chunks of product documents, indexed from a
+document management system. Old documents are deleted when a new version is published.
+
+**Symptom.** The bot tells staff a savings rate of 4.1%; the current sheet says 4.6%.
+
+**Diagnosis.** The ingest job only upserts new and changed documents; it never removes chunks of
+deleted ones. A reconciliation query finds **1,200 chunks (3.2% of the index)** whose `doc_id` no
+longer exists in the source. The old and new rate sheets are near-identical text, so both rank
+high, and the model picked the old one (class (d) on the surface, but caused by an index
+invalidation bug, §3).
+
+**Fix.** Soft-delete sync on every source delete event, nightly reconciliation that tombstones
+orphans, and a staleness SLO of 24 h with an alert on orphan count. Orphans: 1,200 → 0. Stale-answer
+reports from the rates team: several a week → none in the next month.
+
+**Lesson.** The index is a materialized view; deletes need an explicit path (§3).
+
+### Case 3 — "We just changed the model in the config"
+
+**Setup.** E-commerce product search over 2M product descriptions (~200 tokens each). The team
+changed the embedding model in a YAML file. New and updated products were embedded with the new
+model; the existing 2M vectors were left alone.
+
+**Symptom.** Search quality for existing products collapsed overnight; new products looked fine.
+
+**Measurement.** Query vectors now come from the new model and are compared against old-model
+vectors. Recall@10 on the golden set for existing products: 0.82 → 0.41.
+
+**Fix.** Full re-embed into a shadow index: 2M × 200 = 400M tokens × $0.13/M ≈ **$52**, about
+**7 hours** at ~1M tokens per minute. Evaluate, then swap. Recall@10: 0.84. Store `model_version`
+on every vector and refuse queries across versions.
+
+**Lesson.** The embedding model is part of the index's schema. The API bill was small; the outage
+was the cost (§3, §10).
+
+### Case 4 — The reranker that broke the SLO
+
+**Setup.** Legal document search, p99 end-to-end SLO 3 s. A cross-encoder was added over the top
+200 candidates "to improve quality".
+
+**Symptom.** p99 went from 1.8 s to 4.9 s. Rerank alone: ~480 ms at p50, much worse at p99 under
+load because of GPU queueing.
+
+**Measurement.** Sweep the number of candidates reranked: recall@10 after rerank was 0.91 at 200
+candidates and 0.90 at 50. Rerank time scales roughly linearly with candidates: 200 → 50 is 4×
+less work (~480 ms → ~120 ms at p50).
+
+**Fix.** Rerank the top 50. p99: 4.9 s → 2.6 s, inside the SLO, for a 0.01 recall loss.
+
+**Lesson.** A reranker is a line item in the latency budget. Choose the candidate count from a
+sweep (§7, §8).
+
+### Case 5 — Paying for 40 chunks nobody reads
+
+**Setup.** Support desk bot, 50,000 questions a day. The prompt includes 40 chunks of ~400 tokens
+"to be safe" plus 500 tokens of instructions. Illustrative generator price $3/M input tokens.
+
+**Symptom.** Generation bill of about $2,475 a day for input tokens alone.
+
+**Measurement.** 16,500 input tokens × $3/M = $0.0495 per question × 50,000 = $2,475/day. The trace
+shows the cited chunk is in the top 8 after reranking for almost every correct answer.
+
+**Fix.** Rerank and keep 8 chunks: 3,700 input tokens → $0.0111 per question → **$555/day**,
+saving about **$57,600 a month**. Accuracy went up slightly (0.78 → 0.80) because there were
+fewer distractors.
+
+**Lesson.** Retrieval precision is a cost lever; generator input tokens dominate `C_query` (§9).
+
+### Case 6 — Recall 0.95 offline, complaints online
+
+**Setup.** Internal IT assistant. The golden set was written by the team from questions they had
+already tried, and the retriever does well on it.
+
+**Symptom.** Recall@10 = 0.95 on the golden set. Users say the bot "never knows anything".
+
+**Measurement.** A new sample of 300 real production queries, including 90 that users had flagged
+as wrong: recall@10 = **0.68** (204 of 300). Many real questions use internal nicknames for systems
+("the VPN thing", "Okta tile") that never appear in the documentation.
+
+**Fix.** Rebuild the golden set from production traffic (30% flagged failures), add BM25 plus a
+synonym list for internal nicknames. Recall@10 on the new set: 0.68 → 0.83.
+
+**Lesson.** A golden set built from questions that already work measures nothing useful
+(§14, §16).
+
+### Case 7 — The agent that searched 30 times
+
+**Setup.** Agentic research assistant (§12), 20,000 questions a day. Each loop iteration (one
+search + one model call) costs about $0.012. No cap on iterations except a 30-call timeout.
+
+**Symptom.** Mean cost looks fine, but spend is 19% higher than forecast.
+
+**Measurement.** Mean 3.1 iterations per question → 20,000 × 3.1 × $0.012 ≈ $744/day. But 2% of
+questions (400/day) hit the 30-call timeout: 400 × 30 × $0.012 = $144/day, **19% of spend** from 2%
+of traffic, and most of those answers were still wrong.
+
+**Fix.** Cap at 6 iterations and a per-question cost ceiling; when the cap is hit, answer "I
+couldn't find this" with what was found. Mean iterations 3.1 → 2.62; spend ≈ $629/day. Accuracy
+on the rest of traffic unchanged.
+
+**Lesson.** A loop needs an explicit budget and stopping rule; evaluate the trajectory, not just
+the answer (§12).
+
+---
+
 **Rung ledger.** Exercise 1 is built: [`labs/golden-set/`](labs/golden-set/) is **rung 2 —
 implemented** (60 labelled queries over this folder's four chapters, a deterministic
 builder, and a test suite that fails when the labels go stale). It produces labels, not
