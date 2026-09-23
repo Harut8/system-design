@@ -24,6 +24,7 @@ Prerequisites: familiarity with reliability patterns from `33-resilience-pattern
 13. [Cloud-Native Ownership — App vs. Infra vs. Hybrid](#13-cloud-native-ownership--app-vs-infra-vs-hybrid)
 14. [Interview Preparation — Adaptive Load Control & Backpressure](#14-interview-preparation--adaptive-load-control--backpressure)
 15. [Sandbox Experiments — Run These Yourself](#15-sandbox-experiments--run-these-yourself)
+16. [Real-world cases — incidents with numbers](#16-real-world-cases--incidents-with-numbers)
 
 ---
 
@@ -4371,6 +4372,66 @@ a sprint discovering that.
 
 If you can produce those numbers for your own system, you can predict its overload
 behaviour instead of discovering it.
+
+---
+
+## 16. Real-world cases — incidents with numbers
+
+> **In plain words.** Six short incident stories. Each one shows how overload looks from the outside, which numbers point to the cause, and which mechanism from this chapter fixed it. Read the symptom first, then try to guess the fix before you read it.
+>
+> **Real-world example.** In Case 2 a payment API keeps every request in an unbounded queue. After one minute of a small spike the queue holds 12,000 requests, each waits 12 s, and the clients gave up after 2 s. The server is 100% busy and 0% useful.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent.
+
+**Quick index (symptom → case):** traffic to a dependency is many times user traffic → Case 1 · server busy but every response times out → Case 2 · small customers slow down when one big customer runs a job → Case 3 · system stays down after a cache flush even though traffic is normal → Case 4 · errors for a few minutes every evening peak, then fine → Case 5 · dashboards show data minutes old, adding consumers does not help → Case 6.
+
+### Case 1 — Retry storm through three layers (e-commerce checkout)
+
+- **Setup.** Checkout calls an order service, which calls an inventory service, which calls a database. Each layer retries a failed call up to 2 more times (3 attempts total). Normal load is 2,000 RPS; the database handles 3,000 RPS.
+- **Symptom.** A 30-second database slowdown turns into a 20-minute outage. The database stays at 100% CPU long after the original cause is gone.
+- **Measurement/Diagnosis.** With 3 attempts at each of 3 layers, one user request can become 3 × 3 × 3 = **27** database calls. When about half of calls fail, the expected attempts per layer are 1 + 0.5 + 0.25 = 1.75, so the amplification is 1.75³ ≈ **5.4×**: 2,000 RPS becomes ≈ **10,700 RPS** against a 3,000 RPS database. At full failure it is 27 × 2,000 = **54,000 RPS**. More load means more failures, which means more retries (§1, §11).
+- **Fix.** Retry only at one layer (the one closest to the user), add jittered backoff, and add a retry budget of 10% of successful calls. Worst case is now 2,000 × 1.1 = **2,200 RPS**, below the 3,000 RPS capacity. The next database slowdown lasted 40 s and recovered on its own.
+- **Lesson.** Retries multiply across layers. Count the worst-case fan-out and cap it with a budget, not a per-call retry count.
+
+### Case 2 — Queue collapse behind an unbounded queue (payment API)
+
+- **Setup.** A payment API processes μ = 1,000 requests/s. Clients time out after 2 s. The server puts every request into an unbounded in-memory queue (FIFO). Normal load is 800 RPS.
+- **Symptom.** A 60-second spike to 1,200 RPS makes success rate drop to almost zero, and it stays near zero for another minute after the spike ends. CPU is at 100% the whole time.
+- **Measurement/Diagnosis.** The queue grows by 1,200 − 1,000 = 200 requests/s. After 60 s it holds **12,000** requests, so a new request waits 12,000 / 1,000 = **12 s** — six times the client timeout. The server spends all its time on requests whose clients already left. After the spike, spare capacity is only 1,000 − 800 = 200/s, so draining the backlog takes 12,000 / 200 = **60 s** more of useless work (§7).
+- **Fix.** Bound the queue at 200 requests (at most 200 / 1,000 = **0.2 s** of waiting) and reject the rest with a fast 503. Also drop any request that has already waited longer than its deadline (§3, §7). During the same spike the API now serves **1,000 RPS successfully** and rejects about 200 / 1,200 ≈ **17%** fast, instead of serving ~0% usefully.
+- **Lesson.** A long queue does not add capacity; it only adds waiting. Size queues in *seconds of wait*, not in number of items.
+
+### Case 3 — Noisy tenant starves everyone (multi-tenant analytics API)
+
+- **Setup.** 50 tenants share an API cluster with capacity 10,000 RPS. Normal total load is 6,000 RPS. There is one global FIFO queue and no per-tenant limit.
+- **Symptom.** Every weekday at 09:00, all tenants see p99 latency jump from 150 ms to several seconds and some timeouts. Only one tenant changed anything.
+- **Measurement/Diagnosis.** One tenant starts a bulk export at **8,000 RPS**. Total offered load is 6,000 + 8,000 = 14,000 RPS, so with a shared queue everyone gets about 10,000 / 14,000 ≈ **71%** of what they ask for. The 49 small tenants suffer for a load they did not create (§9).
+- **Fix.** Per-tenant token buckets plus fair queuing between tenants. The export tenant is capped at **2,000 RPS** (burst allowed, then throttled with 429 + `Retry-After`). Total load becomes 6,000 + 2,000 = **8,000 RPS**, below capacity; small tenants go back to 150 ms p99. The export takes 4× longer, which that tenant accepted for a batch job.
+- **Lesson.** Without per-tenant isolation, your worst customer sets the latency for all customers.
+
+### Case 4 — Metastable failure after a cache flush (product catalog)
+
+- **Setup.** A catalog service serves 50,000 RPS with a 95% cache hit rate, so the database sees 50,000 × 0.05 = **2,500 RPS**. The database handles 10,000 RPS. Clients time out after 1 s and retry once. The cache is filled only on a successful database read.
+- **Symptom.** A deploy flushes the cache by mistake. The service goes down, and stays down for 40 minutes even though user traffic never changed.
+- **Measurement/Diagnosis.** With a 0% hit rate the database gets **50,000 RPS**, 5× its capacity. Most reads finish after the 1 s timeout, so they never fill the cache, and each timeout triggers a retry: effective load ≈ **100,000 RPS**. The hit rate cannot climb, so the overload keeps itself going. This is a metastable state: the trigger (the flush) is gone, but the feedback loop (misses → timeouts → retries → no cache fills) remains (§11).
+- **Fix.** Shed at the edge so only **8,000 RPS** (80% of DB capacity) reaches the database, turn off retries for the duration, and coalesce identical misses (one DB read per key). About 100,000 hot keys cover 90% of traffic; at 8,000 fills/s they are warm in 100,000 / 8,000 = **12.5 s**. At a 90% hit rate the database sees 50,000 × 0.1 = **5,000 RPS**, so admission can be raised step by step back to 100%. Later incidents with this runbook recovered in under 5 minutes.
+- **Lesson.** Recovery from metastability needs an action that breaks the loop (shed, stop retries, warm the cache). Waiting does not help.
+
+### Case 5 — Autoscaling is too slow for the evening peak (ride-hailing dispatch)
+
+- **Setup.** A dispatch service runs 400 pods; each pod handles about 80 RPS before latency climbs. Fleet capacity is 400 × 80 = **32,000 RPS**. The autoscaler targets 70% utilization. On Friday evenings, traffic goes from 20,000 to 40,000 RPS in about 2 minutes.
+- **Symptom.** For about 3 minutes every Friday around 18:00, 5xx errors and slow ride matching. After that everything looks fine, and the dashboard shows "plenty of pods".
+- **Measurement/Diagnosis.** Target pod count at 40,000 RPS is 40,000 / (80 × 0.7) ≈ **715** pods. Reaction time is roughly 60 s metric window + 15 s scaling decision + 90 s pod start and warm-up ≈ **165 s**. During that time demand exceeds capacity by 40,000 − 32,000 = **8,000 RPS** (20% of traffic) (§13).
+- **Fix.** Two changes. (1) Scheduled pre-scaling: minimum 720 pods from 17:30 to 20:00, so capacity is 720 × 80 = **57,600 RPS** and utilization at peak is ≈ **69%**. Cost: 320 extra pods × 2.5 h = **800 pod-hours** per Friday. (2) Priority shedding during any remaining gap: drop "refresh ETA" polls before "request a ride" calls (§4, §10).
+- **Lesson.** Autoscaling fixes slow growth, not sudden spikes. For spikes faster than the scaling delay, you need headroom or load shedding.
+
+### Case 6 — Kafka consumer lag that more consumers cannot fix (IoT telemetry)
+
+- **Setup.** A telemetry topic has **12 partitions** and 12 consumers; each consumer processes about 1,000 msg/s, so the group handles **12,000 msg/s**. Consumers write to a database and use `max.poll.records = 500` with the default `max.poll.interval.ms = 300000` (5 min).
+- **Symptom.** During a device firmware rollout, dashboards show data 7–8 minutes old. The team scales the consumer group from 12 to 24 pods; lag does not improve. Later, consumers start leaving and rejoining the group repeatedly.
+- **Measurement/Diagnosis.** Producers send **15,000 msg/s** for 30 minutes, so lag grows by 3,000 msg/s × 1,800 s = **5.4 million** messages, which is 5.4M / 12,000 ≈ **450 s** (7.5 min) behind. With 12 partitions, at most 12 consumers in a group get work; the other 12 are idle. Then the database slows to ~0.7 s per record at worst: 500 records × 0.7 s = **350 s** per poll batch, longer than the 300 s poll interval, so Kafka removes the consumer and rebalances, and the batch is processed again (§5). After the burst, at 9,000 msg/s, the 3,000 msg/s spare capacity drains the lag in 5.4M / 3,000 = **1,800 s** (30 min).
+- **Fix.** Increase to 48 partitions (planned in a maintenance window, because it changes which partition a key maps to) and run 24 consumers: **24,000 msg/s** capacity, above the 15,000 msg/s peak. Lower `max.poll.records` to 100 so a slow batch takes at most 70 s. Alert on lag in *seconds* (how stale the data is), not in message count. Put a bounded concurrency limit on database writes so a slow database slows consumption instead of causing rebalances.
+- **Lesson.** Consumer parallelism is capped by partition count. Kafka lag is backpressure working as designed; the danger is not noticing it, or turning it into a rebalance storm.
 
 ---
 
