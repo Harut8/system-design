@@ -8,6 +8,7 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 
 ## Table of Contents
 
+0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Mental Models -- Kafka Is Not a Message Queue](#1-mental-models--kafka-is-not-a-message-queue)
 2. [Core Architecture](#2-core-architecture)
 3. [Producers](#3-producers)
@@ -21,6 +22,95 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 11. [Capacity Planning](#11-capacity-planning)
 12. [Failure Modes and Operational Concerns](#12-failure-modes-and-operational-concerns)
 13. [Kafka vs Alternatives -- Decision Matrix](#13-kafka-vs-alternatives--decision-matrix)
+14. [Real-world cases — incidents with numbers](#14-real-world-cases--incidents-with-numbers)
+
+---
+
+## Start here — the whole chapter in plain words
+
+**The problem.** In a big system, one thing that happens (an order is placed, a ride is booked, a
+sensor sends a reading) must reach many other services. If the source calls each of them directly,
+one slow service slows everyone, and a service that was down simply misses the event. Kafka is a
+durable, shared log in the middle: the source writes the event once, and every reader picks it up
+at its own pace, even hours later. This chapter explains how that log works, how to set it up so
+nothing is lost or doubled, and how to size it.
+
+**A real-world example.** An online shop takes 2,000 orders per second at its Black Friday peak.
+Each order must reach 4 services: payments, inventory, email, and analytics.
+
+- **Without Kafka.** Checkout calls all 4 services one after another. If each is up 99.9% of the
+  time, all 4 succeed only `0.999^4 ≈ 99.6%` of the time, so about 8 checkouts per second fail. When
+  the email service slows to 5 s per call, checkout threads pile up waiting for it and the whole
+  shop slows down. Analytics was down for an hour last week and those orders are gone for good.
+- **With Kafka.** Checkout writes one ~1 KB event to the `order-events` topic and returns. Each
+  service reads the topic in its own **consumer group**.
+  - **Partitions and keys** (§2, §5): the topic has 24 partitions, keyed by `order_id`, so
+    "created → paid → shipped" for one order is always read in order. That is ~83 orders/s per
+    partition.
+  - **Replication and acks** (§3.5, §12): each partition has 3 copies (RF=3). With `acks=all` and
+    `min.insync.replicas=2`, an order is confirmed only once 2 copies have it, so one broker crash
+    loses nothing.
+  - **Idempotent producer** (§3.6): if the network drops the "got it" reply and checkout retries,
+    the broker spots the duplicate and keeps one copy.
+  - **Consumer offsets and lag** (§4): the email service is down for 20 minutes. Its backlog (lag)
+    grows to 2,000 × 1,200 s = 2.4 million events. When it comes back at 4,000 events/s, it gains
+    2,000/s on the backlog and catches up in 20 minutes. No email is lost. Payments never noticed.
+  - **Idempotent consumers** (§6): after a crash, the payments consumer may see an order twice. It
+    stores `order_id` with a unique constraint, so the customer is charged once.
+  - **Retention and sizing** (§11): 2 MB/s × 86,400 s × 7 days × 3 copies ≈ 3.6 TB of disk, or
+    about 1.5 TB after lz4 compression.
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Topic | a named stream of events, like `order-events` | a named notebook everyone can read |
+| Partition | one ordered slice of a topic; the unit of parallelism | one checkout lane in a supermarket |
+| Offset | position of an event in a partition (0, 1, 2, …) | the page number you stopped reading at |
+| Broker | one Kafka server | one warehouse building |
+| Replica / RF | copies of a partition on different brokers | photocopies kept in different buildings |
+| Leader / follower | the copy that takes writes / copies that follow it | the head clerk and the assistants who copy the ledger |
+| ISR (in-sync replicas) | copies that are fully caught up | assistants who are on the current page |
+| `acks` | how many copies must confirm before a write counts | "don't say sent until two people signed for the parcel" |
+| Consumer group | a team of readers sharing the partitions | a team of cashiers splitting the lanes |
+| Rebalance | reshuffling partitions when a reader joins or leaves | reassigning lanes when a cashier goes on break |
+| Consumer lag | how far a reader is behind the newest event | unread emails piling up in your inbox |
+| Idempotent | doing it twice has the same effect as once | pressing a lift button twice calls one lift |
+| Transaction (EOS) | several writes plus the read position commit together or not at all | a bank transfer: both sides move or neither does |
+| Retention / compaction | delete old events by age or size / keep only the latest per key | shredding old files / keeping only the newest version of each form |
+| KRaft | Kafka's built-in metadata consensus that replaced ZooKeeper | the warehouse keeps its own register instead of asking a separate office |
+
+### Symbols and parameters used in this chapter
+
+| Symbol | What it means | Typical value | Simple example |
+|---|---|---|---|
+| RF (`replication.factor`) | copies of each partition | 3 | 100 GB of data uses 300 GB of disk |
+| `min.insync.replicas` | copies that must be in sync for `acks=all` writes to succeed | 2 (with RF=3) | 1 broker down: writes OK; 2 down: `acks=all` writes rejected |
+| `acks` | 0 = don't wait, 1 = leader only, all (-1) = all in-sync copies | `all` (Java default since 3.0) | payments use `all`; debug logs might use 1 |
+| `enable.idempotence` | broker drops duplicate retries using PID + sequence number | true (Java default since 3.0) | a retried send is stored once |
+| PID, seq | producer ID and per-partition sequence number | — | PID 5, seq 41 seen twice → second one ignored |
+| `max.in.flight.requests.per.connection` | unacknowledged requests per broker connection | 5 (max 5 with idempotence) | keeps order while pipelining |
+| `transactional.id` | stable name that lets a restarted producer fence off its old self | one per producer instance | `order-processor-0` |
+| `isolation.level` | whether consumers see uncommitted transactional writes | `read_committed` with EOS | aborted writes are skipped |
+| `batch.size` | max bytes per batch per partition | 16 KB default, 64 KB tuned | ~130 events of 500 B fill a 64 KB batch |
+| `linger.ms` | how long to wait to fill a batch | 0 (Java < 4.0), 5 (4.0+ and librdkafka), 10–20 tuned | adds at most 20 ms latency |
+| `compression.type` | codec applied per batch | lz4 or zstd | ~2.5x smaller (illustrative) |
+| `retention.ms` / `log.retention.hours` | how long events are kept | 7 days (168 h) | 25 MB/s × 7 days ≈ 15 TB raw per copy |
+| `cleanup.policy=compact` | keep only the latest record per key | for state/snapshot topics | a user's newest address survives |
+| `log.segment.bytes` | size of one log file before rolling | 1 GB | retention deletes whole segments |
+| `session.timeout.ms` | silence before a consumer is declared dead | 30–45 s | GC pause of 60 s → kicked out |
+| `heartbeat.interval.ms` | how often a consumer says "alive" | ≤ 1/3 of session timeout | 10 s with a 30 s timeout |
+| `max.poll.interval.ms` | max time between `poll()` calls | 300,000 (5 min) | 6-minute batch → removed from group |
+| `max.poll.records` | records returned per `poll()` | 500 | cut to 50 if processing is slow |
+| `group.instance.id` | static member ID: restart without a rebalance | pod name | rolling deploy with no reshuffle |
+| `replica.lag.time.max.ms` | how far behind a follower may be before leaving the ISR | 30 s | slow disk → follower dropped from ISR |
+| Consumer lag | log-end offset − committed offset | near 0 and stable | 8 − 4 = 4 events behind |
+| `P` | partition count | 6–100 per topic | `max(T_p/t_p, T_c/t_c)` |
+| `T_p`, `T_c` | target producer / consumer throughput for the topic | MB/s | 200 MB/s |
+| `t_p`, `t_c` | throughput one partition can take from a producer / give a consumer | ~10–100 MB/s (measure it) | 200/40 = 5 partitions |
+| events/s × bytes × 86,400 × days × RF ÷ ratio | storage formula | — | 50,000 × 500 B → ~18 TB for 7 days, RF=3, 2.5x |
+| p99 produce latency | 99% of writes are confirmed faster than this | 5–50 ms; alert > 500 ms | spikes during leader failover |
+| Under-replicated partitions | partitions with fewer in-sync copies than RF | 0 | > 0 for 5 min → page |
+
+If a section below gets too technical, read its **In plain words** box first.
 
 ---
 
@@ -1727,6 +1817,118 @@ Kafka advantages:
     (traditionally ZooKeeper) plus BookKeeper
   - Kafka now also has tiered storage (KIP-405, production-ready in 3.9)
 ```
+
+---
+
+## 14. Real-world cases — incidents with numbers
+
+> **In plain words.** These are short incident stories. Each one shows a setting from this chapter
+> going wrong, how the team measured it, and what changed after the fix.
+>
+> **Real-world example.** Case 4 below: a consumer was down for 80 hours on a topic that keeps
+> 72 hours of data, so 8 hours of events were deleted before anyone read them.
+
+These are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent.
+
+**Quick index:** events missing after a broker crash → Case 1 · one consumer far behind, others idle
+→ Case 2 · group keeps rebalancing, lag climbs → Case 3 · lag alert, then data gone → Case 4 ·
+customers charged twice → Case 5 · replayed history has only final states → Case 6 · writes fail
+during a rolling restart → Case 7.
+
+### Case 1: Lost payments after a broker crash (`acks=1`)
+
+- **Setup.** A payments service writes 3,000 events/s to a topic with RF=3. To cut latency, the
+  producer was set to `acks=1`.
+- **Symptom.** After a leader broker lost power, reconciliation found 1,140 payment events that the
+  producer had marked as sent but that were not in Kafka.
+- **Measurement/Diagnosis.** The followers were ~0.4 s behind the leader when it died
+  (3,000 × 0.38 s ≈ 1,140 events). With `acks=1` the old leader had confirmed those writes alone;
+  the new leader never had them (§3.5, §12.2).
+- **Fix.** `acks=all`, `min.insync.replicas=2`, idempotence on. p99 produce latency went from 4 ms
+  to 9 ms (illustrative). In the next two broker failures, 0 events were lost.
+- **Lesson.** `acks=1` trades durability for a few milliseconds. For money, always use
+  `acks=all` + min ISR 2.
+
+### Case 2: Hot partition from a bad key
+
+- **Setup.** An IoT telemetry topic takes 60,000 messages/s on 48 partitions, keyed by
+  `customer_id`. One large customer sends 35% of all traffic.
+- **Symptom.** One consumer's lag climbs all day while the other 47 are nearly idle.
+- **Measurement/Diagnosis.** The hot partition receives 0.35 × 60,000 = 21,000 msg/s. One consumer
+  handles ~8,000 msg/s, so lag grows by 13,000 msg/s (about 47 million per hour). The other
+  partitions average ~830 msg/s each (§5).
+- **Fix.** Re-key by `device_id` (ordering is only needed per device). Load evens out to about
+  60,000 / 48 = 1,250 msg/s per partition; the lag was drained within the day.
+- **Lesson.** Key by the smallest entity that needs ordering, and check that no single key carries a
+  big share of traffic.
+
+### Case 3: Rebalance storm from slow batches
+
+- **Setup.** A video platform's thumbnail worker group reads with `max.poll.records=500`. Each
+  record takes ~2 s to process. `max.poll.interval.ms` is the default 300,000 (5 min).
+- **Symptom.** About 40 rebalances per hour, lag rising steadily, the same videos processed again and
+  again.
+- **Measurement/Diagnosis.** One batch takes 500 × 2 s = 1,000 s, over 3x the 300 s limit. The
+  consumer is removed from the group before it commits, rejoins, gets the same batch, and repeats
+  (§12.3).
+- **Fix.** `max.poll.records=50` (50 × 2 s = 100 s per batch), cooperative sticky assignor, and
+  static membership (`group.instance.id`) so pod restarts do not trigger a rebalance. Rebalances fell
+  to about 1 per hour, during deploys.
+- **Lesson.** Time per batch must stay well under `max.poll.interval.ms`. Size `max.poll.records`
+  from your slowest record.
+
+### Case 4: Lag grew past retention — silent data loss
+
+- **Setup.** An analytics consumer reads a clickstream topic at 10,000 events/s with 72-hour
+  retention. The lag alert only paged during business hours.
+- **Symptom.** After a long weekend, reports for Friday evening were empty.
+- **Measurement/Diagnosis.** The consumer had been down for 80 hours. Kafka deleted segments older
+  than 72 hours, so the oldest 8 hours were gone before the consumer reached them:
+  10,000 × 8 × 3,600 = 288 million events (§4.5).
+- **Fix.** Alert on lag *in time* (e.g. oldest unread event older than 12 hours) 24/7, raise
+  retention to 7 days for this topic, and archive to S3 with a sink connector.
+- **Lesson.** Lag is harmless until it passes retention; then data is lost without any error.
+
+### Case 5: Double charges after a rebalance
+
+- **Setup.** A ride-hailing billing consumer charges riders when a `trip-completed` event arrives.
+  It commits offsets every 5 s. The charge API has no idempotency key.
+- **Symptom.** 1,500 riders were charged twice during one deploy.
+- **Measurement/Diagnosis.** At 300 trips/s, the uncommitted window was up to 5 s = 1,500 events.
+  When the pod was killed, those events were redelivered to another consumer and charged again.
+  Kafka worked as designed: this is at-least-once delivery (§4.3, §6.4).
+- **Fix.** Pass `trip_id` as the payment provider's idempotency key and record it in a table with a
+  unique constraint. The next deploy produced 1,480 redeliveries and 0 double charges.
+- **Lesson.** Kafka EOS covers Kafka-to-Kafka only. Any side effect outside Kafka needs its own
+  duplicate check.
+
+### Case 6: Compacted topic used as an event store
+
+- **Setup.** An e-commerce team stores order events keyed by `order_id` in a topic with
+  `cleanup.policy=compact`, planning to replay it to build new views.
+- **Symptom.** A new "time to ship" report shows almost every order with only a `delivered` event.
+- **Measurement/Diagnosis.** Compaction keeps only the latest record per key. Of the 4 events per
+  order (created, paid, shipped, delivered), 3 were removed once their segments were cleaned
+  (§10.1).
+- **Fix.** Keep the full history in a topic with `retention.ms=-1` (plus tiered storage to keep
+  cost down); keep a separate compacted topic for "current order state".
+- **Lesson.** Compaction is for current state, not history.
+
+### Case 7: Writes rejected during a rolling restart
+
+- **Setup.** A 6-broker cluster with RF=3 and `min.insync.replicas=2`. An operator restarts brokers
+  one by one every 2 minutes. One other broker has a slow disk.
+- **Symptom.** About 6 minutes of `NotEnoughReplicasException` on some partitions; the checkout
+  producer's buffer filled and requests timed out.
+- **Measurement/Diagnosis.** Partitions with one replica on the restarting broker and one on the
+  slow-disk broker (which had dropped out of the ISR) had only the leader in sync: ISR = 1 < 2, so
+  `acks=all` writes were refused (§12.2). The under-replicated partition count was never 0 between
+  restarts.
+- **Fix.** The restart script now waits until under-replicated partitions = 0 before the next
+  broker, and the slow disk was replaced. The next rolling restart caused 0 rejected writes.
+- **Lesson.** `min.insync.replicas=2` protects data by refusing writes. Plan maintenance so ISR
+  never drops below it.
 
 ---
 
