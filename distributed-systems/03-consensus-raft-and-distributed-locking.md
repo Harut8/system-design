@@ -846,6 +846,13 @@ Key design decisions:
   - Not designed for high-throughput data storage — it's a coordination service
 ```
 
+**etcd releases that change operations (2025–2026).**
+
+| Release | What changed | What to do |
+|---|---|---|
+| **v3.6.0** (2025-05-15), the first minor release since v3.5.0 in June 2021 | Average memory **down at least 50%**, mainly because the default `--snapshot-count` fell from 100,000 to 10,000 (it keeps about 10% of the history in memory). About **10% higher** read and write throughput. **Full downgrade support**. Cluster membership moved to the v3 store and the v2 API flags were removed. etcd also became a Kubernetes SIG | Upgrade to **v3.5.20 or later before** going to v3.6. Move any leftover v2 API clients to v3 first |
+| **v3.7.0** (2026-07-08) | **RangeStream**: large range reads (big Kubernetes `LIST`s) come back in chunks instead of one buffered response, so memory is predictable. The server now boots **entirely from the v3 store**, with no v2 remnants. **`LeaseRevoke` is prioritized under overload** and a faster lease keep-alive path was added, so leases expire on time when the cluster is busy | Check that backup and restore tooling is current (snapshot handling changed with the v2 store's removal). Lock and election TTLs (§9.3) now hold more reliably during overload |
+
 ### 8.2 CockroachDB (Multi-Raft)
 
 CockroachDB runs a separate Raft group per range (contiguous key range, default 512 MB). A single node participates in thousands of Raft groups simultaneously:
@@ -990,6 +997,120 @@ Lease lifecycle:
     - Too long (60s): unhealthy client blocks others for 60 seconds
     - Typical production: 10-30 seconds with renewal at half the TTL
 ```
+
+### 9.4 Where the Fence Lives: Compare-and-Swap on Storage You Already Have
+
+§9.2 assumes the storage checks a fencing token. Most don't do that out of the box, but almost
+every store now offers **compare-and-swap (CAS)**, which does the same job:
+
+| Store | CAS primitive | Fenced write |
+|---|---|---|
+| Postgres / MySQL | `UPDATE ... WHERE` a version or token column | `UPDATE jobs SET state = $1, fence = $2 WHERE id = $3 AND fence <= $2`. Zero rows updated means a newer holder exists |
+| DynamoDB | `ConditionExpression` | `attribute_not_exists(pk) OR fence <= :t` |
+| etcd | `Txn` with `Compare` | Compare the lock key's `create_revision` (or that it still exists) in the same transaction as the write. This is the mitigation Jepsen recommended for etcd locks (§17.7) |
+| S3, GCS, Azure Blob | Conditional `PUT` on the object's ETag / generation | S3 added `If-None-Match: *` (create only if absent) in **August 2024** and `If-Match: <etag>` (replace only if unchanged) in **November 2024**. GCS and Azure Blob have long had equivalents |
+
+S3's addition matters most because many systems keep their state *only* in object storage: table
+formats (Delta, Iceberg), object-storage-native stores and queues. They can now elect a leader
+and commit atomically **without running etcd or ZooKeeper at all**.
+
+A lease on any CAS store takes about 30 lines. The epoch it returns is the fencing token:
+
+```python
+import json
+from dataclasses import dataclass
+from typing import Protocol
+
+from botocore.exceptions import ClientError
+
+
+class CasStore(Protocol):
+    """Any storage with compare-and-swap: S3/GCS/Azure Blob (ETags), DynamoDB
+    (ConditionExpression), Postgres (UPDATE ... WHERE version = $n), etcd (Txn)."""
+    def get(self, key: str) -> tuple[bytes, str] | None: ...                 # (body, etag)
+    def put(self, key: str, body: bytes, if_match: str | None) -> bool: ...  # None = must not exist
+
+
+@dataclass(frozen=True)
+class Lease:
+    holder: str
+    epoch: int            # the fencing token: +1 every time leadership changes hands
+    expires_at: float
+
+
+class LeaderLease:
+    def __init__(self, store: CasStore, key: str, me: str, ttl_s: float = 15.0,
+                 skew_margin_s: float = 2.0):
+        self.store, self.key, self.me = store, key, me
+        self.ttl, self.margin = ttl_s, skew_margin_s
+
+    def try_lead(self, now: float) -> int | None:
+        """Acquire or renew. Returns the epoch to stamp on every write, or None."""
+        cur = self.store.get(self.key)
+        if cur is None:
+            nxt, etag = Lease(self.me, 1, now + self.ttl), None
+        else:
+            lease, etag = Lease(**json.loads(cur[0])), cur[1]
+            if lease.holder == self.me:
+                nxt = Lease(self.me, lease.epoch, now + self.ttl)            # renew
+            elif now > lease.expires_at + self.margin:                     # margin: clock skew
+                nxt = Lease(self.me, lease.epoch + 1, now + self.ttl)        # take over
+            else:
+                return None
+        ok = self.store.put(self.key, json.dumps(nxt.__dict__).encode(), if_match=etag)
+        return nxt.epoch if ok else None
+
+
+class S3CasStore:
+    """S3 conditional writes (If-None-Match since Aug 2024, If-Match since Nov 2024)."""
+    def __init__(self, s3, bucket: str):
+        self.s3, self.bucket = s3, bucket
+
+    def get(self, key):
+        try:
+            r = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except self.s3.exceptions.NoSuchKey:
+            return None
+        return r["Body"].read(), r["ETag"]
+
+    def put(self, key, body, if_match):
+        cond = {"IfMatch": if_match} if if_match else {"IfNoneMatch": "*"}
+        try:
+            self.s3.put_object(Bucket=self.bucket, Key=key, Body=body, **cond)
+            return True
+        except ClientError as e:
+            # 412: someone else won. 409: a concurrent conditional write, re-read and retry.
+            if e.response["ResponseMetadata"]["HTTPStatusCode"] in (409, 412):
+                return False
+            raise
+```
+
+Walk through §9.1's pause scenario with a 15 s TTL. Worker A leads with epoch 1 and renews at
+t = 5 s (lease now ends at 20 s). A freezes. At t = 23 s, past the end plus the 2 s skew margin,
+B takes over with **epoch 2**. When A wakes at t = 24 s, its renewal fails because the ETag
+changed. Tested against an S3 mock (moto): two writers with the same ETag, exactly one wins.
+
+Three rules keep it correct:
+
+1. **The lease picks who *tries*. The CAS on the data decides who *succeeds*.** A's work in
+   progress is still dangerous until its *writes* are fenced. Either stamp the epoch on every
+   write and check it (the Postgres row above), or make the commit itself a CAS on the object
+   holding the state (a manifest or metadata pointer). A stale leader's commit then fails on the
+   ETag. This is how lakehouse table formats commit safely.
+2. **Expiry is judged on the challenger's clock,** so leave a margin larger than your worst clock
+   skew. Have the leader stop taking new work before `expires_at - margin`. The fence is what makes
+   a wrong clock merely slow rather than unsafe.
+3. **Price and latency.** Each renewal is a PUT: tens of milliseconds, and $0.005 per 1,000 on
+   S3 Standard. Renewing every 5 s is 17,280 PUTs a day, about $2.60 a month per lease (the GETs
+   add about $0.20). Fine for seconds-scale leadership (a compactor, a scheduler, a singleton
+   job). Too slow for per-request locks, which belong in etcd or the database.
+
+**Kubernetes leader election is a lease, not a fence.** Controllers use `coordination.k8s.io`
+`Lease` objects through client-go's `leaderelection` package, whose documentation states that it
+**does not guarantee only one client is acting as leader** (no fencing). The mechanism is the
+same as above: CAS on the object's `resourceVersion`, with expiry judged from timestamps. For an
+operator whose actions must not overlap (a database failover, a payment batch), fence the
+*effects*: conditional writes on the resources it changes, or idempotency keys.
 
 ---
 
@@ -1184,8 +1305,18 @@ Node types:
 | Max data per node | ~1 MB (default `jute.maxbuffer`) | ~1.5 MiB per request by default (`--max-request-bytes`); 2 GB default DB quota, 8 GB suggested max |
 | Linearizable reads | No by default: any server answers reads from its local copy, which may lag; call `sync()` first for an up-to-date read. Writes are linearizable | Yes by default (ReadIndex); serializable local reads optional |
 | MVCC | No (current state only) | Yes (revision history, compact-able) |
-| Used by | Kafka (before KRaft), HBase, Hadoop, Solr | Kubernetes, CoreDNS, Vitess (CockroachDB and TiKV reuse etcd's Raft library, not etcd itself) |
+| Used by | Kafka up to 3.9 (4.0 removed it), HBase, Hadoop, Solr | Kubernetes, CoreDNS, Vitess (CockroachDB and TiKV reuse etcd's Raft library, not etcd itself) |
 | Operational complexity | High (JVM tuning, GC pauses) | Lower (single binary, Go runtime) |
+
+**ZooKeeper after Kafka 4.0.** Apache Kafka 4.0 (2025-03-18) **removed ZooKeeper entirely**.
+KRaft, Kafka's own Raft-based metadata quorum, is the only mode. A ZooKeeper-based cluster must
+first migrate on the 3.9 bridge release. Kafka was ZooKeeper's largest user, and ClickHouse had
+already moved to ClickHouse Keeper (Raft, ZooKeeper-compatible protocol). The pattern is clear:
+systems now **embed Raft** rather than depend on an external coordinator. For a new system:
+use the coordination built into the platform you already run (Kubernetes → etcd-backed `Lease`
+objects, §9.4; your database → advisory locks and conditional writes). Run etcd yourself only when
+you need its watch and transaction API. Choose ZooKeeper only for software that still requires it
+(HBase, Solr, older Hadoop stacks).
 
 ---
 
@@ -1449,6 +1580,8 @@ Pattern: ensure exactly one instance of a service runs cluster-wide
     election.resign()
 ```
 
+Election gives you a single leader *most of the time*. If two overlapping singletons would do damage, fence the singleton's writes with its election revision (§9.4). In Kubernetes, the built-in `Lease`-based leader election is explicitly unfenced.
+
 ---
 
 ## 15. Failure Modes and Debugging
@@ -1688,7 +1821,7 @@ Architecture:
 | Service discovery | etcd (watches) or Consul | Real-time notifications, health checking |
 | Configuration management | etcd (watch + txn) | Atomic updates, instant propagation |
 | Work queue coordination | etcd lock + Kafka | Lock for claiming, Kafka for durability and ordering |
-| Kafka controller election | ZooKeeper (legacy) / KRaft (new) | Kafka's native integration |
+| Kafka controller election | KRaft (the only mode since Kafka 4.0, March 2025) | Built into Kafka, no external coordinator |
 | Kubernetes control plane | etcd (3 or 5 nodes) | All K8s state lives here |
 | Singleton service | etcd Election or K8s leader-for-life | One active instance cluster-wide |
 
@@ -1700,9 +1833,9 @@ Architecture:
 >
 > **Real-world example.** Case 17.1: a Kubernetes control plane kept "losing" its etcd leader 30 times an hour; the cause was a 400 ms disk, not the network.
 
-These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent. Case 17.6 is a public postmortem.
+These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent. Case 17.6 is a public postmortem, and 17.7–17.8 are public Jepsen analyses.
 
-Quick index: frequent leader elections → 17.1 · double processing despite a lock → 17.2 · a healthy leader keeps stepping down → 17.3 · whole cluster read-only after one region fails → 17.4 · lock service CPU at 95% when locks are released → 17.5 · cross-region failover after a short network blip → 17.6
+Quick index: frequent leader elections → 17.1 · double processing despite a lock → 17.2 · a healthy leader keeps stepping down → 17.3 · whole cluster read-only after one region fails → 17.4 · lock service CPU at 95% when locks are released → 17.5 · cross-region failover after a short network blip → 17.6 · lock holders overlap even on etcd → 17.7 · acknowledged messages lost after a crash → 17.8
 
 ### 17.1 Slow disk, constant elections (Kubernetes control plane)
 
@@ -1751,6 +1884,44 @@ Quick index: frequent leader elections → 17.1 · double processing despite a l
 - **Measurement/Diagnosis.** In that window the failover system promoted primaries in the US West Coast data center. Some writes accepted in the East had not replicated West, and the application now paid cross-country latency on every write. Restoring consistent data took time; GitHub reported **24 hours and 11 minutes** of degraded service.
 - **Fix.** GitHub's postmortem says they changed Orchestrator's configuration to stop promoting database primaries across regional boundaries, and began work on more resilient multi-region operation.
 - **Lesson.** A failover mechanism that can decide in seconds can turn a 43-second blip into a day-long recovery. Decide which failovers must never happen automatically (e.g. across regions), and make sure failover never promotes a node missing acknowledged writes — exactly what Raft's voting rule (§5.2) guarantees within one log.
+
+### 17.7 Public analysis: Jepsen on etcd 3.4.3 — locks are leases (2020)
+
+- **Setup.** Jepsen tested etcd's key-value store and its lock API. The workload used etcd
+  mutexes with **2-second lease TTLs** to protect updates to a shared set, while Jepsen paused
+  processes **every 5 seconds**.
+- **Symptom.** The key-value operations were **strict serializable** as claimed. The locks were
+  not mutual exclusion: about **18% of acknowledged updates were lost**.
+- **Measurement/Diagnosis.** Two causes. Fundamentally, an etcd lock is a lease (§9.3), so a
+  paused holder keeps working after its lease has expired and another client has the lock (§9.1).
+  There was also a bug: after waiting in the queue, the lock call did not re-check that the
+  client's lease was still valid, so a client could be told it held a lock whose lease had
+  already expired.
+- **Fix.** The etcd team fixed the bug and documented the limits. The mitigation, which is also
+  the general rule: do the protected write in an etcd **transaction that compares the lock key**
+  (it still exists with the expected revision), so the write fails if the lock was lost (§9.4).
+- **Lesson.** Even a linearizable, Raft-backed lock service can't stop a paused holder. Only a
+  check at the write can.
+
+### 17.8 Public analysis: Jepsen on NATS 2.12.1 — acknowledged before it was on disk (2025)
+
+- **Setup.** NATS JetStream replicates streams with Raft. By default it **acknowledges writes
+  immediately but calls `fsync` only every 2 minutes**, relying on replication across nodes for
+  durability.
+- **Symptom.** Under Jepsen's fault injection, **acknowledged, committed writes were lost**.
+- **Measurement/Diagnosis.** A coordinated power failure (every replica loses its unsynced page
+  cache at once) loses the last seconds to minutes of acknowledged messages. Worse, an OS crash on
+  a **single** node combined with network delays or process pauses could lose committed writes
+  and cause **persistent split-brain**. Raft's safety argument (§5) assumes a node has **flushed
+  an entry to disk before it acknowledges it**. A node that forgets entries it voted for breaks
+  that assumption.
+- **Fix.** Set `sync_interval: always` where acknowledged means durable, and accept the
+  throughput cost, or keep the default only for data you can afford to lose. Run replication
+  factor 3 across failure domains that don't share power, and never 1 or 2 for important
+  streams.
+- **Lesson.** "Uses Raft" is not a durability guarantee. Check the fsync policy of any consensus
+  system as carefully as its quorum size. etcd's advice to watch `wal_fsync` latency (§17.1)
+  exists for the same reason.
 
 ---
 

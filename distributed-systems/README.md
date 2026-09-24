@@ -281,6 +281,7 @@ Leaf-Spine (CLOS) Datacenter Network:
 ### Advanced Eviction Algorithms
 * **TinyLFU**: Frequency-based cache eviction using Bloom Filter / Count-Min Sketch to maintain minimal memory footprint.
 * **ARC (Adaptive Replacement Cache)**: Dynamically balances between Recency (LRU) and Frequency (LFU) using ghost queues.
+* **S3-FIFO / SIEVE (2023–2024)**: FIFO queues with quick demotion; lower miss ratios than LRU and lock-free hits (`08` §5.5).
 * **Cache Stampede Mitigations**: Singleflight request deduplication, **XFetch** probabilistic early expiration algorithm.
 
 ---

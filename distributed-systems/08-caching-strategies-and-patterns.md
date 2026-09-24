@@ -804,13 +804,120 @@ W-TinyLFU ARCHITECTURE (Caffeine):
 
 **Why TinyLFU beats pure LRU for most workloads**: Real-world cache access patterns follow power-law distributions (Zipfian). A small number of items are accessed very frequently, and a long tail of items are accessed rarely. LRU wastes cache space on long-tail items that happen to be accessed recently. TinyLFU's admission filter keeps these out, reserving cache space for genuinely popular items. In the published trace benchmarks (Einziger, Friedman, Manes, "TinyLFU", ACM ToS 2017, and Caffeine's simulator), W-TinyLFU matches or beats LRU, LFU, and ARC on most traces; the size of the gain depends heavily on the workload and cache size.
 
-### 5.5 Other Policies
+### 5.5 FIFO Is Back: S3-FIFO and SIEVE (2023–2024)
 
-- **FIFO (First In, First Out)**: Evict the oldest entry. Simple but ignores access patterns entirely. Useful only when all entries are equally likely to be accessed (rare in practice).
+For decades the rule was "FIFO is poor, LRU is the baseline, anything better is complex". Two
+papers from the same group (Juncheng Yang et al.) overturned that with algorithms built from FIFO
+queues:
+
+- **S3-FIFO** (SOSP 2023) uses three FIFO queues: a **small** queue (~10% of the space) that every
+  new object enters, a **main** queue for objects that were hit again while in the small queue,
+  and a **ghost** queue that remembers only the keys of recently evicted objects. Most objects are
+  read once and never again ("one-hit wonders"), so the small queue throws them out *quickly*,
+  before they push anything useful out of main. Across 6,594 production traces from 14 datasets,
+  S3-FIFO had a lower miss ratio than each of the 12 state-of-the-art algorithms it was compared
+  with, and it cut LRU's miss ratio by up to 72% on some traces.
+- **SIEVE** (NSDI 2024) is even smaller: **one** FIFO queue, one "visited" bit per object and a
+  "hand" that moves from the oldest object toward the newest. A hit only sets the bit. On
+  eviction the hand clears the bit on visited objects and keeps them *where they are*, then evicts
+  the first unvisited one. New objects enter at the head, so objects that were never hit again
+  are evicted quickly, as with S3-FIFO's small queue.
+
+Two properties matter as much as the hit rate:
+
+1. **A hit is a bit flip, not a list move.** LRU must move the entry to the head on *every read*,
+   which means a lock (or lock-free tricks) on the hottest path. In FIFO-based caches reads don't
+   touch the queue, so they scale across cores. That is the main reason in-process caches and
+   proxies adopted them.
+2. **Quick demotion.** Scan resistance comes from evicting new, unproven objects fast. You get
+   most of what TinyLFU's admission filter gives without a frequency sketch.
+
+```python
+class _Node:
+    __slots__ = ("key", "value", "visited", "prev", "next")
+
+    def __init__(self, key, value):
+        self.key, self.value, self.visited = key, value, False
+        self.prev = self.next = None
+
+
+class SieveCache:
+    """SIEVE (NSDI 2024): one FIFO queue, one 'visited' bit per entry, one moving hand.
+    A hit only sets a bit, so reads need no lock and no list reordering."""
+
+    def __init__(self, capacity: int):
+        self.capacity, self.map = capacity, {}
+        self.head = self.tail = self.hand = None          # head = newest, tail = oldest
+
+    def get(self, key):
+        node = self.map.get(key)
+        if node is None:
+            return None
+        node.visited = True                              # the whole "promotion"
+        return node.value
+
+    def put(self, key, value):
+        if key in self.map:
+            self.map[key].value = value
+            self.map[key].visited = True
+            return
+        if len(self.map) >= self.capacity:
+            self._evict()
+        node = _Node(key, value)
+        node.next, self.head = self.head, node           # insert at head
+        if node.next:
+            node.next.prev = node
+        if self.tail is None:
+            self.tail = node
+        self.map[key] = node
+
+    def _evict(self):
+        node = self.hand or self.tail                    # resume where the hand stopped
+        while node.visited:                              # survivors stay in place
+            node.visited = False
+            node = node.prev or self.tail                # move toward newer, wrap around
+        self.hand = node.prev                            # next scan starts here
+        if node.prev:
+            node.prev.next = node.next
+        else:
+            self.head = node.next
+        if node.next:
+            node.next.prev = node.prev
+        else:
+            self.tail = node.prev
+        del self.map[node.key]
+```
+
+Replaying the same synthetic trace (1 million requests over 100,000 keys, Zipf popularity)
+through FIFO, LRU (`OrderedDict`) and the class above gives these miss ratios:
+
+| Workload | Cache size | FIFO | LRU | SIEVE |
+|---|---|---|---|---|
+| Zipf α = 1.0 | 1,000 (1%) | 0.535 | 0.494 | **0.404** |
+| Zipf α = 1.0 | 10,000 (10%) | 0.300 | 0.265 | **0.224** |
+| Zipf α = 1.0 + a 20,000-key scan every 100,000 requests | 10,000 | 0.418 | 0.395 | **0.343** |
+| Zipf α = 0.8 (flatter) | 10,000 | 0.573 | 0.533 | **0.463** |
+
+At 10,000 entries, SIEVE sends **15% fewer requests to the database** than LRU (miss ratio
+0.224 vs 0.265) with a simpler data structure. This is a synthetic trace. The papers' numbers
+come from real traces, where the gap varies by workload, so replay your own access log before
+switching.
+
+**Where you will meet them.** Cloudflare's Pingora ships **TinyUFO**, a lock-free in-memory
+cache that uses S3-FIFO for eviction and TinyLFU for admission. The authors report production use
+at Google, VMware and Redpanda, among others, and SIEVE libraries exist for most languages.
+**Redis and Valkey don't use them.** Their `allkeys-lru` / `allkeys-lfu` are sampled
+approximations (§6.2), so for a remote cache the choice is still LRU vs LFU. The practical impact
+is in-process caches (L1, §7.2), proxies and CDNs, and any cache you write yourself: start with
+SIEVE, not a hand-rolled LRU.
+
+### 5.6 Other Policies
+
+- **FIFO (First In, First Out)**: Evict the oldest entry. Simple but ignores access patterns entirely. Plain FIFO is weak, but FIFO plus a visited bit or a small probation queue is state of the art (§5.5).
 - **Random**: Evict a random entry. Surprisingly competitive with LRU for uniform access patterns and much simpler to implement. Used in some CPU cache designs. A scan does not flush the whole cache at once (each scanned item only has a small chance of pushing out a hot one), but it is not truly scan-resistant.
 - **TTL-based eviction**: Evict entries closest to expiry. Not a standalone eviction policy -- usually combined with LRU/LFU as a secondary signal.
 
-### 5.6 Eviction Policy Comparison
+### 5.7 Eviction Policy Comparison
 
 ```
 ┌──────────┬──────────────┬──────────────┬────────────────┬────────────────────┐
@@ -822,12 +929,14 @@ W-TinyLFU ARCHITECTURE (Caffeine):
 │ LFU      │ Good         │ Yes          │ Medium         │ Redis (since 4.0)  │
 │ ARC      │ Very good    │ Yes          │ High           │ ZFS (PG 8.0 only)  │
 │ TinyLFU  │ Excellent    │ Yes          │ High           │ Caffeine (Java)    │
+│ S3-FIFO  │ Excellent    │ Yes          │ Low            │ Pingora TinyUFO    │
+│ SIEVE    │ Very good    │ Mostly       │ Very low       │ In-process libs    │
 │ FIFO     │ Poor         │ N/A          │ Very low       │ Simple buffers     │
 │ Random   │ Fair         │ Partly       │ Very low       │ CPU caches (some)  │
 └──────────┴──────────────┴──────────────┴────────────────┴────────────────────┘
 ```
 
-**Interview guidance**: Know LRU (it is the default everywhere), know why TinyLFU is better (admission filtering based on frequency estimation), and know ARC exists for completeness. If asked "which eviction policy would you use?", the answer is: LRU or LFU for a remote cache (in Redis set `maxmemory-policy allkeys-lru` or `allkeys-lfu` -- the default is `noeviction`), TinyLFU/Caffeine for an in-process cache (Java/JVM), and LRU with manual hot-key pinning for everything else.
+**Interview guidance**: Know LRU (it is the default everywhere), know why TinyLFU is better (admission filtering based on frequency estimation), and know ARC exists for completeness. If asked "which eviction policy would you use?", the answer is: LRU or LFU for a remote cache (in Redis set `maxmemory-policy allkeys-lru` or `allkeys-lfu` -- the default is `noeviction`), TinyLFU/Caffeine for an in-process cache (Java/JVM), SIEVE or S3-FIFO when you implement a cache yourself or need reads that don't take a lock (§5.5), and LRU with manual hot-key pinning for everything else.
 
 ---
 
@@ -953,6 +1062,41 @@ results = pipe.execute()  # All 100 results returned at once
 
 **Impact**: Pipelining can improve throughput by 5-10x for batch operations. Always use it when performing multiple independent operations (bulk cache warming, batch reads, multi-key invalidation).
 
+### 6.7 Redis or Valkey? The 2024–2026 Split
+
+Everything in §6 applies to both, but since 2024 "Redis" means two projects, and the choice is
+now a licensing, cost and roadmap decision as much as a technical one.
+
+| Date | Event |
+|---|---|
+| March 2024 | Redis Inc. moves Redis from BSD to dual RSALv2 / SSPLv1 (source-available, not OSI open source). The Linux Foundation forks the last BSD version as **Valkey**, backed by AWS, Google Cloud, Oracle and others |
+| Sept 2024 | **Valkey 8.0**: I/O threads run concurrently with the main thread and batch commands, up to **1.2 million requests/s** on an AWS r7g instance, over 3× the previous version |
+| Oct 2024 | **ElastiCache for Valkey** launches **20% cheaper** than the Redis OSS engine on nodes, **33% cheaper** serverless (from about $6/month). Google Memorystore also offers Valkey |
+| Early 2025 | **Valkey 8.1**: a new hash table saves about **20 bytes per key** (up to 30 with a TTL) |
+| May 2025 | **Redis 8.0** adds **AGPLv3** as a third license option, so it is OSI open source again. Redis 8 also puts JSON, time series, probabilistic types, the Query Engine and **vector sets** (beta) into the core, plus hash-field TTL commands (`HGETEX`, `HSETEX`) |
+| Oct 2025 | **Valkey 9.0**: **atomic slot migration** (whole slots move in one operation instead of key by key, so resharding no longer gets stuck on large keys), per-field hash expiry, multiple databases in cluster mode |
+| May 2026 | **Valkey 9.1**: redesigned I/O threading (up to 17% more throughput) |
+
+How to choose:
+
+- **Pure cache, managed service:** Valkey is the default. It speaks the same protocol, existing
+  clients work unchanged, and on AWS it is cheaper for the same node. The move is an in-place
+  engine upgrade on ElastiCache.
+- **You need Redis 8 features** (Query Engine, vector sets, JSON in core): use Redis 8. If you
+  self-host it *and* offer it to others over a network, have legal review AGPLv3's obligations.
+  For internal use as a cache, AGPL rarely matters.
+- **Self-hosted and you want BSD without questions:** Valkey.
+- **Portability rule:** both keep the core commands in §6.1 compatible, but new commands are
+  starting to diverge (Valkey 9.1 and Redis 8 each added hash and multi-key commands the other
+  may lack). Stick to the shared core in application code, and put engine-specific calls behind
+  one module.
+
+The comparison table in §7.3 says Redis is "single-threaded (mostly)". That still holds for
+**command execution** in both projects: one core runs your commands, so a slow Lua script or
+`KEYS *` blocks everything. **Network I/O** is multi-threaded when enabled (`io-threads`, since
+Redis 6 and much faster in Valkey 8+). That is why a single node now reaches a million+ simple
+requests per second, while a hot key (§11.3) still maxes out one core.
+
 ---
 
 ## 7. Distributed Caching Architecture
@@ -1026,6 +1170,29 @@ Stored in the application's own memory. No network hop. Microsecond access times
 
 **Invalidation**: TTL (short -- 30s to 5min), or broadcast invalidation via pub/sub (when one instance's L1 is invalidated, it publishes an event so other instances invalidate their local copies too).
 
+**Server-assisted invalidation (Redis 6+, Valkey).** Instead of running your own pub/sub, let the
+cache server tell each app instance when a key it holds in L1 has changed. After
+`CLIENT TRACKING ON`, the server remembers which keys each connection has read and pushes an
+`invalidate` message when any of them is modified or evicted. Two modes:
+
+| Mode | Command | Server memory | Messages the client receives |
+|---|---|---|---|
+| Default | `CLIENT TRACKING ON` | One entry per (key, client) read. Capped by `tracking-table-max-keys`, and past the cap the server invalidates early | Only for keys this client actually read |
+| Broadcast | `CLIENT TRACKING ON BCAST PREFIX product:` | None per client | Every change under the prefix, read or not |
+
+With RESP3 the invalidation arrives on the same connection. With RESP2 you `REDIRECT` it to a
+second connection subscribed to `__redis__:invalidate`. Three rules make it safe:
+
+1. **When the connection drops, flush the whole L1.** Invalidations sent while you were
+   disconnected are lost.
+2. **Keep a short L1 TTL anyway.** Invalidations are asynchronous: one network hop of staleness
+   is normal, and a bug in the invalidation path must not become unbounded staleness (§3.6).
+3. **Use broadcast mode for small, hot prefixes** (config, feature flags, prices of the top
+   products), and default mode for large key spaces where each instance reads only a few keys.
+
+Lettuce, Jedis and redis-py (with RESP3) implement it, so check your client before building
+invalidation yourself.
+
 **Libraries**: Caffeine (Java -- the gold standard with W-TinyLFU), Guava Cache (Java -- predecessor to Caffeine), go-cache or bigcache (Go), cachetools or functools.lru_cache (Python).
 
 ### 7.3 L2: Remote Shared Cache
@@ -1043,7 +1210,8 @@ A dedicated cache service (Redis or Memcached) accessible by all application ins
 │ Data structures  │ String, Hash, Set, ZSet, │ String only              │
 │                  │ List, HyperLogLog, etc.  │                          │
 ├──────────────────┼──────────────────────────┼──────────────────────────┤
-│ Threading        │ Single-threaded (mostly) │ Multi-threaded           │
+│ Threading        │ 1 thread runs commands;  │ Multi-threaded           │
+│                  │ I/O threads optional §6.7│                          │
 ├──────────────────┼──────────────────────────┼──────────────────────────┤
 │ Persistence      │ RDB + AOF                │ None                     │
 ├──────────────────┼──────────────────────────┼──────────────────────────┤
@@ -1058,7 +1226,7 @@ A dedicated cache service (Redis or Memcached) accessible by all application ins
 │                  │ data structure operations │ key-value caching        │
 └──────────────────┴──────────────────────────┴──────────────────────────┘
 
-Recommendation: Redis for almost everything. Memcached only when you need
+Recommendation: Redis (or Valkey, §6.7) for almost everything. Memcached only when you need
 multi-threaded performance for simple key-value workloads at extreme scale
 (Facebook's Memcache deployment, described in "Scaling Memcache at Facebook", NSDI 2013, is the canonical example).
 ```
@@ -1116,6 +1284,46 @@ Content Delivery Networks cache responses at edge locations geographically close
 **When to use CDN caching**: Static assets (JS, CSS, images -- long TTL, content-hash in URL for busting). Public API responses that are the same for all users (e.g., product catalog, trending items). Rendered HTML pages for logged-out users.
 
 **When NOT to use CDN caching**: User-specific responses (unless using Vary on a user identifier, which effectively disables caching). Responses that change frequently. Data with strict consistency requirements.
+
+**Security: a shared cache serves everyone the same bytes.** Two attack classes target the
+difference between what the cache thinks a request is and what the origin serves:
+
+- **Web cache deception.** The attacker tricks the cache into storing a *victim's* private
+  response under a URL the attacker can then fetch. Typical trigger: a CDN rule "cache everything
+  ending in `.css`" plus a backend that ignores trailing path segments. The victim clicks
+  `/api/auth/session/x.css`, the backend returns their session JSON, and the CDN caches it as a
+  public stylesheet. This took over ChatGPT accounts in March 2023 (§13, Case 8). PortSwigger's
+  2024 research generalized it to **delimiter and normalization mismatches**. Spring treats `;` as
+  a delimiter, so the CDN caches `/api/profile;.css` as CSS while the app serves `/api/profile`.
+  Encoded `..%2F` sequences that the cache doesn't decode but the origin does work the same way.
+- **Web cache poisoning.** The attacker gets a harmful response cached for *everyone* through an
+  input the origin uses but the cache key ignores, e.g. an unkeyed `X-Forwarded-Host` header
+  that the page uses to build script URLs.
+
+Rules that prevent both:
+
+1. **Origin decides cacheability, explicitly.** Authenticated and personalized responses send
+   `Cache-Control: private, no-store`. Cacheable ones send `public, max-age=...`. Never let a CDN
+   rule cache by **file extension** over the origin's headers. That override is the root cause of
+   most deception bugs. Where the CDN offers it, turn on a check that the `Content-Type` matches
+   the extension (Cloudflare calls this Cache Deception Armor).
+2. **Normalize once, identically.** The cache key and the origin router must see the same path:
+   the same decoding, dot-segment removal and delimiter handling. Otherwise reject ambiguous paths
+   at the edge.
+3. **Every input that changes the response is in the cache key, or stripped at the edge.**
+   Headers, cookies and query parameters alike.
+4. **Cache on an allow-list of routes** (`/static/*`, `/api/catalog/*`), not a deny-list.
+
+**Personal data in caches (GDPR).** A cached copy is still personal data:
+
+- **Erasure must reach every layer.** A deletion request must invalidate L1, L2 and the CDN
+  (purge by URL or surrogate key). Otherwise the TTL, plus any `stale-if-error` window, is how long
+  deleted data keeps being served. Keep TTLs on personal data short enough to defend in a data
+  protection impact assessment.
+- **No PII in cache keys.** Keys show up in logs, `SLOWLOG`, `MONITOR`, `--hotkeys` output and
+  metrics labels. Key by internal ID (`user:8812`), never by email.
+- **Encrypt and restrict.** TLS between app and cache, per-service ACL users (`ACL SETUSER`), and
+  encryption at rest on managed services.
 
 ---
 
@@ -1772,9 +1980,9 @@ ALERT PRIORITY MATRIX:
 
 ## 13. Real-world cases — incidents with numbers
 
-These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent.
+Cases 1–6 are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent. Cases 7–8 are public incidents.
 
-**Quick index:** DB spikes every TTL period → Case 1 · cache restarted empty, DB overwhelmed → Case 2 · hit rate collapses during a nightly job → Case 3 · DB flooded by requests for IDs that don't exist → Case 4 · old prices shown for up to an hour → Case 5 · one Redis shard at 100% CPU, others idle → Case 6
+**Quick index:** DB spikes every TTL period → Case 1 · cache restarted empty, DB overwhelmed → Case 2 · hit rate collapses during a nightly job → Case 3 · DB flooded by requests for IDs that don't exist → Case 4 · old prices shown for up to an hour → Case 5 · one Redis shard at 100% CPU, others idle → Case 6 · users see other users' data from the cache → Case 7 · a crafted link leaks a session through the CDN → Case 8
 
 ### Case 1: Flash-sale stampede on one product key
 
@@ -1824,6 +2032,59 @@ These are **composite scenarios** built from failure modes this chapter describe
 - **Fix.** Put an in-process L1 cache (§7.4) with a 1-second TTL in front of Redis on the 60 app servers. Redis now sees at most ~60 reads/s for that key (one per server per second) instead of 150,000. The score may be up to 1 s old, which is fine for this screen. After: shard CPU back to ~15%.
 - **Lesson.** Sharding spreads *keys*, not *load on one key*. Hot keys need local caching or key replication (§11.3).
 
+### Public incidents — the cache as a security boundary
+
+Cases 1–6 are composites. The two below are **real, public incidents**, taken from OpenAI's
+postmortem and the researchers' write-ups. In both, the cache handed one user's data to another.
+
+### Case 7: Another user's data from a corrupted cache connection (ChatGPT, 2023-03-20)
+
+- **Setup.** ChatGPT cached user data in Redis through the `redis-py` asyncio client, with
+  connections shared from a pool.
+- **Symptom.** Some users saw **other users' chat titles** in their history sidebar. OpenAI took
+  ChatGPT offline. For **1.2% of ChatGPT Plus subscribers** active between 01:00 and 10:00 PT,
+  another user could have seen their name, email, payment address, card type, the last four
+  digits of their card and its expiry date.
+- **Measurement/Diagnosis.** A bug in `redis-py`: if a request was **cancelled after it was sent
+  but before its response was read**, the connection went back to the pool with that response
+  still unread. The next request on the connection, for a different user, read the stale response
+  as its own. A server change that morning had sharply increased request cancellations, which
+  turned a rare race into a visible leak.
+- **Fix.** The library was patched, and OpenAI added **redundant checks that data returned by
+  the cache matches the requesting user**.
+- **Lesson.** Cancellation and timeouts are part of the cache client's correctness, not just
+  its latency. Treat the cache as untrusted for isolation: store the owner ID inside the cached
+  value and check it on read, so a client or key bug returns a miss instead of someone else's
+  data:
+
+```python
+def get_user_scoped(cache, user_id: str, key: str):
+    raw = cache.get(key)
+    if raw is None:
+        return None
+    entry = json.loads(raw)
+    if entry.get("owner") != user_id:          # wrong owner: treat as a miss and alert
+        log.error("cache owner mismatch", extra={"key": key})
+        return None
+    return entry["value"]
+```
+
+### Case 8: Web cache deception takes over accounts (ChatGPT, March 2023)
+
+- **Setup.** ChatGPT's frontend was served through a CDN. `GET /api/auth/session` returned the
+  signed-in user's session context, including an **access token**.
+- **Symptom.** None visible. A researcher (Gal Nagli) reported that one click on a crafted link
+  was enough to take over the clicking user's account.
+- **Measurement/Diagnosis.** The CDN cached paths that looked like static files. A link such as
+  `/api/auth/session/victim.css` reached the session endpoint with the victim's cookies, and the
+  CDN stored the response as a public `.css` file. The attacker then fetched the same URL and got
+  the victim's token (§7.5). OpenAI fixed it quickly. A later variant (reported in 2024) used
+  a URL-encoded `../` that the CDN didn't decode but the origin did.
+- **Fix.** Stop caching the authentication paths, and make cacheability follow the origin's
+  headers rather than the file extension.
+- **Lesson.** The cache key and the origin must agree on what a URL means. Any gap between the
+  two (extension rules, delimiters, encoding) is a data-leak path. Apply §7.5's four rules.
+
 ---
 
 ## Summary: The Interview Caching Checklist
@@ -1849,5 +2110,7 @@ When caching comes up in a system design interview, walk through these items:
 9. **Size the cache**: Quick back-of-envelope: N items x avg_size x overhead x replication. State the number.
 
 10. **State the key metric**: "We would monitor hit rate, targeting 90%+, with alerts on drops."
+
+11. **Protect the data**: private responses are `no-store` at the CDN, no PII in keys, erasure purges every layer, and cached values carry their owner ID (§7.5, §13 Cases 7–8).
 
 This checklist, delivered fluently in an interview, demonstrates production-grade understanding of caching.

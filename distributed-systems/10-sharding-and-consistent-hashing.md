@@ -80,7 +80,7 @@ the team adds an 11th cache server. (Illustrative numbers, computed below.)
 | K | total number of keys | millions to billions | 40M carts |
 | N | number of physical nodes (servers) or buckets | 3 – 1,000 | 10 cache servers |
 | V | virtual nodes (tokens) per physical node | 8 – 256 | Cassandra `num_tokens` = 16 (4.0+) |
-| P | total points on the ring = N × V (§5.5) | thousands | 100 nodes × 256 = 25,600 |
+| P | total points on the ring = N × V (§5.6) | thousands | 100 nodes × 256 = 25,600 |
 | M | Maglev lookup table size (a prime) | 65,537 | backend lookup is `table[hash % M]` |
 | `hash(key) % N` | modular hashing: remainder after dividing by N | — | 7,842,391 % 3 = 1 → node 1 |
 | K/N, K/(N+1) | keys moved when one node joins a consistent-hash cluster | ~1/N of keys | 1M keys, 100 → 101 nodes: ~9,901 move |
@@ -98,6 +98,8 @@ the team adds an 11th cache server. (Illustrative numbers, computed below.)
 | QPS | queries (requests) per second | 1K – millions | 500,000 reads/s total |
 | hotspot_factor | busiest partition QPS ÷ average partition QPS | aim < 5x | 50,000 / 83 ≈ 600x = danger |
 | C, nprobe (§11.2) | number of IVF clusters; clusters searched per query | 1,000; 20 | search 20 of 1,000 partitions |
+| c (bounded loads) | cap on one server's load, as a multiple of the average (§5.5) | 1.25–1.5 | c = 1.25 → no server above 125% of average |
+| L (logical shards) | fixed number of logical shards mapped onto physical databases (§6.5) | hundreds | Notion: 480 on 32, later 96 hosts |
 | MTBF | mean time between failures of one part | ~2M hours (SSD rating) | 800 drives → one failure per ~2,500 h |
 | p99 | 99% of requests finish faster than this | ms | p99 < 5 ms for feature reads |
 
@@ -748,7 +750,81 @@ Ketama, developed by Last.fm, was the first widely deployed consistent hashing i
 - Became the de facto standard for memcached consistent hashing.
 - Simple ring-walk implementation, well-tested in production.
 
-### 5.5 Comparison Table
+### 5.5 Consistent Hashing with Bounded Loads (Google, 2016)
+
+Every variant above balances **keys**. None of them balances **load**. Real traffic is skewed:
+with Zipf-popular keys, the server that owns the top few keys gets several times the average
+load, however many vnodes you use (§6.4). For caches and sticky load balancing, where each server
+is chosen *so that* its local cache is warm, that is exactly the problem.
+
+**Consistent hashing with bounded loads** (Mirrokni, Thorup, Zadimoghaddam, 2016) adds one rule:
+no server may hold more than `c × average load`. A request goes to its usual ring position. If
+that server is at capacity, it walks clockwise to the next server with room. Keys stay put while
+loads are normal, so cache locality is preserved. When a key turns hot, the overflow spills onto
+the next servers on the ring, always the same ones, so their caches warm up for it too.
+
+```python
+import bisect
+import hashlib
+import math
+
+
+def _h(s: str) -> int:
+    return int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8).digest(), "big")
+
+
+class BoundedLoadRing:
+    """Consistent hashing with bounded loads (Mirrokni, Thorup, Zadimoghaddam 2016).
+    A server may hold at most ceil(c * average) in-flight requests. If a key's server
+    is full, walk clockwise to the next server with room."""
+
+    def __init__(self, servers: list[str], vnodes: int = 100, c: float = 1.25):
+        self.c, self.load = c, {s: 0 for s in servers}
+        self.ring = sorted((_h(f"{s}#{i}"), s) for s in servers for i in range(vnodes))
+        self.points = [p for p, _ in self.ring]
+
+    def _capacity(self) -> int:
+        total = sum(self.load.values()) + 1                      # including this request
+        return math.ceil(self.c * total / len(self.load))
+
+    def acquire(self, key: str) -> str:
+        cap, i = self._capacity(), bisect.bisect(self.points, _h(key))
+        for step in range(len(self.ring)):
+            server = self.ring[(i + step) % len(self.ring)][1]
+            if self.load[server] < cap:
+                self.load[server] += 1
+                return server
+        raise RuntimeError("unreachable: c > 1 always leaves room somewhere")
+
+    def release(self, server: str) -> None:
+        self.load[server] -= 1
+```
+
+Simulating 10 servers with 100 vnodes each, 200 requests per tick drawn from 10,000 keys with
+Zipf α = 1.1, and each request in flight for 5 ticks:
+
+| `c` | Busiest server ÷ average (median over time) | Worst moment | Requests served by the key's usual server |
+|---|---|---|---|
+| unbounded (plain ring) | **2.67×** | 3.17× | 100% |
+| 2.0 | 2.00× | 2.00× | 93.2% |
+| 1.5 | 1.50× | 1.50× | 87.6% |
+| **1.25** | **1.25×** | 1.25× | 81.4% |
+| 1.1 | 1.10× | 1.15× | 74.0% |
+
+The trade-off is explicit: a lower `c` caps the hottest server closer to the average but moves
+more requests off their usual server, and those requests miss that server's cache. `c` = 1.25
+to 1.5 is the usual range. The paper proves the cap holds and that each change moves only an
+expected constant number of assignments.
+
+**In production.** Vimeo implemented it in HAProxy (`hash-type consistent` plus
+`hash-balance-factor`, which takes `c` in percent, e.g. 125) for its video cache tier. Cache
+bandwidth fell by a factor of almost 8, removing a scaling bottleneck. Envoy offers the same knob
+for its `RING_HASH` and `MAGLEV` load balancers (`hash_balance_factor`, minimum 100). The load
+counted is **requests in flight**, the same signal as P2C in `34` §6.7, so it needs a balancer
+that sees every request. It doesn't work for client-side key routing to a database, where no one
+knows the global load.
+
+### 5.6 Comparison Table
 
 ```
 CONSISTENT HASHING VARIANTS -- COMPARISON:
@@ -771,6 +847,10 @@ CONSISTENT HASHING VARIANTS -- COMPARISON:
 ├─────────────────┼──────────┼───────────┼──────────┼──────────────┼────────────────────┤
 │ Ketama          │ O(log P) │ O(P)      │ Good     │ K/N keys     │ Memcached clusters │
 │                 │          │           │ (V~150)  │              │                    │
+├─────────────────┼──────────┼───────────┼──────────┼──────────────┼────────────────────┤
+│ Bounded loads   │ Ring or  │ Ring +    │ Load ≤ c │ Ring's, plus │ Cache/sticky LBs   │
+│ (on any ring)   │ Maglev + │ per-server│ × average│ spill-over   │ with skewed keys   │
+│                 │ walk     │ counters  │          │ when hot     │                    │
 └─────────────────┴──────────┴───────────┴──────────┴──────────────┴────────────────────┘
 
 P = total points on ring (N nodes × V vnodes)
@@ -783,6 +863,7 @@ K = total key count, N = node count
 - Stateless cache tier growing monotonically: **Jump hash** (simplest, perfect balance).
 - Load balancer with small backend pool: **Rendezvous** (simple, no state) or **Maglev** (O(1) lookup).
 - Memcached-specific: **Ketama** (the standard).
+- Cache or sticky load-balancer tier with hot keys: any of the above **plus bounded loads** (§5.5), `c` = 1.25–1.5.
 
 ---
 
@@ -885,6 +966,7 @@ A partition receiving disproportionately high traffic relative to other partitio
 - Celebrity/power-law keys: One user has 100M followers and their profile is read 100x more than average.
 - Temporal hotspots: Today's date is the write key for a time-series system; all writes go to one partition.
 - Poor partition key choice: Partitioning by country and 40% of users are in the US.
+- Time-ordered IDs as a range key: UUIDv7 (RFC 9562, 2024), Snowflake IDs and ULIDs are good for B-tree locality on one database (`databases/06`), but as a *range* partition key they send every new row to the last range, the same hot tail as Case 3. Hash them, or put a tenant ID in front of them.
 
 **Solutions**:
 
@@ -916,6 +998,74 @@ Only salt keys that are actually hot.
 **Local aggregation / write buffering**: For counters and aggregations on hot keys, batch writes locally (e.g., accumulate 100 increments) and flush periodically, reducing write QPS by the batch factor.
 
 **Read replicas for hot keys**: Route reads for known-hot keys to dedicated read replicas. Instagram does this for celebrity profiles -- they are cached in a dedicated cache tier separate from the general user cache.
+
+### 6.5 Sharding an Existing SQL Database: The Logical-Shard Playbook
+
+§6.1–§6.4 describe databases that shard themselves. Most teams meet sharding differently: one
+Postgres or MySQL primary that is running out of room, and an application full of joins. Notion,
+Figma and Stripe have all published how they did it (§15, Cases 7–9), and their approaches
+agree closely.
+
+**First, don't shard yet.** Sharding is permanent complexity for every query, migration and
+on-call engineer. Work through the cheaper steps first:
+
+1. Fix the top queries and indexes (`databases/15`).
+2. Scale up. A single modern instance with local NVMe handles far more than most SMB workloads.
+3. Add read replicas and a cache for read load (`08`).
+4. **Split functionally.** Move whole table groups (billing, analytics, audit logs) to their own
+   databases. Figma did this first and it bought them years.
+5. Partition big tables *inside* one database (time-range partitions) to make vacuum, retention
+   and index rebuilds cheap.
+6. Consider a database that shards itself (Citus, Vitess, distributed SQL, see
+   `databases/19`) before building a routing layer yourself.
+
+Shard when one table group's **write** volume or size outgrows the largest single primary you are
+willing to run. Notion's trigger was Postgres `VACUUM` stalling, which risked transaction-ID
+wraparound. When you do, these five steps are the common pattern:
+
+1. **Shard by tenant.** Use workspace, org or account ID, the ID almost every query already
+   filters on. Every table on the hot path carries it, and tables that are joined together share
+   it, so the join stays on one shard. Figma calls such a group a **colo** (colocation).
+2. **Many logical shards, few physical ones.** Hash the tenant into a *fixed* number of logical
+   shards, and map logical shards to physical databases in a small table that config
+   distributes. Resharding then **moves whole logical shards**, and no row is ever rehashed.
+3. **Logical before physical.** Route every query through the shard-aware layer (a proxy or data
+   access library) while all logical shards still live on the *old* database. Figma did this with
+   one Postgres view per logical shard. Queries without a shard key and cross-shard joins show up
+   now, while rollback is still a config flip and no data has moved.
+4. **Move each logical shard online.** Copy a snapshot, **deferring secondary indexes** until
+   after the copy (Notion's sync went from 3 days to 12 hours). Catch up with logical replication
+   or CDC. **Verify** with dark reads: send a sample of reads to both copies and compare. **Cut
+   over** with a brief write pause and a mapping flip. Stripe's switch takes under 2 s and
+   Figma's first cutover caused about 10 s of partial unavailability on primaries. Keep the old
+   copy until the new one has run cleanly.
+5. **Decide what happens to cross-shard queries.** Either ban them from the request path (move
+   them to the warehouse) or let the proxy scatter-gather with strict limits (§9).
+
+```python
+import hashlib
+
+LOGICAL_SHARDS = 480   # fixed forever: 480 divides evenly by 2..6, 8, 10, 12, 15, 16, 20, 24, 30, 32, 40, 48, 60, 80, 96, ...
+
+
+def logical_shard(tenant_id: str) -> int:
+    """Stable across processes and languages. Never Python's hash(): it is salted per process."""
+    return int.from_bytes(hashlib.sha256(tenant_id.encode()).digest()[:8], "big") % LOGICAL_SHARDS
+
+
+def even_layout(hosts: int) -> dict[int, str]:
+    """Logical -> physical map. Only valid when every host gets the same number of logical shards."""
+    if LOGICAL_SHARDS % hosts:
+        raise ValueError(f"{hosts} hosts don't divide {LOGICAL_SHARDS}: layout would be uneven")
+    per_host = LOGICAL_SHARDS // hosts
+    return {ls: f"pg-{ls // per_host:03d}" for ls in range(LOGICAL_SHARDS)}
+
+# 32 hosts -> 15 logical shards each. 96 hosts -> 5 each: each old host's 15 split 5/5/5 over 3 new hosts.
+```
+
+The logical-shard count is the one number you can't change later, so choose one with many
+divisors and 10× more shards than the most hosts you can imagine. It's the same idea as Redis's
+16,384 fixed slots (§6.1), applied to a relational database.
 
 ---
 
@@ -2078,14 +2228,14 @@ TEMPLATE ANSWER:
 
 ## 15. Real-world cases — incidents with numbers
 
-> **In plain words.** Six short incident stories. Each shows a symptom you might see on a dashboard, how the numbers point to the cause, and what fixed it. They reuse the ideas from §2–§13.
+> **In plain words.** Six short incident stories and three published sharding migrations. Each shows a symptom you might see on a dashboard, how the numbers point to the cause, and what fixed it. They reuse the ideas from §2–§13.
 >
 > **Real-world example.** "Cache hit rate fell from 95% to 9% right after we added a node" is almost always modular hashing (Case 1).
 
-These are **composite scenarios** built from failure modes this chapter describes; numbers are
-illustrative but internally consistent.
+Cases 1–6 are **composite scenarios** built from failure modes this chapter describes; numbers are
+illustrative but internally consistent. Cases 7–9 are public case studies.
 
-**Quick index:** hit rate collapses after adding a node → Case 1 · one node at 100% CPU while others idle → Case 2 · write throttling on "today" → Case 3 · latency spike across the cluster during expansion → Case 4 · one hot product takes down a cache node → Case 5 · "find by email" query times out → Case 6.
+**Quick index:** hit rate collapses after adding a node → Case 1 · one node at 100% CPU while others idle → Case 2 · write throttling on "today" → Case 3 · latency spike across the cluster during expansion → Case 4 · one hot product takes down a cache node → Case 5 · "find by email" query times out → Case 6 · one Postgres primary outgrown, how others sharded it → Cases 7–9.
 
 ### Case 1: Adding one cache node wipes out the cache
 
@@ -2135,6 +2285,64 @@ illustrative but internally consistent.
 - **Fix.** Added a global lookup table `email → customer_id`, partitioned by email. Login now does 2 single-shard reads. p99 fell to about 15 ms; each email change costs one extra write.
 - **Lesson.** If a secondary lookup is on a hot path, give it its own partitioned index (§9.2). Scatter-gather to hundreds of shards turns tail latency into the common case.
 
+### Public case studies — sharding a live relational database
+
+Cases 1–6 are composites. The three below are **published by the companies themselves**, and
+§6.5 distills them into a playbook. They are migrations, not outages. The "symptom" is what
+forced the move.
+
+### Case 7: Notion — 480 logical shards, then 32 → 96 hosts (2021, 2023)
+
+- **Setup.** One Postgres monolith holding every workspace's blocks.
+- **Symptom.** In 2021 Postgres `VACUUM` began stalling consistently, which leads to a
+  transaction-ID wraparound failure if left alone. By late 2022, on the sharded fleet, some shards
+  ran above 90% CPU at peak, many were near their provisioned disk IOPS, and the PgBouncer layer
+  was hitting connection limits.
+- **Measurement/Diagnosis.** Almost every query is scoped to one workspace, so workspace ID was
+  the natural shard key (§6.5 step 1).
+- **Fix.** 2021: **480 logical shards on 32 physical databases** (15 each), with 480 chosen for
+  its many divisors. 2023, twenty-one months later: **32 → 96 databases** (5 logical shards each)
+  using Postgres **logical replication**. They deferred index creation until after the copy
+  (sync time **3 days → 12 hours**), verified with **dark reads** compared against the old
+  primaries, and switched over by reconfiguring PgBouncer, with no observable downtime.
+- **Lesson.** Fix the logical count once and move whole logical shards afterwards. The second
+  reshard was an operations project, not a data-model change.
+
+### Case 8: Figma — logical sharding before physical (2023–2024)
+
+- **Setup.** Figma's database stack grew **almost 100× from 2020**. They had already split
+  tables functionally across several Postgres databases, and some table groups were still
+  outgrowing a single primary.
+- **Symptom.** The largest tables were heading past what one primary could safely hold and
+  write.
+- **Measurement/Diagnosis.** Tables that are queried together needed the same shard key, and the
+  application's SQL couldn't be rewritten all at once.
+- **Fix.** A nine-month project built three pieces. **Colos**: groups of related tables that
+  share one shard key and one physical layout. **Logical sharding first**: Postgres views, one per
+  logical shard, on the unsplit database, so the application ran "sharded" before any data moved
+  and every problem was reversible. **DBProxy**: a query engine that parses SQL and routes it,
+  including limited scatter-gather. The first horizontally sharded table shipped in **September
+  2023** with about **10 seconds of partial availability on primaries** and no impact on
+  replicas.
+- **Lesson.** Separate "the application behaves as if sharded" from "data is physically moved".
+  The first is where the bugs are, and it can be tested and rolled back cheaply.
+
+### Case 9: Stripe — moving 1.5 PB between shards without downtime (DocDB, 2023)
+
+- **Setup.** DocDB is Stripe's database-as-a-service on MongoDB: **2,000+ shards**, about
+  **5 million queries/s**, behind a proxy and a chunk-metadata service that maps data chunks to
+  shards.
+- **Symptom.** Thousands of under-used databases, plus a fleet-wide version upgrade, both needed
+  data to move while payments kept flowing.
+- **Measurement/Diagnosis.** Moving data shard by shard by hand didn't scale, and any cutover
+  had to be invisible to payment traffic.
+- **Fix.** A **Data Movement Platform**: bulk copy, replicate ongoing changes, verify, then a
+  **traffic switch that takes under two seconds** by updating the chunk map at the proxy. In 2023
+  it moved **1.5 PB** and bin-packed small databases together, cutting the number of shards by
+  about **three-quarters**.
+- **Lesson.** Once moving a shard is a cheap, routine operation, you can reshape the fleet for
+  cost (merging) as easily as for growth (splitting).
+
 ---
 
 ## Summary of Key Numbers
@@ -2159,6 +2367,8 @@ Production systems:
   - Cassandra default hash: Murmur3
 
 Capacity planning rules of thumb:
+  - Logical shards for app-level sharding: fixed, many divisors (Notion: 480)
+  - Bounded-load factor c: 1.25-1.5 (busiest server <= c x average)
   - Target partition size: 1-10 GB (varies by system)
   - Partition count: 10x expected max node count (for static partition systems)
   - Replication factor: 3 (standard), 5 (high-durability use cases)
@@ -2182,7 +2392,7 @@ Failure timing:
 - **Chapter 22**: Stream processing — how Flink parallelism maps to Kafka partitions.
 - **Chapter 29**: Failure detection. How nodes are declared dead, triggering partition failover.
 - **Chapter 33**: Circuit breakers. How to prevent hot partition cascades.
-- **Chapter 34**: Backpressure and load shedding. Essential for hot partition mitigation.
+- **Chapter 34**: Backpressure and load shedding. Essential for hot partition mitigation. §6.7 covers load balancing (P2C) and §9.5 covers shuffle sharding and cells, which isolate tenants rather than spread data.
 
 ### From databases/
 - **`databases/12-replication-and-distributed-storage.md` §4**: Sharding/Partitioning foundations — range-based (§4.1) and hash-based (§4.2) partitioning with consistent hashing. Covers ISR-based replication per partition.
