@@ -788,6 +788,29 @@ tool for a *small* final stage — reordering 10–20 candidates where the order
 domain-specific and expressible in words. Which is also the shape that `13-agents-and-tool-calling.md`
 uses, so it will come back.
 
+### 8.3 Decision models as a relevance filter
+
+A third option came out in 2026-09: **decision models** such as TypeSafe's Jev (early access;
+the model and its limits are covered in `17-safety-guardrails-and-prompt-injection.md` §7.6).
+You give it the query plus one candidate as the *state*, and it returns a `Score` or a `Noul`
+("does this passage contain evidence that answers the query?") with a probability. It never
+writes text. For reranking, that makes it a **pointwise** reranker priced at input-token cost
+only, with no parse failures. The community `jev-reranker` library already wraps this:
+`relevance_rerank()` scores candidates, sorts them, and drops everything below a threshold
+(0.2 by default).
+
+The part that is actually new is the **filter**, not the ordering. The prompt asks for
+evidence, not for topic overlap, so off-topic-but-similar passages get pushed near 0. That
+makes an absolute cutoff meaningful: "send the LLM only the candidates with p ≥ τ, even if
+that is fewer than k". A fixed top-k can't do that (`06` covers why fewer, cleaner passages
+beat a full window).
+
+Place it carefully in the §10 latency budget. At ~70–500 ms per call it is an LLM-reranker-class
+stage, not a replacement for a GPU cross-encoder (§7) that runs tens of milliseconds. Put it
+after the cross-encoder, on the top 10–20. Decide τ with §13's paired evaluation: a filter that
+raises precision@k but drops the one passage the answer needed is a recall regression. Check it with
+[`appendix-f-recall-at-every-layer.md`](appendix-f-recall-at-every-layer.md).
+
 ---
 
 ## 9. The reranker landscape as an interface-and-constraint table

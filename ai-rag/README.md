@@ -87,6 +87,12 @@ keeps every claim honest by construction.
 | [`appendix-f-recall-at-every-layer.md`](appendix-f-recall-at-every-layer.md) | Every "recall" in the pipeline (span survival, token, embedding, ANN, candidate, context, citation, abstention, judge) on one page: what each counts, its answer key, a worked example, and a per-stage leak report | **written** |
 | [`appendix-g-ranking-and-answer-metrics.md`](appendix-g-ranking-and-answer-metrics.md) | Precision, hit rate, MRR, MAP, nDCG variants, faithfulness vs correctness, RAGAS names, scores vs metrics, pp vs %, κ — one worked list, every metric computed, and a per-stage cheat sheet | **written** |
 
+**Decision models (Jev, TypeSafe AI, 2026-09).** These are models that return typed, calibrated
+probabilities instead of text. They are not a separate chapter. They are covered where they are
+useful: guardrail classifier tier and tool-call risk scoring in `17` §7.6, first judge tier in
+eval cascades in `08` §11.8, boundary detection and metadata tagging at ingest in `02` §6.5.2,
+and relevance filtering after the reranker in `04` §8.3.
+
 ---
 
 ## 4. Cross-reference map — theory already in this repo

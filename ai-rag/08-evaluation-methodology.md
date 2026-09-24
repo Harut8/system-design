@@ -1584,6 +1584,97 @@ The numbers matter less than the shape: **the same eval is ~10× cheaper or more
 on three configuration choices that have nothing to do with quality.** Teams that run evals rarely
 usually believe evals are expensive because they measured the un-optimized version once.
 
+### 11.8 Decision models as the first judge tier (Jev)
+
+> **Status (2026-09-24):** Jev (TypeSafe AI, early access since 2026-09-15) is the first
+> commercial "decision model". It reads a state, answers typed questions (`Noul` = P(yes),
+> `Choice`, `Score`) with probabilities, and writes no text. Costs are the vendor's early-access
+> prices. Details and caveats are in `17` §7.6.
+
+§11.7's judge tiering needs a cheap first tier that is still good enough to trust on the easy
+items. A decision model fits that job well, for three reasons:
+
+- **Most judge questions are already bounded.** "Is this claim supported by the context?" is a
+  `Noul`. §11.4's 3-point rubric is a `Score`. "Which of A/B is better?" is a `Choice`. The
+  verdict *is* the schema, so the parse-failure path goes away completely.
+- **It is cheap enough to run on every item, every commit.** Jev charges for input only
+  ($0.042 / M, output free). The 5,000-claim run from §11.7 (9M input tokens) costs **~$0.38**
+  on the decision model, compared with ~$16 for Opus 5 with batch + cache.
+- **It gives you probabilities, not labels.** So you can escalate by *uncertainty*, not by a
+  random sample. That is exactly what tiering needs.
+
+What you lose: **there is no justification.** §11.4 asks for a reason *before* the verdict so you
+can audit disagreements. A decision model has none. The cascade fixes this: every item the LLM
+tier sees has a written reason, and those are the items worth reading. Also, the vendor's
+calibration claim is "in aggregate, on their data". It still has to be checked on yours.
+
+**The protocol is §11.1 again, plus one extra step: check calibration before you use thresholds.**
+
+```python
+def reliability(p: list[float], y: list[int], bins: int = 10) -> dict:
+    """y=1 means the item is BAD (the class the judge exists to catch). If the model is
+    calibrated, then within each bin mean(p) ~= the share of y=1. ECE is the weighted gap.
+    ECE < ~0.05 on your calibration set: thresholds are usable. Much higher: the p values
+    only rank items, so pick thresholds from the data (below) and never from the vendor's
+    'act above 0.9' guidance."""
+    rows, ece, n = [], 0.0, len(p)
+    for b in range(bins):
+        lo, hi = b / bins, (b + 1) / bins
+        idx = [i for i, pi in enumerate(p) if lo <= pi < hi or (b == bins - 1 and pi == 1.0)]
+        if not idx:
+            continue
+        mean_p = sum(p[i] for i in idx) / len(idx)
+        frac_bad = sum(y[i] for i in idx) / len(idx)
+        ece += len(idx) / n * abs(mean_p - frac_bad)
+        rows.append((round(mean_p, 3), round(frac_bad, 3), len(idx)))
+    return {"ece": ece, "bins": rows}
+
+
+def pick_band(p: list[float], y: list[int], max_missed_bad: float = 0.02,
+              max_false_fail: float = 0.02) -> dict:
+    """Pick the (low, high) band for the three-way cascade from human labels.
+      p <= low  -> auto PASS  (limit: <= max_missed_bad of the BAD items land here)
+      p >= high -> auto FAIL  (limit: <= max_false_fail of the GOOD items land here)
+      otherwise -> escalate to the LLM judge.
+    The escalation rate is the cost of the band; report it next to the thresholds."""
+    bad = sorted(pi for pi, yi in zip(p, y) if yi == 1)
+    good = sorted((pi for pi, yi in zip(p, y) if yi == 0), reverse=True)
+    k_bad = int(max_missed_bad * len(bad))            # BAD items we accept auto-passing
+    k_good = int(max_false_fail * len(good))          # GOOD items we accept auto-failing
+    low = bad[k_bad] - 1e-9 if bad else 1.0           # just below the (k_bad+1)-th lowest BAD p
+    high = good[k_good] + 1e-9 if good else 0.0       # just above the (k_good+1)-th highest GOOD p
+    if low >= high:                                   # clean separation at these budgets:
+        low = high = (low + high) / 2                 # any cut in [high, low] meets both limits
+    escalated = sum(1 for pi in p if low < pi < high) / len(p)
+    return {"low": low, "high": high, "escalation_rate": escalated}
+```
+
+Three rules keep this from turning into the "cheaper way to be wrong" §11.7 warns about:
+
+1. **Validate each tier on its own, and then the whole cascade.** Compute κ and FAIL-class recall
+   (§11.1) for (a) the decision model alone, (b) the LLM judge alone, (c) the cascade. The
+   cascade must beat (a) and stay within noise of (b). If not, the band is wrong.
+2. **Fix the band on one split and report it on another.** `pick_band` fitted on the same 200
+   items it is scored on will look better than it is. Split the calibration set.
+3. **Pin it like any judge (§11.6).** Save the model version *actually served*, the question text
+   hash and the band in every result row. `jev-latest` is an alias. When it moves, re-run
+   `reliability` and `pick_band` on the frozen calibration set before you trust new numbers.
+
+Cost of the cascade on §11.7's example (5,000 claims, 1,800 input tokens each), assuming the band
+sends 20% of items to Opus 5 with batch + cache:
+
+```python
+jev = 5000 * 1800 / 1e6 * 0.042            # ~$0.38 : every item, first tier
+llm = 0.20 * 16.28                         # ~$3.26 : escalated slice, §11.7's optimized Opus 5 run
+print(round(jev + llm, 2))                 # ~$3.64 vs ~$16.28 all-Opus, vs ~$63.75 unoptimized
+```
+
+That makes a judged eval cheap enough to run on every pull request. Whether the cascade *agrees
+with humans* as well as the all-Opus run does is an empirical question, and rule 1 above answers
+it. Where this does **not** fit: open-ended answer quality ("is this a good explanation?"), things
+that need arithmetic or date logic (known weak spots), and agent trajectories longer than the
+64k-token context (§12).
+
 ---
 
 ## 12. Agentic and multi-hop evaluation

@@ -1521,6 +1521,98 @@ prefix, `01` §9.2's contextual retrieval at ~$1/M) before it can be justified.
 - As a default. This is the last resort, after §6.1–§6.4 have been tried and measured. The
   ordering in this section is deliberate.
 
+#### 6.5.2 Pattern A with a decision model (Jev)
+
+> **Status (2026-09-24):** Jev (TypeSafe AI) is a "decision model" in early access since
+> 2026-09-15. It returns typed answers with probabilities and never writes text. Prices are the
+> vendor's early-access prices. The model, its limits and the vendor risk are covered in
+> `17-safety-guardrails-and-prompt-injection.md` §7.6. This section is only about using it at ingest.
+
+Look at the problems §6.5 lists. Pattern A's output is just "split here: yes or no". It doesn't
+need a text generator. A decision model answers exactly that kind of question, and it avoids
+two of the three problems by design:
+
+- **It can't fabricate content.** It only returns probabilities. Chunk text is always the
+  original source text.
+- **It can't pick a bad split point.** You list the candidate breaks yourself: paragraph and
+  heading boundaries from the structure-aware pass (§6.3). The model only decides *which*
+  candidates are real topic changes. There is no "offset in the middle of a sentence" failure.
+- **Cost drops from generation prices to input-only prices.** At $0.042 / M input tokens,
+  100M corpus tokens with the ~1.5× window overlap of the default settings below cost about **$6**, compared with ~$300 (input
+  only) for LLM pattern A and ~$750 for pattern B at the prices above. Embedding the same corpus
+  costs ~$2, so this is now the same order of magnitude as embedding.
+
+Determinism is the problem that stays. Don't count on the API returning the exact same
+probability every time. Make it deterministic yourself: **cache each decision by content hash**,
+so re-ingesting an unchanged document reuses the stored answer and the chunk IDs stay the same
+(§9.1). The model version and question version are part of the key, so changing either one
+re-chunks on purpose, not by accident.
+
+```python
+import hashlib, json
+
+BOUNDARY_Q = "Does paragraph ¶{j} start a different topic from paragraph ¶{i}?"
+BOUNDARY_Q_VERSION = "2026-09-24.1"
+
+
+async def decision_boundaries(paras: list[str], model, model_version: str, cache: dict,
+                              *, stride: int = 6, ctx: int = 1, tau: float = 0.5) -> list[int]:
+    """Indices j where paragraph j starts a new chunk. `model` implements the
+    DecisionModel port from 17 §7.6 (p_yes(state, questions) -> {key: P(yes)}).
+    Each block of `stride` breaks is one call with `ctx` paragraphs of context on each
+    side, so the overlap overhead is ~(stride + 1 + 2*ctx) / stride."""
+    cuts = []
+    for s in range(1, len(paras), stride):
+        breaks = range(s, min(s + stride, len(paras)))
+        lo, hi = max(0, s - 1 - ctx), min(len(paras), s + stride + ctx)
+        state = "\n\n".join(f"¶{k} {paras[k]}" for k in range(lo, hi))
+        questions = {str(j): BOUNDARY_Q.format(j=j, i=j - 1) for j in breaks}
+        key = hashlib.sha256(json.dumps(
+            [state, questions, model_version, BOUNDARY_Q_VERSION]).encode()).hexdigest()
+        if key not in cache:                        # the cache is what makes this deterministic
+            cache[key] = await model.p_yes(state, questions)
+        cuts += [j for j in breaks if cache[key][str(j)] >= tau]
+    return cuts
+
+
+def apply_size_limits(paras: list[str], cuts: list[int], n_tokens,
+                      min_tok: int = 100, max_tok: int = 800) -> list[int]:
+    """Size limits are counting, and counting is a known weak spot, so they live in code.
+    Drop a model cut that would leave a chunk smaller than min_tok, and force a cut when
+    the chunk would grow past max_tok. A single paragraph larger than max_tok is still
+    one chunk here; send it to the recursive splitter (§6.2)."""
+    out, size, cutset = [], 0, set(cuts)
+    for j, p in enumerate(paras):
+        t = n_tokens(p)
+        if j > 0 and ((j in cutset and size >= min_tok) or size + t > max_tok):
+            out.append(j)
+            size = 0
+        size += t
+    return out
+```
+
+`tau` is a chunking parameter, like chunk size. Choose it with the §11 golden-set comparison, not
+by gut feeling. A higher `tau` means fewer, larger chunks.
+
+Two other ingest jobs that fit the same model, both of which are fixed-answer questions:
+
+- **Deciding which chunks need context.** Contextual retrieval (`01` §9.2) calls an LLM for
+  *every* chunk to write a context prefix. First ask the decision model: *"Can this chunk be
+  understood without the rest of the document?"* Then pay the LLM only for the chunks that
+  answer "no". The savings are however many chunks answer "yes". Measure that number on your
+  corpus before you count on it.
+- **Tagging metadata from a fixed list.** Fields like `doc_type`, `audience` or
+  `jurisdiction` come from a closed set, so each one is a `Choice` (§8). Free-text fields
+  (titles, entity names) are extraction, so they stay with the parser or an LLM. A common
+  hybrid is: the LLM extracts, then the decision model checks *"is this value supported by the
+  text?"*
+
+Where it **doesn't** help: documents that already have structure. §6.3's heading splits are
+free and exact, and nothing public yet shows a decision model beating them. The place to try it
+is the §6.5 profile: unstructured or structurally hostile text (transcripts, OCR'd letters,
+chat exports, long emails), measured against recursive and structure-aware splitting at the
+same token budget.
+
 ### 6.6 Decision table
 
 | Strategy | Structure used | Determinism | Ingest cost | Chunk-ID stability | Best fit |
@@ -1530,6 +1622,7 @@ prefix, `01` §9.2's contextual retrieval at ~$1/M) before it can be justified.
 | Structure-aware | headings, layout, AST | total | free (parser already paid) | stable | any corpus with real structure — start here |
 | Semantic | inferred from embeddings | total, but coupled to model version | +1 embedding pass per sentence | **unstable across model changes** | unstructured corpora, as a tested hypothesis |
 | LLM-based | inferred by a generator | none (mitigable, not removable) | generation-priced | **unstable run to run** | small, high-value, structurally hostile corpora |
+| Decision-model boundaries (§6.5.2) | candidate breaks from structure, picked by a classifier | made deterministic by the content-hash cache | input-only, ~3× embedding | stable while model + question version are pinned | unstructured text where §6.3 has no headings to use |
 
 ### 6.7 The library landscape — a practical map
 
