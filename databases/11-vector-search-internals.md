@@ -1081,6 +1081,82 @@ Oversampling + Reranking Pattern:
   Memory: 16 MB (binary) + 512 MB (float32, can be on disk)
 ```
 
+### 6.4 RaBitQ: 1-Bit Codes That Estimate Distances (SIGMOD 2024)
+
+§6.2's binary quantization compares **signs**: Hamming distance between bit strings. It throws
+away the geometry, and its recall depends on whether the embedding model happens to center its
+dimensions around zero. **RaBitQ** (Gao & Long, SIGMOD 2024) keeps 1 bit per dimension but
+changes three things:
+
+1. **Center** each vector on a centroid (the dataset mean, or its IVF cluster centroid) so the
+   signs carry information.
+2. Apply a **random rotation** before taking signs, so no single dimension dominates and the
+   quantization error spreads evenly. This is the same trick as OPQ (§4), with a random rather
+   than a learned matrix.
+3. Store **two floats per vector** (its distance to the centroid, and how well its bit code
+   lines up with it) and use them to turn the bits into an **unbiased estimate of the real
+   distance** with a provable error bound. The bound tells the engine which candidates need an
+   exact re-rank.
+
+```python
+import numpy as np
+
+
+class OneBitIndex:
+    """RaBitQ-style 1-bit quantization (Gao & Long, SIGMOD 2024), simplified.
+    Store 1 bit per dimension plus 2 floats per vector. Estimate distances from the bits,
+    then re-rank a shortlist with the exact vectors."""
+
+    def __init__(self, data: np.ndarray, seed: int = 0):
+        n, d = data.shape
+        rng = np.random.default_rng(seed)
+        self.rot, _ = np.linalg.qr(rng.standard_normal((d, d)))   # random rotation
+        self.c = data.mean(axis=0)                                # center first
+        r = data - self.c
+        self.norm = np.linalg.norm(r, axis=1)                     # float 1: ||o - c||
+        unit = (r / self.norm[:, None]) @ self.rot
+        self.bits = unit > 0                                      # d bits per vector
+        signs = np.where(self.bits, 1.0, -1.0) / np.sqrt(d)
+        self.dot = np.einsum("ij,ij->i", signs, unit)             # float 2: <o_bar, o>, ~0.8
+        self.signs, self.data = signs, data
+
+    def search(self, q: np.ndarray, k: int = 10, rerank: int = 0) -> np.ndarray:
+        qr = q - self.c
+        qn = np.linalg.norm(qr)
+        est_cos = (self.signs @ ((qr / qn) @ self.rot)) / self.dot           # unbiased estimate
+        est_d2 = self.norm**2 + qn**2 - 2 * self.norm * qn * est_cos
+        if not rerank:
+            return np.argsort(est_d2)[:k]
+        short = np.argpartition(est_d2, rerank)[:rerank]                  # shortlist from bits
+        exact = np.linalg.norm(self.data[short] - q, axis=1)
+        return short[np.argsort(exact)[:k]]
+```
+
+The sketch keeps the codes as floats for readability. A real implementation packs the bits and
+computes the estimate with bitwise operations. On 50,000 synthetic 256-dimension vectors with a
+non-zero mean and uneven variance per dimension (a hard case: no cluster structure to exploit),
+recall@10 against exact search:
+
+| Method | Memory per vector | Recall@10 |
+|---|---|---|
+| float32, exact | 1,024 bytes | 100% |
+| §6.2 sign bits, no centering or rotation | 32 bytes | 0.4% |
+| RaBitQ-style estimate, no re-rank | 40 bytes | 31.7% |
+| RaBitQ-style shortlist of 100, exact re-rank | 40 bytes in RAM, float32 fetched for 100 | 79.6% |
+| RaBitQ-style shortlist of 200, exact re-rank | 40 bytes in RAM, float32 fetched for 200 | **90.8%** |
+
+Naive sign bits collapse on data that isn't centered at zero, which is why §6.2's recall
+depends so much on the model. Centering, rotation and the corrected estimate make the bits
+usable as a **shortlist filter**, and the §6.3 re-rank recovers recall while the RAM-resident
+index is **25× smaller** than float32. Real embeddings have more structure than this synthetic
+set and do better. The full algorithm also adds multi-bit variants (extended RaBitQ) and uses the
+error bound to choose the shortlist size per query.
+
+**Where it runs (2024–2026):** Elasticsearch and Lucene ship it as **BBQ** (Better Binary
+Quantization), Milvus 2.6 as `IVF_RABITQ`, and FAISS, turbopuffer, VectorChord and CockroachDB's
+vector indexes use it. If your engine offers it, prefer it to plain binary quantization. It is
+the practical way to hold 100M+ vectors in RAM.
+
 ---
 
 ## 7. Matryoshka Embeddings
@@ -1478,6 +1554,33 @@ IVF-HNSW: Graph-based coarse quantizer.
     efConstruction: 200-500 (build quality)
     efSearch: 50-200 (search quality)
 ```
+
+### 9.1 A New Storage Tier: Vectors in Object Storage (S3 Vectors, 2025)
+
+Vector databases keep the index in RAM or on local SSD, which is the right place for
+millisecond queries at high QPS and expensive for large collections queried rarely (archives,
+per-tenant corpora, agent memory). **Amazon S3 Vectors** (preview July 2025, generally available
+2025-12-02) puts the vector index in object storage:
+
+| Property | S3 Vectors at GA |
+|---|---|
+| Scale | Up to **2 billion vectors per index**, 10,000 indexes per vector bucket |
+| Latency | About **100 ms or less** for frequent queries, **under 1 s** for infrequent ones |
+| Pricing (us-east-1) | **$0.06 per GB-month** stored, **$0.20 per GB** uploaded, **$0.0025 per 1,000 queries** plus a per-TB charge on data processed |
+| Claimed saving | Up to **90%** lower total cost than a dedicated vector database |
+
+Use it as a **tier**, not a replacement:
+
+| Workload | Where the vectors live |
+|---|---|
+| Interactive search, p99 < 50 ms, hundreds of QPS | RAM/SSD index: HNSW (`11-hnsw-vector-search-internals.md`), IVF-PQ, pgvector |
+| Large, cold or per-tenant collections, sub-second is fine, low QPS | Object storage (S3 Vectors, turbopuffer, LanceDB on S3) |
+| Both | Hot subset in a vector database, full corpus in object storage. AWS integrates S3 Vectors with OpenSearch for this |
+
+Check before you rely on it: metadata-filtering limits, whether its recall at your latency
+target is good enough for your evaluation set (`../ai-rag/08-evaluation-methodology.md`), and
+cost per query at your peak QPS. The per-query charge that makes it cheap at low volume makes it
+expensive at high volume.
 
 ---
 

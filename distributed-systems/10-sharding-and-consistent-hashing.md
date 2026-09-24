@@ -1016,8 +1016,9 @@ on-call engineer. Work through the cheaper steps first:
    databases. Figma did this first and it bought them years.
 5. Partition big tables *inside* one database (time-range partitions) to make vacuum, retention
    and index rebuilds cheap.
-6. Consider a database that shards itself (Citus, Vitess, distributed SQL, see
-   `databases/19`) before building a routing layer yourself.
+6. Consider a database that shards itself (Citus, Aurora Limitless, Vitess, distributed SQL;
+   see `databases/07` §9 for the 2026 options and `databases/19`) before building a routing
+   layer yourself.
 
 Shard when one table group's **write** volume or size outgrows the largest single primary you are
 willing to run. Notion's trigger was Postgres `VACUUM` stalling, which risked transaction-ID

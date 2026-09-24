@@ -2990,7 +2990,9 @@ Jepsen: Distributed Systems Testing
   │ Redis Cluster      │ Lost writes during failover (by design)     │
   │ Galera Cluster     │ Inconsistency under partition               │
   │ YugabyteDB         │ Various issues in early versions (fixed)    │
-  │ etcd               │ Generally clean results                     │
+  │ etcd (2020)        │ KV clean; lock API unsafe without fencing   │
+  │ RDS PostgreSQL     │ Long Fork across primary/replicas (2025)    │
+  │ NATS JetStream     │ Lost acked writes, lazy fsync (2025)        │
   │ ZooKeeper          │ Generally clean results                     │
   └────────────────────┴──────────────────────────────────────────────┘
 
@@ -3000,6 +3002,50 @@ Jepsen: Distributed Systems Testing
     - Shifted industry norms: databases now proactively Jepsen-test
     - CockroachDB, TiDB, YugabyteDB all run regular Jepsen tests
 ```
+
+### 9.8 Read Replicas Break Snapshot Isolation: Long Fork (Jepsen, 2025)
+
+On 2025-04-29 Jepsen published an analysis of **Amazon RDS for PostgreSQL Multi-AZ clusters**
+(one primary, two readable standbys). At `REPEATABLE READ`, which in PostgreSQL means snapshot
+isolation, **healthy clusters with no faults injected** occasionally showed **Long Fork**, in
+every version tested from 13.15 to 17.4.
+
+```
+Long Fork: two readers see two concurrent writes in opposite orders
+
+  T1: UPDATE x = 1          T2: UPDATE y = 1          (independent, concurrent)
+
+  Reader A (on the primary):   sees x = 1, y = 0      "T1 happened, T2 not yet"
+  Reader B (on a replica):     sees x = 0, y = 1      "T2 happened, T1 not yet"
+
+  No single order of T1 and T2 explains both reads, so this is not snapshot isolation
+  across the cluster. Each node on its own is still consistent.
+```
+
+**Why it happens.** It's community PostgreSQL behaviour, not an RDS bug. It is reproducible
+on any self-managed primary with streaming replicas and has been discussed on the PostgreSQL
+lists since at least 2013. On the **primary**, a committed transaction becomes visible when it
+leaves the in-memory list of running transactions (the ProcArray). On a **replica**, transactions
+become visible in the order their **commit records appear in the WAL**. Two concurrent commits
+can take those two steps in different orders, so the primary and a replica disagree about which
+committed first. The fix under discussion upstream is to order visibility by a **commit sequence
+number (CSN)** on both sides.
+
+**What it means in practice:**
+
+- **No data is lost or corrupted,** and each node alone is consistent. The anomaly needs
+  **two readers on different nodes** comparing notes. Examples: a job that reads from a replica
+  and then acts on the primary, or two services that each read a different node and exchange
+  results.
+- **Invariant checks that span nodes are unsafe.** "Read on a replica, decide, write on the
+  primary" can act on a state that never existed from the primary's point of view. Read
+  anything you will decide on **from the primary, in the same transaction as the write**, or
+  use `SERIALIZABLE` on the primary.
+- **Single-AZ deployments, Aurora Limitless and Aurora DSQL are not affected,** per AWS's
+  response. Nor is any setup where every reader uses the primary.
+- **"Read replica" means a weaker model than the primary,** already known for lag (§9.4
+  session guarantees) and now for ordering too. Document which endpoints are allowed for which
+  decisions.
 
 ---
 

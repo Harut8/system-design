@@ -631,6 +631,24 @@ Merge-on-Read (Iceberg v2 — position delete files):
   Slower reads, but writer doesn't need to find the exact position.
 ```
 
+### Iceberg v3 (2025): Deletion Vectors, Row Lineage, Variant
+
+The Iceberg community approved format **v3** in 2025, and engines rolled it out through early
+2026. As of mid-2026, Spark 4.0 with Iceberg 1.10 has the most complete open-source support. The
+additions that change designs:
+
+| v3 feature | What it replaces or enables |
+|---|---|
+| **Deletion vectors** | One Roaring bitmap per data file, stored in a Puffin file, replaces the growing pile of v2 **position delete files** above. Readers apply one bitmap instead of merging many delete files. The design follows Delta Lake's deletion vectors (§5), a step toward the two formats handling deletes the same way |
+| **Row lineage** | Every row carries a stable `_row_id` and the sequence number of its last change. Incremental and CDC-style consumers can read "rows changed since snapshot N" without diffing files |
+| **`VARIANT` type** | Semi-structured JSON-like data stored in a binary, shredded form (shared with Parquet and Spark), instead of `STRING` columns parsed at query time |
+| **Default column values** | Add a column with a default without rewriting existing files |
+| Geometry / geography types, nanosecond timestamps, multi-argument partition transforms | Spatial data and high-precision event data without workarounds |
+
+**Operational caveat:** raising a table's `format-version` to 3 is **one-way**, and every engine
+that reads the table must understand v3. Upgrade only after checking each reader: BI tools,
+Trino/Athena versions, Snowflake or BigQuery external tables, and your own Python jobs.
+
 ### Hidden Partitioning
 
 ```
@@ -1147,6 +1165,37 @@ Nessie branching model:
   4. CI/CD for data: validate data quality on branch, then merge
 ```
 
+### DuckLake: The Catalog Is a SQL Database (2025–2026)
+
+Iceberg and Delta keep table metadata as **files in object storage** (metadata JSON, manifest
+lists, manifests), and the catalog only holds a pointer to the latest one. Every commit writes
+several small files, and planning a query means reading a chain of them. **DuckLake** (announced
+by DuckDB Labs in May 2025, **v1.0 on 2026-04-13**) keeps the data as Parquet on object storage
+but puts **all metadata in ordinary tables in a SQL database**: PostgreSQL, SQLite or DuckDB in
+the reference implementation.
+
+| | Iceberg / Delta | DuckLake |
+|---|---|---|
+| Metadata | Files in object storage, plus a catalog pointer | Rows in a SQL database |
+| Commit | Write metadata files, then CAS the pointer | One SQL transaction. Multi-table commits come for free |
+| Many small writes | Each creates files, so it needs compaction | Small inserts can be kept inline in the catalog until flushed |
+| Engine support | Broadest (Spark, Trino, Flink, Snowflake, BigQuery, DuckDB...) | DuckDB (the `ducklake` extension, DuckDB 1.5.2+); others are early |
+| Operational need | A catalog service (REST, Glue, Unity, Polaris) | A Postgres you probably already run |
+
+```sql
+-- Syntax from the DuckLake documentation: Postgres as the catalog, S3 for the Parquet files
+INSTALL ducklake;
+ATTACH 'ducklake:postgres:dbname=lake_catalog host=db.internal' AS lake
+       (DATA_PATH 's3://acme-lake/data/');
+CREATE TABLE lake.orders AS SELECT * FROM read_parquet('s3://acme-raw/orders/*.parquet');
+SELECT * FROM lake.orders AT (VERSION => 3);          -- time travel by snapshot
+```
+
+**When it fits:** a small team whose analytics already run on DuckDB (`21-in-process-olap-duckdb-chdb.md`)
+and who want ACID tables, time travel and cheap frequent small writes without running Spark or
+a catalog service. **When it doesn't:** several engines must read the same tables. Iceberg's
+ecosystem is the reason to pick Iceberg.
+
 ---
 
 ## 9. Query Engine Integration
@@ -1416,6 +1465,27 @@ CALL catalog.system.rewrite_data_files(
 CALL catalog.system.expire_snapshots('db.events', TIMESTAMP '2024-01-01 00:00:00');
 CALL catalog.system.remove_orphan_files('db.events');
 ```
+
+### Managed Compaction: Amazon S3 Tables (2024–2025)
+
+Running `rewrite_data_files`, `expire_snapshots` and `remove_orphan_files` on a schedule is the
+chore most teams get wrong (§17). **S3 Tables** (launched December 2024) are "table buckets"
+that store Iceberg tables, expose an Iceberg REST catalog endpoint, and run **compaction,
+snapshot expiry and unreferenced-file removal automatically**.
+
+| Cost item (us-east-1) | Price |
+|---|---|
+| Storage | **$0.0265 per GB-month**, about 15% more than S3 Standard ($0.023) |
+| Compaction, objects | $0.004 per 1,000 objects processed |
+| Compaction, data | $0.05 per GB processed (after the July 2025 cut: per-byte prices fell 90% for bin-pack and 80% for sort / z-order, per-object prices 50%) |
+
+Compaction is charged **per GB processed**, so cost follows how often data is **rewritten**, not
+how much is stored. A table receiving a steady stream of small files is compacted over and over.
+Before the July 2025 price cut, third-party analyses found automatic compaction could cost 20×+
+more than running it yourself on such tables. With current prices, **model it**: bytes ingested
+per day × expected rewrites × $0.05/GB, compared with the compute you would otherwise spend. For
+most SMB workloads the managed option wins on engineer time. For very high-churn streaming
+tables, batch writes upstream first (§10) so there is less to compact.
 
 ### Sort Order and Z-Order
 
@@ -1923,6 +1993,14 @@ The honest take (2025):
   UniForm (Databricks) and format interop layers are blurring the lines:
   Delta UniForm writes Delta + Iceberg metadata simultaneously,
   so the "which format" question is becoming less important over time.
+
+The 2026 update:
+  - Iceberg v3 (§4) adopted deletion vectors modelled on Delta's, which
+    narrows the Delta/Iceberg gap further.
+  - Managed Iceberg (S3 Tables, §11) removes most maintenance work on AWS.
+  - DuckLake (§8) is the lightweight option: one Postgres for metadata,
+    Parquet on S3, DuckDB as the engine. Good for a small team, but check
+    that every engine you need can read it.
 ```
 
 ---

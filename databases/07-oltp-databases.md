@@ -706,6 +706,60 @@ Key differences from physical:
 | **Remote write** (`synchronous_commit = remote_write`) | Primary waits for replica to receive WAL (not fsync) | Compromise: lower latency than sync, better than async |
 | **Remote apply** (`synchronous_commit = remote_apply`) | Primary waits for replica to replay WAL | Read-your-writes on replica, highest latency |
 
+### PostgreSQL 18 and 19: What Changed (2025–2026)
+
+**PostgreSQL 18** was released on 2025-09-25. The changes that matter for an OLTP system:
+
+| Area | Change | What it means for you |
+|---|---|---|
+| I/O | **Asynchronous I/O** subsystem. `io_method` = `worker` (the default, background I/O workers) or `io_uring` (Linux, needs a build with liburing) or `sync` (the old behaviour) | Up to **3×** faster reads from storage in the project's tests, for sequential scans, bitmap heap scans and vacuum. Biggest gains on cloud network storage with high latency per I/O. Index lookups on a warm cache change little |
+| Indexes | **B-tree skip scan** | A multicolumn index can serve queries that skip a low-cardinality leading column (`06-indexing-internals.md`, "Skip Scan") |
+| Keys | **`uuidv7()`** built in | Time-ordered UUID primary keys, with no extension (measured in `06-indexing-internals.md`) |
+| Schema | **Virtual generated columns**, now the default kind. `STORED` must be requested explicitly | Derived columns cost no disk and no write amplification, and are computed on read |
+| SQL | **`RETURNING old.*, new.*`** in `INSERT`/`UPDATE`/`DELETE`/`MERGE` | Before-and-after values in one round trip, for audit logs and balance checks |
+| SQL | **Temporal constraints**: `PRIMARY KEY (room_id, during WITHOUT OVERLAPS)` | "No two bookings of one room overlap" enforced by the database, not application code |
+| Upgrades | `pg_upgrade` **keeps planner statistics** | No long `ANALYZE` window of bad plans right after a major-version upgrade |
+| Integrity | `initdb` enables **data checksums by default** | Silent page corruption is detected on read. **Upgrade gotcha:** `pg_upgrade` needs matching settings, so for an old cluster without checksums, create the new one with `initdb --no-data-checksums` (or enable checksums on the old one offline with `pg_checksums` first) |
+| Security | **OAuth 2.0** authentication. **MD5 passwords deprecated** | Move to SCRAM-SHA-256 now. Single sign-on to the database becomes possible |
+
+Verified on PostgreSQL 18.4:
+
+```sql
+-- Virtual generated column (the default kind): computed on read, no storage
+CREATE TABLE line_items (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  qty         int            NOT NULL CHECK (qty > 0),
+  unit_price  numeric(10,2)  NOT NULL,
+  total       numeric(12,2)  GENERATED ALWAYS AS (qty * unit_price)     -- VIRTUAL by default
+);
+
+-- Before-and-after in one statement
+UPDATE accounts SET balance = balance - 30 WHERE id = 1
+RETURNING old.balance AS before, new.balance AS after;                  -- 100.00 | 70.00
+
+-- Temporal primary key (needs btree_gist for the scalar column)
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE room_bookings (
+  room_id int       NOT NULL,
+  during  tstzrange NOT NULL,
+  PRIMARY KEY (room_id, during WITHOUT OVERLAPS)
+);
+INSERT INTO room_bookings VALUES (7, '[2026-10-01 09:00+00, 2026-10-01 10:00+00)');
+INSERT INTO room_bookings VALUES (7, '[2026-10-01 09:30+00, 2026-10-01 11:00+00)');
+-- ERROR: conflicting key value violates exclusion constraint "room_bookings_pkey"
+```
+
+**PostgreSQL 19** reached beta 4 on 2026-09-24, and general availability is expected in October
+2026. Features in the betas include `REPACK` (rebuild a bloated table with less locking than
+`VACUUM FULL` or `CLUSTER`), `ON CONFLICT DO SELECT`, `GROUP BY ALL`, `FOR PORTION OF` for
+temporal updates, and 64-bit MultiXact offsets (removing one wraparound limit). Treat the list
+as provisional: the SQL/PGQ graph-query feature was reverted on 2026-09-07, before release.
+
+**Upgrade policy for an SMB.** Each major version gets five years of fixes. Run the newest major
+version your managed provider supports, with a lag of one or two minor releases. Upgrade yearly
+with `pg_upgrade` or a logical-replication blue/green switch, rather than jumping several
+versions at once.
+
 ---
 
 ## 3. MySQL / InnoDB Internals Deep Dive
@@ -1157,6 +1211,26 @@ InnoDB Cluster = Group Replication + MySQL Router + MySQL Shell
 | **Async** (default) | Commits immediately, sends binlog async | Potential data loss on crash |
 | **Semi-sync** | Waits for at least 1 replica to acknowledge receiving the event | At most 1 transaction lost on crash |
 | **Semi-sync (after_sync)** | Waits before committing to storage engine | No phantom reads on failover |
+
+### MySQL Release Model and the End of 8.0 (2025–2026)
+
+Oracle moved MySQL to two tracks: **LTS** releases (bug and security fixes only, about 8 years
+of support: 5 premier plus 3 extended) and short-lived **Innovation** releases that carry new
+features between LTS versions.
+
+| Version | Status (September 2026) |
+|---|---|
+| 5.7 | End of life since October 2023 |
+| **8.0** | Premier support ended **2025-04-30**. **End of life 2026-04-30**: no further fixes, including security fixes |
+| **8.4 LTS** | Supported. The first LTS under the new model |
+| **9.7 LTS** | Supported. The second LTS |
+| 9.x Innovation | Only for testing upcoming features |
+
+If you still run 8.0, upgrade to **8.4 LTS**. It is the smaller step, and the main behaviour
+changes are defaults. `mysql_native_password` is disabled by default, so clients must support
+`caching_sha2_password` first. Several deprecated replication terms and options are removed.
+Check your managed provider's calendar too: RDS (Extended Support) and Cloud SQL both charge
+extra per vCPU to keep running a major version past the end of standard support.
 
 ---
 
@@ -2293,6 +2367,36 @@ SELECT create_distributed_table('order_items', 'customer_id',
 -- Reference table (replicated to all workers)
 SELECT create_reference_table('countries');
 ```
+
+### Managed and Sharded Postgres in 2026
+
+Postgres became the default OLTP database for new projects, and the market consolidated around
+it:
+
+| Event | Date |
+|---|---|
+| Databricks agrees to acquire **Neon** (serverless Postgres with branching), about $1 billion | May 2025 |
+| Snowflake acquires **Crunchy Data**, about $250 million, launching Snowflake Postgres | June 2025 |
+| **Aurora DSQL** (distributed, active-active, optimistic concurrency) generally available | May 2025 |
+| **Aurora PostgreSQL Limitless Database** (managed sharding across Aurora writers) generally available | Late 2024 |
+| PlanetScale launches **PlanetScale Postgres** and previews **Neki**, sharded Postgres from the Vitess team | 2025 |
+| Supabase starts **Multigres** ("Vitess for Postgres", open source), led by Vitess co-creator Sugu Sougoumarane | 2025 |
+
+Options for when one Postgres primary is no longer enough (see
+`distributed-systems/10-sharding-and-consistent-hashing.md` §6.5 for when to shard at all):
+
+| Option | Model | Maturity | Choose it when |
+|---|---|---|---|
+| **Citus** (extension, open source; also Azure Cosmos DB for PostgreSQL) | Distributed tables and reference tables, co-located joins | Production for years | Multi-tenant SaaS keyed by tenant, and you want to stay close to stock Postgres |
+| **Aurora Limitless** | Managed sharded tables inside one Aurora endpoint | GA, AWS only | You are on Aurora and want sharding without a routing layer |
+| **Neki** (PlanetScale) | Sharding plus full lifecycle management (backups, schema changes, pooling) | Preview, closed source | Evaluation only today |
+| **Multigres** (Supabase) | Vitess-style proxy and orchestration for Postgres | Early, open source | Evaluation only today |
+| **PgDog** | Sharding-aware pooler and proxy (successor to PgCat) | Young, open source | You want a thin proxy in front of existing Postgres shards |
+| **Distributed SQL** (Aurora DSQL, CockroachDB, YugabyteDB, Spanner) | Automatic range sharding with Raft/Paxos, Postgres-compatible dialects | Production | Multi-region writes or strict consistency across shards, and you can accept compatibility gaps and retry-on-conflict (`19-distributed-databases-deep-dive.md`) |
+
+**Vendor risk.** For an SMB, the acquisitions are a reason to keep the exit path open: stick to
+community Postgres features, test restoring a `pg_dump` or logical-replication copy to another
+provider once a year, and avoid proprietary extensions on the core data path.
 
 ### Scaling Decision Matrix
 

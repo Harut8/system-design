@@ -115,6 +115,14 @@ Durability Spectrum
 
 ## 2. Redis Deep Dive
 
+> **2024–2026 note: Redis and Valkey.** In March 2024 Redis moved from BSD to source-available
+> licenses, and the Linux Foundation forked the last BSD version as **Valkey**. Redis 8 (May
+> 2025) added AGPLv3 as an option, so it is open source again. Everything in this section applies
+> to both at the protocol and data-structure level. The differences that matter (Valkey's
+> multi-threaded I/O and 20-byte-per-key hash table, Redis 8's built-in Query Engine and vector
+> sets, managed-service pricing, and which to choose) are in
+> [`../distributed-systems/08-caching-strategies-and-patterns.md` §6.7](../distributed-systems/08-caching-strategies-and-patterns.md).
+
 ### Architecture
 
 #### Single-Threaded Event Loop

@@ -519,6 +519,48 @@ Example:
   But (customer_id, order_date) prefix is fully utilized.
 ```
 
+#### Skip Scan: When the Leftmost-Prefix Rule Bends (PostgreSQL 18, MySQL 8.0.13+, Oracle)
+
+The table above marks `WHERE order_date = '...'` as "✗ NO". That is still the safe default, but
+it is no longer always true. A **skip scan** treats a missing leading column as "every distinct
+value of it": the engine jumps to each distinct value of `customer_id` in turn and does a normal
+range search on `order_date` inside it. The cost is one index descent per distinct leading
+value, so it pays off only when the leading column has **few distinct values** (region, tenant
+tier, status), not a unique ID.
+
+| Engine | Skip scan | Notes |
+|---|---|---|
+| Oracle | Since 9i ("index skip scan") | Long-standing |
+| MySQL | Since **8.0.13** | Range access method. Only for queries the index covers, on a single table, with no `GROUP BY` / `DISTINCT` |
+| PostgreSQL | Since **18** (2025) | B-tree only. `EXPLAIN ANALYZE` shows `Index Searches: N`, the number of descents |
+
+Measured on 2 million orders with an index on `(region, created_at)`, where `region` has 10
+values, and a query that filters only on `created_at` (one day):
+
+```sql
+CREATE INDEX orders_region_created ON orders (region, created_at);
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM orders
+WHERE created_at >= '2025-06-01' AND created_at < '2025-06-02';
+```
+
+| | PostgreSQL 16 | PostgreSQL 18 |
+|---|---|---|
+| Plan | Parallel Seq Scan (2 workers + leader) | **Index Only Scan**, `Index Searches: 12` |
+| Buffers touched | 14,706 | **79** |
+| Execution time (warm) | 63 ms | **0.8 ms** |
+
+What this changes in practice:
+
+- **Before adding a second index**, check `EXPLAIN` on PostgreSQL 18+ or MySQL 8.0.13+. An
+  existing `(low_cardinality, x)` index may already serve queries on `x` alone.
+- **Don't rely on it for high-cardinality leaders.** With `customer_id` first (millions of
+  values) the planner correctly falls back to a scan. The column-order heuristic above still
+  applies.
+- **Watch `Index Searches` after upgrading.** A plan that silently switched to a skip scan is
+  fast while the leading column stays low-cardinality and degrades as it grows.
+
 ### Partial Indexes / Filtered Indexes
 
 Only index a **subset** of rows. Dramatically reduces index size and maintenance cost.
@@ -585,6 +627,44 @@ Enforcement mechanism:
   index page. Under heavy concurrent inserts to the same key range,
   this can cause contention.
 ```
+
+### Primary Key Choice: Random vs Time-Ordered UUIDs (Measured on PostgreSQL 18)
+
+A B+Tree stays compact when inserts arrive in key order: every new key goes to the rightmost
+leaf, and a full leaf splits once. **Random keys** (UUIDv4) land on a random leaf. Every leaf
+must stay in memory to absorb inserts, splits leave half-empty pages everywhere, and each
+checkpoint forces full-page images of pages scattered all over the index.
+
+**UUIDv7** (RFC 9562, May 2024) puts a 48-bit Unix-millisecond timestamp first and random bits
+after it. It's still globally unique without coordination, but it sorts by creation time, so
+inserts behave like an auto-increment key. PostgreSQL 18 generates it natively with `uuidv7()`,
+and `uuid_extract_timestamp()` reads the time back out.
+
+```sql
+CREATE TABLE ev4 (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), payload text NOT NULL);  -- v4
+CREATE TABLE ev7 (id uuid PRIMARY KEY DEFAULT uuidv7(),          payload text NOT NULL);  -- v7
+INSERT INTO ev4 (payload) SELECT 'x' FROM generate_series(1, 3000000);
+INSERT INTO ev7 (payload) SELECT 'x' FROM generate_series(1, 3000000);
+```
+
+3 million rows each, PostgreSQL 18.4, default settings (`shared_buffers` = 128 MB), two runs:
+
+| Key | Insert time | Primary-key index size | Average leaf density (`pgstatindex`) |
+|---|---|---|---|
+| UUIDv4 (random) | 22–23 s | 119–121 MB | 67–69% |
+| **UUIDv7** (time-ordered) | **13 s** | **90 MB** | **90%** |
+
+UUIDv7 inserted about **1.7× faster** into a **25% smaller** index. The gap widens once the
+index no longer fits in memory, because random inserts then turn into random disk reads.
+
+Two cautions:
+
+- **UUIDv7 leaks creation time.** Anyone holding the ID can read when the row was created. For
+  public identifiers where that matters (user IDs visible in URLs, invite links), keep a separate
+  random public ID.
+- **Time-ordered keys are a hot spot in range-partitioned distributed databases.** Every insert
+  goes to the last range (see `distributed-systems/10` §6.4). Single-node B+Trees benefit.
+  CockroachDB, Spanner and similar systems need hash sharding or a non-time prefix.
 
 ---
 
