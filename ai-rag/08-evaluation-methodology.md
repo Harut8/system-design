@@ -1608,6 +1608,13 @@ can audit disagreements. A decision model has none. The cascade fixes this: ever
 tier sees has a written reason, and those are the items worth reading. Also, the vendor's
 calibration claim is "in aggregate, on their data". It still has to be checked on yours.
 
+**Independent tests show why you have to check** (details in `17` §7.6.1). Jev's ECE ranged
+from **0.004** on one triage task to **0.246** on a mixed benchmark, where LLM judges scored
+0.039–0.122. On items that had no knowable answer, it said it was unsure only **49.7%** of the
+time, compared with 97–100% for the LLMs. Accuracy was around mid-price-LLM level: 76.3% on
+77-way Banking77 vs 80–81% for the best LLMs tested, and 93.0% on spam. One number from the
+vendor tells you nothing about your task.
+
 **The protocol is §11.1 again, plus one extra step: check calibration before you use thresholds.**
 
 ```python
@@ -1649,6 +1656,20 @@ def pick_band(p: list[float], y: list[int], max_missed_bad: float = 0.02,
     return {"low": low, "high": high, "escalation_rate": escalated}
 ```
 
+If `reliability` shows a large ECE, **recalibrate before you pick the band**. Fit a monotone
+map from the model's p to the observed bad-rate on the calibration split, and apply it to every
+later score (Guo et al. 2017 is the standard reference; references are listed in `17` §7.6.4).
+Monotone means the ranking doesn't change, so AUC stays the same, but the thresholds mean
+something again:
+
+```python
+from sklearn.isotonic import IsotonicRegression
+
+iso = IsotonicRegression(out_of_bounds="clip").fit(p_fit, y_fit)   # fit split ONLY
+p_report = iso.predict(p_report_raw)                                # then reliability() + pick_band()
+# Version the fitted map with the model version + question hash: a new model means a new map.
+```
+
 Three rules keep this from turning into the "cheaper way to be wrong" §11.7 warns about:
 
 1. **Validate each tier on its own, and then the whole cascade.** Compute κ and FAIL-class recall
@@ -1668,6 +1689,15 @@ jev = 5000 * 1800 / 1e6 * 0.042            # ~$0.38 : every item, first tier
 llm = 0.20 * 16.28                         # ~$3.26 : escalated slice, §11.7's optimized Opus 5 run
 print(round(jev + llm, 2))                 # ~$3.64 vs ~$16.28 all-Opus, vs ~$63.75 unoptimized
 ```
+
+**Throughput, not cost, sets the limit.** Jev's early-access limit is 1,200 requests/minute
+(`17` §7.6.2). The 5,000-claim run takes **~4.2 minutes** at that rate. A 50,000-claim nightly
+run takes ~42 minutes, even though it costs only ~$4. Two ways around it. First, claims from the
+same answer share one context, so send **one state per answer with one `Noul` per claim**. That
+makes the number of calls equal to the number of answers, not claims, and output is free. Second,
+for eval-heavy teams, run a **fine-tuned Laya** locally (`17` §7.6.3). There is no per-call cost
+and no rate limit, only GPU time. Fine-tune it only on a training split that is kept apart from
+the golden set, or the eval grades its own answer key.
 
 That makes a judged eval cheap enough to run on every pull request. Whether the cascade *agrees
 with humans* as well as the all-Opus run does is an empirical question, and rule 1 above answers

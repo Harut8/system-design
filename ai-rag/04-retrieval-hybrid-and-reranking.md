@@ -805,8 +805,15 @@ makes an absolute cutoff meaningful: "send the LLM only the candidates with p �
 that is fewer than k". A fixed top-k can't do that (`06` covers why fewer, cleaner passages
 beat a full window).
 
-Place it carefully in the §10 latency budget. At ~70–500 ms per call it is an LLM-reranker-class
-stage, not a replacement for a GPU cross-encoder (§7) that runs tens of milliseconds. Put it
+Place it carefully in the §10 latency budget. At ~70–500 ms per call (independent p50s were
+127–276 ms) it is an LLM-reranker-class stage, not a replacement for a GPU cross-encoder (§7)
+that runs in tens of milliseconds. Two numbers change that. First, at $0.042/M input, filtering
+20 × 300-token candidates costs ~$0.00025 per query, or ~$250 per million queries. Second,
+the early-access limit is 1,200 requests/minute, so score all candidates for a query in **one
+call** (one state holding the query and the numbered candidates, one question per candidate)
+rather than one call per candidate. Otherwise 20 candidates per query caps you at 1 query per
+second. Self-hosted Laya (`17` §7.6.3) gets into cross-encoder territory, at ~7 ms per
+question batched on a GPU. Put it
 after the cross-encoder, on the top 10–20. Decide τ with §13's paired evaluation: a filter that
 raises precision@k but drops the one passage the answer needed is a recall regression. Check it with
 [`appendix-f-recall-at-every-layer.md`](appendix-f-recall-at-every-layer.md).

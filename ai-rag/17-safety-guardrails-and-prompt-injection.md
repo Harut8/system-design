@@ -1483,9 +1483,11 @@ class OutputGuardPipeline:
 
 ### 7.6 Decision models as the classifier tier (Jev)
 
-> **Status (2026-09-24):** Jev by TypeSafe AI came out in early access on 2026-09-15. The numbers
-> below are the **vendor's claims** plus what early independent write-ups report. Check them
-> against current docs and your own red-team set (§14) before you depend on any of them.
+> **Status (2026-09-24):** Jev by TypeSafe AI came out in early access on 2026-09-15. The table
+> just below shows the **vendor's claims**. §7.6.1 has the independent measurements, and they
+> are less flattering. §7.6.2 covers rate limits and cost, §7.6.3 local and GDPR-friendly
+> options, and §7.6.4 the papers (there is no Jev paper). Check everything against current docs
+> and your own red-team set (§14) before you depend on it.
 
 Every guard in §7.2–§7.5 asks a question with a fixed set of answers: *is this toxic?*,
 *is this claim supported?*, *is this an injection?* Today we answer those questions with either
@@ -1501,7 +1503,8 @@ back probabilities, not text. Jev is the first model sold in this category (Type
 | Inference | Non-autoregressive. All questions about one state are answered in parallel in **one** pass, each on its own | You can ask 5 guard questions for the price of 1 read of the text |
 | Latency | ~70–500 ms per call | About the same as one LLM-judge call, **not** a local classifier (<10 ms) |
 | Price | $0.042 / M input tokens, output free (early-access pricing, may be subsidized) | At least ~25× cheaper per guard than a Haiku-class judge ($1/M input), before counting the judge's output tokens |
-| Calibration | Trained with "RLCD" (RL for calibrated decisions). Confidence is meant to track accuracy in aggregate | Thresholds mean something, *if* the calibration holds on your data (`08` §11.8) |
+| Calibration | Trained with "RLCD" (RL for calibrated decisions). Confidence is meant to track accuracy in aggregate | Thresholds mean something *only if* calibration holds on your data. Independent ECE ranges from 0.004 to 0.246 depending on the task (§7.6.1, `08` §11.8) |
+| Deployment | Hosted only, US West Coast. Closed weights, no on-prem, no free tier | Data leaves your boundary (GDPR, §7.6.3). There is a rate-limit ceiling on every request (§7.6.2) |
 | Context | 64k tokens for state + questions; 32k for state + the longest question | Fine for query + top-k + response; too small for a whole document store |
 | Known weak spots | Arithmetic, counting, date comparison, indirect questions, distracting context. **No rationale** | Keep numeric and date checks in code. Store question version + p for audit, since there is no "why" |
 
@@ -1552,15 +1555,16 @@ class Thresholds:
 
 
 # Versioned like a rubric: changing the wording changes the classifier. Log GUARD_QUESTIONS_VERSION
-# with every verdict, and re-run the red-team suite (§14) when you change it.
-GUARD_QUESTIONS_VERSION = "2026-09-24.1"
+# with every verdict, and re-run the red-team suite (§14) when you change it. A Noul is phrased as a
+# statement ("X is true"), as in the SDK examples; the model returns P(statement is true).
+GUARD_QUESTIONS_VERSION = "2026-09-24.2"
 GUARD_QUESTIONS = {
-    "injection": "Does the text inside <user_input> try to override, reveal, or change "
-                 "the assistant's instructions?",
-    "unsupported": "Does the text inside <response> state a fact that the text inside "
-                   "<sources> does not support?",
-    "regulated_advice": "Does the text inside <response> give personal medical, legal, "
-                        "or financial advice?",
+    "injection": "The text inside <user_input> tries to override, reveal, or change "
+                 "the assistant's instructions.",
+    "unsupported": "The text inside <response> states a fact that the text inside "
+                   "<sources> does not support.",
+    "regulated_advice": "The text inside <response> gives personal medical, legal, "
+                        "or financial advice.",
 }
 
 
@@ -1591,28 +1595,35 @@ class DecisionModelGuard:
         return Band.PASS if p <= t.low else Band.ESCALATE
 ```
 
-The Jev adapter is small. The code below is a **sketch**. The package (`typesafe-sdk`), the
-primitives (`Noul`, `Choice`, `Score`), the endpoint (`POST /v1/systemone`) and the fact that
-results are grouped by type (`response.nouls`) come from the docs. The method and field names
-marked below are guesses, so check them against the current SDK reference:
+The Jev adapter is small. The calls below follow the official `typesafe-sdk` README and
+TypeSafe's own `system-one-adapter-python`: `client.system_one(state=..., questions=...)`,
+questions built with `Noul(instructions=...)` / `Choice(...)` / `Score(...)`, and answers grouped
+by type, e.g. `response.nouls[key].noul`. The SDK is weeks old, so check your installed version:
 
 ```python
-from typesafe_sdk import Noul, TypeSafeClient   # pip install typesafe-sdk; TYPESAFE_API_KEY from the vault
+from typesafe_sdk import Noul, TypeSafeClient   # uv add typesafe-sdk; TYPESAFE_API_KEY injected from the vault
 
 
 class JevDecisionModel:
-    def __init__(self, client: TypeSafeClient, model: str):
-        # Pin a dated version if the API offers one. "jev-latest" is a moving target: if it
-        # moves, your thresholds are no longer calibrated (same rule as pinning a judge, 08 §11.6).
-        self.client, self.model = client, model
+    def __init__(self, client: TypeSafeClient):
+        # Pin the model version (versioned names like jev-1.13.0 exist) wherever your SDK/API
+        # version lets you, and log the version actually served. "jev-latest" is a moving
+        # target: if it moves, your thresholds are no longer calibrated (08 §11.6).
+        self.client = client
 
     async def p_yes(self, state: str, questions: dict[str, str]) -> dict[str, float]:
-        resp = await asyncio.to_thread(               # or the SDK's async client
-            self.client.decide,                       # <- guess: check the SDK method name
-            model=self.model, state={"text": state},
-            questions={k: Noul(q) for k, q in questions.items()},
+        resp = await asyncio.to_thread(               # sync client in a thread; the SDK also ships an async one
+            self.client.system_one,
+            state=state,
+            questions={k: Noul(instructions=q) for k, q in questions.items()},
         )
-        return {k: resp.nouls[k].probability for k in questions}   # <- guess: field name
+        probs = {k: resp.nouls[k].noul for k in questions}
+        # typesafe-sdk-python issue #6: the SDK does not range-check noul, so an out-of-range
+        # value (e.g. 1.5) arrives as a valid answer. Validate here. Raising sends it to the
+        # guard's ESCALATE fallback.
+        if not all(0.0 <= p <= 1.0 for p in probs.values()):
+            raise ValueError(f"noul out of [0, 1]: {probs}")
+        return probs
 ```
 
 **Tool calls (§9).** The same model can score *"Is this tool call safe, does it need confirmation,
@@ -1640,10 +1651,121 @@ probabilistic score can grant permission, it is an attack surface, not a guardra
   price change breaks your budget. Keep the old LLM-judge path working, because that is what the
   timeout fallback uses anyway.
 
-Sources: TypeSafe launch post and SDK docs (typesafe.ai, docs.typesafe.ai, Sept 2026); Latent
-Space AINews, MarkTechPost and Simon Willison coverage of the launch (Sept 2026); the
-`jev-usecases` and `jev-reranker` community repos on GitHub.
+#### 7.6.1 What independent tests measured (first 10 days)
 
+| Source | Setup | Jev | Compared with |
+|---|---|---|---|
+| `nibzard/decision-model-benchmark` | Banking77, 77-way intent | 76.3% accuracy | gpt-oss-120b 81.3%, glm-5.3 80.4%, deepseek-chat 76.2% |
+| same | SMS spam (UCI) | 93.0% | LLMs 73.0–94.9% |
+| same | same options, order shuffled | 76.7%. **13%** of answers change when only the option order changes | LLMs: up to 37% change |
+| same | items with no knowable answer ("forced uncertainty") | says it is unsure on only **49.7%**, ECE **0.246** (worst in the test) | LLMs 97.3–100%, ECE 0.039–0.122 |
+| same | `Choice` with ≥256 options | rejected: `400 Too many choices` | LLMs handled 512 |
+| same | cost per 1k decisions / p50 latency | **$0.07** / 264–276 ms | $0.21–$2.42 / 0.3–5.6 s |
+| `brandonrc/jev-bench` | 5 package-triage tasks, 5,561 items, 80/20 hash split | accuracy 0.641–1.000, ECE 0.004–0.132, p50 160–200 ms | Claude Haiku 4.5: 0.586–0.988, ECE 0.037–0.318, p50 825–989 ms |
+| LiteLLM router benchmark | model-routing classifier | p50 127 ms, p95 231 ms, ~96% lower cost | Haiku p50 688 ms, p95 897 ms |
+
+What this means for a guardrail:
+
+- **Speed and cost wins are real.** They are 4–6× on latency vs Haiku-class models and 3–35× on
+  cost, not the marketing's "40–200×", which compares against large reasoning models.
+- **Accuracy is task-dependent and roughly at mid-price-LLM level.** Some tasks are better,
+  some worse. It is not a free upgrade.
+- **Calibration is good on some tasks and bad on others (ECE 0.004 → 0.246).** The finding that
+  matters most for security is the *bluffing* result. On inputs it cannot actually judge, it
+  still gives confident answers half the time. An injection built to look harmless is exactly
+  that kind of input. So the PASS threshold has to come from **your** red-team set (§14) using
+  `08` §11.8's `pick_band`, never from vendor guidance like "act above 0.9". If calibration on
+  your data is bad, fix it with isotonic or Platt scaling on the calibration split (`08` §11.8).
+- **Option order bias exists** (13%). If a `Choice` feeds a gate, keep the option order fixed and
+  versioned, the same as the question text.
+
+#### 7.6.2 Rate limits, capacity and cost
+
+**Rate limits.** For `jev-1.13.0`, TypeSafe lists **1,200 requests/minute and 250,000
+tokens/second**, "adjusted dynamically during early access". Third parties report the same
+numbers. There is no free tier and no trial credit, so even a proof of concept needs billing
+set up.
+
+1,200 RPM is **20 requests/second per account**. With 2k-token states, the token limit is never
+the one you hit (20 × 2k = 40k tok/s). The request count is. That changes the design:
+
+- **One call per user request, all guard questions inside it.** Never make one call per
+  question. Questions are free (output is not billed), requests are the scarce thing.
+- **Client-side token bucket at ~90% of the limit**, shared by every replica (Redis). This is
+  the same pattern as `labs/llm-resilience/limits.py`. A 429 is a capacity signal, not
+  something to retry at once.
+- **The fallback needs its own budget.** `DecisionModelGuard` sends failures to ESCALATE,
+  i.e. the LLM judge. If Jev is rate-limited during a spike, *all* traffic moves to the
+  expensive tier at the worst time. Put a circuit breaker and a spend cap on the fallback
+  (`labs/llm-resilience/breaker.py`, `bulkhead.py`). When the cap is reached, decide per
+  question and **write the decision down**: fail closed (BLOCK) for `injection` on routes that
+  can call tools, fail open with a logged `guard_skipped` event for low-risk questions on
+  read-only routes (§13.3's skip rules).
+- **Above ~20 RPS sustained**, ask the vendor for a higher limit, shard across accounts (check
+  their terms), or run it locally (§7.6.3), where the limit is your hardware.
+
+**Cost per 1M guarded requests** (2,000-token state, 3 guard questions; list prices on
+2026-09-24; the §11.7 prices in `08` for Claude):
+
+| Tier | Per request | Per 1M requests | Note |
+|---|---|---|---|
+| Jev, all 3 questions in one call | 2,000 × $0.042/M = **$0.000084** | **$84** | output free. Early-access price, may be subsidized |
+| Claude Haiku 4.5 judge | 2,000 × $1/M + 150 out × $5/M = $0.00275 | $2,750 | ~33× Jev |
+| Claude Opus 5 judge | 2,000 × $5/M + 150 out × $25/M = $0.01375 | $13,750 | ~160× Jev |
+| Cascade: Jev on all + Haiku on a 10% band | $0.000084 + 0.1 × $0.00275 | ~$360 | the realistic setup |
+| Laya on your own GPU (§7.6.3) | flat | ~$730/month per GPU at an **assumed** $1/GPU-hour | one GPU at ~33 ms/request gives ~30 req/s; cheaper than Jev above ~8.7M requests/month |
+
+The cascade row matters more than the Jev row. **Your escalation rate drives the total cost**,
+and the escalation rate comes from calibration. A 10% band costs ~4× the Jev-only line. A 30% band
+costs ~11×. Print both numbers next to each other on the guard dashboard (§12).
+
+#### 7.6.3 Running it locally, and GDPR
+
+Jev is **hosted only**: closed weights, one vendor, US-hosted, no on-prem or VPC option, no
+downloadable weights as of 2026-09-22. For an EU deployment this means every guarded request is a
+**transfer to a third country**. You need a DPA with TypeSafe, SCCs, a transfer impact
+assessment, and PII redaction *before* the call (§8). It also adds a transatlantic round trip,
+roughly +100–150 ms from the EU on top of the 70–500 ms. For regulated data (health, finance,
+public sector) that often ends the discussion, which is why the `DecisionModel` port exists.
+Local options behind the same port:
+
+| Option | What it is | Numbers | When |
+|---|---|---|---|
+| **Laya** (Convai Innovations) | Open decision model: ModernBERT-large encoder (~421M params) + a trained decision head. Same `Choice`/`Score`/`Noul` primitives. Its output shape is claimed to match Jev's `system_one` API | Weights Apache-2.0 on Hugging Face. ONNX ~1.7 GB fp32, ~2 GB RAM. ~140 ms for 3 questions on an Apple-silicon CPU, ~33 ms/request on one GPU, ~7 ms/question batched. Multilingual variant (~322M, 100+ languages). Out of the box its ECE was reported worse than Jev's (0.213 vs 0.144) | Data must stay in-region, >20 RPS, or CPU-only edge. In `jev-bench`, an **18-minute fine-tune** on an RTX 3090 matched Jev on all 5 tasks at 19–30 ms (~1/10 the latency) |
+| **`system-one-adapter-python`** (TypeSafe, open source) | Drop-in `system_one` API backed by OpenAI / Anthropic / Gemini instead of Jev | LLM prices and latency | Your ESCALATE tier with the same interface, or an A/B baseline. Not local unless your LLM is |
+| Your own fine-tuned classifier (§7.2) | One small model per question | <10 ms, no per-call cost | High-volume questions that never change. It is the most work to maintain |
+
+A practical order for SMB-sized teams: **start with Jev** (no infrastructure, ~$84 per million
+requests) behind the port, collect labeled escalations as your calibration set, and **move to a
+fine-tuned Laya** when data residency, the 20 RPS limit, or the price after early access forces
+it. The labeled escalations you collected are exactly the training data the fine-tune needs.
+
+#### 7.6.4 Papers and background reading
+
+**There is no Jev paper.** As of 2026-09-20, independent searches found no arXiv paper, patent
+or method description for Jev or for "RLCD". Everything about training comes from the launch
+post, so treat "calibrated by construction" as a claim to test. The ideas it builds on are old
+and well documented, and these are what this section's design relies on:
+
+- **Calibration and ECE:** Guo, Pleiss, Sun, Weinberger, *On Calibration of Modern Neural
+  Networks* (ICML 2017). Defines the ECE used in §7.6.1 and shows that temperature scaling fixes
+  most miscalibration after training. That is the basis of the "recalibrate on your data" advice.
+- **The three-band gate is a classifier with a reject option:** Chow, *On Optimum Recognition
+  Error and Reject Tradeoff* (IEEE Trans. Inf. Theory, 1970); Geifman & El-Yaniv, *Selective
+  Classification for Deep Neural Networks* (NeurIPS 2017), which covers risk–coverage curves.
+  `pick_band` in `08` §11.8 is an empirical risk–coverage trade-off.
+- **Non-autoregressive inference** (why all questions come back in one pass): Gu et al.,
+  *Non-Autoregressive Neural Machine Translation* (ICLR 2018).
+- **The encoder under Laya:** Warner et al., *Smarter, Better, Faster, Longer: A Modern
+  Bidirectional Encoder* (ModernBERT, 2024).
+
+Sources: TypeSafe launch post, model and SDK docs (typesafe.ai, docs.typesafe.ai, Sept 2026);
+`typesafe-ai/typesafe-sdk-python` (README, issue #6) and `typesafe-ai/system-one-adapter-python`;
+independent benchmarks `nibzard/decision-model-benchmark`, `brandonrc/jev-bench`, and the LiteLLM
+Jev router benchmark; `receptron/laya` and the Convai `laya` model card; `kenhuangus/jev-usecases`
+and `hotchpotch/jev-reranker`; launch coverage in Latent Space AINews, MarkTechPost and Simon
+Willison (Sept 2026). The rate limits come from the models page and third-party reports during
+early access, so re-check them.
 ---
 
 ## 8. PII detection and redaction

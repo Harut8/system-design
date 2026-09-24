@@ -1594,6 +1594,17 @@ def apply_size_limits(paras: list[str], cuts: list[int], n_tokens,
 `tau` is a chunking parameter, like chunk size. Choose it with the §11 golden-set comparison, not
 by gut feeling. A higher `tau` means fewer, larger chunks.
 
+**Throughput and local runs.** Ingest usually hits the rate limit before it hits the budget. At
+Jev's early-access 1,200 requests/minute (`17` §7.6.2), a 100M-token corpus with ~80-token
+paragraphs (~1.25M breaks) needs ~208k calls with `stride=6`. That is about **2.9 hours** for a
+full re-chunk, while the bill is only ~$6. Raising `stride` to 40 (a ~3.4k-token state) cuts it
+to ~31k calls and **~26 minutes**, and the overlap drops to ~1.08×. The catch is that
+"distracting context" is one of the model's known weak spots, so a bigger window can move
+boundaries. Tune `stride` and `tau` together on the golden set. For corpora that must not leave
+your network, or that are re-chunked often, run **Laya** locally behind the same port (`17`
+§7.6.3). At the reported ~7 ms per question batched on one GPU, the same 1.25M breaks take
+~2.4 GPU-hours, with no rate limit and no data transfer.
+
 Two other ingest jobs that fit the same model, both of which are fixed-answer questions:
 
 - **Deciding which chunks need context.** Contextual retrieval (`01` §9.2) calls an LLM for
@@ -1602,7 +1613,9 @@ Two other ingest jobs that fit the same model, both of which are fixed-answer qu
   answer "no". The savings are however many chunks answer "yes". Measure that number on your
   corpus before you count on it.
 - **Tagging metadata from a fixed list.** Fields like `doc_type`, `audience` or
-  `jurisdiction` come from a closed set, so each one is a `Choice` (§8). Free-text fields
+  `jurisdiction` come from a closed set, so each one is a `Choice` (§8). A `Choice` accepts at most
+  255 options (independent tests got `400 Too many choices` at 256). A larger taxonomy, such as
+  product codes, needs two levels: first the family, then the code within that family. Free-text fields
   (titles, entity names) are extraction, so they stay with the parser or an LLM. A common
   hybrid is: the LLM extracts, then the decision model checks *"is this value supported by the
   text?"*
