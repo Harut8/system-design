@@ -150,3 +150,23 @@ Provide a **practical, production-oriented design** that includes:
 * Assume this system will evolve for **10+ years**
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/instagram-feed-design.md) · [Caching](../distributed-systems/08-caching-strategies-and-patterns.md) §7 layers, §7.5 CDN security · [Load control](../distributed-systems/34-adaptive-load-control-and-backpressure.md) §11 recovery · [Sharding](../distributed-systems/10-sharding-and-consistent-hashing.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A user with 300M followers posts. Push, pull, or hybrid, and where exactly is the threshold? *(Hybrid: pull for celebrities, and state the follower-count cut-off and why.)*
+2. The feed cache cluster restarts empty at peak. What stops the database from collapsing? *(Admission control, request coalescing, serving a degraded feed.)*
+3. A CDN rule starts caching `/api/feed/me.json` for everyone. *(Web cache deception: private responses are `no-store`, and cacheability follows origin headers.)*
+4. Ranking model latency doubles. What does the feed serve while it's slow?
+
+**Must answer (security, privacy, operations):**
+
+- Private accounts and blocks in fan-out: what happens to already-fanned-out posts when someone is blocked
+- Account deletion: removing posts from millions of precomputed feeds
+
+**Phase it (MVP → Growth → Scale):** MVP: pull model with SQL `ORDER BY created_at` plus cache. Growth: fan-out-on-write into Redis lists. Scale: hybrid fan-out, ranking service, multi-region feeds.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

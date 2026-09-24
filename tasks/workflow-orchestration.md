@@ -298,3 +298,25 @@ Study these for inspiration:
 * **Netflix Conductor** — Orchestration engine (JSON DSL, less code-centric)
 * **Restate** — Newer entrant, durable execution with virtual objects
 * **Inngest** — Event-driven durable functions
+
+---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/workflow-orchestration-design.md) incl. crypto-shredding · [Consensus](../distributed-systems/03-consensus-raft-and-distributed-locking.md) · [WAL](../databases/14-write-ahead-log-internals.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A customer invokes GDPR erasure, but their data sits in immutable event history that must stay replayable. *(Per-subject payload encryption and key deletion.)*
+2. A code change reorders two activities, and 40K running workflows now fail replay. *(Versioning/patching, replay tests in CI.)*
+3. One namespace's timers all fire at midnight UTC. *(Timer jitter, per-namespace rate limits.)*
+4. A history shard's database is slow. Which workflows stall, and which don't?
+
+**Must answer (security, privacy, operations):**
+
+- Workflow payloads encrypted in the SDK. Search attributes never contain PII
+- Worker authentication per task queue (a rogue poller receives real inputs)
+
+**Phase it (MVP → Growth → Scale):** MVP: a single-cluster engine on Postgres (or managed Temporal). Growth: sharded history service, visibility store. Scale: multi-cluster replication, archival, per-namespace isolation.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

@@ -301,3 +301,23 @@ both efficiently without requiring teams to become distributed systems experts.
   the parallelism framework and scheduler must be extensible.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/parallel-ml-training-design.md) incl. Security section · [Failure detection](../distributed-systems/29-failure-detection-phi-accrual.md) · [Reliability math](../distributed-systems/35-reliability-math-slos-and-error-budgets.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. At 4,096 GPUs, a node fails every few hours. What checkpoint interval minimizes lost work, and what does a checkpoint cost? *(Young/Daly formula, async and in-memory checkpoints.)*
+2. One slow GPU (thermal throttling) makes the whole job 30% slower. How do you detect and evict it?
+3. A colleague's job overwrites your checkpoint prefix. *(Per-job storage credentials.)*
+4. Legal asks which checkpoints were trained on a dataset that must be removed.
+
+**Must answer (security, privacy, operations):**
+
+- `torch.load` on untrusted checkpoints (unpickling runs code), safetensors, per-job IAM
+- Dataset provenance and licensing recorded with every run
+
+**Phase it (MVP → Growth → Scale):** MVP: single-node multi-GPU with DDP and S3 checkpoints. Growth: gang scheduling, FSDP, automatic restart. Scale: 3D parallelism, topology-aware placement, elastic and spot capacity.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

@@ -28,6 +28,7 @@
 20. [Failure Walkthroughs](#20-failure-walkthroughs)
 21. [Trade-offs](#21-trade-offs)
 22. [Evolution Path](#22-evolution-path)
+- [Security, Privacy, and Abuse Prevention](#security-privacy-and-abuse-prevention)
 
 ---
 
@@ -2181,6 +2182,58 @@ Alert fires → operator manually cancels H-123 via hotel admin portal
 - [ ] Cloud-native managed offering (multi-tenant control plane)
 - [ ] Workflow replay debugger in Web UI (step-through execution)
 - [ ] Cost attribution per namespace/team
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+Event-sourced history (§4) is **immutable and replayed**, which creates the design's hardest
+privacy problem: workflow inputs, activity results and signals are stored for as long as the
+history exists, and you can't edit them without breaking deterministic replay.
+
+| Threat | Control |
+|---|---|
+| **Personal data in history** | Encrypt payloads **in the SDK** before they leave the worker (the pluggable data converter from §1, running in the SDK, §17), so the server stores ciphertext. The server never needs plaintext: it routes by IDs and timers. The UI and CLI decrypt through a codec service the operator authenticates to |
+| **Right to erasure vs. immutable history** | **Crypto-shredding**: encrypt each payload with a per-subject key (per customer), and erase the key to make every payload for that subject unreadable at once, in history, archives and backups (below) |
+| **Cross-namespace access** | Namespaces are the tenancy boundary (§16). The frontend authorizes every call by namespace from the caller's token or mTLS identity. Workers get credentials scoped to their namespace and task queues |
+| **Rogue workers** | Any process that polls a task queue receives tasks and their inputs. Workers authenticate with mTLS, and task-queue polling is authorized per identity |
+| **Signals and updates as an input channel** | Signals (§11) come from other services and possibly users. Validate them in the workflow like any external input, and authorize who can signal which workflow types |
+| **Visibility store leaks** | Search attributes are indexed in plain text in the Elasticsearch visibility store (§3), so they must never contain personal data. Use IDs, and store the rest in the encrypted payload |
+
+```python
+class SubjectKeys:
+    """One data key per data subject (user/customer). Production: keys live in a KMS or
+    vault, wrapped by a master key; this dict stands in for that store."""
+    def __init__(self):
+        self._keys: dict[str, bytes] = {}
+
+    def key_for(self, subject_id: str) -> bytes:
+        return self._keys.setdefault(subject_id, AESGCM.generate_key(bit_length=256))
+
+    def get(self, subject_id: str) -> bytes:
+        if subject_id not in self._keys:
+            raise KeyErased(subject_id)
+        return self._keys[subject_id]
+
+    def erase(self, subject_id: str) -> None:        # the GDPR erasure: delete one key
+        self._keys.pop(subject_id, None)
+
+
+def encrypt_payload(keys: SubjectKeys, subject_id: str, plaintext: bytes) -> dict:
+    nonce = os.urandom(12)
+    ct = AESGCM(keys.key_for(subject_id)).encrypt(nonce, plaintext, subject_id.encode())
+    return {"subject": subject_id, "nonce": nonce, "ct": ct}      # this goes into history
+
+
+def decrypt_payload(keys: SubjectKeys, blob: dict) -> bytes:
+    return AESGCM(keys.get(blob["subject"])).decrypt(blob["nonce"], blob["ct"], blob["subject"].encode())
+```
+
+The subject ID is bound as associated data, so a ciphertext can't be moved to another subject.
+After `erase("cust-42")`, replaying a workflow that touched cust-42 fails to decode its
+payloads. That is intended: close or terminate those workflows first, then erase. Decide
+up front which workflows may hold personal data (payment, onboarding) and require the codec for
+their task queues, so a new workflow can't store plaintext by accident.
 
 ---
 

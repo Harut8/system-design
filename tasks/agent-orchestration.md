@@ -319,3 +319,23 @@ observability.
   maximizes autonomy.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/agent-orchestration-design.md) · [Agent patterns](../ai-rag/22-agent-orchestration-patterns.md) · [LangGraph](../ai-rag/21-langgraph-deep-dive.md) · [Guardrails](../ai-rag/17-safety-guardrails-and-prompt-injection.md) §4.7
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. An agent reads an email containing injected instructions and has a "send payment" tool. *(Rule of Two, human approval for irreversible actions, capability limits.)*
+2. A 40-step run crashes at step 31. What is replayed, and what must not run twice? *(Durable execution, idempotent tools.)*
+3. Two agents deadlock waiting on each other's output. *(Timeouts, supervisor, step budgets.)*
+4. Costs per task vary 50×. How do you bound them? *(Step, token and time budgets per run.)*
+
+**Must answer (security, privacy, operations):**
+
+- Per-run credentials scoped to the task, not the agent's owner
+- Audit trail of every tool call with inputs and outputs, and its retention
+
+**Phase it (MVP → Growth → Scale):** MVP: a single agent with a fixed tool list and step budget, with runs stored in Postgres. Growth: durable workflows, human-in-the-loop approvals, evals. Scale: multi-agent supervision, cost controls, a tool marketplace.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

@@ -140,3 +140,25 @@ Study these for inspiration:
 * **Temporal** — Durable execution, lease-based ownership
 * **Que** — Ruby, advisory lock approach
 * **River** — Go, `LISTEN/NOTIFY` + polling hybrid
+
+---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/job-scheduler-postgres-deep-dive.md) · [OLTP](../databases/07-oltp-databases.md) §2 Postgres internals, vacuum · [Transactions](../databases/05-transactions-and-concurrency.md) · [Resilience](../distributed-systems/33-resilience-patterns-circuit-breakers.md) §2 retries
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A worker pauses for 40 s mid-job; its lease expires and another worker runs the same job. How do you stop the first one's side effects? *(Fencing by lease epoch, idempotency keys downstream.)*
+2. Dead tuples from `SKIP LOCKED` churn make the queue table 10× its live size. *(Autovacuum tuning, partition by time and drop partitions.)*
+3. A tenant enqueues 50M jobs at once. How do the other tenants keep their latency? *(Per-tenant fair scheduling and admission.)*
+4. After a 2-hour outage, 30M delayed jobs are due at once. *(Constant-work recovery, rate-limited catch-up; see load control §11.5.)*
+
+**Must answer (security, privacy, operations):**
+
+- Job payloads with personal data: encryption, retention, and deletion when a user leaves
+- Who may enqueue or cancel which tenant's jobs (API authorization)
+
+**Phase it (MVP → Growth → Scale):** MVP: one Postgres table with `FOR UPDATE SKIP LOCKED`. Growth: partitioned tables, per-tenant fairness, a dead-letter queue. Scale: shard by tenant, archive to object storage.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

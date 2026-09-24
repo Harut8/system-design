@@ -460,3 +460,25 @@ posture onto another's iteration speed.
   (full online eval with automated rollback) is available without forcing
   every team to pay its complexity cost upfront.
 </content>
+
+---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/ai-observability-evaluation-design.md) · [Evaluation](../ai-rag/08-evaluation-methodology.md) §10.9 nuggets, §11.8 calibration · [LLM observability](../sre-observability/26-llm-and-ai-observability.md) · [Compliance and privacy](../sre-observability/32-compliance-and-privacy.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. The LLM judge approves 95% of answers that humans reject 30% of the time. *(Judge calibration against labels, per-slice agreement.)*
+2. Trace volume grows 20× after agents launch and storage cost follows. *(Sampling by value, tail sampling, tiered storage.)*
+3. A customer asks you to delete all traces containing their data. *(Tenant- and subject-keyed storage, crypto-shredding.)*
+4. An eval dataset leaks into a fine-tuning set. How do you detect contamination?
+
+**Must answer (security, privacy, operations):**
+
+- PII in traces: redaction at ingestion, access control, retention
+- Tenant isolation of traces and eval results
+
+**Phase it (MVP → Growth → Scale):** MVP: OpenTelemetry traces for LLM calls plus a fixed eval set run in CI. Growth: online evals, judge calibration, dashboards per feature. Scale: multi-tenant storage, sampling, a regression gate on every deploy.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

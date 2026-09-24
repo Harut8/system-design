@@ -21,6 +21,7 @@
 13. [Cost Model](#13-cost-model)
 14. [Evolution Path](#14-evolution-path)
 15. [Trade-offs](#15-trade-offs)
+- [Security, Privacy, and Abuse Prevention](#security-privacy-and-abuse-prevention)
 
 ---
 
@@ -2047,6 +2048,23 @@ Why document-partitioned wins at web scale:
   - All major web search engines (Google, Bing) use document-partitioned
     indexes for this reason
 ```
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+An AI search engine reads the adversarial web and writes answers that users trust. Both
+directions need controls. §12's failure walkthroughs cover content-quality incidents. This
+section covers security.
+
+| Threat | Control |
+|---|---|
+| **Prompt injection in crawled pages.** Hidden text tells the model to change its answer or add a link | Treat retrieved passages as data, never instructions. Pattern filters catch only known injections (§12), so also: (1) strip hidden and off-screen text at indexing time; (2) run the answer generator with **no tools and no side effects**, so injected text can at most distort an answer; (3) make every claim cite a retrieved source, and drop claims that don't; (4) run an injection classifier on passages from low-reputation domains. See `../ai-rag/17-safety-guardrails-and-prompt-injection.md` §4 for why filtering alone fails |
+| **SSRF from the crawler.** A URL or redirect points at internal addresses (`169.254.169.254`, `10.0.0.0/8`) | Crawler fetchers run in an isolated network with egress only to the public internet. Resolve DNS, then **reject private, loopback and link-local addresses**, and check again after every redirect (DNS rebinding) |
+| **SEO spam and poisoning** | Domain reputation in ranking (§7). Cluster near-duplicate content. Demote sites whose content changes abruptly to target trending queries |
+| **Query logs** | Queries are among the most sensitive personal data there is. Log with pseudonymous IDs, keep raw logs 30–90 days, restrict access, and never use one user's query in suggestions or training examples shown to others without aggregation |
+| **Abuse of the answer API** | Per-user and per-IP rate limits. Cost-based limits on generation (tokens per minute). Refuse to quote pages behind paywalls or `noindex` |
+| **Publisher opt-out** | Respect `robots.txt` for the crawler, and honour AI-specific opt-out signals for use in generated answers. Store the opt-out state per domain in the index so it applies at query time, not only at the next crawl |
 
 ---
 

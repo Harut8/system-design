@@ -331,3 +331,25 @@ agents holding open streaming sessions for minutes at a time.
   what the calling service observes and what it should do about it.
 * Prefer a design a small platform team can actually operate over one that
   needs its own on-call rotation to understand.
+
+---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/llm-gateway-design.md) · [Multi-LLM gateway](../ai-rag/23-multi-llm-model-gateway.md) · [Load control](../distributed-systems/34-adaptive-load-control-and-backpressure.md) §8 rate limiting · [Resilience](../distributed-systems/33-resilience-patterns-circuit-breakers.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. The primary provider returns 529 overloaded for 20 minutes. What fails over, what doesn't, and how do you avoid overloading the fallback? *(Per-tier fallbacks, retry budgets, a circuit breaker per provider.)*
+2. One team's agent loops and spends $40K overnight. *(Per-key token budgets, anomaly alerts, hard caps.)*
+3. A provider deprecates a model that 60 services pin by name. *(Aliases/tiers, migration windows.)*
+4. Legal requires EU data to stay in the EU. *(Region-pinned routing, provider data-processing terms.)*
+
+**Must answer (security, privacy, operations):**
+
+- Provider keys in a vault, never in callers. Per-team virtual keys with scopes
+- Prompt logging and PII redaction, and zero-retention agreements with providers
+
+**Phase it (MVP → Growth → Scale):** MVP: a thin proxy with provider keys, logging and per-team budgets. Growth: tiers, fallbacks, caching, streaming. Scale: multi-region routing, self-hosted pools, cost optimization.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

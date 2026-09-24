@@ -272,3 +272,23 @@ point for 80%+ of user sessions.
   global multi-region, over one that requires Netflix-scale infra on day one.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/recommendation-system-design.md) incl. Security section · [HNSW](../databases/11-hnsw-vector-search-internals.md) · [Vector quantization](../databases/11-vector-search-internals.md) §6.4 RaBitQ · [Caching](../distributed-systems/08-caching-strategies-and-patterns.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A bot farm pushes an item into 5% of feeds in two hours. Where do you catch it? *(At ingestion, before features and the real-time loop.)*
+2. The embedding index no longer fits in RAM at 2B items. *(Quantization, IVF, SSD-resident indexes, object-storage tiers.)*
+3. EU law requires a non-profiled feed option. What part of your system already provides it? *(The cold-start popularity path.)*
+4. Model rollout drops watch time 3% in one region only. How do you find out in hours, not weeks?
+
+**Must answer (security, privacy, operations):**
+
+- No features built on special-category data (health, religion, politics) without consent. Minors' protections
+- Erasure through raw events, feature stores, embeddings and training sets
+
+**Phase it (MVP → Growth → Scale):** MVP: popularity plus item-to-item co-occurrence served from Redis. Growth: two-tower retrieval with ANN and a ranking model. Scale: multi-stage ranking, real-time feedback, an experimentation platform.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

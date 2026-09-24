@@ -3564,41 +3564,49 @@ CREATE EXTENSION vector;
 CREATE TABLE documents (
     id SERIAL PRIMARY KEY,
     content TEXT,
-    embedding vector(1536)  -- OpenAI ada-002 dimension
+    embedding vector(1536)  -- e.g. OpenAI text-embedding-3-small; match your model's dimension
 );
 
--- Create index for fast similarity search
-CREATE INDEX ON documents USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- HNSW: the default choice since pgvector 0.5 (better recall/latency than IVFFlat,
+-- no training step, works on an empty table). IVFFlat builds faster and uses less memory.
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
 
--- Similarity search
+-- Similarity search ($1 = query embedding)
 SELECT id, content,
-       1 - (embedding <=> query_embedding) as similarity
+       1 - (embedding <=> $1) AS similarity
 FROM documents
-ORDER BY embedding <=> '[0.1, 0.2, ...]'::vector
+ORDER BY embedding <=> $1
 LIMIT 10;
+
+-- With a WHERE filter, pgvector 0.8+ can keep scanning until enough rows pass the filter:
+SET hnsw.iterative_scan = relaxed_order;
 ```
 
 **pgvector Limitations:**
 - Realistic max: 10-100M vectors before performance degrades
-- Index build time increases significantly at scale
+- Index build time increases significantly at scale (HNSW builds are memory-hungry: raise `maintenance_work_mem`)
 - No built-in sharding
+- For larger or colder collections see `../databases/11-vector-search-internals.md` §6.4 (1-bit quantization) and §9.1 (object-storage vector indexes)
 
 ### Dedicated Vector Database Example (Pinecone)
 
 ```python
-import pinecone
-from openai import OpenAI
+import os
 
-# Initialize
-pinecone.init(api_key="YOUR_KEY", environment="us-west1-gcp")
-index = pinecone.Index("documents")
-openai = OpenAI()
+from openai import OpenAI
+from pinecone import Pinecone        # pinecone SDK v3+; pinecone.init() was removed
+
+# Initialize: keys come from the environment / secret store, never from code
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+index = pc.Index("documents")
+openai = OpenAI()                    # reads OPENAI_API_KEY
+EMBED_MODEL = "text-embedding-3-small"
 
 # Upsert vectors
 def upsert_document(doc_id: str, text: str, metadata: dict):
     embedding = openai.embeddings.create(
-        model="text-embedding-ada-002",
+        model=EMBED_MODEL,
         input=text
     ).data[0].embedding
 
@@ -3607,7 +3615,7 @@ def upsert_document(doc_id: str, text: str, metadata: dict):
 # Query
 def semantic_search(query: str, top_k: int = 10):
     query_embedding = openai.embeddings.create(
-        model="text-embedding-ada-002",
+        model=EMBED_MODEL,
         input=query
     ).data[0].embedding
 
@@ -3624,14 +3632,13 @@ def semantic_search(query: str, top_k: int = 10):
 Combine semantic understanding with keyword precision:
 
 ```python
-# Weaviate hybrid search
-result = client.query.get("Document", ["content", "title"]) \
-    .with_hybrid(
-        query="machine learning best practices",
-        alpha=0.5  # 0 = pure keyword, 1 = pure vector
-    ) \
-    .with_limit(10) \
-    .do()
+# Weaviate hybrid search (Python client v4)
+docs = client.collections.get("Document")
+result = docs.query.hybrid(
+    query="machine learning best practices",
+    alpha=0.5,          # 0 = pure keyword (BM25), 1 = pure vector
+    limit=10,
+)
 ```
 
 ---

@@ -177,3 +177,23 @@ Provide a **practical, production-oriented design** that includes:
 * Assume this system will be maintained by hundreds of engineers for **20+ years**
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/ibkr-trading-platform-design.md) incl. Security section · [Transactions](../databases/05-transactions-and-concurrency.md) · [Consensus](../distributed-systems/03-consensus-raft-and-distributed-locking.md) §17.6 GitHub failover · [Resilience](../distributed-systems/33-resilience-patterns-circuit-breakers.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A client retries `POST /orders` after a timeout and buys twice. *(Mandatory idempotency keys with fingerprints.)*
+2. A change to the order API lets a user submit orders for another account ID. *(Entitlement check on the body's `account_id`, IDOR tests.)*
+3. The primary region's network blips for 43 s. Should the OMS fail over? *(Never promote a replica missing acknowledged writes. Manual cross-region failover.)*
+4. Market open sends 50× order volume in the first second. What do you reject, and how?
+
+**Must answer (security, privacy, operations):**
+
+- Account-takeover defenses: phishing-resistant MFA, step-up for trading and withdrawals
+- Retention conflict: SEC record-keeping vs. GDPR erasure, and how you resolve it
+
+**Phase it (MVP → Growth → Scale):** MVP: a monolith OMS with Postgres, one broker connection, pre-trade risk checks. Growth: Kafka event log, separate risk engine, market-data fan-out. Scale: per-venue gateways, multi-region, surveillance at scale.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

@@ -368,3 +368,25 @@ Your system must support:
 13. **An evolution path** from a v1 (single agent + tools, one team) to a
     v4 platform (autonomous multi-agent systems with human oversight,
     150+ tenants).
+
+---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/ai-agent-platform-design.md) · [Tool calling](../ai-rag/24-tool-calling-and-enterprise-integration.md) · [Memory](../ai-rag/25-memory-and-state-management.md) · [LLM observability](../sre-observability/26-llm-and-ai-observability.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A product team's agent starts leaking another tenant's data through shared memory. *(Memory scoped per tenant and user, tested isolation.)*
+2. A new model version changes tool-calling behaviour and 12 agents regress. *(Pinned models, eval gates in deploy.)*
+3. The credential vault is unavailable for 10 minutes. Which agents keep working?
+4. Leadership asks what the platform costs per resolved customer ticket.
+
+**Must answer (security, privacy, operations):**
+
+- Credential brokering: agents never see raw secrets. Short-lived, scoped tokens
+- Data residency and retention for conversation memory
+
+**Phase it (MVP → Growth → Scale):** MVP: SDK plus gateway plus tracing for one team. Growth: eval harness, credential vault, deploy pipeline. Scale: multi-tenant isolation, a marketplace of tools and agents, chargeback.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

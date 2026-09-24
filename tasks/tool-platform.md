@@ -299,3 +299,23 @@ Your design must support:
   tenants over one that requires bespoke, high-touch onboarding per team.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/tool-platform-design.md) · [Tool calling](../ai-rag/24-tool-calling-and-enterprise-integration.md) · [Guardrails](../ai-rag/17-safety-guardrails-and-prompt-injection.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A tool response contains instructions that make the agent call a delete tool. *(Tool output is data. Destructive tools need confirmation.)*
+2. A code-execution sandbox is used to mine crypto and scan the internal network. *(Egress deny-by-default, CPU/time quotas, microVMs.)*
+3. Salesforce rate-limits the whole company because one agent loops. *(Per-integration shared quotas, backpressure to agents.)*
+4. An integration's OAuth token belongs to a user who left the company.
+
+**Must answer (security, privacy, operations):**
+
+- On-behalf-of authorization: the agent acts with the *user's* permissions, never more
+- Audit logs of tool calls, and redaction of secrets in arguments
+
+**Phase it (MVP → Growth → Scale):** MVP: a registry of HTTP tools with OAuth brokering and audit logs. Growth: sandboxed execution, per-integration quotas, MCP compatibility. Scale: multi-region, a policy engine, a tool marketplace.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

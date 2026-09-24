@@ -163,3 +163,23 @@ Provide a **practical, production-oriented design** that includes:
 * Practical applicability to real projects
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/fastapi-rbac-design.md) · [API design patterns](../solutions/api-design-patterns.md) · [Caching](../distributed-systems/08-caching-strategies-and-patterns.md) §3 invalidation
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. An admin removes a role, and the user keeps access for 10 more minutes. *(Permission-cache invalidation, token lifetime vs. revocation.)*
+2. A request for `/tenants/B/invoices` succeeds with a tenant-A token. Where is the check missing? *(Tenant scoping in every query, not only in the route.)*
+3. Customers want custom roles. What changes in your model?
+4. Auditors ask who could access payroll data on a given date last year.
+
+**Must answer (security, privacy, operations):**
+
+- Default deny, tests for every route's permission, and object-level (IDOR) checks
+- An audit log of permission changes and access to sensitive resources
+
+**Phase it (MVP → Growth → Scale):** MVP: roles in Postgres with a FastAPI dependency per route. Growth: tenant-scoped roles, a permission cache with invalidation. Scale: a policy engine (OPA/Cedar/Zanzibar-style) for relationships and custom roles.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

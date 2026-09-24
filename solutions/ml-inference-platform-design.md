@@ -34,6 +34,7 @@ Before or alongside this document, study these deep-dive chapters from the curri
 15. [Observability](#15-observability)
 16. [Evolution Path](#16-evolution-path)
 17. [Exercises](#17-exercises)
+- [Security, Privacy, and Abuse Prevention](#security-privacy-and-abuse-prevention)
 
 ---
 
@@ -2796,3 +2797,52 @@ Each version is independently shippable. v1 alone, operated for months, solves t
 8. **Benchmark the platform overhead.** Design a load test that isolates and measures the platform overhead (steps 2-8 and 10-12 from section 2's request path) independently from model inference time. The test must produce a P99 number that proves (or disproves) the 5ms P99 overhead SLO. What model backend do you use? (Hint: a model that returns instantly, so all measured latency is platform overhead.)
 
 ---
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+A serving platform runs **artifacts produced elsewhere** on expensive GPUs and exposes them to
+callers. The main risks are supply chain, tenant isolation and data leaving through
+predictions.
+
+| Threat | Control |
+|---|---|
+| **Malicious model file.** Pickle-based formats (`.pt`, `.pth`, `.bin`, `.pkl`) execute code when loaded | The registry (§3) accepts only formats that can't run code on load (safetensors, ONNX, GGUF) for production models. Every file has a digest recorded by the training pipeline, and the loader verifies it before the runtime starts (below) |
+| **Tampered artifact in S3** | Registry entries signed. Artifact buckets write-once (object lock) and writable only by the training pipeline's role. Serving pods get read-only credentials scoped to their model's prefix |
+| **Cross-tenant access** | Callers authenticate with mTLS or a JWT checked locally (§2), then per-model authorization. Namespaces with network policies so one team's pods can't call another's runtime directly. mTLS in the mesh (§8) |
+| **Prompt/input logging leaks PII** | Request payload logging off by default. Sampling for debugging goes to a restricted store with a short TTL (7–30 days) and PII redaction. Tenants can opt out |
+| **Model extraction and abuse** | Per-key rate and token limits. Top-k logprobs off unless needed. Anomaly alerts on query patterns that sweep the input space |
+| **GPU node escape / noisy neighbour** | No privileged containers. Separate node pools for untrusted custom runtimes. MIG or whole-GPU allocation (never time-slicing) between tenants with different trust levels |
+
+```python
+SAFE_SUFFIXES = {".safetensors", ".onnx", ".gguf", ".json", ".txt", ".model"}   # no code on load
+UNSAFE_SUFFIXES = {".pkl", ".pickle", ".pt", ".pth", ".bin", ".joblib"}         # pickle: runs code
+
+
+def verify_artifact(model_dir: Path, manifest: dict[str, str]) -> None:
+    """manifest: relative path -> sha256, written by the training pipeline and signed in the
+    registry. Every file must be listed, match its digest, and be a format that can't run code."""
+    on_disk = {p.relative_to(model_dir).as_posix() for p in model_dir.rglob("*") if p.is_file()}
+    if on_disk != set(manifest):
+        raise ArtifactRejected(f"files differ from manifest: {sorted(on_disk ^ set(manifest))}")
+    for rel, expected in manifest.items():
+        suffix = Path(rel).suffix
+        if suffix in UNSAFE_SUFFIXES or suffix not in SAFE_SUFFIXES:
+            raise ArtifactRejected(f"{rel}: format {suffix!r} not allowed")
+        h = hashlib.sha256()
+        with open(model_dir / rel, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != expected:
+            raise ArtifactRejected(f"{rel}: digest mismatch")
+```
+
+Run it in the `model-downloader` init container (§4), so a rejected artifact fails the rollout
+instead of reaching a GPU. Third-party models from public hubs get the same treatment:
+convert to safetensors in an isolated job, scan, then register.
+
+**Privacy.** Training data can resurface in outputs. For models trained on customer data,
+record the data sources in the registry entry, and when a customer leaves or requests erasure,
+retire or retrain the models whose data included them. That is a registry query, not an
+investigation.

@@ -28,6 +28,7 @@
 20. [Failure Walkthroughs](#20-failure-walkthroughs)
 21. [Trade-offs](#21-trade-offs)
 22. [Evolution Path](#22-evolution-path)
+- [Security, Privacy, and Abuse Prevention](#security-privacy-and-abuse-prevention)
 
 ---
 
@@ -2161,6 +2162,27 @@ Mitigation:
 - [ ] Visual DAG editor (low-code, generates Python)
 - [ ] Plugin marketplace (custom operators, hooks, triggers)
 - [ ] Managed cloud offering with per-run billing
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+In a DAG orchestrator, **DAG files are code** executed by the platform (§4). Anyone who can
+merge a DAG can run code with the scheduler's or worker's credentials. Treat it as a
+code-execution platform.
+
+| Threat | Control |
+|---|---|
+| **Malicious or careless DAG code** | DAGs arrive only through reviewed Git merges and CI (lint, `dag.test()`), never uploaded to a live volume. Parsing runs in a separate DAG-processor process with **no access to secrets and no network access beyond Git** (§4) |
+| **Workers reaching the metadata DB** | In §8's executor flow the worker updates `task_instance` in the metadata DB directly (step 5), so every task pod holds DB credentials and user code could rewrite any DAG's state. **Change for production:** workers report state through a small internal API using a token scoped to their one task instance. Airflow 3 (2025) moved to a Task Execution API for the same reason |
+| **Secrets in connections and variables** | Store them in a secrets backend (Vault, AWS Secrets Manager), not in the metadata DB. If they must live in the DB, encrypt them (Airflow's Fernet key) with the key in a vault and rotated. Mask them in logs and the UI |
+| **Cross-team access** | Per-team RBAC on DAG view, trigger and clear. Per-team Kubernetes namespaces and **service accounts per DAG or team** (§9), so each task pod gets only its team's cloud permissions (IRSA / Workload Identity), not a shared all-powerful role |
+| **Data leaking through XCom and logs** | XCom (§11) is for small references (S3 URIs), not data. Large or personal data goes to object storage with its own access control. Task logs are retained per data class, and debug logging of payloads is off in production |
+| **Pod escape** | Task pods run as non-root with a read-only root filesystem, no privilege escalation, dropped capabilities, and resource limits. Images are pinned by digest and scanned in CI |
+
+**Personal data in pipelines.** Many DAGs move personal data (exports, CDC, ML features).
+Record each DAG's input and output datasets (§15) with a data classification. That lineage is
+what answers "where did this user's data go?" for an erasure request or a breach assessment.
 
 ---
 

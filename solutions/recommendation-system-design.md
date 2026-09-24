@@ -3573,3 +3573,37 @@ async def health_check() -> Dict:
 │  Cost per recommendation request        │  $0.0000014 (~$1.40 per M reqs) │
 └─────────────────────────────────────────┴───────────────────────────────────┘
 ```
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+A recommender is built from behavioural data, the most sensitive data most consumer products
+hold, and its output is an attack surface: whoever can steer it gets free distribution.
+§13 covers content safety. This section covers data protection and manipulation.
+
+| Threat | Control |
+|---|---|
+| **Engagement fraud / data poisoning.** Bot farms fake clicks and watches to push items into candidate generation | Score events for bot likelihood at ingestion (device and IP reputation, velocity, session shape) and drop or down-weight them **before** they reach the feature store (§5) and the real-time feedback loop (§8). Cap how much any single user or device can move an item's counters per hour. Alert on items whose engagement rises much faster than similar items |
+| **Sensitive inferences** | Don't build features or segments on health, sexual orientation, religion or politics (GDPR Art. 9 special categories) unless you have explicit consent. Review embeddings-based "lookalike" features for proxies of them |
+| **Minors** | Age-gated users get restricted recommendations, the stricter safety filters from §13, and no profiling-based ads. The EU DSA requires a high level of privacy and safety for minors and bans ads based on profiling them |
+| **Feature store as a data lake of personal data** | Features keyed by internal user ID, never email or phone. Per-team read scopes. Online store (Redis/DynamoDB) reachable only from serving pods. Encryption at rest and TLS in transit |
+
+**Erasure and consent across a pipeline with many copies.** A deleted user's data lives in raw
+events (Kafka, S3), batch features (Spark output), online features (Redis/DynamoDB), user
+embeddings and model training sets. Make erasure a pipeline, not a ticket:
+
+1. The deletion request writes a **tombstone** (user ID, time) to a deletion topic.
+2. Online stores delete the user's keys within hours. Embedding tables drop the user row.
+3. Raw event storage is partitioned so the user's rows can be removed in the next compaction,
+   or is encrypted with per-user keys that are deleted (crypto-shredding, see
+   `workflow-orchestration-design.md`).
+4. Training jobs read through a filter that excludes tombstoned users. Models are retrained on
+   their normal schedule, and the next model no longer includes the user.
+5. Consent withdrawal ("don't personalize") is a **serving-time flag**: the user gets the
+   non-personalized path immediately, without waiting for any of the above.
+
+**Transparency.** The EU Digital Services Act requires very large platforms to explain their
+main ranking parameters and offer at least one feed not based on profiling. Keep a
+non-personalized ranking path (popularity plus freshness, §9 cold start already has one) as a
+first-class, user-selectable option.

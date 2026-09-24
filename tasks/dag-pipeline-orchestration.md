@@ -337,3 +337,25 @@ Study these for inspiration:
 * **Mage** — Notebook-first pipeline builder
 * **Argo Workflows** — Kubernetes-native DAG execution (YAML-based)
 * **Flyte** — Type-safe, container-native ML pipelines
+
+---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/dag-pipeline-orchestration-design.md) incl. Security section · [OLTP](../databases/07-oltp-databases.md) Postgres at scale · [Lakehouse](../databases/22-data-lake-lakehouse.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A merged DAG reads every connection's password from the metadata DB. How was that possible, and what architecture change prevents it? *(Workers without DB credentials, a task-execution API, a secrets backend.)*
+2. A backfill of 3 years × 500 DAGs starts on Monday morning. *(Pools, priority, backfill quotas.)*
+3. The metadata DB hits 2 TB and the scheduler loop slows to 30 s. *(Archival, partitioning, index review.)*
+4. Upstream data arrives late; the dataset-triggered DAG ran on partial data. *(Data-quality gates, sensors vs. dataset events.)*
+
+**Must answer (security, privacy, operations):**
+
+- Per-team RBAC and per-DAG cloud identities (no shared admin role)
+- Lineage: answering "where did this user's data go?" for an erasure request
+
+**Phase it (MVP → Growth → Scale):** MVP: a single scheduler with LocalExecutor on Postgres. Growth: KubernetesExecutor, HA schedulers, a secrets backend. Scale: sharded schedulers, metadata archival, dataset-driven scheduling.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

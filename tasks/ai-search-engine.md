@@ -361,3 +361,23 @@ answer generation, and result presentation.
   engineers and must remain debuggable as complexity grows.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/ai-search-engine-design.md) incl. Security section · [Query understanding](../ai-rag/05-query-understanding.md) §5.6 agentic search · [Guardrails](../ai-rag/17-safety-guardrails-and-prompt-injection.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A page hides white-on-white text telling the model to recommend a scam site. *(Strip hidden text, tool-less generation, citation-required claims.)*
+2. A crawled URL redirects to `http://169.254.169.254/`. *(SSRF protection re-checked after DNS resolution and every redirect.)*
+3. A breaking news query needs answers within 60 s of publication. *(Freshness tier, real-time crawl queue.)*
+4. Publishers opt out of AI answers but not of search. Where is that enforced?
+
+**Must answer (security, privacy, operations):**
+
+- Query-log privacy (retention, pseudonymization, no single-user suggestions)
+- Safe search for minors and YMYL guardrails
+
+**Phase it (MVP → Growth → Scale):** MVP: BM25 over a focused crawl plus LLM answers with citations. Growth: hybrid retrieval, reranking, a freshness tier. Scale: web-scale sharded index, per-vertical routing, cost-aware generation.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

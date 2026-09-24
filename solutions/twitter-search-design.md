@@ -1222,3 +1222,24 @@ Response:
 - Semantic search (embeddings)
 - Personalization
 - Real-time ML feature updates
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+Search is where privacy bugs become visible: a result that should not exist is shown to
+someone. The hard requirements are visibility and deletion, not just transport security.
+
+| Threat | Control |
+|---|---|
+| **Showing content the viewer may not see** (protected accounts, blocks, mutes, deleted or withheld tweets) | Visibility is checked **at query time, per viewer**, after retrieval and before ranking returns results. The index stores the author and a visibility class. A filter service checks author-level rules (protected, suspended, blocked-by-viewer) against the viewer's graph. Never rely only on index-time filtering, which goes stale the moment someone blocks someone |
+| **Deleted tweets still searchable** | Deletion writes a tombstone to Kafka that the query path checks (bloom filter or cache of recent deletes) until the index delete is applied (§6). SLO: gone from results within seconds, gone from the index within hours |
+| **Query injection into Elasticsearch** | Never pass user text into `query_string` (its syntax allows field access, wildcards and costly regex). Build queries from parsed tokens with `match` / `simple_query_string`. Disable dynamic scripting for search roles |
+| **Scraping and enumeration** | Per-user and per-IP rate limits, lower for logged-out users. Cap deep pagination (`search_after` with a maximum page count). Bot detection on query patterns |
+| **Search logs as personal data** | Queries reveal health, politics and more. Keep raw query logs with user IDs for a short period (e.g. 30 days) with restricted access, then aggregate or anonymize them. Autocomplete suggestions are built only from queries issued by many distinct users (k-anonymity threshold), so one person's query never becomes a suggestion |
+| **Legal holds and regional takedowns** | Country-withheld content is a visibility class evaluated with the viewer's region, in the same filter as blocks |
+
+**GDPR erasure.** Account deletion must remove the user's tweets from the index, their queries
+from logs and features (§7), and cached result pages (Redis). Drive all three from one deletion
+event rather than three manual jobs, and verify with a periodic job that searches for a sample
+of deleted IDs.

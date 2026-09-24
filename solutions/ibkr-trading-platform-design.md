@@ -2298,3 +2298,56 @@ alerts:
 11. Client receives fill notification via WebSocket — **tick-to-client: < 5ms**
 12. End-of-day: Settlement engine nets trades, matches with clearing firm, settles T+1
 13. Compliance: CAT report generated, surveillance scans for anomalies
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+A brokerage is a direct target: a stolen session can move money, and a bug in one endpoint can
+trade on someone else's account. §14 covers market-conduct compliance. This section covers
+protecting accounts and data.
+
+| Threat | Control in this design |
+|---|---|
+| **Account takeover** (phished password, SIM swap) | Phishing-resistant MFA (passkeys / FIDO2) for login. **Step-up authentication** for trading enablement, withdrawals, new bank details and API-key creation. Device binding, and alerts on new devices. Withdrawals to new bank details held 24–72 h |
+| **Acting on another customer's account (IDOR)** | `account_id` arrives in the request body (§16.1), so every call checks it against the caller's **entitlements from the account service**, never against IDs cached in the token. Advisors and multi-account owners get explicit grants |
+| **Duplicate orders from client retries** | Mandatory `Idempotency-Key` per caller on `POST /orders`, stored with a fingerprint of the order. The OMS `ClOrdID` (§9) stays unique per order |
+| **Stolen API keys / algo-trading abuse** | Keys scoped (read / trade / no withdrawals), IP allow-lists, per-key order-rate and notional limits enforced **before** the risk engine (§7), and instant revocation |
+| **Insider access** | Production data behind just-in-time access with approval and session recording. Support tools show masked data by default. Every read of a customer record is audit-logged |
+| **Exchange / FIX links** | Dedicated cross-connects or private lines with TLS where the venue supports it. FIX logon credentials in a vault and rotated. Sequence-number anomalies alert (§9) |
+
+```python
+def submit_order(principal: Principal, order: dict, idempotency_key: str,
+                 store: dict, oms) -> dict:
+    """Authorize against the account in the body, then submit at most once per key."""
+    if order["account_id"] not in principal.accounts:           # blocks IDOR: U1234567 -> U7654321
+        raise Forbidden("account not accessible")
+    if not principal.trading_enabled:
+        raise Forbidden("step-up authentication or KYC required")
+
+    fingerprint = hashlib.sha256(json.dumps(order, sort_keys=True).encode()).hexdigest()
+    scope = (principal.user_id, idempotency_key)                 # keys are per caller
+    if scope in store:
+        prior_fp, prior_resp = store[scope]
+        if prior_fp != fingerprint:
+            raise Conflict("idempotency key reused with a different order")
+        return prior_resp                                        # retry: same answer, no 2nd order
+    resp = oms.submit(order)          # production: reserve the key in the same DB txn first
+    store[scope] = (fingerprint, resp)
+    return resp
+```
+
+**Data protection.**
+
+- **Encryption:** TLS 1.2+ everywhere, mTLS between internal services, and encryption at rest
+  with KMS-managed keys for Postgres, Kafka and S3. National ID and bank-account numbers get
+  field-level encryption and a tokenized form for display.
+- **Payments:** card data never touches these services. Use the processor's hosted fields, which
+  keeps PCI DSS scope to SAQ A. Bank transfers use tokenized account references.
+- **Retention vs. erasure:** SEC Rule 17a-4 requires broker-dealers to keep order and trade
+  records for years (three to six, by record type) in non-rewritable form or with a complete
+  audit trail. Under GDPR, a legal obligation overrides the right to erasure (Art. 17(3)(b)).
+  So for a closed account: delete or anonymize marketing, analytics and support data. Keep the
+  regulatory records until their retention period ends, then delete them on schedule.
+- **Audit log:** the Kafka order-event log (§8) is append-only and replicated to a separate
+  account with object lock. It is the record that proves who did what.

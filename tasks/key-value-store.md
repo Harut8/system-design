@@ -285,3 +285,23 @@ zero downtime and a working rollback at every step.
   it.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/key-value-store-design.md) · [Consensus](../distributed-systems/03-consensus-raft-and-distributed-locking.md) §5–§7, §9.4 CAS fencing · [LSM trees](../databases/13-lsm-trees-and-compaction.md) · [Replication](../databases/12-replication-and-distributed-storage.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A team uses your store for a distributed lock and double-processes payments during a GC pause. Whose bug is it, and what API do you add? *(Leases plus fencing tokens / CAS, §9.4.)*
+2. Your Raft nodes acknowledge before `fsync` "for speed". What can be lost, and when? *(Jepsen NATS 2025: a coordinated power loss loses acknowledged writes.)*
+3. One tenant's key is read 500K times per second. *(Hot-key detection per tenant, read leases or follower reads, client caching.)*
+4. Losing a whole region must not lose acknowledged writes. What does that cost in write latency?
+
+**Must answer (security, privacy, operations):**
+
+- Tenant isolation enforced server-side (key prefixing, clipped scans), and per-tenant encryption keys
+- Backups that can't bring back a crypto-shredded tenant
+
+**Phase it (MVP → Growth → Scale):** MVP: single Raft group (etcd-like) for less than 8 GB. Growth: multi-Raft ranges with splits. Scale: multi-region placement, follower reads, tenant quotas.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

@@ -265,3 +265,23 @@ cost-efficiency are first-class requirements.
   requires deep GPU kernel expertise to debug.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/ml-inference-platform-design.md) incl. artifact verification · [Load control](../distributed-systems/34-adaptive-load-control-and-backpressure.md) §6.7 model-aware routing · [Deployment and compute](../ai-rag/appendix-e-deployment-and-compute.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A team registers a `.pt` checkpoint downloaded from a public hub. What runs when you load it? *(Pickle code execution: safetensors-only plus digest checks.)*
+2. Round-robin across vLLM replicas gives p99 TTFT of 8 s while the average GPU sits at 50%. *(KV-cache- and queue-aware routing, the Gateway API Inference Extension.)*
+3. A 70B model takes 9 minutes to cold-start and traffic doubles in 2. *(Warm pools, NVMe cache, predictive scaling, shedding.)*
+4. A canary model is 2% worse on a slice nobody monitors.
+
+**Must answer (security, privacy, operations):**
+
+- Per-model authorization, and payload logging off by default with redaction
+- Cost attribution per team and per model (GPU-hours, tokens)
+
+**Phase it (MVP → Growth → Scale):** MVP: KServe/Triton behind one gateway, manual scaling. Growth: autoscaling on queue depth, canaries, a model registry with signed artifacts. Scale: model-aware routing, multi-LoRA, heterogeneous GPU pools.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

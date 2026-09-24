@@ -36,6 +36,7 @@
 28. [Variant D: The Migration](#28-variant-d-the-migration)
 29. [Stretch Problems](#29-stretch-problems)
 30. [Exercises](#30-exercises)
+- [Security, Privacy, and Abuse Prevention](#security-privacy-and-abuse-prevention)
 
 ---
 
@@ -2071,3 +2072,25 @@ Implement `PutIfAbsent`-plus-lease locking. Simulate a GC pause longer than the 
 Back up a populated cluster, destroy it, and restore to a specific timestamp. Record the wall-clock time. Compare to your §20 estimate and account for the difference.
 
 ---
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+A multi-tenant key-value store (§19) is shared infrastructure: one tenant must never read,
+list or slow down another.
+
+| Threat | Control |
+|---|---|
+| **Cross-tenant reads** | Every request carries a tenant identity from mTLS client certificates or short-lived tokens. The server, not the client library, prefixes keys with the tenant ID, and range scans are clipped to that prefix. A client can't express a key outside its tenant |
+| **Noisy or hostile tenant** | Per-tenant admission control and quotas (§19). Also cap per-request cost: scan length, value size, watch count and lease count per tenant (§16). Watches and leases are memory on the leader |
+| **Hot-key attacks** | A tenant hammering one key is a hot-key problem (§14). Detect it per tenant and throttle the tenant, not the range |
+| **Data at rest** | Encrypt SSTables and WAL segments (§11) with per-tenant data keys wrapped by a KMS key, so a tenant's data can be crypto-shredded on offboarding without rewriting shared files |
+| **Backups** | Backups (§20) are encrypted with separate keys, stored in a different account, restore-tested, and immutable (object lock) against ransomware. A restore must not bring back crypto-shredded tenants: check the key registry when restoring |
+| **Internal traffic** | Raft replication and inter-node RPCs over mTLS with node certificates. A node that can't prove its identity can't join a Raft group, which prevents rogue-replica attacks |
+| **Operator access** | No shell access to raw data in normal operations. Debugging tools show key metadata, not values. Break-glass access is audited |
+
+**Privacy by design for callers.** The store can't know what's personal, so the API should make
+the right thing easy: TTLs on keys (§16) for session and cache data, and a per-tenant
+"delete by prefix" operation that runs as a background range deletion. Erasure requests from
+tenants then map to a prefix, e.g. `tenant/users/{user_id}/`.

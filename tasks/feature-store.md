@@ -268,3 +268,23 @@ correctness for training) and serving reliability are existential requirements.
 * Prefer a design that a platform team of 4-6 engineers can operate.
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/feature-store-design.md) · [Stream processing](../distributed-systems/22-stream-processing-flink-watermarks-eos.md) · [Lakehouse](../databases/22-data-lake-lakehouse.md) Iceberg, point-in-time · [Caching](../distributed-systems/08-caching-strategies-and-patterns.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. Offline AUC 0.91, online AUC 0.74. Where is the training/serving skew and how do you prove it? *(Point-in-time joins, logging served features.)*
+2. A streaming job restarts and double-counts an hour of events into a 1-hour window feature. *(Exactly-once sinks, idempotent aggregation.)*
+3. The online store (Redis) loses a shard. What do models receive? *(Defaults plus a staleness flag, never silent zeros.)*
+4. A regulator asks which models used a user's data after they withdrew consent.
+
+**Must answer (security, privacy, operations):**
+
+- Feature-level access control and PII tagging. Keys by internal ID, not email
+- Erasure across offline tables, online stores and training snapshots
+
+**Phase it (MVP → Growth → Scale):** MVP: batch features in the warehouse plus Redis for online reads. Growth: streaming features, a registry with owners and SLAs. Scale: point-in-time correct backfills, multi-region online stores.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

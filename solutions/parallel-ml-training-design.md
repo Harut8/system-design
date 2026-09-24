@@ -19,6 +19,7 @@
 11. [Cost Model](#11-cost-model)
 12. [Evolution Path](#12-evolution-path)
 13. [Trade-offs](#13-trade-offs)
+- [Security, Privacy, and Abuse Prevention](#security-privacy-and-abuse-prevention)
 
 ---
 
@@ -1992,6 +1993,24 @@ Rule of thumb:
   - Over 30B params or >128 GPUs: TP + PP + DP (or FSDP for the DP dimension)
   - MoE models: add Expert Parallelism regardless of size
 ```
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+A training cluster holds the most valuable artifacts in the company (datasets and weights) and
+runs user-supplied code on thousands of GPUs. The main risks are unsafe deserialization,
+over-broad storage access and data provenance.
+
+| Threat | Control |
+|---|---|
+| **Code execution from checkpoints** | `torch.load` unpickles, which can run arbitrary code. Load with `weights_only=True` (the default since PyTorch 2.6), store weights as **safetensors**, and never load checkpoints from outside the job's own prefix without verifying their digest |
+| **Over-broad storage credentials** | Each job gets a role limited to its dataset prefixes (read) and its checkpoint prefix (write), issued per job and expiring with it. No job can write to another job's checkpoints, which also blocks poisoning a colleague's run |
+| **Multi-tenant clusters** | Gang-scheduled jobs (§4) from different teams share nodes only at whole-node or whole-GPU granularity. Separate namespaces, network policies that allow NCCL traffic only within a job, no privileged pods. GPU memory is cleared between jobs (the driver does this when the process exits; verify for custom runtimes) |
+| **Supply chain** | Base images and Python dependencies pinned by hash and scanned. Third-party pretrained weights converted to safetensors in an isolated job before use |
+| **Dataset provenance and licensing** | The job spec references datasets by registry ID and version, not raw paths. The registry records source, licence and whether the data contains personal data. The experiment tracker (§7) stores that list with every checkpoint |
+| **Personal data in training sets** | Filter or pseudonymize PII before data enters the training bucket. Record which models were trained on which dataset versions, so an erasure request that must reach models becomes a query: "which checkpoints used dataset v3?" |
+| **Exfiltration of weights** | Egress from training nodes allowed only to storage and the tracker. Downloads of final weights are audit-logged and need approval for flagship models |
 
 ---
 

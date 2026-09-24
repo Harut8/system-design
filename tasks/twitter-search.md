@@ -129,3 +129,23 @@ Provide a **practical, production-oriented design** that includes:
 * Assume this system will be maintained by hundreds of engineers over many years
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/twitter-search-design.md) · [Sharding](../distributed-systems/10-sharding-and-consistent-hashing.md) §9 secondary indexes · [Stream processing](../distributed-systems/22-stream-processing-flink-watermarks-eos.md) · [Indexing](../databases/06-indexing-internals.md) §8 full-text
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A user blocks someone. Within how many seconds must the blocked person's tweets disappear from their results, and where is that enforced? *(At query time, per viewer, not at index time.)*
+2. An election night sends query volume 20× for one hour, all for five terms. *(Result cache with short TTL, request coalescing, and shedding of expensive queries.)*
+3. Legal requires a tweet to be withheld in one country only. *(A visibility class evaluated with the viewer's region.)*
+4. Autocomplete suggests a private medical query typed by one user. How did that happen, and what threshold prevents it?
+
+**Must answer (security, privacy, operations):**
+
+- Deleted tweets: the SLO for disappearing from results vs. from the index, and how tombstones bridge the gap
+- Query-log retention and anonymization. Why user text never reaches `query_string`
+
+**Phase it (MVP → Growth → Scale):** MVP: Postgres full-text search plus Redis for trends. Growth: Kafka to Elasticsearch with time-sharded indexes. Scale: earlybird-style in-memory real-time tier plus archive tier, multi-region.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

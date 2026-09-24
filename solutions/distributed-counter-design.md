@@ -1896,3 +1896,25 @@ class GlobalCounterAggregator:
 4. Add HyperLogLog for ultra-hot items
 5. Migrate to ScyllaDB
 6. Duration: 6-12 months
+
+---
+
+## Security, Privacy, and Abuse Prevention
+
+Like counts are **social proof**, which makes them worth faking. The counter itself is
+simple to secure. The real work is keeping fake likes out and treating "who liked what" as
+personal data.
+
+| Threat | Control |
+|---|---|
+| **Fake likes / bot farms** | The like API requires an authenticated user session, no anonymous likes. Per-user velocity limits (e.g. at most 30 likes per minute, 1,000 per day) at the edge. Device and IP reputation scoring. Likes from accounts later found to be fake are **removed by replaying their unlikes** through the normal write path (§5), so counts heal without manual edits |
+| **Replayed or forged requests** | The (user, item) uniqueness key (§7) already makes a replay a no-op. Require the user ID from the session, never from the request body |
+| **Enumeration of who liked what** | "Who liked this" lists are subject to the item's visibility and the viewer's blocks. Hidden like counts (a product setting) must be hidden in the API response, not just in the UI |
+| **Inference from counts** | A counter on a private item must not be readable by non-followers. Batch `GetCount` (§11) checks visibility per item, not once per request |
+
+**Personal data.** The count is aggregate data. The **like edges** (user, item, time) in
+Cassandra/Postgres (§8) are personal data: they reveal interests and relationships. On account
+deletion, delete the user's edges and decrement the affected counters through the same
+idempotent path. Aggregated time-series (daily likes per item) can stay because they no longer
+identify anyone. Keep edge-level analytics exports pseudonymized (hashed user IDs with a
+rotating salt).

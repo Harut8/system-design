@@ -257,3 +257,25 @@ contracted SLAs, to internal service-to-service calls that should bypass some
   the calling client observes and what it should do about it.
 * Prefer a design a small platform team can actually operate over one that
   needs its own on-call rotation to understand.
+
+---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/api-gateway-rate-limiter-design.md) incl. §15 2026 update · [Load control](../distributed-systems/34-adaptive-load-control-and-backpressure.md) §8 rate limiting, §6.7 load balancing · [Resilience](../distributed-systems/33-resilience-patterns-circuit-breakers.md) §2.7 retry budgets
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. Redis (the limiter's state) is down for 3 minutes. Fail open or closed, per tier, and what is the blast radius of each? *(Local fallback buckets, and fail open for most tiers.)*
+2. A config push doubles a generated rules file past a hard limit and every node crashes (Cloudflare, Nov 2025). *(Validate artifacts, staged rollout, last-known-good, kill switches.)*
+3. Clients retry 429s immediately and triple load. What do you send, and what do you enforce? *(Accurate `Retry-After`, `RateLimit` headers, retry budgets.)*
+4. Your Kubernetes edge runs ingress-nginx, retired in March 2026. Migration plan?
+
+**Must answer (security, privacy, operations):**
+
+- Authentication at the edge (API keys vs. OAuth tokens), key rotation, and never logging credentials
+- Per-tenant limits vs. global protection: which one stops a DDoS, which one stops a noisy customer
+
+**Phase it (MVP → Growth → Scale):** MVP: one NGINX/Envoy with local token buckets. Growth: Redis GCRA with Redis-side time, per-tenant tiers. Scale: two-tier limits (local plus global quota), cells, config canaries.
+
+Score yourself with the [rubric](README.md#scoring-rubric).

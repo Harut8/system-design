@@ -175,3 +175,23 @@ Provide a **production-grade system design** that includes:
 * Assume this system will be used by **multiple teams and products**
 
 ---
+
+### Interview Kit
+
+**Read first:** [Solution](../solutions/distributed-counter-design.md) · [Caching](../distributed-systems/08-caching-strategies-and-patterns.md) §4 stampedes, Case 6 hot key · [Sharding](../distributed-systems/10-sharding-and-consistent-hashing.md) §6.4 hot partitions · [Load control](../distributed-systems/34-adaptive-load-control-and-backpressure.md)
+
+**Curveballs.** The interviewer changes one thing mid-design. The hint in italics is what a strong answer reaches for:
+
+1. A celebrity post gets 2M likes in 60 s. Which single key melts, and what do you change? *(Counter sharding for that item only, local write aggregation, L1 cache for reads.)*
+2. A bot farm adds 5M fake likes over a week, then gets banned. How do counts heal without manual edits? *(Replay unlikes through the normal idempotent path.)*
+3. Redis loses its primary, and the replica missed the last 2 s of increments. What is the source of truth, and how do you reconcile? *(Durable like edges plus periodic recount, and the counter is a cache of them.)*
+4. Product wants exact counts for posts under 1,000 likes and "1.2M" style above. Does that simplify anything?
+
+**Must answer (security, privacy, operations):**
+
+- Who can read *who* liked an item, and how blocks and private accounts apply to batch `GetCount`
+- What happens to a deleted user's likes (GDPR erasure, counters decremented idempotently)
+
+**Phase it (MVP → Growth → Scale):** MVP: one Postgres table of like edges, unique on (user, item), plus `count(*)` cached in Redis. Growth: async counter updates through Kafka. Scale: sharded counters for hot items and a multi-region merge.
+
+Score yourself with the [rubric](README.md#scoring-rubric).
