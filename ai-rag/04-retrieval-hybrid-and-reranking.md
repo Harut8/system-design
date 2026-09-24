@@ -818,6 +818,54 @@ after the cross-encoder, on the top 10–20. Decide τ with §13's paired evalua
 raises precision@k but drops the one passage the answer needed is a recall regression. Check it with
 [`appendix-f-recall-at-every-layer.md`](appendix-f-recall-at-every-layer.md).
 
+### 8.4 Reasoning rerankers: when relevance needs thinking
+
+Every reranker so far scores how well a passage *matches* the query. Some queries have relevant
+documents that share almost nothing with them on the surface. "Why does my sourdough collapse
+after the second rise?" is answered by a passage about gluten over-proofing that never says
+"collapse". A LeetCode problem's most useful document may be a different problem that uses the
+same algorithm. Relevance there is an **inference**, and similarity models can't make it.
+
+**BRIGHT** (ICLR 2025) measured this gap: 1,384 real queries across 12 domains (StackExchange
+biology, economics, robotics, …, LeetCode, AoPS math, TheoremQA). The model then leading MTEB
+scored **nDCG@10 = 18.0** on BRIGHT against 59.0 on standard benchmarks. The retrievers weren't
+bad. The task was different.
+
+2025–26 answered this with rerankers that **reason before ranking**, trained with SFT and then
+RL on synthetic reasoning-heavy data:
+
+| Model | Shape | Reported result | Cost shape |
+|---|---|---|---|
+| Rank1 | Pointwise: one reasoning chain *per passage* | Early "test-time compute for reranking" result | Output tokens × passages. The slowest |
+| Rank-K, Rank-R1 | Listwise with reasoning | Beat non-reasoning listwise rerankers on BRIGHT | One chain per window |
+| **ReasonRank** (7B / 32B) | Listwise: one chain per window of passages | **32B: nDCG@10 40.6 avg on BRIGHT**, up to +5 over earlier reasoning rerankers. 7B: **0.25–0.5 s/query for 100 passages on 4×A800**, 2–2.7× faster than Rank1 | Needs a multi-GPU node or a hosted endpoint |
+| ReasonIR-8B | A *retriever* trained for reasoning queries (first stage) | Used as a strong first stage in BrowseComp-Plus (`05` §5.6) | Embedding cost at 8B scale |
+
+The ladder from §8 now has one more rung. Each rung costs roughly 10× the one before:
+
+```
+BM25/dense (ms) -> cross-encoder, top-100 (10s of ms, 1 GPU) -> LLM listwise, top-20 (~1 s)
+                -> reasoning reranker, top-20..100 (0.25-0.5 s on 4 GPUs self-hosted; seconds via API)
+```
+
+**Where it earns its cost.** Only on the query classes that need inference: technical support
+("why does X happen"), troubleshooting, math and code "find a similar problem", legal "which
+precedent applies". Not on lookups: names, IDs, error codes and "what is the refund window" are
+already solved by the cross-encoder, and a reasoning reranker only adds a second of latency to
+them. That makes it a **routing decision** (`05` §2): the classifier that sends queries to HyDE
+or decomposition can also send "needs reasoning" queries to this rung.
+
+**How to decide with data, not the leaderboard:**
+
+1. Tag a *reasoning* slice in the golden set (`08` §3): queries where the relevant passage
+   shares few terms with the query. A quick proxy for finding candidates is low BM25 score on
+   the known-relevant passage. Then check them by hand.
+2. Run §13's paired comparison: cross-encoder vs cross-encoder + reasoning reranker, **per slice**.
+   Expect a gain on the reasoning slice and ~0 on the rest. If the rest gets worse, the
+   reranker is overriding correct lexical matches, so route more narrowly.
+3. Check the p95 latency and GPU cost against §10's budget **for that slice only**. A 20% slice
+   paying +0.5 s is a very different product from 100% paying it.
+
 ---
 
 ## 9. The reranker landscape as an interface-and-constraint table

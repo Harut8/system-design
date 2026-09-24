@@ -1215,7 +1215,7 @@ less latency.
 > **Real-world example.** A bank bot's answer makes 5 claims and 4 are in the retrieved text: faithfulness 0.8. On 40 questions with no answer in the documents, it declines only 9 times: abstention recall 9/40 = 0.225, so it invents an answer 78% of the time.
 
 Retrieval metrics stop at "the right passage was in the prompt." Everything after that is this
-section. There are four distinct output failure modes and they need four distinct metrics — a single
+section. There are four distinct output failure modes (plus incompleteness, §10.9) and they need distinct metrics — a single
 "answer quality" score blends them into something undebuggable.
 
 | Failure | Name | Metric |
@@ -1224,6 +1224,7 @@ section. There are four distinct output failure modes and they need four distinc
 | Faithful to context, but doesn't answer the question | Irrelevant | Answer relevance (§10.3) |
 | Answers, but the answer is wrong vs the world | Incorrect | Answer correctness vs reference (§10.4) |
 | Answers when it should have declined | Over-answering | Abstention correctness (§10.5) |
+| Faithful and on-topic, but leaves out what matters | Incomplete | Nugget recall (§10.9) |
 
 ### 10.1 Extractive vs abstractive changes everything
 
@@ -1376,6 +1377,77 @@ suppress**:
 - The pinned things are now: model ID, `effort`, thinking mode, prompt bytes, tool set, and the
   dataset. Pin those in the manifest and accept residual sampling noise as measurement error, which
   is what §13's intervals are for.
+
+### 10.9 Nugget recall: did the answer say the things that matter?
+
+Faithfulness (§10.2) checks that everything the answer says is supported. It is a *precision*
+check. It can't see what the answer **left out**. An answer that says one true, cited sentence
+scores 1.0 faithfulness and is still a bad answer to a question with four parts. Correctness
+(§10.4) catches that, but only if you wrote a reference answer, and one reference answer is a
+poor key for long answers that can be correctly written a hundred ways.
+
+**Nugget evaluation** is the recall side. For each question you list the atomic facts
+("nuggets") a good answer must contain, then check which ones each answer contains. The idea
+comes from the TREC QA track (2003). The TREC RAG track (2024–25) brought it back and automated
+it with LLMs (**AutoNuggetizer**, Pradeep et al.). TREC RAG 2026 is the first "agent-first"
+track and keeps nuggets as its answer metric.
+
+| Step | What happens | Done how often |
+|---|---|---|
+| 1. Nugget creation | From the relevant documents, write each question's atomic facts. Label each one **vital** (a good answer must have it) or **okay** (useful, optional) | **Once per golden question.** An LLM drafts, a human edits, then freeze and version with the golden set (§3) |
+| 2. Nugget assignment | For each answer and each nugget: **support** / **partial** / **none** | **Every run.** This is a fixed-answer classification, so it's cheap |
+| 3. Scoring | `V_strict` = share of vital nuggets fully supported. `A_strict` = share of all nuggets. Non-strict versions give "partial" 0.5 | Every run |
+
+```python
+from dataclasses import dataclass
+from typing import Literal
+
+Support = Literal["support", "partial", "none"]
+
+
+@dataclass(frozen=True)
+class Nugget:
+    id: str
+    text: str
+    vital: bool          # vital = a good answer must contain it; okay = nice to have
+
+
+def nugget_scores(nuggets: list[Nugget], assigned: dict[str, Support]) -> dict[str, float]:
+    """TREC-RAG-style scores for ONE answer. A nugget missing from `assigned` counts as none."""
+    def score(ns: list[Nugget], strict: bool) -> float:
+        credit = {"support": 1.0, "partial": 0.0 if strict else 0.5, "none": 0.0}
+        return sum(credit[assigned.get(n.id, "none")] for n in ns) / len(ns) if ns else float("nan")
+    vital = [n for n in nuggets if n.vital]
+    return {"v_strict": score(vital, True), "v": score(vital, False),
+            "a_strict": score(nuggets, True), "a": score(nuggets, False)}
+```
+
+**What the automation can and cannot be trusted for.** This number decides how you use it. On
+TREC 2024 (21 topics, 45 runs), fully automatic nuggets + automatic assignment agreed with the
+mostly-manual version at **Kendall τ = 0.783 when ranking whole runs**. Per topic, τ averaged
+**0.518**, and at the topic-and-run level it was **0.324**.
+
+- **Use it to compare systems.** "Pipeline B beats pipeline A on V_strict across 200 questions"
+  is what the automation does well. That makes it a good regression gate (§14) and A/B metric.
+- **Don't use it to grade a single answer.** At τ ≈ 0.3 per item, one answer's nugget score is
+  too noisy to alert on, block on, or show to a customer. It's the same rule as §11.1: validate
+  the automatic judge against humans at the level you'll use it.
+- **The human edit in step 1 is where the quality comes from.** Automatic nugget *creation* is
+  the weak link. Fifteen minutes of human editing per golden question, done once, is the best
+  money you'll spend in this section. 2026 work on human-in-the-loop nugget annotation formalizes
+  exactly this step.
+
+**Where it fits with the rest of §10.** Nuggets pair with faithfulness. Faithfulness asks "did
+it say only supported things", nuggets ask "did it say the important things". Report both. A
+change that raises one and lowers the other is a trade-off you now see instead of a blended
+score. Nuggets also suit questions with **no single right answer**: "summarize our incident
+history with vendor X", global questions over a corpus (appendix H), and deep-research agents
+(`05` §5.6), where a reference answer would be a paragraph nobody can match word for word.
+
+**Cost.** Step 2 is a fixed-answer check per (answer, nugget) pair: "does this answer support
+nugget N?" That makes it a good fit for §11.8's cascade, with a decision model for every pair
+and the LLM judge only for its uncertain band. 200 questions × 8 nuggets = 1,600 checks per run.
+Batch them per answer: one state (the answer), one question per nugget.
 
 ---
 

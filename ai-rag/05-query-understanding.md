@@ -1018,6 +1018,98 @@ The guard against over-decomposition:
 4. **The original query always runs** alongside sub-queries: over-decomposition adds noise but
    does not remove signal
 
+### 5.6 Agentic search: when the plan can't be written in advance
+
+> **In plain words.** Decomposition (§5.1–§5.5) writes the whole search plan before it reads
+> anything. Agentic search gives the model a search tool and lets it loop: search, read, decide
+> what to look for next. It finds things a fixed plan can't, like a name mentioned in document
+> one that you need in order to find document two. It costs 10–60× more per question and takes
+> tens of seconds.
+>
+> **Real-world example.** "Which of our EU suppliers had a product recall after we signed them?"
+> The model searches "EU suppliers", reads the list, searches each supplier's name plus
+> "recall", compares dates, and stops. The second round of queries could not exist before the
+> first round of results.
+
+This became the 2026 default for hard questions, for two different reasons, and they lead to
+two different designs.
+
+**1. Coding agents dropped the vector index.** Claude Code, Codex, Cursor, Aider and Cline
+search code with `grep`/`glob` and file reads in a loop, not with embeddings. Anthropic's
+stated reasons: it was more accurate for code, and it removes the index's staleness,
+maintenance and security costs (no second copy of the source in a vector store). Code is the
+best case for this. Queries are exact identifiers (`handle_refund`, `ERR_4102`), the corpus
+changes every commit, and following a call chain (`handler.ts → auth.ts → jwt.ts`) is traversal,
+not similarity. JetBrains argues the other side: *"where do we handle retries?"* has no string to
+grep for, and a semantic index finds it. The practical consensus is **layered**: grep for
+exploration, LSP/symbol tools for precision, embeddings as one more tool for conceptual queries.
+
+**2. Deep-research agents showed the retriever still matters.** BrowseComp-Plus (ACL 2026)
+fixed the corpus (100,195 documents, 830 hard queries) so that retrievers and agents could be
+compared fairly. Each search returns the top 5 documents, first 512 tokens each:
+
+| Agent + retriever | Accuracy | Avg. search calls | Citation recall |
+|---|---|---|---|
+| Search-R1 (small open RL-trained agent) + BM25 | 3.86% | ~1.8 | — |
+| GPT-5 + BM25 | 55.9% | 23.2 | 51.3% |
+| GPT-5 + Qwen3-Embedding-8B | **70.1%** | **21.7** | **62.3%** |
+
+Two lessons for design. First, **a better retriever made the agent both more accurate (+14
+points) and cheaper (fewer calls)**. Agentic search sits on top of your retrieval stack, so
+everything in `01`–`04` still pays off. Second, **the model's search policy dominates**. The
+small RL-trained agent gave up after about 2 searches. Strong agents keep going for 20+. If your
+agent model is small, a well-built single-shot pipeline (§12) will beat it.
+
+**Cost and latency, as arithmetic.** Each turn re-sends the growing context, so input tokens grow
+with the square of the number of calls:
+
+```python
+def agentic_cost(calls: int, base_tokens: int = 3_000, tokens_per_result: int = 5 * 512,
+                 out_per_turn: int = 200, price_in: float = 2.0, price_out: float = 10.0,
+                 cached: bool = True) -> float:
+    """USD per question. Turn i re-sends base + i results. With prompt caching, the prefix is
+    read at ~0.1x and only the new part is written at ~1.25x (`08` §11.7 multipliers).
+    Defaults: Sonnet 5 list prices, BrowseComp-Plus result size."""
+    total_in = sum(base_tokens + i * tokens_per_result for i in range(1, calls + 1))
+    if cached:
+        new = base_tokens + calls * tokens_per_result
+        eff_in = new * 1.25 + (total_in - new) * 0.1
+    else:
+        eff_in = total_in
+    return eff_in / 1e6 * price_in + calls * out_per_turn / 1e6 * price_out
+
+# 20 calls: ~$1.24 uncached (598k input tokens), ~$0.28 with caching.
+# Single-shot RAG (3k prompt + 10 x 512-token chunks, 400 out): ~$0.02.
+# Latency: 20 sequential model turns + 20 searches = tens of seconds, not the
+# couple of seconds of the single-pass pipeline in §10.1.
+```
+
+So agentic search is a **route**, not a replacement. The §2 router sends a query down the agentic
+path only when it needs to be:
+
+| Query / corpus | Path | Why |
+|---|---|---|
+| Lookup, one fact, latency budget < 3 s | Single-shot hybrid (§12) | 10–60× cheaper. Nothing to re-plan |
+| Multi-part, parts known up front | Decomposition (§5.1–§5.5) | Parallel, bounded cost |
+| Multi-hop: part 2 depends on what part 1 found | **Agentic over your index** | The plan can't exist before reading |
+| Code, configs, logs: exact identifiers, fast-changing | **Agentic grep + symbol tools**, embeddings optional | No index to go stale. Exact match wins |
+| Global "what are the themes across everything" | Neither. See appendix H (GraphRAG) | Top-k can't return a summary of the whole corpus |
+
+**Build rules for the agentic path:**
+
+- **Expose your existing retriever as the tool**: `search(query, k, filters) -> [{id, title,
+  snippet}]` plus `read(id, range)`. Return snippets and let the agent pull full text (progressive
+  disclosure). BrowseComp-Plus's 512-token results are a sensible default size.
+- **Authorization lives inside the tool**, from the session's identity. Never trust a `tenant_id`
+  or ACL filter the model passes as an argument (`17` §9.2).
+- **Budgets are code, not prompt**: max calls (e.g. 25), max input tokens, max wall-clock time.
+  When a budget runs out, answer with what was found and say so, or abstain (`08` §10.5).
+- **Everything the tool returns is untrusted input.** An agent that searches and can also act
+  is the Rule-of-Two case in `17` §4.7.
+- **Log the trajectory** (queries, ids read, tokens) per question. That log is the eval surface:
+  accuracy, citation recall, calls and tokens per question, reported side by side, as the table
+  above does. A change that adds 2 points of accuracy and 8 calls may be a regression.
+
 ---
 
 ## 6. Multi-query generation
