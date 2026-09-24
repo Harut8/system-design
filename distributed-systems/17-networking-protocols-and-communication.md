@@ -717,6 +717,8 @@ No proxy in the path → lower latency.
 
 **Interview answer**: "gRPC requires L7 load balancing because HTTP/2 multiplexing defeats L4 balancers. We would use Envoy as an L7 proxy, or client-side balancing with `grpc-go`'s built-in round-robin resolver backed by service discovery."
 
+**Which algorithm, once you are at L7.** Round-robin fixes the *connection* problem but not the *slow replica* problem: a replica that is half as fast (GC, noisy neighbour) still gets 1/N of the calls and its queue grows without bound. Prefer **power-of-two-choices least-request** (Envoy `LEAST_REQUEST`, gRPC xDS `least_request`), which reads requests in flight. With thousands of clients, add **subsetting** so each client keeps connections to k backends instead of all N. The simulation and the algorithm table are in [`34-adaptive-load-control-and-backpressure.md`](34-adaptive-load-control-and-backpressure.md) §6.7.
+
 ### 4.7 gRPC vs REST: Decision Matrix
 
 | Factor | gRPC | REST (HTTP+JSON) |

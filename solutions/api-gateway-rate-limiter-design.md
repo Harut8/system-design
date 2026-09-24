@@ -33,6 +33,7 @@ Before or alongside this document, study these deep-dive chapters from the curri
 12. [Failure Walkthroughs](#12-failure-walkthroughs)
 13. [Trade-offs](#13-trade-offs)
 14. [Evolution Path](#14-evolution-path)
+15. [2026 Update: What Changed Around the Gateway](#15-2026-update-what-changed-around-the-gateway)
 
 ---
 
@@ -123,11 +124,14 @@ Rate-limit decisions:   ~1,000/sec
 
 ```lua
 -- Token bucket in Redis via Lua script (atomic)
-local key = "rl:" .. api_key
-local now = tonumber(ARGV[1])
-local rate = tonumber(ARGV[2])        -- tokens/sec
-local capacity = tonumber(ARGV[3])    -- max burst
-local requested = tonumber(ARGV[4])   -- tokens to consume (usually 1)
+-- KEYS[1] = "rl:" .. api_key   (keys must be passed in KEYS, not built from globals)
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])        -- tokens/sec
+local capacity = tonumber(ARGV[2])    -- max burst
+local requested = tonumber(ARGV[3])   -- tokens to consume (usually 1)
+
+local t = redis.call("TIME")          -- Redis's clock: consistent once you add gateway nodes
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
 
 local bucket = redis.call("HMGET", key, "tokens", "last_refill")
 local tokens = tonumber(bucket[1]) or capacity
@@ -143,10 +147,10 @@ if tokens >= requested then
     allowed = 1
 end
 
-redis.call("HMSET", key, "tokens", tokens, "last_refill", now)
+redis.call("HSET", key, "tokens", tokens, "last_refill", now)
 redis.call("EXPIRE", key, math.ceil(capacity / rate) * 2)
 
-return { allowed, tokens }  -- {1=allowed/0=rejected, remaining tokens}
+return { allowed, math.floor(tokens) }  -- {1=allowed/0=rejected, whole tokens remaining}
 ```
 
 **Why This Works at 1K RPS:**
@@ -509,13 +513,16 @@ Rate = prev_count × (1 - 0.4) + current_count
      = prev_count × 0.6 + current_count
 ```
 
-**Redis Implementation (Lua script, atomic):**
+**Redis Implementation (Lua script, atomic; tested on Redis 7):**
 
 ```lua
-local key_prefix = KEYS[1]              -- "rl:{client_id}"
-local now = tonumber(ARGV[1])           -- current timestamp (ms)
-local window = tonumber(ARGV[2])        -- window size (ms)
-local limit = tonumber(ARGV[3])         -- max requests per window
+local key_prefix = KEYS[1]              -- "rl:{client_id}" (braces = one hash slot in Redis Cluster)
+local window = tonumber(ARGV[1])        -- window size (ms)
+local limit = tonumber(ARGV[2])         -- max requests per window
+
+-- Redis clock, not the gateway node's: every node must agree on which window "now" is in.
+local t = redis.call("TIME")
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
 local current_window = math.floor(now / window) * window
 local previous_window = current_window - window
@@ -529,16 +536,25 @@ local previous_count = tonumber(redis.call("GET", previous_key) or "0")
 local elapsed_ratio = (now - current_window) / window
 local weighted_count = previous_count * (1 - elapsed_ratio) + current_count
 
-if weighted_count >= limit then
-    return {0, math.ceil(limit - weighted_count), 0}  -- rejected
+if weighted_count + 1 > limit then
+    -- Rejected: nothing remaining. Retry once enough of the previous window has slid out
+    -- (or at the next window boundary if the current window alone is full).
+    local retry_ms = current_window + window - now
+    if previous_count > 0 and current_count + 1 <= limit then
+        local needed_ratio = 1 - (limit - current_count - 1) / previous_count
+        retry_ms = math.max(1, math.ceil(current_window + needed_ratio * window - now))
+    end
+    return {0, 0, retry_ms}
 end
 
 redis.call("INCR", current_key)
 redis.call("PEXPIRE", current_key, window * 2)
 
-return {1, math.ceil(limit - weighted_count - 1), current_window + window - now}
--- {allowed, remaining, reset_ms}
+return {1, math.floor(limit - weighted_count - 1), current_window + window - now}
+-- {allowed, remaining, reset_or_retry_ms}
 ```
+
+Three details matter. (1) **The clock is Redis's** (`TIME`), not the gateway node's. Nodes' clocks drift, and a node 2 s behind would count requests into the wrong window. Using one clock makes every node agree. (2) The two window keys are derived from `KEYS[1]`, whose `{client_id}` hash tag keeps them in the same Redis Cluster slot. (3) **A rejection returns `remaining = 0` and a real retry time**: either when enough of the previous window has slid out, or the next window boundary. That value becomes `Retry-After`. Returning a negative "remaining" and a 0 reset, as naive versions do, tells clients to retry immediately, which is the retry storm you are trying to prevent.
 
 **Memory per client:** 2 Redis keys × ~50 bytes = 100 bytes per (client, window). For 10K clients × 5 window types (sec, min, hour, day, endpoint) = 50K keys = ~5MB. Negligible.
 
@@ -583,6 +599,8 @@ Redis healthy?
                                       guarantees; allowing unmetered
                                       traffic violates the contract
 ```
+
+> **Trade-off to revisit.** Failing *closed* for the enterprise tier turns an internal Redis outage into an outage for your highest-value customers, and most enterprise SLAs penalize unavailability far more than a few minutes of unmetered traffic. The common alternative is fail-open with the stricter local limit for **every** tier, plus reconciling usage from access logs afterwards (§10). Choose deliberately and write the choice into the SLA review. Don't inherit it from this diagram.
 
 ---
 
@@ -953,6 +971,8 @@ Request arrives
     Normal auth + rate-limit pipeline
 ```
 
+A Bloom filter has false positives but never false negatives. So a "blocked" answer must be **confirmed against the exact set** (or a hash set of the same list) before a request is rejected. Otherwise a small, random share of innocent IPs gets blocked with no way to explain why.
+
 Unauthenticated requests hit the per-IP rate limiter before the auth pipeline runs. This prevents credential-stuffing attacks from consuming auth-cache and IdP resources.
 
 ---
@@ -1207,6 +1227,10 @@ Timeline:
   optional for staging.
 ```
 
+**The same scenario at internet scale: Cloudflare, 2025-11-18.** Cloudflare's Bot Management module reads a *feature file* that is regenerated **every five minutes** from a ClickHouse query and pushed to every proxy in the network. The proxy (FL2) **preallocates room for 200 features**, and about 60 were in use. At 11:05 UTC a ClickHouse permissions change made the query return duplicate rows, so the file **doubled in size and exceeded 200**. The proxy hit the limit, the error was unwrapped instead of handled, and **the whole proxy process panicked**, returning 5xx for a large share of the internet from **11:20 UTC**. The ClickHouse cluster was being updated node by node, so each five-minute run produced either a good or a bad file. The network **recovered and failed again repeatedly**, which initially looked like a DDoS. Stopping propagation and pushing a known-good file restored core traffic by **14:30**, with all systems normal by **17:06 UTC**. A second, shorter global outage on **2025-12-05** also came from a configuration change propagated network-wide. Cloudflare's response ("Code Orange: Fail Small") is staged, health-gated rollout for configuration, not only code.
+
+What this adds to the canary above: **machine-generated files are config too** (they bypassed the review a human route change would get), a **limit in the data plane must degrade, not crash** (keep the last good file, fail open for a non-critical module), and a **flapping** failure is a hint that something is being regenerated on a timer. §15.4 turns these into control-plane requirements.
+
 ### Scenario 5: Client Exceeding Limits Across Multiple Nodes
 
 ```
@@ -1292,6 +1316,87 @@ Tier 3 (Month 3-6)          Tier 4 (Month 6-12)
 | Tier 1 → 2 | Single node at >60% CPU sustained; need HA | Over-engineering for <1K RPS; Redis Cluster ops overhead for a 2-person team |
 | Tier 2 → 3 | >10 backend services; config changes need to be self-service; rate-limit accuracy matters for billing | Control plane is its own service to maintain; 3-person team may not have capacity |
 | Tier 3 → 4 | Latency SLA requires regional presence; compliance requires data residency; traffic >50K RPS sustained | Multi-region doubles operational complexity; cross-region sync adds consistency challenges |
+
+---
+
+## 15. 2026 Update: What Changed Around the Gateway
+
+Four changes since this design was first written affect how you would build or run it today.
+
+### 15.1 Kubernetes: Ingress NGINX is retired, Gateway API is the default
+
+If Tiers 2–4 run on Kubernetes, the edge was often the community **`ingress-nginx` controller**.
+Kubernetes SIG Network and the Security Response Committee announced its retirement in November
+2025, and **best-effort maintenance ended in March 2026**. There are no more releases or security
+fixes. The official migration target is **Gateway API**, and the project's `ingress2gateway`
+converter reached 1.0 on 2026-03-20, translating 30+ common ingress-nginx annotations.
+
+Two clarifications prevent the usual panic:
+
+- This retires the *Kubernetes Ingress controller project*. **NGINX and OpenResty themselves are
+  unaffected**, so Tier 1's single NGINX + Lua node (§2.1) doesn't change.
+- Gateway API is a *spec*. You still pick an implementation (Envoy Gateway, Istio, kgateway,
+  NGINX Gateway Fabric, cloud load-balancer controllers). The fleet design in §2.3 stays the same.
+  What changes is how routes are declared.
+
+| Concern in this design | Ingress + annotations | Gateway API |
+|---|---|---|
+| Who owns what | One `Ingress` object mixes platform and app settings | `GatewayClass` (infra provider) → `Gateway` (platform team: listeners, TLS) → `HTTPRoute` / `GRPCRoute` (app teams). This is §1's "configuration is code" with ownership boundaries built in |
+| gRPC routes (§6) | Controller-specific annotations | `GRPCRoute`, standard since v1.1 |
+| Traffic splitting / canary config (§12 Scenario 4) | Annotations, differ per controller | `backendRefs` with `weight`, portable across implementations |
+| Rate limits, auth, retries (§3, §5, §7) | Annotations | Policy attachment. Rate-limit policies are still **implementation-specific** (e.g. Envoy Gateway `BackendTrafficPolicy`), so keep the §3 logic behind your own abstraction |
+
+### 15.2 Model-aware routing for LLM backends
+
+If some backends are self-hosted LLM servers (vLLM and similar), round-robin or least-request
+routing is the wrong signal. Two requests to the same replica can differ 100× in cost, and a
+replica's **KV-cache** decides whether it can take more work. The **Gateway API Inference
+Extension** (GA September 2025) adds an `InferencePool` resource and an **endpoint picker** that
+routes each request using per-replica **KV-cache utilization, pending-queue length and loaded LoRA
+adapters**, with criticality so that sheddable requests go only to replicas below thresholds
+(e.g. < 80% KV-cache use, < 5 queued). This is the same "balance on requests in flight, not CPU"
+principle as `distributed-systems/34` §6.7, specialized for LLMs. Token-based rate limits, model
+fallback and per-tenant spend limits belong in the LLM gateway layer:
+[`llm-gateway-design.md`](llm-gateway-design.md) and
+[`../ai-rag/23-multi-llm-model-gateway.md`](../ai-rag/23-multi-llm-model-gateway.md).
+
+### 15.3 Rate-limit mechanics: corrections and new options
+
+- **Use Redis's clock inside the Lua script** (`redis.call('TIME')`), as in the corrected §3
+  script. Gateway nodes' clocks differ, so a script that trusts the caller's timestamp enforces a
+  different limit depending on which node served the request.
+- **GCRA** gives the same behaviour as the token bucket with one stored value per key and an
+  exact `Retry-After`. It is worth it at Tier 3–4 key counts
+  (`distributed-systems/34` §8.5).
+- **Envoy has three rate-limit mechanisms, not one**: a local per-instance bucket (no
+  coordination), a global service called per request, and **RLQS** quota assignments with
+  periodic usage reports. RLQS is the managed version of this design's two-tier limiter
+  (`distributed-systems/34` §8.3).
+- **Response headers:** the IETF draft now uses `RateLimit-Policy` + `RateLimit` structured
+  fields, not the `RateLimit-Limit/Remaining/Reset` trio from early drafts. Keep `Retry-After`
+  and the `X-RateLimit-*` headers your clients parse, and add the new fields next to them
+  (`distributed-systems/34` §8.4).
+- **Clients change too.** From November 2026, AWS SDKs default to a 500-token retry quota with
+  14 tokens per transient retry and 1 s base backoff on throttling (`distributed-systems/33`
+  §2.7). Well-behaved clients will back off sooner on your 429s, which makes an accurate
+  `Retry-After` more valuable.
+
+### 15.4 Config is the most dangerous thing the gateway loads
+
+The biggest edge outages of 2025 were not traffic events. They were **configuration and data
+files propagated to every node at once** (Cloudflare 2025-11-18 in §12 Scenario 4; Google Cloud
+2025-06-12 in `distributed-systems/34` §16, Case 7). Add these to the Tier 3 control plane:
+
+1. **Validate every generated artifact like untrusted input** before it leaves the control
+   plane: schema, size and count limits, and a diff-size alarm ("this file doubled").
+2. **Staged rollout for config, not only code:** one node → one PoP or zone → 10% → all, each
+   stage gated on error rate. This is §12 Scenario 4's canary, applied to *every* artifact,
+   including machine-generated ones like IP reputation lists and bot-score features.
+3. **Fail to last-known-good, never crash.** A module that can't load new config keeps serving
+   with the previous version, fails *open* if it's non-critical (bot scoring), and raises an
+   alarm. A parse error must never take the proxy process down.
+4. **Global kill switches per module**, tested regularly, so a bad feature can be switched off in
+   seconds without a deploy.
 
 ---
 

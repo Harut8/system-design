@@ -1278,6 +1278,101 @@ TOKEN BUCKET:                          LEAKY BUCKET:
 
 Adaptive concurrency limits and circuit breakers are complementary, not redundant. The concurrency limit controls how many requests are allowed in flight to a dependency. The circuit breaker decides whether to allow any requests at all. A natural integration: when the concurrency limit drops below a minimum viable threshold (e.g., 3), the circuit breaker opens, routing traffic to a fallback or returning errors immediately. When the limit recovers above the threshold, the circuit breaker enters half-open and begins probing.
 
+### 6.7 Load Balancing: Where Each Request Goes Decides Who Overloads
+
+Everything above limits *how much* work enters. The load balancer decides *where* it goes, and a
+bad choice overloads one server while the fleet average looks fine. Three facts drive every
+modern algorithm:
+
+1. **Servers are not equal**, even on identical hardware. GC pauses, noisy neighbours, cold
+   caches and a slow disk make some replicas temporarily slower. Round-robin and random send
+   every server the same share regardless. A server that is half as fast still gets 1/N of the
+   traffic, and its queue grows without limit.
+2. **Load information is always stale.** By the time a balancer reads "server 7 has 2 requests",
+   other balancers have already sent it more. "Always pick the least-loaded server" turns stale
+   information into a **herd**: every balancer picks the same server until the next update
+   (Mitzenmacher, *How Useful Is Old Information?*, 2000).
+3. **Picking the better of two random choices is almost as good as knowing everything, and
+   far more robust.** With n requests into n servers, random placement gives a maximum load of
+   about ln n / ln ln n. Choosing the less-loaded of **two** random servers drops it to about
+   ln ln n / ln 2. That is an exponential improvement from one extra sample (Azar et al. 1994;
+   Mitzenmacher 2001, *The Power of Two Choices*). Because the two candidates are random, stale
+   data can't make every balancer herd onto the same server.
+
+A small simulation shows all three. It uses 100 servers, half of them slow (serving 0.5
+requests per tick instead of 1), total load at 90% of fleet capacity, and balancers that see
+queue lengths refreshed every tick (fresh) or every 20 ticks (stale):
+
+```python
+import random
+
+
+def simulate(policy: str, n: int = 100, load: float = 0.9, ticks: int = 5_000,
+             refresh: int = 1, seed: int = 1) -> float:
+    """Mean p99 queue length across servers. Half the fleet is slow. Balancers see a
+    snapshot of queue lengths refreshed every `refresh` ticks."""
+    rng = random.Random(seed)
+    speed = [1.0 if i % 2 == 0 else 0.5 for i in range(n)]
+    cap, q, rr, p99s = sum(speed), [0] * n, 0, []
+    snap = q[:]
+    for t in range(ticks):
+        if t % refresh == 0:
+            snap = q[:]
+        arrivals = sum(rng.random() < 0.5 for _ in range(int(2 * load * cap)))
+        for _ in range(arrivals):
+            if policy == "round_robin":
+                i = rr = (rr + 1) % n
+            elif policy == "random":
+                i = rng.randrange(n)
+            elif policy == "least_loaded":
+                i = min(range(n), key=lambda k: (snap[k], rng.random()))
+            else:                                                   # "p2c"
+                a, b = rng.randrange(n), rng.randrange(n)
+                i = a if snap[a] <= snap[b] else b
+            q[i] += 1
+            if refresh == 1:
+                snap[i] += 1                                        # fresh info sees its own sends
+        for i in range(n):
+            if q[i] and rng.random() < speed[i]:
+                q[i] -= 1
+        if t > ticks // 5:
+            p99s.append(sorted(q)[int(0.99 * n) - 1])
+    return sum(p99s) / len(p99s)
+```
+
+| Policy | p99 queue, fresh info | p99 queue, info 20 ticks stale |
+|---|---|---|
+| Round-robin | 575, still growing | 575, still growing |
+| Random | 629, still growing | 629, still growing |
+| Least-loaded (global min) | **1.0** | **167**: the herd |
+| **Power of two choices** | 3.9 | **15** |
+
+Round-robin and random are **unstable**, not just slow: the slow half receives more than it can
+serve, so their numbers keep growing the longer you run the simulation. Least-loaded is perfect
+with perfect information and collapses with stale information. P2C is close to the best in both.
+That is why it's the default in the proxies you already run:
+
+| Algorithm | What it compares | Where you'll meet it |
+|---|---|---|
+| **P2C + least request** | Active requests at each of 2 random backends | Envoy `LEAST_REQUEST` (default `choice_count: 2`), NGINX `random two least_conn`, gRPC xDS |
+| **P2C + peak EWMA latency** | Recent latency × outstanding requests. Reacts to a slow server *before* its queue builds | Finagle, Linkerd |
+| **Prequal** (Google, NSDI 2024) | Async, reused **probes** for requests-in-flight (RIF) and latency. Replicas above a RIF threshold are "hot". Pick the lowest-latency cold replica. If all are hot, pick the lowest RIF | YouTube for 2+ years. Lower tail latency, errors and resource use, so servers can run at higher utilization |
+| **Subsetting** | Each client connects to only k of the N backends | Google (deterministic subsetting, SRE book ch. 20), Finagle deterministic aperture. Keeps connections at clients × k instead of clients × N |
+| **Model-aware (LLM serving)** | KV-cache utilization, pending-queue length, loaded LoRA adapters | Kubernetes Gateway API Inference Extension endpoint picker (GA 2025-09). See `solutions/api-gateway-rate-limiter-design.md` §15 |
+
+The title of the Prequal paper, *"Load is not what you should balance"*, is the lesson of this
+section. Balancing CPU percentage is balancing a lagging, averaged signal. **Requests in flight
+and recent latency** are what a new request will actually wait behind. That is the same signal
+§6.2–§6.4 use to size concurrency limits, applied to choosing a replica.
+
+**Subsetting, briefly.** 1,000 clients × 1,000 backends is 1,000,000 connections, each with TLS
+state, health checks and memory. Letting each client pick k = 20 random backends fixes the
+connection count but spreads load unevenly: some backends land in many subsets, some in few.
+*Deterministic* subsetting fixes that. Clients are grouped into rounds, each round gets a
+shuffled copy of the backend list split into subsets, and every backend ends up in the same
+number of subsets. Use it once the connection count, not the request rate, becomes the cost
+that limits you.
+
 ---
 
 ## 7. Queue Collapse and Bufferbloat
@@ -1445,21 +1540,24 @@ Single-node rate limiting is straightforward. Distributed rate limiting -- enfor
 **Centralized counter (Redis).** All instances increment a shared counter in Redis. Atomicity is achieved with Lua scripts or `MULTI/EXEC` transactions. This is the approach used by most API gateways (Kong, Envoy).
 
 ```
-REDIS TOKEN BUCKET (Lua script):
+REDIS TOKEN BUCKET (Lua script, Redis >= 5):
 
   -- KEYS[1] = rate limit key
   -- ARGV[1] = max tokens (burst)
   -- ARGV[2] = refill rate (tokens/sec)
-  -- ARGV[3] = current timestamp (seconds, float)
-  -- ARGV[4] = tokens to consume (usually 1)
+  -- ARGV[3] = tokens to consume (usually 1)
 
   local key = KEYS[1]
   local max_tokens = tonumber(ARGV[1])
   local refill_rate = tonumber(ARGV[2])
-  local now = tonumber(ARGV[3])
-  local requested = tonumber(ARGV[4])
+  local requested = tonumber(ARGV[3])
 
-  local bucket = redis.call('hmget', key, 'tokens', 'last_refill')
+  -- Use Redis's clock, not the caller's: gateway nodes' clocks differ, and a node whose
+  -- clock runs behind would otherwise refill nothing (or, ahead, refill too much).
+  local t = redis.call('TIME')
+  local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+
+  local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
   local tokens = tonumber(bucket[1]) or max_tokens
   local last_refill = tonumber(bucket[2]) or now
 
@@ -1471,15 +1569,27 @@ REDIS TOKEN BUCKET (Lua script):
     tokens = tokens - requested
   end
 
-  redis.call('hmset', key, 'tokens', tokens, 'last_refill', now)
-  redis.call('expire', key, math.ceil(max_tokens / refill_rate) * 2)
+  redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
+  redis.call('EXPIRE', key, math.ceil(max_tokens / refill_rate) * 2)
 
   return allowed and 1 or 0
 ```
 
+Two details in that script matter more than they look. **The clock comes from Redis (`TIME`), not from the caller.** Gateway nodes' clocks drift apart. A node whose clock runs 2 s behind computes negative elapsed time and refills nothing, and a node running ahead refills too much, so the effective limit depends on which node a request hits. Using one clock (Redis's) removes the skew. Scripts may call `TIME` before writing since Redis 5 (effects replication). **`HSET` with several fields replaces the deprecated `HMSET`.**
+
 The limitation of centralized rate limiting: every request requires a round trip to Redis, adding 0.5-2ms of latency. Under high throughput, Redis itself becomes the bottleneck.
 
-**Local rate limiting with synchronization.** Each instance maintains a local token bucket initialized with `global_limit / num_instances`. Periodically (every 1-10 seconds), instances synchronize unused tokens through a coordination service. This reduces Redis round trips but allows short bursts above the global limit during synchronization gaps. Envoy uses this approach via its rate limit service.
+**Local rate limiting with synchronization.** Each instance maintains a local budget (initially `global_limit / num_instances`) and periodically (every 1-10 seconds) reports usage and receives a new share from a coordinator. This removes the per-request round trip but allows short bursts above the global limit between synchronizations.
+
+Envoy, often cited here, actually ships **three different** mechanisms. Pick deliberately:
+
+| Envoy mechanism | How it works | Accuracy | Per-request cost |
+|---|---|---|---|
+| **Local rate limit** filter | Token bucket inside each Envoy instance. **No coordination at all** | Global limit ≈ per-instance limit × number of instances. Drifts when you scale | None |
+| **Global rate limit** (`ratelimit` filter + the reference `envoyproxy/ratelimit` service on Redis) | Envoy makes a **gRPC call to the rate limit service for each matching request**, using descriptors (e.g. `api_key`, `path`) | Exact (centralized) | One RPC. The RLS and Redis are now on the request path. Set `failure_mode_deny` deliberately |
+| **Rate Limit Quota** filter + **RLQS** | The quota service **pushes quota assignments** to each Envoy. Envoy enforces them locally and **periodically reports usage** so the server can rebalance. Assignments have a TTL, and on expiry Envoy keeps the last assignment or uses a configured fallback | Approximate, bounded by the report interval | None on the request path. This is the "local with synchronization" design above |
+
+Kong's advanced rate-limiting plugin offers the same trade-off through its `sync_rate` setting: `0` means synchronous (exact, a Redis call per request), a positive number means sync every N seconds (approximate, fast).
 
 ### 8.4 Rate Limit Headers
 
@@ -1493,7 +1603,67 @@ X-RateLimit-Reset: 1625000000     ← Unix timestamp when window resets
 Retry-After: 30                   ← seconds to wait before retrying
 ```
 
-The IETF draft `RateLimit` header (draft-ietf-httpapi-ratelimit-headers) standardizes these as `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`. Production APIs should support both the `X-` prefixed and standardized variants during the transition period.
+**The IETF draft changed shape; update anything written against the early versions.** `draft-ietf-httpapi-ratelimit-headers` (still an Internet-Draft, around revision -11 in 2026) no longer uses `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset`, which came from early revisions. It now defines **two** Structured Fields:
+
+```
+HTTP/1.1 200 OK
+RateLimit-Policy: "default";q=100;w=60      ← the policy: quota q units per window w seconds
+RateLimit: "default";r=37;t=21              ← current state: r remaining, t seconds until more
+
+HTTP/1.1 429 Too Many Requests
+RateLimit-Policy: "default";q=100;w=60
+RateLimit: "default";r=0;t=21
+Retry-After: 21                             ← still the field clients must obey
+```
+
+Each item is named, so one response can describe several policies at once (e.g. `"burst";q=10;w=1, "daily";q=10000;w=86400`). Because it is still a draft, the practical rule is: keep sending `Retry-After` (RFC 9110, a finished standard) on every 429 and 503, keep the `X-RateLimit-*` headers your clients already parse, and add the draft fields alongside them. Don't remove the old headers until your SDKs read the new ones.
+
+### 8.5 GCRA: A Token Bucket in One Number
+
+The **Generic Cell Rate Algorithm** (from ATM networks, ITU-T I.371) behaves exactly like a token bucket but stores **one value per key**: the *theoretical arrival time* (TAT), the time at which the bucket would be full again if no more requests arrived. There is no refill arithmetic and no second field, and the key can simply expire when the client goes quiet. It's what `redis-cell` and several popular rate-limit libraries implement.
+
+```
+GCRA with limit L per period P and burst B:
+  T   = P / L                emission interval (e.g. 100 req/10 s -> T = 100 ms)
+  tau = T * (B - 1)          how far ahead of schedule a client may run
+
+  On a request at time now:
+    tat      = max(TAT, now)
+    new_tat  = tat + T
+    allow_at = new_tat - tau - T
+    if now < allow_at:  REJECT, Retry-After = allow_at - now
+    else:               TAT = new_tat, ALLOW
+```
+
+```lua
+-- GCRA. KEYS[1] = limiter key
+-- ARGV[1] = emission interval T in ms (period / limit), ARGV[2] = burst size B (>= 1)
+-- Returns {allowed (1/0), retry_after_ms, remaining}
+local t = redis.call('TIME')                          -- Redis clock: one clock for all gateways
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local T = tonumber(ARGV[1])
+local tau = T * (tonumber(ARGV[2]) - 1)               -- burst tolerance
+local tat = tonumber(redis.call('GET', KEYS[1])) or now
+tat = math.max(tat, now)
+local new_tat = tat + T
+local allow_at = new_tat - tau - T
+if now < allow_at then
+  return {0, allow_at - now, 0}
+end
+redis.call('SET', KEYS[1], new_tat, 'PX', new_tat - now)   -- key vanishes once the bucket is "full" again
+return {1, 0, math.floor((now + tau - new_tat) / T) + 1}
+```
+
+Run against Redis 7 with T = 100 ms and B = 5: the first 5 calls return `{1,0,4}` … `{1,0,0}`, the 6th returns `{0,72,0}` (retry in 72 ms), and 250 ms later two more are allowed. That is the burst-then-steady-rate behaviour of §8.1's bucket, plus an exact `Retry-After` for free.
+
+| | Token bucket (§8.1) | GCRA |
+|---|---|---|
+| State per key | tokens + last_refill (2 fields) | TAT (1 value) |
+| Retry-After on reject | extra arithmetic | `allow_at - now`, already computed |
+| Key expiry | TTL guessed from burst/rate | exact: expires at TAT |
+| Behaviour | burst B, then rate L/P | identical |
+
+Use GCRA when you store millions of keys (per API key × endpoint) or want exact `Retry-After` values. Use the token bucket when the team already knows it. They are interchangeable, so this is not a correctness decision.
 
 ---
 
@@ -1629,6 +1799,85 @@ STARVATION:
   is promoted to medium. After 60 seconds, to high.
   This guarantees eventual service for all priorities.
 ```
+
+### 9.5 Shuffle Sharding and Cells: Limiting the Blast Radius
+
+Per-tenant limits (§3.4, §8) stop a tenant from using *too much*. They don't help when one
+tenant's traffic is *poisonous*: a request that crashes the server, a query shape that pins the
+CPU, a DDoS aimed at one customer's domain. Every server that sees it goes down, together with
+every other tenant on those servers. The question becomes **how many other tenants share servers
+with the bad one.**
+
+**Plain sharding** splits 8 workers into 4 shards of 2. A poisonous tenant takes out its shard,
+and **1 in 4 of all tenants** go down with it.
+
+**Shuffle sharding** gives each tenant its own random combination of k workers out of n. With
+n = 8 and k = 2 there are C(8,2) = **28** combinations instead of 4 shards. Another tenant loses
+*all* of its workers only if it drew exactly the same pair. As long as clients retry on the other
+worker in their shard, tenants that share just one worker keep working:
+
+```python
+import hashlib
+import random
+from math import comb
+
+
+def shard_for(tenant_id: str, n: int, k: int) -> list[int]:
+    """Deterministic shuffle shard: every router computes the same k workers for a tenant,
+    with no shared state. (Seeding random.Random with bytes is stable across processes.)"""
+    rng = random.Random(hashlib.sha256(tenant_id.encode()).digest())
+    return sorted(rng.sample(range(n), k))
+
+
+def overlap_odds(n: int, k: int) -> dict[str, float]:
+    """For one poisonous tenant: chance another tenant shares ALL its workers (fully down)
+    and chance it shares NONE (untouched)."""
+    total = comb(n, k)
+    return {"shards": total, "p_full_overlap": 1 / total, "p_no_overlap": comb(n - k, k) / total}
+
+# n=8,    k=2: 28 shards,       full overlap 3.6%   (vs 25% with 4 plain shards)
+# n=100,  k=5: 75,287,520 shards, full overlap ~1.3e-8
+# n=2048, k=4: ~7.3e11 shards (Amazon Route 53: 2,048 virtual name servers, 4 per domain)
+```
+
+Route 53 uses exactly this. Each hosted zone gets 4 of 2,048 virtual name servers, giving about
+**730 billion** combinations, so practically every domain has a unique shard. A DDoS on one
+domain saturates its 4 name servers, and no other customer loses all four. The attacked domain
+can then be moved onto dedicated capacity.
+
+Three conditions must hold, or shuffle sharding gives false comfort:
+
+1. **Clients must fail over within their shard.** Partial overlap is only harmless if a request
+   that hits the dead worker retries on another one in the same shard (§2 of `33`, with a budget).
+2. **The damage must come from the tenant,** not from global overload. If total load exceeds
+   total capacity, every shard is overloaded and the combinatorics don't help. That is §3–§4's
+   job.
+3. **Routing must be deterministic and stateless** (`shard_for` above), so every router agrees
+   without a lookup service that could itself fail.
+
+**Cells** apply the same idea to the whole stack. A cell is a complete, independent copy of the
+service: compute, database, cache, queue and config. Tenants are mapped to cells by a thin
+**cell router**. A bad deploy, a poison tenant or a corrupted database affects one cell's tenants.
+
+| | Shuffle sharding | Cells |
+|---|---|---|
+| Isolates | Tenants from each other, at one tier (workers, name servers) | Tenants **and deployments**, across every tier including data |
+| Blast radius | Tenants sharing *all* k workers: ≈ 1/C(n,k) | One cell: 1 / number of cells |
+| Cost | Nearly free, same fleet | Duplicated stacks, cell-sized capacity planning, a router |
+| Deploys | Unchanged | **Deploy cell by cell** (waves). A bad version stops at the first cell |
+| Main failure mode | Clients that don't fail over inside the shard | A "thick" cell router or any shared component (global DB, global config) that reconnects the cells |
+
+The rule that makes cells work is **nothing shared**: not the database, not the cache, not the
+feature-flag service, and ideally not the config pipeline. The 2025 outages in §16 (Cases 7–8)
+and the Cloudflare incidents in `solutions/api-gateway-rate-limiter-design.md` §12 all spread
+through something global: a replicated policy, a regional DNS record, a network-wide config file.
+Cloudflare's "Code Orange: Fail Small" plan after its November and December 2025 outages is
+essentially a plan to make configuration roll out in cells.
+
+For SMB scale, the practical order is: per-tenant limits (§3.4) → shuffle-sharded worker pools
+for the tier that can be poisoned (usually query or render workers) → cells only when one cell's
+worth of customers is a business-acceptable outage and you have more than a few thousand
+tenants. Two cells of 50% each is already a big improvement over one global deployment.
 
 ---
 
@@ -1851,6 +2100,61 @@ OVERLOAD TESTING SCENARIOS:
     If the control plane is overwhelmed by data-plane overload,
     operators cannot observe or fix the problem.
 ```
+
+### 11.5 Designing So Recovery Needs No Extra Work: Static Stability and Constant Work
+
+§11.3 lists what to do *during* recovery. The stronger move is to design so that recovery puts no
+extra load on the system. Two patterns from the AWS Builders' Library do this, and the October
+2025 us-east-1 outage (§16, Case 8) shows what happens without them.
+
+**Static stability: survive a failure without having to do anything.** A statically stable system
+keeps working in its last known good state when a dependency, usually a *control plane*, is
+impaired. The classic example is capacity. If you need 6 servers and run in 3 zones, run 3 per
+zone (9 total), not 2 per zone with a plan to launch 3 more when a zone fails. The launch API is a
+control plane, and control planes tend to be impaired *in the same event* that took the zone out.
+The extra servers cost money every day. They are what you pay to not depend on launching
+anything during an outage.
+
+The same rule applies to software: the data plane serves from its **cached last-known-good
+config** when the config service is down. It does not block, crash or empty itself. Cloudflare's
+November 2025 outage (`solutions/api-gateway-rate-limiter-design.md` §12) is the counter-example:
+a bad config file made the data plane crash instead of keeping the previous version.
+
+**Constant work: do the same amount of work whether or not anything changed.** Instead of
+pushing configuration *deltas* (quiet on a normal day, enormous after an outage), push the
+**whole** config every few seconds. Instead of health-checking only "suspicious" nodes, check all
+of them on a fixed schedule. The load on a bad day is then identical to the load on a normal day,
+so there is **no backlog to build up and no recovery surge**. It is the cure for metastability
+(§11.2), because the feedback loop needs work that grows with the size of the problem.
+
+| | Delta / on-demand design | Constant-work design |
+|---|---|---|
+| Normal-day cost | Low | Higher (full pushes, full scans) |
+| Cost right after an outage | **Proportional to the backlog.** Can exceed capacity, so it becomes a new outage | Unchanged |
+| Tested every day? | The big-backlog path runs only during incidents | The only path is the one that runs every day |
+
+**Velocity limits on automated removal.** One more pattern from the same outage. When health
+checks fail on *most* of a fleet at once, the likely cause is the checker, the network or a shared
+dependency, not every server going bad together. Automation that removes every failing server
+will remove the capacity you need to recover. AWS's remediation added **velocity control** to NLB
+health-check failover, which caps how much capacity it may remove. The rule is small enough to
+put in any orchestrator:
+
+```python
+def removals_allowed(fleet_size: int, failing: list[str], removed_in_window: int,
+                     max_fraction: float = 0.1) -> list[str]:
+    """Remove at most max_fraction of the fleet per time window, however many checks fail.
+    When more than that is failing, suspect the checker or a shared dependency and page a
+    human instead of draining the fleet."""
+    budget = max(0, int(fleet_size * max_fraction) - removed_in_window)
+    return failing[:budget]
+
+# 100 servers, 60 failing checks at once, nothing removed yet -> remove 10, alert on the rest.
+```
+
+Recovery checklist from §11.3–§11.5: recovery paths get **admission control** (a backlog is
+traffic too), **jitter** (restarts are retries), **constant or bounded work** (no step that scales
+with the outage's length), and **velocity limits** on anything automated that takes capacity away.
 
 ---
 
@@ -4377,13 +4681,13 @@ behaviour instead of discovering it.
 
 ## 16. Real-world cases — incidents with numbers
 
-> **In plain words.** Six short incident stories. Each one shows how overload looks from the outside, which numbers point to the cause, and which mechanism from this chapter fixed it. Read the symptom first, then try to guess the fix before you read it.
+> **In plain words.** Six short incident stories, plus two real 2025 cloud incidents (Cases 7–8). Each one shows how overload looks from the outside, which numbers point to the cause, and which mechanism from this chapter fixed it. Read the symptom first, then try to guess the fix before you read it.
 >
 > **Real-world example.** In Case 2 a payment API keeps every request in an unbounded queue. After one minute of a small spike the queue holds 12,000 requests, each waits 12 s, and the clients gave up after 2 s. The server is 100% busy and 0% useful.
 
 These are **composite scenarios** built from failure modes this chapter describes; numbers are illustrative but internally consistent.
 
-**Quick index (symptom → case):** traffic to a dependency is many times user traffic → Case 1 · server busy but every response times out → Case 2 · small customers slow down when one big customer runs a job → Case 3 · system stays down after a cache flush even though traffic is normal → Case 4 · errors for a few minutes every evening peak, then fine → Case 5 · dashboards show data minutes old, adding consumers does not help → Case 6.
+**Quick index (symptom → case):** traffic to a dependency is many times user traffic → Case 1 · server busy but every response times out → Case 2 · small customers slow down when one big customer runs a job → Case 3 · system stays down after a cache flush even though traffic is normal → Case 4 · errors for a few minutes every evening peak, then fine → Case 5 · dashboards show data minutes old, adding consumers does not help → Case 6 · a fix is deployed but one region stays down longer → Case 7 · the trigger is fixed in hours but recovery takes most of a day → Case 8.
 
 ### Case 1 — Retry storm through three layers (e-commerce checkout)
 
@@ -4433,6 +4737,66 @@ These are **composite scenarios** built from failure modes this chapter describe
 - **Fix.** Increase to 48 partitions (planned in a maintenance window, because it changes which partition a key maps to) and run 24 consumers: **24,000 msg/s** capacity, above the 15,000 msg/s peak. Lower `max.poll.records` to 100 so a slow batch takes at most 70 s. Alert on lag in *seconds* (how stale the data is), not in message count. Put a bounded concurrency limit on database writes so a slow database slows consumption instead of causing rebalances.
 - **Lesson.** Consumer parallelism is capped by partition count. Kafka lag is backpressure working as designed; the danger is not noticing it, or turning it into a rebalance storm.
 
+### Public incidents (2025) — the same mechanisms at cloud scale
+
+Cases 1–6 are composites. The two below are **real, public incidents** from 2025. Details are
+taken from the providers' post-incident reports as summarized in public coverage. The times are
+the providers' own.
+
+### Case 7 — Restart herd after a global crash loop (Google Cloud, 2025-06-12)
+
+- **Setup.** Service Control handles API authorization and quota checks for Google Cloud APIs. It
+  reads quota *policy* data that is replicated globally within seconds. A new code path for
+  policy checks shipped on 2025-05-29 **without a feature flag and without handling blank
+  fields**. It stayed dormant because no policy exercised it.
+- **Symptom.** Starting around 10:49 PDT, API calls across dozens of Google Cloud and Workspace
+  products failed with authorization errors in every region at once. Downstream services built
+  on Google Cloud (Cloudflare, Spotify, Discord and others) failed with them.
+- **Measurement/Diagnosis.** A policy change containing unintended blank fields replicated to
+  every region, hit the new code path, and caused a **null-pointer crash loop in every Service
+  Control task worldwide**. A kill switch ("red button") for the code path was rolled out, and
+  most regions recovered within about **two hours**. **us-central1 took up to 2 h 40 min**:
+  hundreds of restarting Service Control tasks all loaded their policy metadata from the regional
+  Spanner database at the same moment, and Service Control **had no randomized exponential
+  backoff**. The restart itself was the overload (§11.1, §11.3 item 5).
+- **Fix.** Google throttled task creation in us-central1 and shifted load to multi-regional
+  databases until Spanner recovered. Its follow-ups: new code paths behind feature flags that are off by default, globally replicated
+  data propagated **incrementally with validation** instead of globally within seconds, the
+  check failing *open* rather than crashing, and randomized exponential backoff.
+- **Lesson.** Two chapter mechanisms failed together. Global, instant propagation turned one bad
+  record into a worldwide outage (§9.5: nothing shared). Synchronized restarts without jitter
+  turned the recovery into a second overload (§11.3, `33` §2.4 and §2.7).
+
+### Case 8 — Recovery work that grew with the outage (AWS us-east-1, 2025-10-19/20)
+
+- **Setup.** DynamoDB's regional endpoint DNS is managed by automation. A *DNS Planner* produces
+  plans, and independent *DNS Enactors* (one per availability zone) apply them to Route 53. EC2's
+  *DropletWorkflow Manager* (DWFM) keeps a **lease** with every physical server ("droplet") and
+  stores its state in DynamoDB.
+- **Symptom.** From **23:48 PDT on 19 October**, DynamoDB in us-east-1 couldn't be reached, and
+  with it everything that depends on DynamoDB, which includes much of AWS. DynamoDB recovered
+  within about three hours, but EC2 launches, networking and load balancers stayed impaired until
+  **14:20 PDT on 20 October**, about **14.5 hours** in total.
+- **Measurement/Diagnosis.** A delayed Enactor applied an old plan **after** a newer one, and
+  cleanup automation then deleted that "stale" plan. That left the endpoint's DNS record
+  **empty**, and the automation couldn't repair it. That was the trigger, a race condition. The
+  long tail was **metastable** (§11.2). While DynamoDB was down, DWFM's droplet leases expired.
+  When DynamoDB returned (~02:25), DWFM tried to re-establish leases for **the whole fleet at
+  once**. The work couldn't finish before leases timed out again, so it restarted, and DWFM
+  entered **congestive collapse**. Engineers **throttled incoming work and selectively restarted
+  DWFM hosts**, and leases were restored by **05:28**. Then EC2's Network Manager worked through a
+  large **backlog** of delayed network configurations. New instances came up without network
+  state, NLB health checks failed on them, and NLB **removed capacity** in response, which made
+  things worse.
+- **Fix.** AWS disabled the DynamoDB DNS Planner/Enactor automation worldwide until the race was
+  fixed. It added **velocity control** limiting how much capacity NLB may remove on health-check
+  failures, improved throttling in EC2's recovery paths, and added recovery testing at fleet
+  scale.
+- **Lesson.** The trigger lasted about 3 hours and the recovery about 12. Recovery work was
+  **proportional to the backlog** (all leases, all queued network configs), so it overloaded the
+  systems doing it. That is exactly what §11.5's constant work, admission control on recovery
+  paths, and velocity limits on automated removal are for.
+
 ---
 
-> **Further reading:** Google SRE Book, Chapter 21 "Handling Overload"; Netflix Technology Blog, "Performance Under Load" (2018); Kathleen Nichols & Van Jacobson, "Controlling Queue Delay" (CoDel, ACM Queue 2012); TCP Congestion Avoidance (Jacobson, 1988); Amazon Builders' Library, "Using load shedding to avoid overload"; Bronson et al., "Metastable Failures in Distributed Systems" (HotOS 2021); Huang et al., "Metastable Failures in the Wild" (OSDI 2022); Kingman, "The single server queue in heavy traffic" (1961).
+> **Further reading:** Google SRE Book, Chapter 21 "Handling Overload"; Netflix Technology Blog, "Performance Under Load" (2018); Kathleen Nichols & Van Jacobson, "Controlling Queue Delay" (CoDel, ACM Queue 2012); TCP Congestion Avoidance (Jacobson, 1988); Amazon Builders' Library, "Using load shedding to avoid overload"; Bronson et al., "Metastable Failures in Distributed Systems" (HotOS 2021); Huang et al., "Metastable Failures in the Wild" (OSDI 2022); Kingman, "The single server queue in heavy traffic" (1961); Mitzenmacher, "The Power of Two Choices in Randomized Load Balancing" (2001) and "How Useful Is Old Information?" (2000); Wydrowski et al., "Load is not what you should balance: Introducing Prequal" (NSDI 2024); Google SRE Book, Chapter 20 "Load Balancing in the Datacenter" (subsetting); Amazon Builders' Library, "Workload isolation using shuffle-sharding", "Static stability using Availability Zones" and "Reliability, constant work, and a good cup of coffee"; AWS Well-Architected, "Reducing the Scope of Impact with Cell-Based Architecture"; draft-ietf-httpapi-ratelimit-headers; Google Cloud incident report for 2025-06-12 (Service Control); AWS post-event summary for the 2025-10-19/20 us-east-1 DynamoDB disruption; Cloudflare, "Code Orange: Fail Small" (2025).

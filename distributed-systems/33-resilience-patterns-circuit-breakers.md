@@ -11,6 +11,7 @@ Prerequisites: familiarity with distributed system failure models from `00-primi
 0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why Resilience Patterns Exist](#1-why-resilience-patterns-exist)
 2. [Retry Patterns — The Deceptively Dangerous Pattern](#2-retry-patterns--the-deceptively-dangerous-pattern)
+   - [2.7 Retry Budgets as Shipped: gRPC, AWS SDKs, Envoy](#27-retry-budgets-as-shipped-grpc-aws-sdks-envoy) *(includes the November 2026 AWS SDK retry-default change)*
 3. [Circuit Breaker Pattern — Deep Dive](#3-circuit-breaker-pattern--deep-dive)
 4. [Bulkhead Pattern](#4-bulkhead-pattern)
 5. [Timeout Patterns](#5-timeout-patterns)
@@ -576,6 +577,80 @@ HEDGED REQUESTS:
     propagation handles this; HTTP requires cooperative cancellation
     (e.g., client drops the connection and server checks for broken pipe).
 ```
+
+### 2.7 Retry Budgets as Shipped: gRPC, AWS SDKs, Envoy
+
+§2.2.2 explains the retry budget as an idea. You rarely have to build one, because the clients
+and proxies you already use include one, usually turned off or left at a default nobody on the
+team has read. The three you're most likely to run:
+
+| Where | Mechanism | Defaults | What it means in practice |
+|---|---|---|---|
+| **gRPC** (gRFC A6, service config `retryThrottling`) | Token bucket **per server name**. Starts at `maxTokens`. Every failed RPC costs 1 token, every success adds `tokenRatio`. **Retries and hedges stop while tokens ≤ maxTokens / 2** | Recommended `maxTokens: 10`, `tokenRatio: 0.1` | Sustained failure over roughly 10% turns retries off automatically. Needs no coordination between clients |
+| **gRPC server pushback** | Server sets trailer `grpc-retry-pushback-ms`. A positive value means "retry after this delay". A **negative or unparseable value means "don't retry"** | — | The *server* switches client retries off during overload. It's the RPC equivalent of `Retry-After` |
+| **gRPC hedging** | `hedgingPolicy`: `maxAttempts`, `hedgingDelay`, `nonFatalStatusCodes` | `maxAttempts` capped at **5** | Hedges spend from the same throttling bucket as retries, so hedging turns off under failure too |
+| **AWS SDKs, "standard" mode** | Client-wide **retry quota**, a 500-token bucket. Each retry spends tokens, each first-attempt success refunds 1. **At zero, the SDK stops retrying and fails fast** | 500 tokens, max 3 attempts, max backoff 20 s | A client can make at most a few dozen retries in a burst before it stops making things worse |
+| **AWS SDKs, "adaptive" mode** | Standard mode plus a **client-side rate limiter** that slows down on throttling errors. It can delay *first* attempts, not only retries | — | The client finds the rate the service will accept, similar to AIMD (`34` §6.3) |
+| **Envoy** (cluster `circuit_breakers.thresholds.retry_budget`) | Active retries may be at most `budget_percent` of active requests, with a floor of `min_retry_concurrency` | **20%**, floor **3** | A proxy-level budget for every client behind the mesh. The request-count equivalent of §2.2.2 |
+
+**AWS is changing its SDK retry defaults (opt-in now, default no sooner than November 2026).**
+Set `AWS_NEW_RETRIES_2026=true` (or `-Daws.newRetries2026=true` on the JVM) to try it today. The
+Java v2 announcement lists:
+
+| Setting | Before | After |
+|---|---|---|
+| Retry mode | `legacy` for Java, Python, Ruby, PHP, C++ and the CLI (no quota) | `standard` (500-token quota) |
+| Max attempts, general | 4 | **3** |
+| Max attempts, DynamoDB | 9 (11 in some SDKs) | **4** |
+| Base delay, transient errors | 100 ms | **50 ms** |
+| Base delay, throttling errors | 500 ms (DynamoDB 25 ms) | **1,000 ms** |
+| Quota cost per transient retry | 5 tokens | **14 tokens** |
+| Quota cost per throttling retry | same as transient | **5 tokens**. Timeouts lose their separate discount |
+| Long-polling calls (e.g. `SQS.ReceiveMessage`) when the quota is empty | tight loop | **back off before returning the error** |
+
+Two things follow for your own design:
+
+1. **The quota now runs out after ~35 transient retries (500 / 14), not ~100 (500 / 5).** A wave
+   of 500s stops client retries three times sooner. That is the intended "fail fast instead of
+   waiting on retries that are unlikely to succeed". If your service's error budget or alerting
+   assumed callers would retry past a burst of 5xx, callers now surface those errors sooner.
+2. **Throttling now waits longer (1 s base) and costs less quota.** The SDK treats a 429 or
+   `ThrottlingException` as "slow down", not "broken". That is the distinction §2.5 and
+   `34` §8.4 ask *your* clients to make too.
+
+A minimal gRPC-style throttle you can put in front of any retry loop:
+
+```python
+class RetryThrottle:
+    """gRFC A6 retry throttling. One instance per downstream (per server name), shared by
+    every request to it. Failures drain it faster than successes refill it, so a sustained
+    failure rate above ~tokenRatio switches retries off without any coordination."""
+
+    def __init__(self, max_tokens: float = 10.0, token_ratio: float = 0.1):
+        self.max_tokens, self.token_ratio = max_tokens, token_ratio
+        self.tokens = max_tokens
+
+    def on_success(self) -> None:
+        self.tokens = min(self.max_tokens, self.tokens + self.token_ratio)
+
+    def on_failure(self) -> None:          # only retryable failures count, as in A6
+        self.tokens = max(0.0, self.tokens - 1.0)
+
+    def retry_allowed(self) -> bool:
+        return self.tokens > self.max_tokens / 2
+```
+
+At a steady failure rate *f*, tokens drift by `(1 − f) × 0.1 − f` per request. That is negative
+whenever *f* > 0.1 / 1.1 ≈ **9.1%**. So above ~9% failures the bucket drains to the threshold and
+retries stop. Below that it refills and retries are available. That is §2.2.2's 10% budget,
+enforced by a counter instead of a dashboard.
+
+**Jitter is not only for retries.** In Google Cloud's June 2025 outage, most regions recovered
+within about two hours. us-central1 took up to 2 h 40 min, because hundreds of
+restarting Service Control tasks all loaded policy from the same regional Spanner database at
+the same moment, with **no randomized backoff**. Restarts, reconnects, cache refills and cron
+jobs are retries too. Anything a fleet does "at the same time after an event" needs the same
+jittered backoff as §2.4. The full case is in `34` §16, Case 7.
 
 ---
 
