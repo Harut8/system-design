@@ -704,6 +704,8 @@ If you want to read every doc once, this order minimizes "wait, what is X?" mome
 
 For "I just want to build it" mode, follow phases 0–20 in §3 instead of reading docs end-to-end.
 
+For hands-on practice with every chapter (a local docker-compose stack plus predict, break and measure tasks), work through [LABS.md](LABS.md).
+
 ### 9.1 Beyond-Roadmap Chapters (21+)
 
 The original roadmap was the *plumbing* and *practice* of observability. The chapters below cover what a Staff Engineer is repeatedly asked about that the original roadmap doesn't cover.
