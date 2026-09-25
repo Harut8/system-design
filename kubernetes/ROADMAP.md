@@ -6,6 +6,8 @@ Scope: this is a **staff-level deep dive** roadmap. We don't stop at "what is a 
 
 If you only ever read one page in this folder, read this one.
 
+Hands-on labs for every chapter (build, break, measure; below the API surface): [LABS.md](LABS.md).
+
 ---
 
 ## Table of Contents
