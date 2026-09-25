@@ -119,11 +119,13 @@ PACELC: if Partition, choose Availability or Consistency;
 │  CockroachDB     │ PC            │ EC           │ PC/EC             │
 │  Cassandra       │ PA (available)│ EL (low lat) │ PA/EL             │
 │  DynamoDB        │ PA            │ EL           │ PA/EL             │
-│  MongoDB         │ PC            │ EC           │ PC/EC             │
+│  MongoDB (maj.)* │ PC            │ EC           │ PC/EC             │
 │  PostgreSQL+sync │ PC            │ EC           │ PC/EC             │
 │  Yugabyte        │ PC            │ EC           │ PC/EC             │
 │  NATS JetStream  │ PC            │ EC           │ PC/EC             │
 └──────────────────┴───────────────┴──────────────┴───────────────────┘
+* MongoDB with writeConcern majority and readConcern majority/linearizable, reads from
+  the primary. With secondary reads or readConcern local it behaves closer to PA/EL.
 ```
 
 **Key insight**: PACELC explains why Cassandra and DynamoDB are fast even without partitions -- they sacrifice consistency for latency at all times, not just during failures. Spanner pays the latency cost of consensus on every write to maintain consistency always.
@@ -935,7 +937,8 @@ Sloppy Quorum
   - Sloppy quorum does NOT guarantee read-after-write consistency
     (reading from A, B, C might miss the value stored on D)
   - Cassandra: sloppy quorum OFF by default (strict quorum)
-  - DynamoDB: uses sloppy quorum
+  - Dynamo (2007 paper): sloppy quorum + hinted handoff. The DynamoDB service is
+    different: each partition is a Multi-Paxos replica group with a leader (2022 paper)
 ```
 
 #### Read Repair and Anti-Entropy
@@ -2715,7 +2718,8 @@ Linearizability (Strongest)
   Cost:
     - Requires consensus (Raft, Paxos) or synchronous replication
     - Latency lower-bound: 1 RTT to majority of replicas
-    - Not composable (linearizable ops on different objects ≠ linearizable together)
+    - Composable per object (Herlihy & Wing call it "local"), but NOT transactional:
+      linearizable ops on objects A and B do not make a multi-object update atomic
 
   Systems providing linearizability:
     - etcd, ZooKeeper (for all operations)

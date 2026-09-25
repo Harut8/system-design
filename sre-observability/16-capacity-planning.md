@@ -476,7 +476,7 @@ N regions handling traffic
 +1 (or +2) regions of spare capacity, ready to absorb failure
 ```
 
-For 99.99% SLO across 3 active regions, you need each region to handle full load if any one fails — i.e., each region at ≤ 1/2 capacity for N=3 (2 remaining must handle 100%).
+For 99.99% SLO across 3 active regions, the 2 surviving regions must together absorb 100% of peak if any one fails. Each region is therefore sized for 1/2 of peak while normally serving 1/3 of it, i.e. it runs at ≤ 2/3 of its capacity (in general ≤ (N−1)/N), which matches the 1.5× multiplier in §10.2.
 
 ### 10.2 The geometric capacity cost
 
