@@ -571,6 +571,8 @@ The original plan numbered 45 chapters. About half of them are already covered i
 2. **Building services:** 06 → 10 → 08 → 07 → 22
 3. **Keeping them up:** 33 → 34 → 35 → 37 → 38 → 36
 
+Hands-on tasks for every chapter (reproduce, measure, fix): [LABS.md](LABS.md).
+
 ---
 
 ## Principal-Level Architectural Trade-off Matrix
