@@ -4,6 +4,8 @@ The other docs in this folder go deep on individual layers. This file is the **m
 
 If you only ever read one page in this folder, read this one.
 
+Hands-on tasks for every chapter (predict, build, break, measure) are in [LABS.md](./LABS.md).
+
 ---
 
 ## Table of Contents
