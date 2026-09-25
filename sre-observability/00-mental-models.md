@@ -133,7 +133,7 @@ Saturation is *not* utilization. It's the *queueing* that happens when utilizati
 | Connection pool | 40 of 100 in use | pool wait time > 0, connection acquisition latency > 0 |
 | Goroutine scheduler | N goroutines | runnable but not running (sched_lat) |
 
-**Why it matters.** Utilization saturates linearly; latency saturates exponentially as you approach 100% (Little's law, §16). A queue at 90% utilization has 10× the wait time of one at 50%. *Saturation* signals tell you "an outage is near" *before* the latency-and-error symptoms show up. They are the leading indicator; latency and errors are the lagging ones.
+**Why it matters.** Utilization saturates linearly; latency saturates exponentially as you approach 100% (Little's law, §16). In an M/M/1 queue, the time spent waiting at 90% utilization is 9× the wait at 50% (ρ/(1−ρ): 9 vs 1). *Saturation* signals tell you "an outage is near" *before* the latency-and-error symptoms show up. They are the leading indicator; latency and errors are the lagging ones.
 
 ---
 
@@ -585,7 +585,7 @@ Mean latency for a request distribution `[10ms, 11ms, 12ms, 13ms, 14ms, 5000ms]`
 
 ### 16.2 The tail is where the pain is
 
-For most production services, p50 is fine, p99 is 10–50× p50, and the p99.9 *is the user's experience* — because most users hit several services per page-view, and the slowest one dominates. Jeff Dean's 2013 *The Tail at Scale* paper is the canonical reference; the math is sobering: a service with p99=10s, called 100 times per page, has a *50% chance* of one call hitting that 10s on every page view.
+For most production services, p50 is fine, p99 is 10–50× p50, and the p99.9 *is the user's experience* — because most users hit several services per page-view, and the slowest one dominates. Jeff Dean's 2013 *The Tail at Scale* paper is the canonical reference; the math is sobering: a service with p99=10s, called 100 times per page, has a *~63% chance* (1 − 0.99¹⁰⁰) that at least one call hits that 10s on any given page view.
 
 ### 16.3 Little's Law
 
