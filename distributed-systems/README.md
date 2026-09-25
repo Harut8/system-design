@@ -28,7 +28,7 @@
 20. [Phase 18 — Specialized Advanced Topics & Internet-Scale Systems](#phase-18--specialized-advanced-topics--internet-scale-systems)
 21. [Canonical Distributed Systems Reading List (Landmark Papers)](#canonical-distributed-systems-reading-list-landmark-papers)
 22. [Learn-by-Doing: Hands-On Mini-Projects & Reference Repositories](#learn-by-doing-hands-on-mini-projects--reference-repositories)
-23. [Complete 45-Chapter Index & Execution Roadmap](#complete-45-chapter-index--execution-roadmap)
+23. [Chapter Index — Where Each Topic Lives](#chapter-index--where-each-topic-lives)
 24. [Principal-Level Architectural Trade-off Matrix](#principal-level-architectural-trade-off-matrix)
 
 ---
@@ -483,60 +483,93 @@ Studying production source code and building toy implementations is the most eff
 
 ---
 
-## Complete 45-Chapter Index & Execution Roadmap
+## Chapter Index — Where Each Topic Lives
 
-Below is the complete 45-chapter execution plan for the `distributed-systems` directory:
+The original plan numbered 45 chapters. About half of them are already covered in depth by another track in this repo (`databases/`, `kubernetes/`, `python-mastery/`, `sre-observability/`, `gpu-observability/`, `solutions/`), so they are linked from here instead of rewritten. Chapter numbers in this folder are stable file names, not a reading order; the suggested order is below the table.
 
-```text
-distributed-systems/
-├── README.md                                             <-- Master Roadmap & System Architecture Blueprint
-├── 00-primitives-and-system-models.md                    <-- FLP Impossibility, CAP, PACELC, & Fault Taxonomy
-├── 01-time-clocks-and-ordering.md                        <-- Lamport, Vector, Matrix Clocks, DVV, HLC, & TrueTime
-├── 02-consensus-paxos-internals.md                       <-- Single-Decree, Multi-Paxos, Fast Paxos, Flexible Paxos
-├── 03-consensus-raft-internals.md                        <-- Leader Election, Log Sync, Lease Reads, Joint Consensus
-├── 04-consensus-leaderless-epaxos.md                     <-- EPaxos, Dependency Graphs, SCC Conflict Resolution
-├── 05-consensus-byzantine-fault-tolerance.md             <-- PBFT, Tendermint, HotStuff, Narwhal/Tusk DAG Consensus
-├── 06-distributed-transactions-2pc-3pc.md               <-- Two-Phase Commit, 3PC Network Flaws, & Paxos/2PC Systems
-├── 07-distributed-transactions-sagas-calvin.md          <-- Saga Orchestration/Choreography & Calvin Determinism
-├── 08-distributed-transactions-percolator-farm-fdb.md    <-- Percolator TSO, FaRM RDMA/NVRAM, FoundationDB Architecture
-├── 09-isolation-levels-and-concurrency-control.md        <-- 2PL, MVCC, SSI, & External Consistency
-├── 10-sharding-and-consistent-hashing.md                 <-- Ketama Hash Rings, Virtual Nodes, Jump Consistent Hash
-├── 11-distributed-storage-engines-lsm-vs-btree.md        <-- SSTables, WAL, Compaction Algorithms, Write Amplification
-├── 12-storage-engines-rocksdb-pebble-badger.md           <-- RocksDB, PebbleDB, BadgerDB WISCKEY Value-Log Separation
-├── 13-distributed-query-execution-plans.md              <-- Distributed SQL Planners, Exchange Operators, Shuffles
-├── 14-distributed-filesystems-gfs-hdfs-ceph-juicefs.md   <-- NameNodes, CRUSH Placement Algorithm, JuiceFS POSIX
-├── 15-distributed-object-storage-s3-internals.md         <-- Metadata LSM engines, Strong Consistency, Erasure Coding
-├── 16-distributed-databases-spanner-cockroach-tidb.md    <-- Spanner TrueTime, Cockroach HLC, & TiDB Placement Rules
-├── 17-tcp-internals-and-congestion-control.md           <-- BBR, TIME_WAIT Exhaustion, Socket Buffers, Epoll
-├── 18-modern-transport-quic-and-http3.md                 <-- UDP Multiplexing, Connection Migration, HOL Mitigation
-├── 19-datacenter-networking-leaf-spine.md                <-- Leaf-Spine Fabrics, ECMP Routing, Overbooking Ratios
-├── 20-kernel-networking-ebpf-and-xdp.md                  <-- Express Data Path, Socket Filter Bytecode, Driver Offload
-├── 21-distributed-messaging-kafka-pulsar.md             <-- Partitioned Logs, Zero-Copy IO, BookKeeper Compute/Storage
-├── 22-stream-processing-flink-watermarks-eos.md         <-- Event Time, Watermarks, Chandy-Lamport Snapshots, EOS
-├── 23-rpc-frameworks-grpc-protobuf.md                    <-- HTTP/2 Framing, Protobuf Serialization, Multiplexing
-├── 24-distributed-caching-tinylfu-arc.md                 <-- TinyLFU, ARC Cache, Singleflight, XFetch Algorithm
-├── 25-zero-trust-and-spiffe-spire-identity.md            <-- SPIFFE ID, Workload Attestation, X.509 SVID Rotation
-├── 26-distributed-authorization-zanzibar-opa.md          <-- Relationship-Based Access Control, OPA Rego Engine
-├── 27-secrets-management-and-kms.md                      <-- Key Management Services, Envelope Encryption, HSMs
-├── 28-gossip-protocols-swim-and-epidemic.md              <-- SWIM Protocol, Dissemination, Anti-Entropy
-├── 29-failure-detection-phi-accrual.md                   <-- Heartbeating, Timeout Tuning, Phi-Accrual Engine
-├── 30-distributed-coordination-etcd-zookeeper.md        <-- Raft/Zab Integration, MVCC Watches, Ephemeral Locks
-├── 31-container-runtime-primitives.md                    <-- Linux Namespaces, cgroups v2, OverlayFS, CRI/OCI
-├── 32-distributed-schedulers-borg-kubernetes.md          <-- Scheduling Frameworks, Gang Scheduling, NUMA/GPU Locality
-├── 33-resilience-patterns-circuit-breakers.md            <-- Circuit Breakers, Bulkhead Thread Pools, Fallbacks
-├── 34-adaptive-load-control-and-backpressure.md          <-- AIMD Concurrency Limits, Load Shedding, Queue Collapse
-├── 35-reliability-math-slos-and-error-budgets.md         <-- MTBF/MTTR Formulas, Availability Nines, SLO Management
-├── 36-multi-region-crdts-and-conflict-resolution.md      <-- CvRDT vs CmRDT, Monotonic Semilattices, LWW Pitfalls
-├── 37-geo-replication-and-quorum-placement.md            <-- Latency Triangles, Active-Active, Region Evacuation
-├── 38-hardware-performance-and-memory-hierarchy.md       <-- CPU Cache Misses, NUMA Latency, Memory Barriers, False Sharing
-├── 39-production-profiling-and-flame-graphs.md           <-- Continuous eBPF Profiling, Perf Events, Stack Tracing
-├── 40-formal-verification-tla-pluscal-alloy.md           <-- TLA+, PlusCal, Alloy Model Checking, AWS s2n Verification
-├── 41-deterministic-simulation-testing.md               <-- FoundationDB / TigerBeetle Event Loop Simulation
-├── 42-distributed-machine-learning-systems.md            <-- Ring-AllReduce, NCCL Inter-GPU, Tensor & Pipeline Parallelism
-├── 43-llm-serving-infrastructure-vllm.md                 <-- Continuous Batching, PagedAttention KV Cache Management
-├── 44-internet-scale-architecture-case-studies.md        <-- Meta TAO, Google Infrastructure, Amazon Dynamo, Cosmos DB
-└── 45-distributed-tracing-opentelemetry.md              <-- W3C Context Propagation, Head vs Tail Sampling
-```
+**Status:** **Written** = chapter in this folder · **Elsewhere** = covered by another track (links) · **Planned** = not written anywhere yet.
+
+### Foundations: models, replication, consensus
+
+| Topic | Status | Read |
+| :--- | :--- | :--- |
+| System models, failure models, FLP, CAP, PACELC | Written | [00 — Primitives and System Models](00-primitives-and-system-models.md) |
+| Replication (leader, multi-leader, leaderless), lag, quorums, consistency models, conflict resolution | Written | [04 — Replication and Consistency](04-replication-and-consistency.md) · background: [databases/12 Replication](../databases/12-replication-and-distributed-storage.md) |
+| Time, clocks, ordering (Lamport, vector, HLC, TrueTime) | Elsewhere | [databases/19 §3 Time, Clocks, and Ordering](../databases/19-distributed-databases-deep-dive.md) |
+| Raft consensus and distributed locking | Written | [03 — Raft and Distributed Locking](03-consensus-raft-and-distributed-locking.md) · [kubernetes/04 etcd internals](../kubernetes/04-etcd-internals.md) |
+| Paxos family | Elsewhere | [databases/12 §3 Consensus Protocols](../databases/12-replication-and-distributed-storage.md) |
+| Failure detection, heartbeats, phi accrual, SWIM | Written | [29 — Failure Detection](29-failure-detection-phi-accrual.md) · [databases/16 Failure Detection and Leader Election](../databases/16-failure-detection-and-leader-election.md) |
+| Coordination services (etcd, ZooKeeper) | Elsewhere | [kubernetes/04 etcd internals](../kubernetes/04-etcd-internals.md) · [03 §locking](03-consensus-raft-and-distributed-locking.md) |
+| Leaderless / Byzantine consensus (EPaxos, PBFT, HotStuff) | Planned | low priority for backend work |
+
+### Data: transactions, partitioning, storage
+
+| Topic | Status | Read |
+| :--- | :--- | :--- |
+| Transactions across services: 2PC, sagas, outbox, idempotency | Written | [06 — Sagas, Outbox, Idempotency](06-distributed-transactions-sagas-outbox-idempotency.md) |
+| Isolation levels, MVCC, SSI, concurrency control | Elsewhere | [databases/05 Transactions and Concurrency](../databases/05-transactions-and-concurrency.md) · [databases/18 Concurrency Control](../databases/18-concurrency-control-and-scheduling.md) |
+| Percolator, Calvin, Spanner, CockroachDB, TiDB | Elsewhere | [databases/19 Distributed Databases Deep Dive](../databases/19-distributed-databases-deep-dive.md) |
+| Sharding and consistent hashing | Written | [10 — Sharding and Consistent Hashing](10-sharding-and-consistent-hashing.md) |
+| Storage engines: pages, B-trees, LSM, WAL | Elsewhere | [databases/01](../databases/01-storage-engine-fundamentals.md) · [databases/13 LSM](../databases/13-lsm-trees-and-compaction.md) · [databases/14 WAL](../databases/14-write-ahead-log-internals.md) |
+| Query execution | Elsewhere | [databases/04 Query Engine Internals](../databases/04-query-engine-internals.md) |
+| Object storage, data lakes | Elsewhere | [databases/22 Data Lake and Lakehouse](../databases/22-data-lake-lakehouse.md) |
+| Distributed filesystems (GFS, HDFS, Ceph) | Planned | |
+| Caching strategies and eviction | Written | [08 — Caching Strategies and Patterns](08-caching-strategies-and-patterns.md) |
+
+### Messaging, streaming, networking
+
+| Topic | Status | Read |
+| :--- | :--- | :--- |
+| Kafka and event streaming | Written | [07 — Kafka and Event Streaming](07-kafka-and-event-streaming.md) |
+| Stream processing (Flink, watermarks, exactly-once) | Written | [22 — Stream Processing](22-stream-processing-flink-watermarks-eos.md) |
+| Batch processing (Spark, MapReduce) | Written | [23 — Batch Processing](23-batch-processing-spark-mapreduce.md) |
+| Networking protocols, TCP, QUIC, gRPC | Written | [17 — Networking Protocols and Communication](17-networking-protocols-and-communication.md) |
+| Kernel networking, eBPF, service mesh | Elsewhere | [kubernetes/16 Cilium and eBPF](../kubernetes/16-cilium-and-ebpf-deep-dive.md) · [kubernetes/17 Ingress, Gateway, Mesh](../kubernetes/17-ingress-gateway-and-service-mesh.md) |
+
+### Reliability and production engineering
+
+| Topic | Status | Read |
+| :--- | :--- | :--- |
+| Retries, circuit breakers, bulkheads, timeouts | Written | [33 — Resilience Patterns](33-resilience-patterns-circuit-breakers.md) |
+| Load shedding, backpressure, queueing theory | Written | [34 — Adaptive Load Control](34-adaptive-load-control-and-backpressure.md) |
+| Reliability math, SLI/SLO/SLA, error budgets | Written | [35 — Reliability Math](35-reliability-math-slos-and-error-budgets.md) · [sre-observability/13 SLO Engineering](../sre-observability/13-slo-engineering.md) |
+| Multi-region active-active, quorum placement, region evacuation | Written | [36 — Multi-Region Systems](36-multi-region-active-active-and-geo-replication.md) · CRDT math: [databases/19 §7](../databases/19-distributed-databases-deep-dive.md) |
+| Debugging distributed systems (tracing, tail latency, lag, pools, contention) | Written | [37 — Distributed Systems Debugging](37-distributed-systems-debugging.md) |
+| Disaster recovery, backups, PITR, RPO/RTO | Written | [38 — Disaster Recovery](38-disaster-recovery-backups-rpo-rto.md) |
+| Observability, OpenTelemetry, distributed tracing | Elsewhere | [sre-observability/02 OpenTelemetry](../sre-observability/02-opentelemetry-deep-dive.md) · [08 Traces storage](../sre-observability/08-traces-storage.md) · [25 Tracing through Kafka](../sre-observability/25-streaming-and-kafka-observability.md) |
+| Incident response, on-call, postmortems | Elsewhere | [sre-observability/14 On-call](../sre-observability/14-on-call.md) · [15 Incident Response](../sre-observability/15-incident-response-and-postmortem.md) |
+| Chaos engineering, game days | Elsewhere | [sre-observability/38 Continuous Verification](../sre-observability/38-continuous-verification.md) · [33 §7](33-resilience-patterns-circuit-breakers.md) |
+| Capacity planning, load testing | Elsewhere | [sre-observability/16 Capacity Planning](../sre-observability/16-capacity-planning.md) · [kubernetes/35 Performance and Scaling](../kubernetes/35-performance-scaling-and-tuning.md) |
+| Formal verification (TLA+), deterministic simulation testing | Planned | |
+
+### Performance engineering
+
+| Topic | Status | Read |
+| :--- | :--- | :--- |
+| CPU, caches, memory hierarchy, NUMA | Elsewhere | [python-mastery/00 CPU](../python-mastery/00-cpu-execution-model.md) · [01 Memory Hierarchy](../python-mastery/01-memory-hierarchy-and-caches.md) · [07 Virtual Memory](../python-mastery/07-virtual-memory.md) · [08 Allocators](../python-mastery/08-allocators.md) |
+| Concurrency, atomics, memory models | Elsewhere | [python-mastery/02 Atomics](../python-mastery/02-atomics-and-memory-models.md) · [03 Lock-free](../python-mastery/03-lockfree-and-reclamation.md) · [30 Concurrency Correctness](../python-mastery/30-concurrency-correctness.md) · [databases/17 Latches and Locks](../databases/17-latches-and-locks-internals.md) |
+| Async I/O (epoll, io_uring, asyncio) | Elsewhere | [python-mastery/09 Syscalls and I/O](../python-mastery/09-syscalls-and-io.md) · [28 asyncio Internals](../python-mastery/28-asyncio-internals.md) · [29 Async Pitfalls](../python-mastery/29-async-patterns-and-pitfalls.md) |
+| Garbage collection | Elsewhere | [python-mastery/22 Garbage Collection](../python-mastery/22-garbage-collection.md) · GC pauses in services: [37](37-distributed-systems-debugging.md) |
+| Measurement, percentiles, profiling, flame graphs | Elsewhere | [python-mastery/31 Measurement](../python-mastery/31-measurement-methodology.md) · [32 Profiling](../python-mastery/32-profiling.md) · [12 Observing a Process](../python-mastery/12-observing-a-process.md) · [sre-observability/09 Profiling](../sre-observability/09-profiling.md) |
+
+### Platform, security, AI infrastructure
+
+| Topic | Status | Read |
+| :--- | :--- | :--- |
+| Container runtimes, cgroups, namespaces | Elsewhere | [kubernetes/00 Linux Primitives](../kubernetes/00-linux-primitives-for-containers.md) · [01 CRI/OCI](../kubernetes/01-container-runtimes-cri-oci.md) |
+| Schedulers (Borg, Kubernetes) | Elsewhere | [kubernetes/09 Scheduler](../kubernetes/09-kube-scheduler-internals.md) · [34 Scheduler Framework](../kubernetes/34-custom-schedulers-and-scheduler-framework.md) |
+| Workload identity, mTLS, SPIFFE, authn/authz | Elsewhere | [kubernetes/07 Authentication and Authorization](../kubernetes/07-authentication-authorization.md) · [kubernetes/17 Service Mesh](../kubernetes/17-ingress-gateway-and-service-mesh.md) |
+| Secrets, KMS, envelope encryption | Elsewhere | [kubernetes/44 Secrets and ConfigMaps](../kubernetes/44-secrets-and-configmaps-deep-dive.md) |
+| Relationship-based authorization (Zanzibar, OPA) | Planned | app-level RBAC: [solutions/fastapi-rbac-design](../solutions/fastapi-rbac-design.md) |
+| Distributed ML training | Elsewhere | [solutions/parallel-ml-training-design](../solutions/parallel-ml-training-design.md) · [gpu-observability/15](../gpu-observability/15-distributed-training-observability.md) |
+| LLM serving | Elsewhere | [solutions/ml-inference-platform-design](../solutions/ml-inference-platform-design.md) · [solutions/llm-gateway-design](../solutions/llm-gateway-design.md) · [gpu-observability/14](../gpu-observability/14-llm-inference-observability.md) |
+| Internet-scale case studies (Dynamo, TAO, Spanner) | Planned | partial: [databases/19](../databases/19-distributed-databases-deep-dive.md) |
+
+### Suggested reading order
+
+1. **Vocabulary:** 00 → 04 → 29 → 03
+2. **Building services:** 06 → 10 → 08 → 07 → 22
+3. **Keeping them up:** 33 → 34 → 35 → 37 → 38 → 36
 
 ---
 
@@ -556,4 +589,4 @@ distributed-systems/
 
 ---
 
-> **Note**: This master document serves as the authoritative blueprint for the `distributed-systems` architecture repository. All subsequent chapter implementations (`00` through `45`) strictly reference the theoretical models, math invariants, and architectural guidelines established here.
+> **Note**: The phases above are the full map of the field. The [chapter index](#chapter-index--where-each-topic-lives) is the source of truth for what is written, where, and what is still planned.

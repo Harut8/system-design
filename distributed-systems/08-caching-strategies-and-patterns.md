@@ -2,7 +2,7 @@
 
 A production-grade reference covering caching from first principles through production architecture. Covers the five foundational read/write strategies, cache invalidation approaches that actually work, thundering herd mitigation, eviction policies and their tradeoffs, Redis internals, distributed cache architecture with multi-level hierarchies, consistent hashing for cache sharding, capacity planning math, failure modes, and the concrete caching patterns that appear in every system design interview. Written for senior and Staff+ engineers who need to discuss caching with precision under interview pressure.
 
-Prerequisites: familiarity with distributed system fundamentals from `00-primitives-and-system-models.md` and consistency models from `04-consistency-models-linearizability-to-eventual.md`.
+Prerequisites: familiarity with distributed system fundamentals from `00-primitives-and-system-models.md` and consistency models from `04-replication-and-consistency.md`.
 
 ---
 

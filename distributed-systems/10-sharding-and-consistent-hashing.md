@@ -2,7 +2,7 @@
 
 A production-grade reference covering data partitioning from first principles through the consistent hashing algorithm and its modern variants, rebalancing mechanics, routing strategies, and the interaction between sharding and replication. Includes deep dives into how DynamoDB, Cassandra, Redis Cluster, Kafka, and CockroachDB partition data in production, with dedicated sections on partitioning for ML/AI systems (feature stores, embedding indexes, model serving, training data distribution). Written for senior and Staff+ engineers who need to reason precisely about data placement, hotspot mitigation, and capacity planning under interview pressure.
 
-Prerequisites: familiarity with distributed system fundamentals from `00-primitives-and-system-models.md`, replication from `05-replication-strategies.md`, and consistency models from `04-consistency-models-linearizability-to-eventual.md`. This chapter is referenced heavily by the solutions for recommendation systems, feature stores, ML inference platforms, agent orchestration, AI search engines, and parallel ML training.
+Prerequisites: familiarity with distributed system fundamentals from `00-primitives-and-system-models.md`, and replication and consistency models from `04-replication-and-consistency.md`. This chapter is referenced heavily by the solutions for recommendation systems, feature stores, ML inference platforms, agent orchestration, AI search engines, and parallel ML training.
 
 ---
 
