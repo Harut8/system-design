@@ -14,7 +14,7 @@ several have runnable code alongside them.
 | --- | --- | --- |
 | [`python-mastery/`](python-mastery/README.md) | CPU execution model, caches, virtual memory, allocators, syscalls, then CPython internals: refcounting, eval loop, GC, the GIL, free-threading, asyncio | 30 |
 | [`databases/`](databases/MENTAL_MODEL.md) | Storage engines, encoding formats, access methods, query engines, transactions, B-trees and LSM-trees, WAL, vector search, data lake and lakehouse | 25 |
-| [`distributed-systems/`](distributed-systems/README.md) | Consensus, replication, failure detection, coordination | roadmap |
+| [`distributed-systems/`](distributed-systems/README.md) | System models and CAP/PACELC, replication and consistency, consensus, sagas/outbox/idempotency, sharding, streaming, resilience and load control, multi-region, production debugging, disaster recovery — plus an index into the other tracks | 17 |
 | [`kubernetes/`](kubernetes/ROADMAP.md) | Linux primitives, etcd, API server, scheduler and kubelet internals, CNI/Cilium/eBPF, CSI, operators, multi-tenancy, supply-chain security | 46 |
 | [`k8s-learn/`](k8s-learn/README.md) | Hands-on Kubernetes task sheets with manifests | 14 |
 | [`sre-observability/`](sre-observability/ROADMAP.md) | OpenTelemetry, instrumentation, telemetry storage and query layers, SLO engineering, on-call, cardinality and cost | 47 |
@@ -23,6 +23,17 @@ several have runnable code alongside them.
 | [`tasks/`](tasks/) · [`solutions/`](solutions/) · [`implementation/`](implementation/) | Design problems at four scale tiers (10k → 10m), worked solutions, and reference implementations | — |
 | [`primitives/`](primitives/README.md) | The reusable decisions extracted out of the worked solutions — one sheet per design, so the next design costs less than the last | 1 |
 | [`SYSTEM-DESIGN-GUIDE.md`](SYSTEM-DESIGN-GUIDE.md) | Cross-cutting reference tying the tracks together | — |
+
+### Labs
+
+Every track has a `LABS.md`: pure learn-by-doing tasks, one section per chapter. Each task asks you to
+predict a result before measuring it, break something on purpose, and end with a number you can check.
+Each section closes with three closed-book questions to redo after a day, a week and a month, and each
+sheet ends with multi-day capstones. They run on a laptop with Docker; anything paid is marked optional.
+
+[databases](databases/LABS.md) · [distributed-systems](distributed-systems/LABS.md) ·
+[python-mastery](python-mastery/LABS.md) · [kubernetes](kubernetes/LABS.md) (with [`k8s-learn/`](k8s-learn/README.md) for the API basics) ·
+[sre-observability](sre-observability/LABS.md) · [ai-rag](ai-rag/LABS.md) · [gpu-observability](gpu-observability/tasks.md)
 
 ## Building the site locally
 
