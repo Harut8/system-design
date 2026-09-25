@@ -13,6 +13,7 @@ metaprogramming → production quality.
 
 Companion file: **[BOOKS.md](BOOKS.md)** — the researched reading list (editions,
 verdicts, and *when* in this roadmap each book actually pays off).
+Hands-on companion: **[LABS.md](LABS.md)** — per-chapter predict/measure/break tasks, closed-book checkpoints, and capstones.
 
 > **How to use this folder.** Don't read it linearly on day one. Read Tier 0–1 once for
 > vocabulary, then live in Tiers 2–6 and come back down whenever something doesn't make
