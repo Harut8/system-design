@@ -57,6 +57,8 @@ is part of the job (`06`).
 Written as they're needed, not up front. Each one is a build-log with theory attached, which
 keeps every claim honest by construction.
 
+**Task sheet:** [`LABS.md`](LABS.md) turns every written chapter and appendices D–H into predict, build, break and measure tasks on a laptop.
+
 | Doc | Topic | Status |
 |---|---|---|
 | [`00-mental-models.md`](00-mental-models.md) | The retrieval→generation pipeline as a data system; where correctness actually lives | **written** — labs unrun |

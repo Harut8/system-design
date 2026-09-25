@@ -27,6 +27,8 @@ CANONICAL_VERSION = "canon-v1"
 # The lab corpus: the ai-rag chapters themselves. A real corpus you own, per 00 §16
 # exercise 1. Sorted for determinism — `glob` order is filesystem-dependent.
 CORPUS_GLOB = "*.md"
+# The lab task sheet is not a chapter: its quiz answers would become distractor passages.
+CORPUS_EXCLUDE = frozenset({"LABS.md"})
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,8 @@ def load_corpus(root: Path, pattern: str = CORPUS_GLOB) -> dict[str, Document]:
     """Load every matching file under `root` as a canonical Document, keyed by doc_id."""
     docs: dict[str, Document] = {}
     for path in sorted(root.glob(pattern)):
+        if path.name in CORPUS_EXCLUDE:
+            continue
         text = canonicalize(path.read_text(encoding="utf-8"))
         doc_id = path.name
         docs[doc_id] = Document(doc_id=doc_id, text=text, sha256=digest(text))
