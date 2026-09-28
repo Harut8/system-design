@@ -11,7 +11,7 @@ Hands-on tasks for every chapter (predict, build, break, measure) are in [LABS.m
 ## Table of Contents
 
 - [Start here — the whole map in plain words](#start-here--the-whole-map-in-plain-words)
-  - [Key terms](#key-terms-in-this-chapter) · [Key terms explained — why each one exists](#key-terms-explained--why-each-one-exists)
+  - [Where the numbers come from](#where-the-numbers-come-from) · [Key terms](#key-terms-in-this-chapter) · [Key terms explained — why each one exists](#key-terms-explained--why-each-one-exists)
 1. [The One-Page Picture](#1-the-one-page-picture)
 2. [The Four Universal Pipelines](#2-the-four-universal-pipelines) — each with *why this path* and *what if it changes*
 3. [The Build Order: Phase 0 → Phase 16](#3-the-build-order-phase-0--phase-16)
@@ -54,14 +54,15 @@ The scenario: an online shop. Table `users` has **10 million rows** of about **1
 **1 GB**. Pages are **8 KB**, so the table is ≈ **125,000 pages**. There is a B+Tree index on
 `users.id`. The server has a **256 MB buffer pool** ≈ **32,000 page frames** — it can hold about a
 quarter of the table in RAM. The disk is an NVMe SSD (~**80 µs** per random page read). All numbers
-are illustrative but consistent with each other.
+are illustrative but consistent with each other; every one of them is derived step by step in
+[Where the numbers come from](#where-the-numbers-come-from) right after the walkthrough.
 
 **Read — a customer logs in:** `SELECT name FROM users WHERE id = 42`
 
 1. **Parse + plan** (doc 04). The text becomes a tree, names are checked against the catalogue,
    and the optimizer compares two routes: read all 125,000 pages (~1 GB) or walk the index (≈4
    pages). It picks the index. *Without care:* stale statistics make it believe the table has 10
-   rows, it picks the full scan, and login takes seconds instead of microseconds.
+   rows, it picks the full scan, and login takes ~0.5–1 s instead of ~20 µs.
 2. **Walk the index** (doc 06). Each 8 KB index page holds ~400 keys, so 10M keys need only **3
    levels** (400³ = 64M). Root and middle pages are touched by every query, so they are always in
    RAM. The leaf page may or may not be. Result: a *tuple ID* — "page 2,104, slot 3".
@@ -75,7 +76,7 @@ are illustrative but consistent with each other.
 
 **Write — the customer renames themselves:** `UPDATE users SET name = 'Ana B.' WHERE id = 42`
 
-6. **Log first** (doc 14). Append a ~100-byte record "txn 311 changed page 2,104 slot 3 to 'Ana
+6. **Log first** (doc 14). Append a ~100–150-byte record "txn 311 changed page 2,104 slot 3 to 'Ana
    B.'" to the write-ahead log (WAL) in memory. Then change the page in the buffer pool and mark it
    *dirty*. The 8 KB page is **not** written to disk now.
 7. **Commit = one fsync of the log** (docs 00, 14). `fsync` forces the log to durable storage:
@@ -93,11 +94,181 @@ are illustrative but consistent with each other.
 
 ```
  READ                                         WRITE                              CRASH
- SQL → plan → index (3 levels) → buffer pool  log record (100 B) → page in RAM   replay WAL
+ SQL → plan → index (3 levels) → buffer pool  log record (~150 B) → page in RAM  replay WAL
  1 query     ~400 keys/page     hit 1 µs /    → fsync log (20 µs–2 ms)           from last
              4 page touches     miss 80 µs    → "OK"  → page to disk later       checkpoint
           → MVCC check → 'Ana'   (~20–200 µs)          (batched, async)          → same state
 ```
+
+### Where the numbers come from
+
+Every number above, derived. Units: 1 KB = 1,024 B for pages and RAM, and the "≈" results are
+rounded so the arithmetic is easy to redo in your head. The goal is not the exact value but
+knowing **which inputs drive each number**, so you can recompute it for your own system.
+
+**A. Table size and page count**
+
+```
+row size          ≈ 100 B of user data (id 8 B + name + email + timestamps …)
+table data        = 10,000,000 rows × 100 B = 1,000,000,000 B ≈ 1 GB
+
+per-row overhead  = 24 B tuple header (xmin, xmax, flags, null bitmap) + 4 B slot pointer
+bytes per row     ≈ 100 + 28 = 128 B on the page
+usable per page   = 8,192 B − 24 B page header ≈ 8,168 B
+rows per page     = 8,168 / 128 ≈ 64 rows              (if you ignore overhead: 8,192/100 ≈ 82)
+table pages       = 10,000,000 / 64 ≈ 156,000 pages
+                    (1 GB / 8 KB ≈ 122,000 pages if you ignore overhead)
+```
+
+We use **≈125,000 pages** as the round middle value. The takeaway: per-row overhead adds **~25%**
+to a narrow table, which is why the Tuple card below calls it out.
+
+**B. Buffer pool capacity**
+
+```
+frames            = 256 MB / 8 KB = 268,435,456 / 8,192 = 32,768 ≈ 32,000 frames
+share of table    = 32,768 / 125,000 ≈ 26%  → "about a quarter"
+share of table+index = 32,768 / (125,000 + 25,000 leaf pages, see C) ≈ 22%
+```
+
+So most of the table **cannot** be cached; whether a given lookup is fast depends on whether its
+pages are in the hot ~quarter.
+
+**C. B+Tree fanout and depth**
+
+```
+index entry       = 8 B key (bigint id) + 6 B TID + 2 B flags/length  = 16 B
+                  + 4 B slot pointer                                    = 20 B per entry
+keys per page     = 8,168 / 20 ≈ 408  → "~400"  (≈ 360 at a 90% fill factor)
+
+leaf pages        = 10,000,000 / 400 = 25,000          (≈ 200 MB of leaves)
+level above       = 25,000 / 400 ≈ 63 internal pages
+level above       = 63 / 400 < 1   → 1 root page
+depth             = root → internal → leaf = 3 levels
+capacity check    = 400³ = 64,000,000 keys ≥ 10M → 3 levels is enough
+                    a 4th level is needed only past 400⁴ = 25.6 billion keys
+```
+
+Why the top levels are "always in RAM": root + internal = **64 pages = 512 KB**, and *every*
+lookup touches them, so the eviction policy never picks them. The 25,000 leaves (200 MB) compete
+with the table for the 256 MB pool, so a given leaf may or may not be cached.
+
+**D. Pages touched per lookup: "≈4"**
+
+```
+index: root (1) + internal (1) + leaf (1) = 3 pages
+heap:  the page named by the TID          = 1 page
+total                                     = 4 page touches
+```
+
+Compare with the full scan the optimizer rejected: **125,000 pages**. That ratio (≈31,000×) is
+why stale statistics that flip this choice are so expensive.
+
+**E. Hit vs miss latency**
+
+```
+hit  ≈ 0.1–1 µs   hash-table lookup page_id → frame, pin, take a shared latch
+                  (all in RAM; ~100 ns per cache-missing memory access, a few of them)
+miss ≈ 80 µs      pick a victim frame (write it first if dirty!), pread() 8 KB from NVMe
+                  typical NVMe random 4–8 KB read at low queue depth: ~60–100 µs
+ratio            ≈ 80–800× → "a miss costs about as much as a hundred hits"
+cloud network disk (EBS/PD): ~0.5–1 ms per read → ~10× worse than local NVMe
+```
+
+**F. "20,000 logins/s would need 80,000 random reads/s"**
+
+```
+reads/s without a buffer pool = 20,000 queries/s × 4 pages/query = 80,000 random reads/s
+latency per query             = 4 × 80 µs = 320 µs of pure I/O   (vs ~4 µs when all hits)
+```
+
+A good NVMe drive *can* do 80K IOPS, so throughput isn't the only issue: each query becomes
+~80× slower, and a cloud disk capped at e.g. 16,000 IOPS simply couldn't keep up.
+
+**G. The full-scan alternative: "~0.5–1 s"**
+
+```
+bytes to read   = 125,000 pages × 8 KB ≈ 1 GB
+sequential read ≈ 2–3 GB/s on NVMe   → ~0.3–0.5 s of I/O
+CPU per row     ≈ 20–50 ns to check visibility + evaluate id = 42
+                  10,000,000 × ~50 ns ≈ 0.5 s
+total           ≈ 0.5–1 s  (parallel workers can cut it, but it is still ~30,000× the index route)
+```
+
+**H. End-to-end read latency: "~20 µs hot, ~200 µs with two misses"**
+
+```
+parse + plan                ≈ 10–15 µs  (≈1–2 µs with a prepared statement / cached plan)
+4 page touches (all hits)   ≈ 4 × ~1 µs = 4 µs
+visibility check + project  ≈ 1 µs
+                            ─────────────
+all hot                     ≈ 15–20 µs  → "~20 µs"
+
+two misses (leaf + heap)    ≈ 20 µs + 2 × 80 µs = 180 µs → "~200 µs"
+```
+
+Network round trip to the client (~50–500 µs in a datacenter) comes on top — for a hot query it
+is often *larger* than the database's own work. §7 shows the same trace with ~250 µs total.
+
+**I. WAL record size: "~100–150 B"**
+
+```
+WAL record header             ≈ 24 B  (length, xid, LSN link, record type, CRC)
+block reference               ≈ 12–20 B (which relation + which page)
+update payload                ≈ the new row version (~100 B) or just the changed bytes
+                              ─────────────
+typical                       ≈ 100–150 B
+```
+
+Exception: the **first** change to a page after a checkpoint also logs the whole 8 KB page (a
+*full-page image*, protection against torn writes) — so that one record is ~8 KB, ~60× larger.
+
+**J. fsync latency: "20–50 µs NVMe, 0.5–2 ms cloud disk"**
+
+```
+datacenter NVMe with power-loss protection: the drive can acknowledge once data is in its
+  capacitor-backed cache → ~20–50 µs
+cloud network disk: request travels over the network to replicated storage and back
+  → ~0.5–2 ms
+consumer SSD without PLP: an honest flush must reach flash → often 1–10 ms
+```
+
+**K. Group commit: "50 transactions share one fsync"**
+
+```
+one fsync per commit, 1 ms fsync      → max 1 / 0.001 s = 1,000 commits/s  (per log)
+arrivals during one 1 ms fsync        = arrival rate × 1 ms
+  e.g. 50,000 commits/s arriving      → 50 waiting when the next fsync starts
+one fsync commits all 50              → 50 × 1,000 = 50,000 commits/s
+each commit's latency                 ≈ up to 2 fsyncs (wait for the current one + its own)
+```
+
+The "50" isn't a configured value. It's *however many commits pile up during one fsync*, which is
+why group commit helps most exactly when load is high.
+
+**L. Write absorption: "30 more updates ride on one write"**
+
+```
+rows on the page           ≈ 64 (from A)
+page stays dirty until     the next checkpoint (every ~5 min by default) or eviction
+if 30 of those 64 users update their rows within that window:
+  without write-back caching: 31 page writes × 8 KB = 248 KB
+  with dirty-page caching:     1 page write  × 8 KB =   8 KB   → 31× fewer page writes
+  WAL written either way:     31 records × ~150 B ≈ 4.6 KB (sequential)
+```
+
+**M. Recovery time after the crash**
+
+```
+WAL to replay   = WAL generated since the last checkpoint
+                ≤ WAL rate × checkpoint interval
+  e.g. 5 MB/s × 300 s (5 min) = 1.5 GB worst case
+replay speed    ≈ 100–500 MB/s (mostly limited by random reads of the pages being fixed)
+recovery time   ≈ 1.5 GB / (100–500 MB/s) ≈ 3–15 s
+```
+
+This is the knob behind the Checkpoint card below: halve the checkpoint interval → roughly halve
+worst-case recovery time, at the cost of more checkpoint I/O.
 
 The whole folder is these nine steps, seen up close — plus what changes when you want them faster
 (docs 04, 15), on many machines (docs 12, 16, 19), or for a different workload (docs 07–13, 22).
