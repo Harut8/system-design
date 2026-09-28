@@ -11,6 +11,7 @@ Hands-on tasks for every chapter (predict, build, break, measure) are in [LABS.m
 ## Table of Contents
 
 - [Start here — the whole map in plain words](#start-here--the-whole-map-in-plain-words)
+  - [Key terms](#key-terms-in-this-chapter) · [Key terms explained — why each one exists](#key-terms-explained--why-each-one-exists)
 1. [The One-Page Picture](#1-the-one-page-picture)
 2. [The Four Universal Pipelines](#2-the-four-universal-pipelines) — each with *why this path* and *what if it changes*
 3. [The Build Order: Phase 0 → Phase 16](#3-the-build-order-phase-0--phase-16)
@@ -103,25 +104,212 @@ The whole folder is these nine steps, seen up close — plus what changes when y
 
 ### Key terms in this chapter
 
-| Term | Plain meaning | Everyday analogy |
-|---|---|---|
-| Page | fixed-size block (4–16 KB) — the unit the DB reads and writes | a box in the library basement; you always carry a whole box |
-| Tuple / row | one record inside a page | one book in the box |
-| TID (tuple ID) | address of a row: (page number, slot number) | "basement box 2,104, position 3" |
-| Buffer pool | the DB's own RAM cache of pages | the reading desk near the door |
-| Hit / miss | page found in RAM / had to read it from disk | book on the desk / walk to the basement |
-| Dirty page | page changed in RAM but not yet written to disk | a book with pencil notes not yet copied into the master |
-| WAL (write-ahead log) | append-only list of changes, written before the pages | the librarian's logbook |
-| fsync | "OS, put this on durable storage now, and tell me when" | posting the logbook page into the fire safe |
-| LSN | position of a record in the WAL; every page remembers the last LSN applied to it | logbook line number |
-| Checkpoint | point where all older changes are known to be on disk; recovery starts here | "everything before line 5,000 is already copied into the books" |
-| Transaction | a group of changes that all happen or none happen | a bank transfer: debit and credit together |
-| MVCC | keep old row versions so readers see a consistent snapshot without locking | readers get the printed edition while an editor works on the draft |
-| Lock vs latch | lock = protects a row for a whole transaction; latch = protects a memory structure for microseconds | reserving a meeting room for the afternoon vs holding a door for a second |
-| Optimizer | picks the cheapest way to run a query, using statistics | a route planner using traffic data |
-| Index | extra structure that maps a key to where rows live | the catalogue |
-| Replica | another machine holding a copy, fed from the WAL | a branch library receiving copies of the logbook |
-| Amplification | extra bytes read/written/stored per byte the user asked for | carrying a whole box to read one page |
+Read the table for the one-line version. For any term where you're asking "why does this even
+exist?", jump to its card in [Key terms explained](#key-terms-explained--why-each-one-exists) below.
+
+| Term | Plain meaning | Everyday analogy | Why we need it (the problem without it) | Problems it creates |
+|---|---|---|---|---|
+| Page | fixed-size block (4–16 KB), the unit the DB reads and writes | a box in the library basement; you always carry a whole box | Disks move whole blocks anyway; without a fixed unit there's no simple addressing, caching or free-space tracking | Read amplification for tiny rows, wasted space, torn writes, rows bigger than a page need overflow storage |
+| Tuple / row | one record inside a page | one book in the box | The logical unit users insert, update and lock | Per-row overhead (~28 B in Postgres: 24 B header + 4 B slot pointer), alignment padding |
+| TID (tuple ID) | address of a row: (page number, slot number) | "basement box 2,104, position 3" | Lets every index point at the row without copying it | Changes when a row moves to another page, so indexes must be updated |
+| Buffer pool | the DB's own RAM cache of pages | the reading desk near the door | Disk is ~1,000× slower than RAM; without it every page touch is a disk read | Sizing is hard, it's cold after restart, and it's a contention point |
+| Hit / miss | page found in RAM / had to read it from disk | book on the desk / walk to the basement | Hit ratio is the single best predictor of read latency | The ratio hides the real cost: going from 99% to 90% hits means 10× more disk reads |
+| Dirty page | page changed in RAM but not yet written to disk | a book with pencil notes not yet copied into the master | Lets 1,000 updates to one page cost one disk write | Lost on crash (so WAL is required); must be flushed before eviction; checkpoint I/O spikes |
+| WAL (write-ahead log) | append-only list of changes, written before the pages | the librarian's logbook | Fast durable commits (one sequential append) and a way to repair pages after a crash | Every change is written twice; the disk fills if archiving or a replica stalls; fsync latency sets the commit floor |
+| fsync | "OS, put this on durable storage now, and tell me when" | posting the logbook page into the fire safe | `write()` only reaches the OS cache, which power loss erases | Slow (µs–ms), easy to get wrong, and some hardware lies about it |
+| LSN | position of a record in the WAL; every page remembers the last LSN applied to it | logbook line number | Lets recovery tell whether a page already has a change, so replay is safe to repeat | Almost none; the cost is 8 bytes per page |
+| Checkpoint | point where all older changes are known to be on disk; recovery starts here | "everything before line 5,000 is already copied into the books" | Without it, recovery replays the whole history and old WAL can never be deleted | I/O bursts, extra WAL (full-page images) after each one; a balance between recovery time and I/O |
+| Transaction | a group of changes that all happen or none happen | a bank transfer: debit and credit together | Crashes and errors mid-change would leave half-done data that every app has to clean up | Long transactions hold locks and snapshots; apps must retry aborts |
+| MVCC | keep old row versions so readers see a consistent snapshot without locking | readers get the printed edition while an editor works on the draft | Without it, a long report blocks every writer on the rows it reads (or vice versa) | Old versions pile up (bloat, VACUUM); snapshot isolation allows write skew; xid wraparound in Postgres |
+| Lock vs latch | lock = protects a row for a whole transaction; latch = protects a memory structure for microseconds | reserving a meeting room for the afternoon vs holding a door for a second | Two different dangers (logical conflicts vs corrupting a structure) at two very different timescales | Locks → deadlocks and waiting; latches → contention on hot pages |
+| Optimizer | picks the cheapest way to run a query, using statistics | a route planner using traffic data | Plans differ by 1,000×+ and the best plan changes as the data grows | Bad estimates → plan flips; unpredictable latency; planning cost for many-way joins |
+| Index | extra structure that maps a key to where rows live | the catalogue | Without it, finding one row reads the whole table | Every write pays for every index; extra space and bloat |
+| Replica | another machine holding a copy, fed from the WAL | a branch library receiving copies of the logbook | A single machine is a single point of failure and a read-throughput ceiling | Lag → stale reads; async failover can lose commits |
+| Amplification | extra bytes read/written/stored per byte the user asked for | carrying a whole box to read one page | Explains *where the cost of a design goes*; every design trades one kind for another | None itself, but you can't minimize read, write and space amplification all at once (RUM) |
+
+### Key terms explained — why each one exists
+
+Each card answers the same questions: **What goes wrong without it? How does it fix that? Why this
+size/shape? What new problems does it create? What do others do instead?**
+
+**Page**
+- *Without it:* the DB would read arbitrary byte ranges. But the hardware never works that way:
+  SSDs read and program in pages of 4–16 KB, and the OS caches in 4 KB pages. Reading 100 bytes
+  still costs a whole block. Without a fixed unit you also can't address data simply, cache it in
+  interchangeable slots, or track free space.
+- *How it fixes it:* everything is a page of the same size. Address = `page_id × page_size`, every
+  buffer frame fits any page, and free space is tracked per page.
+- *Why this size:* **4 KB** matches the OS page and the atomic write unit of most drives. **8 KB**
+  (Postgres) and **16 KB** (InnoDB) are bigger so that B+Tree nodes hold more keys (fewer levels)
+  and scans do fewer I/Os. Bigger is worse for point reads (read 16 KB to get a 100-byte row) and
+  wastes cache on cold neighbours. Columnar formats use much larger units (MB-scale column chunks)
+  because they only ever scan.
+- *Problems it creates:* **torn writes** — an 8 KB page written as two 4 KB halves can be half
+  new after power loss (fixed by full-page images in WAL or InnoDB's doublewrite buffer).
+  **Overflow** — rows bigger than a page go out of line (Postgres TOAST). **Fragmentation** —
+  deleted rows leave holes until compaction.
+- *Alternatives:* variable-size blocks in LSM SSTables; immutable files on object storage.
+
+**Tuple / row**
+- *Without it:* no unit to insert, lock, or version.
+- *Why this shape:* header (visibility info xmin/xmax, null bitmap, flags) + data. The header is
+  what makes MVCC and NULLs possible without touching other rows.
+- *Problems it creates:* overhead. A Postgres row has a ~23-byte header + a 4-byte slot pointer,
+  so a row of two integers takes ~36 bytes, not 8. At billions of narrow rows this dominates →
+  column stores and time-series engines strip per-row headers.
+
+**TID (tuple ID)**
+- *Without it:* each index would store a copy of the whole row (every update rewrites every copy)
+  or the primary key (every secondary lookup becomes a second tree walk — which is exactly what
+  InnoDB does, by choice).
+- *Why this size:* 6 bytes in Postgres (4-byte page number + 2-byte slot) — small enough that
+  indexes stay compact.
+- *Why the slot (not a byte offset):* the slot is an indirection *inside* the page, so the row can
+  be moved or compacted within the page without changing its TID.
+- *Problems it creates:* if the row moves to *another* page (a Postgres update that doesn't fit),
+  its TID changes and every index gets a new entry — the source of index write amplification
+  (HOT updates avoid it when the new version fits on the same page and no indexed column changed).
+
+**Buffer pool**
+- *Without it:* every page access is a disk read (~80 µs NVMe, ~1 ms cloud disk) instead of
+  ~100 ns in RAM. A lookup touching 4 pages at 20,000 queries/s would need 80,000 random reads/s.
+- *Why the DB owns it (not just the OS):* it must control eviction (one big scan shouldn't evict
+  the hot set), write order (WAL before page), and pinning (don't evict a page someone is reading).
+- *Why this size:* as large as the **hot working set**, not the whole database. Postgres
+  `shared_buffers` ≈ 25% of RAM because it also relies on the OS cache (double buffering); InnoDB
+  ≈ 70–80% because it bypasses the OS cache with `O_DIRECT`.
+- *Problems it creates:* **cold start** after restart (latency spike until it warms up; tools like
+  `pg_prewarm`), a shared structure that needs careful latching, and a "cliff" when the working
+  set grows past it.
+- *Alternatives:* mmap (gives up control), fully in-memory engines (no pool at all).
+
+**Hit / miss (hit ratio)**
+- *Why track it:* it's the biggest single driver of read latency.
+- *Why the percentage misleads:* what matters is the *miss* rate. 99% → 90% hits sounds like a 9%
+  change, but misses go from 1% to 10% → **10× more disk reads**. OLTP systems aim for >99%.
+- *Problems it creates:* a high average can hide a cold table that one important query always misses.
+
+**Dirty page**
+- *Without it (write-through):* every update writes its page to disk immediately → random writes on
+  the commit path, and a hot page updated 1,000×/s is written 1,000×/s.
+- *How it fixes it:* change in RAM, mark dirty, write once later → **write absorption**.
+- *Problems it creates:* dirty pages die with a crash → you *need* the WAL. A dirty page must be
+  written before its frame can be reused, so a pool full of dirty pages makes reads wait on writes
+  → background writers flush ahead of time. Checkpoints must flush them all → I/O bursts.
+
+**WAL (write-ahead log)**
+- *Without it:* either force every touched page at commit (slow, and a torn page still corrupts
+  data) or accept losing data on crash.
+- *How it fixes it:* one small sequential append per change, one fsync per commit (shared by group
+  commit). Pages become a cache that can always be rebuilt from the log.
+- *Why this shape:* append-only, because sequential writes are the fastest thing any disk does.
+  Split into **segments** (16 MB by default in Postgres) so old parts can be archived or deleted
+  as whole files.
+- *Problems it creates:* every change is written twice (log + page). WAL volume can exceed the data
+  size on write-heavy tables. If an archiver or a replication slot stops consuming, WAL piles up
+  until **the disk fills and the DB stops**. The commit latency can never be lower than the log
+  device's fsync latency.
+- *Bonus:* the same stream powers replicas, point-in-time recovery and change-data-capture.
+
+**fsync**
+- *Without it:* `write()` returns once bytes are in the OS page cache. A power cut erases that
+  cache — the "committed" transaction is gone.
+- *Why only at commit, only on the log:* it costs ~20–50 µs on datacenter NVMe with power-loss
+  protection and ~0.5–2 ms on cloud network disks, so it's done as rarely as correctness allows.
+- *Problems it creates:* latency floor for commits. Consumer SSDs without power-loss protection
+  may acknowledge before data is really safe. Error handling is subtle: in 2018 ("fsyncgate")
+  Postgres learned that after a failed fsync, Linux could drop the dirty pages and a *retried*
+  fsync would report success. Postgres now crashes and recovers from WAL instead of retrying.
+
+**LSN (log sequence number)**
+- *Without it:* after a crash you can't tell whether a page on disk already contains a change, so
+  re-applying could apply it twice (e.g. insert the same row twice).
+- *How it fixes it:* each WAL record has a position; each page stores the LSN of the last change
+  applied to it. Redo applies a record only if `page_lsn < record_lsn` → replay is **idempotent**.
+- *Why this size:* 64 bits (a byte offset into the log) — it never wraps in practice.
+- *Also used for:* measuring replication lag (primary LSN − replica LSN = bytes behind) and
+  enforcing the WAL rule (a page can be flushed only if `page_lsn ≤ flushed_lsn`).
+
+**Checkpoint**
+- *Without it:* recovery would replay the WAL from the very beginning, and no WAL could ever be
+  deleted.
+- *How it fixes it:* periodically flush all dirty pages, then record "everything before LSN X is
+  on disk". Recovery starts at X; older WAL can be recycled.
+- *Why this interval:* Postgres defaults to every **5 minutes** (`checkpoint_timeout`) or when
+  **1 GB** of WAL accumulates (`max_wal_size`). Shorter → faster recovery but more flush I/O and
+  more full-page images in WAL. Longer → less I/O, but recovery replays more and needs more WAL
+  disk. Writes are spread across the interval (`checkpoint_completion_target`) to avoid a spike.
+- *Problems it creates:* I/O bursts and WAL volume spikes right after each checkpoint.
+
+**Transaction**
+- *Without it:* a crash or error between "debit A" and "credit B" leaves money missing, and every
+  application has to write its own cleanup logic.
+- *How it fixes it:* all-or-nothing (atomicity via WAL/undo), isolation from others (MVCC/locks),
+  durability at commit (fsync).
+- *Problems it creates:* long transactions hold locks (blocking others) and old snapshots
+  (blocking cleanup). Under stricter isolation some transactions abort and **must be retried by
+  the app**. Each commit pays an fsync, so millions of tiny transactions are slower than batches.
+
+**MVCC (multi-version concurrency control)**
+- *Without it (plain locking):* a reader must lock rows so a writer can't change them mid-read. A
+  10-minute report then blocks every update to the rows it touches.
+- *How it fixes it:* writers create new versions; each reader sees the versions that were committed
+  when its snapshot started. Readers and writers don't block each other.
+- *Problems it creates:* **bloat** — old versions stay until VACUUM/purge removes them, and one
+  long-open transaction prevents that for everyone. **Write skew** under snapshot isolation.
+  **Transaction ID wraparound** in Postgres: xids are 32-bit (~2 billion usable), so old rows
+  must be "frozen" by VACUUM or the DB stops accepting writes to protect itself.
+- *Alternatives:* 2PL (readers lock), OCC (validate at commit), SSI (MVCC + conflict tracking).
+
+**Lock vs latch**
+- *Why two mechanisms:* two different dangers at two timescales. A **lock** protects a logical
+  row from another *transaction* (held for ms to minutes, can deadlock → needs a deadlock
+  detector). A **latch** protects a data structure in memory from another *thread* while it's being
+  changed (held for µs, deadlocks avoided by always taking them in a fixed order). Using a heavy
+  lock for a µs job is too slow; using a latch for a transaction-long job breaks isolation.
+- *Problems they create:* locks → waiting and deadlocks. Latches → **hot-spot contention**. For
+  example, with an ever-increasing key every insert hits the same right-most B+Tree leaf, so
+  threads queue on its latch. (That's the flip side of "sequential keys are good for cache
+  locality" — both are true; at very high insert rates, hash-sharding or partitioning spreads it out.)
+
+**Optimizer**
+- *Without it:* the programmer writes the plan by hand, and it silently becomes wrong when the table
+  grows from 1,000 to 100M rows.
+- *How it fixes it:* enumerate plans, estimate each one's cost from statistics (row counts,
+  histograms, distinct values), and pick the cheapest.
+- *Why cost-based and not "always use the index":* for a query returning 40% of a table, an index
+  scan does ~1 random read per row and is slower than reading the whole table sequentially.
+- *Problems it creates:* estimates can be wrong (correlated columns, stale stats, skew), and a small
+  estimate change can **flip the plan** → a query that took 5 ms takes 30 s with no code change.
+  Planning time grows fast with join count (Postgres switches to a genetic search at 12 tables,
+  `geqo_threshold`).
+
+**Index**
+- *Without it:* finding one row among 10M means reading ~125,000 pages.
+- *Why a B+Tree by default:* ~400 keys per page → 3–4 levels for billions of rows, the top levels
+  stay cached, and sorted order serves ranges and `ORDER BY` too.
+- *Problems it creates:* each index is extra work on **every** insert/update/delete, extra space,
+  and it bloats. Unused indexes are pure cost, so audit them (`pg_stat_user_indexes`). Too many
+  indexes also give the optimizer more ways to pick badly.
+
+**Replica**
+- *Without it:* one machine = one point of failure, and reads are capped at what one machine can
+  serve.
+- *How it works:* the primary streams its WAL; the replica replays it (crash recovery that never
+  ends).
+- *Problems it creates:* **replication lag** → stale reads (a user doesn't see the comment they just
+  posted). Async failover can **lose** the last acknowledged commits. Long queries on a replica can
+  conflict with replayed cleanup (Postgres cancels the query or delays replay). Sync replication
+  fixes loss but adds a network round trip to every commit.
+
+**Amplification (read / write / space)**
+- *Why the concept exists:* it's the common currency for comparing designs. *Read amplification*
+  = bytes read ÷ bytes wanted (read a 16 KB page for a 100 B row = 160×). *Write amplification* =
+  bytes written to disk ÷ bytes changed (WAL + page + index pages; LSM compaction rewrites data
+  10–30×). *Space amplification* = bytes on disk ÷ live data (MVCC bloat, obsolete LSM versions).
+- *Why it matters:* **RUM conjecture** — you can make two of read cost, update cost and memory/space
+  cost small, never all three. B+Tree favours reads, LSM favours writes, compression favours space.
+  Every design choice in §10 and §11 is a move along this triangle.
 
 ---
 
