@@ -300,10 +300,18 @@ exist?", jump to its card in [Key terms explained](#key-terms-explained--why-eac
 
 ### Key terms explained — why each one exists
 
-Each card answers the same questions: **What goes wrong without it? How does it fix that? Why this
+Each card starts with a **real-world analogy** (memorize this one first, then map each detail onto
+it), then answers the same questions: **What goes wrong without it? How does it fix that? Why this
 size/shape? What new problems does it create? What do others do instead?**
 
 **Page**
+- *Real-world analogy — shipping containers.* Before standard containers, every cargo item was
+  loaded by hand in its own shape; ports were slow and nothing fit anywhere. The fixed-size
+  container fixed that: every ship, crane and truck handles the same box, and you address it by
+  number. The price is the same as a page's: ship a whole container for one parcel (read
+  amplification), half-empty containers (fragmentation), oversized cargo that needs special
+  handling (TOAST), and a container dropped halfway onto the dock (torn write). Bigger containers
+  = fewer trips but more waste per small shipment — the page-size trade-off.
 - *Without it:* the DB would read arbitrary byte ranges. But the hardware never works that way:
   SSDs read and program in pages of 4–16 KB, and the OS caches in 4 KB pages. Reading 100 bytes
   still costs a whole block. Without a fixed unit you also can't address data simply, cache it in
@@ -322,6 +330,10 @@ size/shape? What new problems does it create? What do others do instead?**
 - *Alternatives:* variable-size blocks in LSM SSTables; immutable files on object storage.
 
 **Tuple / row**
+- *Real-world analogy — a parcel with a shipping label.* The contents are your data; the label
+  (sender, date sent, "returned?" flag) is the tuple header that tells the system who created it
+  and whether it's still valid. For a tiny parcel the label can be bigger than the contents — the
+  same reason a two-integer row costs ~36 bytes.
 - *Without it:* no unit to insert, lock, or version.
 - *Why this shape:* header (visibility info xmin/xmax, null bitmap, flags) + data. The header is
   what makes MVCC and NULLs possible without touching other rows.
@@ -330,6 +342,11 @@ size/shape? What new problems does it create? What do others do instead?**
   column stores and time-series engines strip per-row headers.
 
 **TID (tuple ID)**
+- *Real-world analogy — a street address with apartment numbers.* "Building 2,104, apartment 3."
+  Mail (the index) is addressed to the apartment, not to the person's description. Inside the
+  building the super can renumber the floors or move tenants between rooms as long as apartment 3
+  still points to them (the slot indirection). But if the tenant moves to *another building*,
+  every friend's address book (every index) must be updated — the cost of a non-HOT update.
 - *Without it:* each index would store a copy of the whole row (every update rewrites every copy)
   or the primary key (every secondary lookup becomes a second tree walk — which is exactly what
   InnoDB does, by choice).
@@ -342,6 +359,12 @@ size/shape? What new problems does it create? What do others do instead?**
   (HOT updates avoid it when the new version fits on the same page and no indexed column changed).
 
 **Buffer pool**
+- *Real-world analogy — your kitchen countertop vs the basement pantry.* You keep what you're
+  cooking with on the counter (RAM); everything else is downstairs (disk). The counter is small,
+  so something must go back down when you need space (eviction), and you decide what — not the
+  landlord (the OS). After you move house, the counter starts empty and every ingredient needs a
+  trip downstairs (cold start). A bigger counter helps only until it holds everything you actually
+  cook with (the hot working set).
 - *Without it:* every page access is a disk read (~80 µs NVMe, ~1 ms cloud disk) instead of
   ~100 ns in RAM. A lookup touching 4 pages at 20,000 queries/s would need 80,000 random reads/s.
 - *Why the DB owns it (not just the OS):* it must control eviction (one big scan shouldn't evict
@@ -355,12 +378,20 @@ size/shape? What new problems does it create? What do others do instead?**
 - *Alternatives:* mmap (gives up control), fully in-memory engines (no pool at all).
 
 **Hit / miss (hit ratio)**
+- *Real-world analogy — commuting by train.* If the train is on time 99% of days, you're late
+  ~3 days a year. At 90% you're late ~36 days — a "9% drop" that feels 10× worse. What you feel
+  is the misses, not the hits.
 - *Why track it:* it's the biggest single driver of read latency.
 - *Why the percentage misleads:* what matters is the *miss* rate. 99% → 90% hits sounds like a 9%
   change, but misses go from 1% to 10% → **10× more disk reads**. OLTP systems aim for >99%.
 - *Problems it creates:* a high average can hide a cold table that one important query always misses.
 
 **Dirty page**
+- *Real-world analogy — a shopping list on the fridge.* You don't drive to the store every time
+  you run out of something; you write it down and go once a week, buying 20 things in one trip
+  (write absorption). The risk: if the list is lost before the trip (crash), you forget what you
+  needed — so you also keep the notes somewhere safe (the WAL). And if the list gets too long,
+  you're forced to go shopping at a bad moment (flushing dirty pages before eviction).
 - *Without it (write-through):* every update writes its page to disk immediately → random writes on
   the commit path, and a hot page updated 1,000×/s is written 1,000×/s.
 - *How it fixes it:* change in RAM, mark dirty, write once later → **write absorption**.
@@ -369,6 +400,13 @@ size/shape? What new problems does it create? What do others do instead?**
   → background writers flush ahead of time. Checkpoints must flush them all → I/O bursts.
 
 **WAL (write-ahead log)**
+- *Real-world analogy — a ship's logbook / a bank teller's journal.* The teller doesn't
+  re-print every customer's passbook the instant money moves; they write one line in the journal
+  and update passbooks later. If the branch floods, the journal (kept in the safe) is enough to
+  rebuild every balance. The costs match too: everything is written twice (journal + passbook), a
+  journal nobody archives eventually fills the safe (disk full from a stuck replication slot), and
+  the teller can't say "done" faster than they can lock the journal page in the safe (fsync
+  latency).
 - *Without it:* either force every touched page at commit (slow, and a torn page still corrupts
   data) or accept losing data on crash.
 - *How it fixes it:* one small sequential append per change, one fsync per commit (shared by group
@@ -383,6 +421,12 @@ size/shape? What new problems does it create? What do others do instead?**
 - *Bonus:* the same stream powers replicas, point-in-time recovery and change-data-capture.
 
 **fsync**
+- *Real-world analogy — handing a letter to the post office vs getting a signed delivery
+  receipt.* Dropping it in the mailbox (`write()`) feels done, but it can still be lost before it
+  arrives (power cut → page cache gone). A registered letter with a signature (fsync) is slow and
+  costs more, so you use it only for what truly matters (the commit record). And some couriers
+  sign for parcels they haven't actually delivered yet (consumer SSDs without power-loss
+  protection).
 - *Without it:* `write()` returns once bytes are in the OS page cache. A power cut erases that
   cache — the "committed" transaction is gone.
 - *Why only at commit, only on the log:* it costs ~20–50 µs on datacenter NVMe with power-loss
@@ -393,6 +437,11 @@ size/shape? What new problems does it create? What do others do instead?**
   fsync would report success. Postgres now crashes and recovers from WAL instead of retrying.
 
 **LSN (log sequence number)**
+- *Real-world analogy — the "last read" bookmark in a series you're re-reading, or the version
+  number on a document.* If the page's sticker says "updated up to line 5,000" and the logbook
+  line is 4,800, you skip it — it's already applied. That's why replaying the log twice never
+  double-applies a change, exactly like a bank ignoring a cheque whose number it has already
+  processed.
 - *Without it:* after a crash you can't tell whether a page on disk already contains a change, so
   re-applying could apply it twice (e.g. insert the same row twice).
 - *How it fixes it:* each WAL record has a position; each page stores the LSN of the last change
@@ -402,6 +451,12 @@ size/shape? What new problems does it create? What do others do instead?**
   enforcing the WAL rule (a page can be flushed only if `page_lsn ≤ flushed_lsn`).
 
 **Checkpoint**
+- *Real-world analogy — saving your game.* Without saves, a crash sends you back to the very
+  start (replay the whole WAL). Save often and a crash costs little, but saving itself pauses the
+  game (checkpoint I/O). Save rarely and play is smooth, but a crash costs you a long replay. The
+  checkpoint interval is exactly this "how often do I save?" setting. Also like an accountant
+  closing the books monthly: older receipts can be archived once the month is closed (old WAL
+  recycled).
 - *Without it:* recovery would replay the WAL from the very beginning, and no WAL could ever be
   deleted.
 - *How it fixes it:* periodically flush all dirty pages, then record "everything before LSN X is
@@ -413,6 +468,10 @@ size/shape? What new problems does it create? What do others do instead?**
 - *Problems it creates:* I/O bursts and WAL volume spikes right after each checkpoint.
 
 **Transaction**
+- *Real-world analogy — a house purchase through escrow.* Money and keys change hands
+  together or not at all; nobody ends up with the money *and* the house, or neither. The costs
+  match too: while escrow is open the house is "held" for you (locks held by a long transaction),
+  and if a check fails the whole deal is cancelled and restarted (abort + retry).
 - *Without it:* a crash or error between "debit A" and "credit B" leaves money missing, and every
   application has to write its own cleanup logic.
 - *How it fixes it:* all-or-nothing (atomicity via WAL/undo), isolation from others (MVCC/locks),
@@ -422,6 +481,11 @@ size/shape? What new problems does it create? What do others do instead?**
   the app**. Each commit pays an fsync, so millions of tiny transactions are slower than batches.
 
 **MVCC (multi-version concurrency control)**
+- *Real-world analogy — Wikipedia page history / a newspaper's editions.* Readers see the
+  published edition while editors work on the next one; nobody waits for anybody. Old editions
+  must eventually be recycled (VACUUM), and one person still reading a very old edition forces the
+  library to keep every edition since then (a long transaction blocking cleanup). The counter on
+  the editions eventually wraps and must be reset before it runs out (xid wraparound).
 - *Without it (plain locking):* a reader must lock rows so a writer can't change them mid-read. A
   10-minute report then blocks every update to the rows it touches.
 - *How it fixes it:* writers create new versions; each reader sees the versions that were committed
@@ -433,6 +497,12 @@ size/shape? What new problems does it create? What do others do instead?**
 - *Alternatives:* 2PL (readers lock), OCC (validate at commit), SSI (MVCC + conflict tracking).
 
 **Lock vs latch**
+- *Real-world analogy — booking a meeting room vs holding the door.* A **lock** is a room
+  reservation: held for the whole meeting, visible on the calendar, and two people who each
+  booked the room the other needs next can block each other forever (deadlock → someone must
+  cancel). A **latch** is holding a door for a second while someone walks through: nobody books
+  it, it's released immediately, and a crowd at the one busy door (the right-most B+Tree leaf) is
+  the only way it becomes a problem.
 - *Why two mechanisms:* two different dangers at two timescales. A **lock** protects a logical
   row from another *transaction* (held for ms to minutes, can deadlock → needs a deadlock
   detector). A **latch** protects a data structure in memory from another *thread* while it's being
@@ -444,6 +514,11 @@ size/shape? What new problems does it create? What do others do instead?**
   locality" — both are true; at very high insert rates, hash-sharding or partitioning spreads it out.)
 
 **Optimizer**
+- *Real-world analogy — a navigation app (Google Maps / Waze).* You give the destination, it
+  picks the route from traffic data (statistics). With fresh data it finds the 10-minute route;
+  with stale data it confidently sends you onto a closed motorway (a plan flip). With 12+ stops it
+  stops trying every order and uses a heuristic, just like the planner switching to genetic search
+  for many-table joins.
 - *Without it:* the programmer writes the plan by hand, and it silently becomes wrong when the table
   grows from 1,000 to 100M rows.
 - *How it fixes it:* enumerate plans, estimate each one's cost from statistics (row counts,
@@ -456,6 +531,11 @@ size/shape? What new problems does it create? What do others do instead?**
   `geqo_threshold`).
 
 **Index**
+- *Real-world analogy — the index at the back of a textbook.* Look up "WAL" → pages 214, 380;
+  no need to read the whole book. Every time the author edits the book, every index entry that
+  moved must be updated (write cost), and the index adds pages to the book (space). A book with an
+  index for every word would be twice as thick and slow to revise — the "too many indexes"
+  problem.
 - *Without it:* finding one row among 10M means reading ~125,000 pages.
 - *Why a B+Tree by default:* ~400 keys per page → 3–4 levels for billions of rows, the top levels
   stay cached, and sorted order serves ranges and `ORDER BY` too.
@@ -464,6 +544,12 @@ size/shape? What new problems does it create? What do others do instead?**
   indexes also give the optimizer more ways to pick badly.
 
 **Replica**
+- *Real-world analogy — a news ticker in another city / a branch office receiving faxed
+  updates.* The branch can answer customers locally (read scaling) and keeps working if head
+  office burns down (failover). But the faxes arrive with a delay, so the branch may quote
+  yesterday's price (replication lag, stale reads). If head office burns before the last fax was
+  sent, those updates are gone (async data loss). Waiting for "fax received" on every change makes
+  every change slower (sync replication).
 - *Without it:* one machine = one point of failure, and reads are capped at what one machine can
   serve.
 - *How it works:* the primary streams its WAL; the replica replays it (crash recovery that never
@@ -474,6 +560,11 @@ size/shape? What new problems does it create? What do others do instead?**
   fixes loss but adds a network round trip to every commit.
 
 **Amplification (read / write / space)**
+- *Real-world analogy — shipping and moving house.* Read amplification: driving to a warehouse
+  and carrying back a whole box to get one screw. Write amplification: to change one line in a
+  printed book you reprint the page, the table of contents and the index. Space amplification:
+  keeping old versions of every document "just in case" until the cupboard is full. RUM: fast to
+  find, cheap to change, small to store — like "fast, cheap, good", pick two.
 - *Why the concept exists:* it's the common currency for comparing designs. *Read amplification*
   = bytes read ÷ bytes wanted (read a 16 KB page for a 100 B row = 160×). *Write amplification* =
   bytes written to disk ÷ bytes changed (WAL + page + index pages; LSM compaction rewrites data
