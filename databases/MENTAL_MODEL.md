@@ -10,8 +10,9 @@ Hands-on tasks for every chapter (predict, build, break, measure) are in [LABS.m
 
 ## Table of Contents
 
+- [Start here — the whole map in plain words](#start-here--the-whole-map-in-plain-words)
 1. [The One-Page Picture](#1-the-one-page-picture)
-2. [The Four Universal Pipelines](#2-the-four-universal-pipelines)
+2. [The Four Universal Pipelines](#2-the-four-universal-pipelines) — each with *why this path* and *what if it changes*
 3. [The Build Order: Phase 0 → Phase 16](#3-the-build-order-phase-0--phase-16)
 4. [Component Responsibility Map](#4-component-responsibility-map)
 5. [Cross-Cutting Concerns (the 4 Hard Problems)](#5-cross-cutting-concerns-the-4-hard-problems)
@@ -19,6 +20,108 @@ Hands-on tasks for every chapter (predict, build, break, measure) are in [LABS.m
 7. [End-to-End Trace of One Query](#7-end-to-end-trace-of-one-query)
 8. [Linear Reading Order](#8-linear-reading-order)
 9. [Common Pitfalls When Building Your Own](#9-common-pitfalls-when-building-your-own)
+10. [Layer by Layer: Why Exactly This Way](#10-layer-by-layer-why-exactly-this-way)
+11. [What If the Architecture Changes? — the change matrix](#11-what-if-the-architecture-changes--the-change-matrix)
+12. [Interview Questions and System Design Prompts](#12-interview-questions-and-system-design-prompts)
+
+---
+
+## Start here — the whole map in plain words
+
+**The problem.** A database makes two promises at once: *(1) once I say "saved", your data survives
+anything short of losing the disk*, and *(2) I answer quickly, even while thousands of people read
+and write the same data at the same time*. Both promises are hard for the same reason: RAM is fast
+but forgets everything on power loss, disks remember but are ~1,000× slower, and users collide.
+Every layer in this folder exists to keep one of those two promises despite those three facts.
+
+**The everyday analogy: a big library.**
+
+| Library | Database layer | What it does |
+|---|---|---|
+| The front desk that checks your card | Session / wire layer | Who are you, what language do you speak, one queue per visitor |
+| The librarian who plans how to find your books | Query engine (optimizer) | "Walk to shelf 12" vs "check every shelf" — picks the cheapest route |
+| The catalogue cards | Indexes | Jump straight to the shelf instead of walking every aisle |
+| The rules "one person edits a book at a time; readers see the last published edition" | Transactions + concurrency control | Nobody sees half-written pages; two editors don't overwrite each other |
+| The reading desk next to the door | Buffer pool | Keep popular books close so nobody walks to the basement twice |
+| The librarian's logbook, written *before* touching any book | WAL | After a fire, replay the logbook to rebuild exactly what was agreed |
+| The basement stacks | Disk (pages) | Cheap, huge, slow; books are stored in fixed-size boxes |
+| Branch libraries holding copies | Replication / distribution | Survive losing one building, serve more readers |
+
+### One user, all the way through the stack
+
+The scenario: an online shop. Table `users` has **10 million rows** of about **100 bytes** each ≈
+**1 GB**. Pages are **8 KB**, so the table is ≈ **125,000 pages**. There is a B+Tree index on
+`users.id`. The server has a **256 MB buffer pool** ≈ **32,000 page frames** — it can hold about a
+quarter of the table in RAM. The disk is an NVMe SSD (~**80 µs** per random page read). All numbers
+are illustrative but consistent with each other.
+
+**Read — a customer logs in:** `SELECT name FROM users WHERE id = 42`
+
+1. **Parse + plan** (doc 04). The text becomes a tree, names are checked against the catalogue,
+   and the optimizer compares two routes: read all 125,000 pages (~1 GB) or walk the index (≈4
+   pages). It picks the index. *Without care:* stale statistics make it believe the table has 10
+   rows, it picks the full scan, and login takes seconds instead of microseconds.
+2. **Walk the index** (doc 06). Each 8 KB index page holds ~400 keys, so 10M keys need only **3
+   levels** (400³ = 64M). Root and middle pages are touched by every query, so they are always in
+   RAM. The leaf page may or may not be. Result: a *tuple ID* — "page 2,104, slot 3".
+3. **Fetch the page** (doc 01). The buffer pool is asked for page 2,104. **Hit:** ~1 µs. **Miss:**
+   evict a cold page, read from SSD, ~80 µs. *Without a buffer pool:* every one of the ~4 page
+   touches is a disk read, and 20,000 logins/s would need 80,000 random reads/s.
+4. **Check visibility** (doc 05). The row carries "created by transaction 107, not deleted". Your
+   snapshot says 107 committed before you started → you may see it. No lock was taken, so a writer
+   updating this row right now does not block you.
+5. **Return** `'Ana'`. Total: ~20 µs if everything was hot, ~200 µs with two misses.
+
+**Write — the customer renames themselves:** `UPDATE users SET name = 'Ana B.' WHERE id = 42`
+
+6. **Log first** (doc 14). Append a ~100-byte record "txn 311 changed page 2,104 slot 3 to 'Ana
+   B.'" to the write-ahead log (WAL) in memory. Then change the page in the buffer pool and mark it
+   *dirty*. The 8 KB page is **not** written to disk now.
+7. **Commit = one fsync of the log** (docs 00, 14). `fsync` forces the log to durable storage:
+   ~20–50 µs on a datacenter NVMe, ~0.5–2 ms on a cloud network disk. Only then does the client
+   hear "COMMIT OK". *Group commit* lets 50 concurrent transactions share one fsync.
+8. **Later, in the background**, the dirty page is written to disk. If 30 more updates hit the
+   same page first, they all ride on that one write.
+
+**Crash — someone pulls the power cable one second later.**
+
+9. **Recovery** (doc 14). RAM is gone, so the buffer pool (with the dirty page) is gone. On
+   restart the database reads the WAL from the last *checkpoint* and re-applies every change the
+   disk is missing. The rename is back. A transaction that had not committed is rolled back. *Why
+   it works:* the log reached disk before "OK" was sent; the page never needed to.
+
+```
+ READ                                         WRITE                              CRASH
+ SQL → plan → index (3 levels) → buffer pool  log record (100 B) → page in RAM   replay WAL
+ 1 query     ~400 keys/page     hit 1 µs /    → fsync log (20 µs–2 ms)           from last
+             4 page touches     miss 80 µs    → "OK"  → page to disk later       checkpoint
+          → MVCC check → 'Ana'   (~20–200 µs)          (batched, async)          → same state
+```
+
+The whole folder is these nine steps, seen up close — plus what changes when you want them faster
+(docs 04, 15), on many machines (docs 12, 16, 19), or for a different workload (docs 07–13, 22).
+
+### Key terms in this chapter
+
+| Term | Plain meaning | Everyday analogy |
+|---|---|---|
+| Page | fixed-size block (4–16 KB) — the unit the DB reads and writes | a box in the library basement; you always carry a whole box |
+| Tuple / row | one record inside a page | one book in the box |
+| TID (tuple ID) | address of a row: (page number, slot number) | "basement box 2,104, position 3" |
+| Buffer pool | the DB's own RAM cache of pages | the reading desk near the door |
+| Hit / miss | page found in RAM / had to read it from disk | book on the desk / walk to the basement |
+| Dirty page | page changed in RAM but not yet written to disk | a book with pencil notes not yet copied into the master |
+| WAL (write-ahead log) | append-only list of changes, written before the pages | the librarian's logbook |
+| fsync | "OS, put this on durable storage now, and tell me when" | posting the logbook page into the fire safe |
+| LSN | position of a record in the WAL; every page remembers the last LSN applied to it | logbook line number |
+| Checkpoint | point where all older changes are known to be on disk; recovery starts here | "everything before line 5,000 is already copied into the books" |
+| Transaction | a group of changes that all happen or none happen | a bank transfer: debit and credit together |
+| MVCC | keep old row versions so readers see a consistent snapshot without locking | readers get the printed edition while an editor works on the draft |
+| Lock vs latch | lock = protects a row for a whole transaction; latch = protects a memory structure for microseconds | reserving a meeting room for the afternoon vs holding a door for a second |
+| Optimizer | picks the cheapest way to run a query, using statistics | a route planner using traffic data |
+| Index | extra structure that maps a key to where rows live | the catalogue |
+| Replica | another machine holding a copy, fed from the WAL | a branch library receiving copies of the logbook |
+| Amplification | extra bytes read/written/stored per byte the user asked for | carrying a whole box to read one page |
 
 ---
 
@@ -144,6 +247,30 @@ Project columns, filter further, return tuple to client
 
 **Where each doc fits:** parsing/optimization → 04 · index → 06 · buffer/page → 01, 02 · access methods → 03 · MVCC → 05 · OS-level read → 00.
 
+> **In plain words.** Plan the route, look the key up in the catalogue, get the box from the desk
+> (or the basement), and check you're allowed to see that edition of the book.
+
+**Why exactly this path — what each step solves:**
+
+| Step | Problem it solves | Why it sits *here* in the order |
+|---|---|---|
+| Optimize before executing | The same SQL has many plans; the best and worst differ by 1,000×+ | Planning costs µs; running a bad plan costs seconds. Decide once, up front |
+| Index returns a **TID**, not the row | Many indexes on one table must not each hold a full copy of the row | Indirection: the heap owns the row, indexes own *where it is*. A row can move inside its page (slot directory) without touching any index |
+| Buffer pool between everyone and disk | Disk is ~1,000× slower than RAM | Every layer above asks for pages by ID; only one layer decides what stays in RAM |
+| MVCC check **after** fetching the tuple | Readers must not block writers | Version info (xmin/xmax) lives *on the row*, so visibility can only be decided once the row is in hand. That's also why indexes can return invisible rows and the heap must re-check |
+
+**What if the architecture changes:**
+
+| Change | What happens to the read path | Who does it |
+|---|---|---|
+| **Clustered index** instead of heap | Row lives inside the PK B+Tree leaf → PK lookup is one tree walk, no heap hop. Secondary indexes store the *PK*, not a TID → secondary lookup = two tree walks | InnoDB, SQL Server (clustered), SQLite (rowid tables) |
+| **Index-only scan** | If all needed columns are in the index *and* the page is known all-visible, skip the heap entirely | Postgres (visibility map), covering indexes everywhere |
+| **LSM tree** instead of B+Tree | Read = memtable → L0 files → L1 → … ; bloom filters skip most files, but a miss can still touch several levels (**read amplification**) | RocksDB, Cassandra, ScyllaDB |
+| **Columnar** storage | No per-row lookup; read only the needed columns, skip blocks via min/max (zone maps). Point lookups get *slower*, scans of 3 columns out of 100 get ~30× less I/O | ClickHouse, DuckDB, Parquet |
+| **In-memory** | Buffer pool disappears; index points straight at the row in RAM | Redis, VoltDB, SAP HANA row store |
+| **Read replica** | Same path, but on a copy that is behind the primary by the replication lag → stale reads | Any async replica |
+| **Sharded / distributed** | A routing step (which shard owns `id=42`?) and a read timestamp (HLC/TrueTime) are added in front | CockroachDB, Spanner, Vitess |
+
 ### 2.2 Write Path: `INSERT INTO users VALUES (42, 'Ana')`
 
 ```
@@ -183,7 +310,36 @@ Dirty page eventually written to disk by background flusher
    (NOT required for durability — WAL already has it)
 ```
 
-**Two non-negotiable rules.** (1) WAL is written **before** the page is dirtied is allowed to leave the buffer pool (Write-Ahead Logging). (2) Commit returns to the client only **after** WAL fsync. Get either wrong and your DB silently corrupts under crash.
+**Two non-negotiable rules.** (1) The WAL record describing a change must be on disk **before** the dirty page it describes is allowed to leave the buffer pool (Write-Ahead Logging). (2) Commit returns to the client only **after** WAL fsync. Get either wrong and your DB silently corrupts under crash.
+
+> **In plain words.** Write one line in the logbook, change the book on the desk, and only when
+> the logbook line is in the fire safe say "done". The book goes back to the basement whenever it's
+> convenient.
+
+**Why exactly this path — what it solves:**
+
+- **Log first, pages later.** A commit touches pages scattered across the disk (heap page + one
+  page per index). Writing all of them at commit = several *random* writes. Writing a ~100-byte
+  log record = one *sequential* append. The WAL turns "make N random pages durable now" into
+  "make one sequential log durable now, fix the pages later".
+- **Pages written lazily.** A hot page updated 1,000 times per second is written to disk once per
+  checkpoint, not 1,000 times (**write absorption**).
+- **Free-space map before insert.** Finding a page with room by scanning the table would make
+  every insert O(table size).
+- **Indexes updated in the same transaction.** Otherwise a crash leaves the index pointing at rows
+  that don't exist, or rows no index can find.
+- **`page_lsn` stamped on each page.** It lets recovery ask "has this page already seen this log
+  record?" — the key to idempotent redo (§2.4).
+
+**What if the architecture changes:**
+
+| Change | Effect on the write path | Trade-off |
+|---|---|---|
+| **No WAL, force pages at commit** | Commit = random write of every touched page; a crash mid-write leaves a *torn* page (half old, half new) | ~10× slower commits and still unsafe, unless you add shadow paging / copy-on-write (LMDB, the old SQLite rollback journal) |
+| **LSM tree** | Write = WAL append + in-memory memtable insert. No page read-modify-write at all | Very fast ingest; the cost moves to background **compaction** (write amplification 10–30×) and to reads |
+| **Postgres heap vs InnoDB update-in-place** | Postgres writes a *new tuple version* and, unless it's a HOT update, a new entry in *every* index. InnoDB updates in place and writes the old value to an undo log | Postgres: simple MVCC, but index write amplification and VACUUM. InnoDB: fewer index writes, but undo purge and secondary-index indirection |
+| **Columnar store** | Rows can't be appended column-by-column cheaply → writes land in a row-format delta/buffer, merged into columns in bulk | Great scans, poor single-row writes (see doc 09 HTAP) |
+| **Torn-page protection** | Postgres logs a *full page image* on the first change after each checkpoint; InnoDB uses a doublewrite buffer | Protects against 8 KB pages on 4 KB-atomic hardware, costs extra WAL volume right after checkpoints |
 
 ### 2.3 Commit Path (the critical second of a transaction's life)
 
@@ -214,6 +370,33 @@ Release row locks (2PL), drop xact MVCC slot                  ── doc 17
 Reply to client: "COMMIT OK"
 ```
 
+> **In plain words.** "Committed" means exactly one thing: the log record saying so is on durable
+> storage. Everything else — pages, replicas, cleanup — can happen before or after, but the reply
+> waits for that one fsync.
+
+**Why exactly this path:**
+
+- **The durability point is one fsync of one file.** It's the cheapest possible thing that
+  survives power loss. Everything that can be deferred is deferred.
+- **Group commit.** fsync costs roughly the same for 1 record or 50. With 50 transactions waiting,
+  one fsync commits all of them: on a 1 ms cloud disk this is the difference between ~1,000 and
+  ~50,000 commits/s.
+- **Locks are released *after* the commit record is durable** (strict 2PL). Release earlier and
+  another transaction could read a value that a crash then erases (dirty read → cascading abort).
+- **Reply is last.** If the client hears "OK" before the fsync, a crash in between loses a
+  transaction the client believes is safe.
+
+**What if the architecture changes:**
+
+| Change | Where the durability point moves | Trade-off |
+|---|---|---|
+| **Async commit** (`synchronous_commit = off`, `innodb_flush_log_at_trx_commit = 2`) | Reply before fsync; WAL flushed every ~200 ms–1 s | Crash loses the last fraction of a second of commits — but never corrupts. Fine for clicks/metrics, not for payments |
+| **Sync replication** | Reply after the replica *also* has the WAL | RPO = 0 on primary loss; commit latency += network RTT (~0.5 ms same zone, 30–100 ms cross-region) |
+| **Consensus (Raft/Paxos)** | Reply after a *majority* has the log entry | Survives f failures with 2f+1 nodes, no manual failover; every write pays one quorum round trip |
+| **Distributed transaction across shards** | Two-phase commit: all shards *prepare* (durable), then coordinator logs *commit* | Two rounds instead of one; a coordinator crash between phases leaves participants blocked holding locks |
+| **Spanner-style commit wait** | Reply after waiting out clock uncertainty (a few ms) | External consistency across the globe, paid for in latency on every write |
+| **Shared-storage (Aurora, Neon)** | Reply after a write quorum of storage nodes (Aurora: 4 of 6) has the *log* — compute never writes pages | Fast failover and storage that scales separately; you depend on a custom storage tier |
+
 ### 2.4 Recovery Path (ARIES, after crash)
 
 ```
@@ -239,6 +422,38 @@ DB online. Clients reconnect. No data loss for committed txns.
 ```
 
 **Mental model:** WAL = "what *should* have happened." After crash, replay the WAL onto whatever the disk happens to look like, then unwind anything uncommitted. The disk pages are essentially a cache that the WAL is the source of truth for.
+
+> **In plain words.** After the fire, open the logbook at the last "everything before here is
+> safe" bookmark, redo every line, then cross out the work of anyone who hadn't signed off.
+
+**Why exactly this path — the buffer-pool policy it makes safe.** Two choices decide how hard
+recovery is:
+
+| | **No-force** (don't flush pages at commit) | **Force** (flush every page at commit) |
+|---|---|---|
+| **Steal** (may flush uncommitted pages to free RAM) | Fast commits + bounded RAM. Needs **redo** *and* **undo** → ARIES | Needs undo only; slow commits |
+| **No-steal** (never flush uncommitted pages) | Needs redo only; a huge transaction must fit in RAM | No recovery needed; slowest and RAM-bound |
+
+Every serious disk database picks **steal + no-force**, because it gives the fastest commits and
+the most flexible buffer pool. ARIES exists to make that choice safe:
+
+- **Analysis** rebuilds "who was running, which pages were dirty" — because RAM lost that.
+- **Redo repeats history**, including uncommitted work — because that is simple, and the
+  `page_lsn` check makes it idempotent (a crash *during* recovery just restarts it).
+- **Undo** rolls back losers and writes CLRs — so undo itself is never undone twice.
+- **Checkpoints** bound how much WAL must be replayed → they bound **recovery time**
+  (RTO). More frequent checkpoints = faster recovery, but more background I/O.
+
+**What if the architecture changes:**
+
+| Change | Effect on recovery |
+|---|---|
+| **Postgres-style MVCC** | No physical undo pass: an uncommitted transaction's row versions stay on the page but are invisible, because the commit log (`pg_xact`) says the xid never committed. VACUUM cleans them later |
+| **InnoDB** | Redo from the redo log, then roll back uncommitted transactions using the undo logs (background) |
+| **LSM tree** | Replay WAL into a fresh memtable. SSTables are immutable, so they never need repair — only the manifest says which ones are live |
+| **In-memory DB** | Load last snapshot + replay command log; recovery time ∝ dataset size, so snapshot often |
+| **Replica failover** | Don't recover — promote a replica that's already warm. Seconds instead of minutes, at the cost of losing unreplicated commits if replication was async |
+| **Shared storage (Aurora)** | Storage nodes apply redo continuously; compute restart is near-instant because there is nothing to replay locally |
 
 ---
 
@@ -502,6 +717,514 @@ The list of mistakes you (and every textbook DB) will make on the first try.
 10. **Distributed before single-node is solid.** Adding consensus to a buggy storage engine multiplies the bugs. Get phases 0–10 reliable first. → doc 12, 19.
 11. **Confusing replication consistency with transaction isolation.** "Async replicated" ≠ "read uncommitted." They're orthogonal. → doc 12 §9, 19 §1.
 12. **Heartbeat-only failure detection on flaky networks.** Use phi-accrual or SWIM-style suspicion levels; binary "alive/dead" causes flap storms. → doc 16, `failure_detection_phi_accrual.py`.
+
+---
+
+## 10. Layer by Layer: Why Exactly This Way
+
+> **In plain words.** Each layer below gets the same six questions: what is it in one sentence,
+> what everyday thing is it like, what problem forces it to exist, why it's built *this* way and
+> not another, what it costs, and what happens if you swap it for the alternative.
+>
+> **How to use this section.** When a design choice in any doc feels arbitrary, find its layer
+> here. The "why" is almost always one of three hardware facts: *RAM forgets on power loss*,
+> *disk is ~1,000× slower than RAM*, *sequential I/O beats random I/O*. Plus one human fact:
+> *many users touch the same data at once*.
+
+### 10.1 Session / Wire Layer
+
+- **Simple explanation.** The front door: it checks who you are, speaks the client's protocol,
+  and gives each connection its own conversation state.
+- **Analogy.** The reception desk that checks your badge and hands you a visitor number.
+- **Problem it solves.** Authentication, message framing, and keeping per-connection state
+  (current transaction, prepared statements, `SET` variables) apart.
+- **Why exactly this way.** Parse and execute are separate protocol messages (prepared
+  statements) so a query can be planned once and run many times, and so parameters travel
+  *separately* from SQL text — which is what makes parameter binding immune to SQL injection.
+- **Cost / trade-off.** Connections are expensive: Postgres forks one OS process per connection
+  (several MB each, plus snapshot-computation cost that grows with connection count).
+- **What if you change it.**
+
+| Change | Result |
+|---|---|
+| Process-per-connection → thread-per-connection (MySQL) | Cheaper connections, but one bad thread can take down the whole server process |
+| Add a pooler (PgBouncer, RDS Proxy) in *transaction* mode | 10,000 app connections share ~100 server connections; session state (session-level `SET`, advisory locks, `LISTEN`) no longer survives across transactions |
+| HTTP/serverless drivers (Neon, PlanetScale, Data API) | Works from edge functions with no persistent sockets; each request pays connection/auth setup unless the provider pools |
+
+### 10.2 Query Engine (parser → optimizer → executor) — doc 04, 15
+
+- **Simple explanation.** Turns "what I want" (SQL) into "how to get it" (a plan of operators),
+  picks the cheapest plan, then runs it.
+- **Analogy.** A route planner: you give the destination, it picks roads using live traffic data
+  (statistics).
+- **Problem it solves.** Users should not have to know which indexes exist or which join order is
+  fast — and the right answer *changes as the data grows*.
+- **Why exactly this way.**
+  - **Declarative SQL** separates *what* from *how*, so the DB can switch plans when a table goes
+    from 1,000 to 100M rows without anyone changing application code.
+  - **Cost-based optimizer** because join orders explode combinatorially (n! for n tables); only
+    estimates from statistics can prune them.
+  - **Volcano iterator (`next()`)** because any operator can plug into any other — a join does not
+    care whether its input is a scan, a filter or another join.
+- **Cost / trade-off.** Estimates are guesses: a 10× cardinality error on a join input can flip the
+  plan from hash join to nested loop and turn 50 ms into 5 min. Volcano's one-virtual-call-per-row
+  wastes CPU on big scans.
+- **What if you change it.**
+
+| Change | Result | Who |
+|---|---|---|
+| Tuple-at-a-time → **vectorized** (batches of ~1,000 values) | 10–100× faster analytical scans (CPU caches, SIMD); little gain for single-row OLTP | DuckDB, ClickHouse, Snowflake |
+| Interpretation → **compiled** plans (codegen) | Removes interpretation overhead; compile time hurts short queries | HyPer/Umbra, Spark whole-stage codegen |
+| Pull → **push-based** execution | Easier parallelism and pipeline scheduling | DuckDB, Umbra |
+| Cost-based → **rule-based** / no optimizer | Predictable plans, but performance depends on how the query was written | early Oracle RBO, many NoSQL query layers |
+| Plan per execution → **cached generic plan** | Saves planning time; can be terrible for skewed parameters (one plan for `country='US'` and `country='IS'`) | Postgres generic plans, SQL Server parameter sniffing |
+
+### 10.3 Access Methods — doc 03
+
+- **Simple explanation.** The adapter between "the executor wants the next row" and "the storage
+  has pages and indexes".
+- **Analogy.** The warehouse picker who knows whether to walk every aisle or use the shelf map.
+- **Problem it solves.** Keeps the executor ignorant of how data is laid out, so new index types or
+  storage formats can be added without rewriting the executor.
+- **Why exactly this way.** There's no single best scan: a **sequential scan** reads every page but
+  sequentially; an **index scan** reads few pages but randomly; a **bitmap scan** collects TIDs
+  first, sorts them by page, then reads each page once — the middle ground. The crossover is
+  roughly "an index wins when the query needs under a few percent of the table" (driven by
+  `random_page_cost` / `seq_page_cost`).
+- **Cost / trade-off.** Choosing wrong is the #1 slow-query cause: an index scan over 30% of a
+  table does ~1 random read per row.
+- **What if you change it.** Columnar engines replace "scan pages, emit rows" with "read column
+  chunks, skip chunks whose min/max can't match". Table access methods as a plug-in API (Postgres
+  `tableam`) are what let extensions like columnar storage or OrioleDB replace the heap.
+
+### 10.4 Transactions + Concurrency Control — docs 05, 17, 18
+
+- **Simple explanation.** Makes many users behave as if each were alone, and makes a group of
+  changes happen completely or not at all.
+- **Analogy.** Readers get the printed edition; editors work on drafts; two editors can't edit the
+  same paragraph at the same time; a draft is published all at once.
+- **Problem it solves.** Two facts: *users collide* (lost updates, reading half-done work) and
+  *crashes happen mid-change* (half a bank transfer).
+- **Why exactly this way.**
+  - **MVCC for reads** because the most common conflict is "long report vs short updates". With
+    versions, readers never wait for writers and writers never wait for readers.
+  - **Locks for write–write conflicts** because two writers to the same row must be ordered —
+    versions alone can't decide who wins.
+  - **Latches ≠ locks.** Latches guard in-memory structures for microseconds and never deadlock (by
+    ordering); locks guard logical rows for a whole transaction and can deadlock (so they need
+    detection). Different lifetimes → different mechanisms.
+- **Cost / trade-off.** Old versions pile up → VACUUM/purge is mandatory, and one long-open
+  transaction blocks cleanup for everybody. Snapshot isolation still allows **write skew** (two
+  doctors each check "someone else is on call", both go off call).
+- **What if you change it.**
+
+| Change | Result | Who |
+|---|---|---|
+| MVCC → **pure 2PL** | Serializable and simple; readers block writers, long reports stall OLTP | SQL Server default (non-RCSI) |
+| → **OCC** (validate at commit) | No waiting at low contention; abort storms on hot rows | many in-memory DBs (Hekaton, Silo) |
+| Snapshot → **SSI** | True serializability with modest overhead; some *false-positive* aborts, so apps must retry | Postgres `SERIALIZABLE`, CockroachDB |
+| → **Deterministic** (Calvin) | Pre-ordered transactions, no concurrency aborts, easy replication; needs the read/write set up front | FaunaDB (Calvin-inspired) |
+| Weaker isolation (Read Committed) | Fewer aborts, more anomalies the app must handle (lost updates without `SELECT … FOR UPDATE`) | Postgres/Oracle default |
+
+### 10.5 Indexes — doc 06, 11, 13
+
+- **Simple explanation.** Extra structures that answer "where are the rows with key X?" without
+  reading the whole table.
+- **Analogy.** The library catalogue, sorted so you can find one card — or a range of cards — fast.
+- **Problem it solves.** Finding 1 row in 10M without reading 125,000 pages.
+- **Why exactly this way (B+Tree).**
+  - **High fanout** (~400 keys per 8 KB page) → only 3–4 levels for billions of rows, and the top
+    levels stay in RAM. So a lookup costs ~1 disk read.
+  - **Sorted** → the same structure serves `=`, ranges, `ORDER BY` and `MIN/MAX`.
+  - **Node = page** → the index uses the same buffer pool, WAL and latches as everything else.
+  - **Values only in leaves, leaves linked** → range scans walk sideways without going back up.
+- **Cost / trade-off.** Every index is paid on every write (an insert into a table with 6 indexes
+  = 7 page modifications). Random inserts (UUIDv4 keys) split pages all over the tree and wreck
+  cache locality — which is why time-ordered keys (UUIDv7, sequences) insert faster.
+- **What if you change it.**
+
+| Change | Wins | Loses |
+|---|---|---|
+| **Hash index** | O(1) equality | No ranges, no ordering |
+| **LSM tree** (doc 13) | Sequential writes, high ingest | Read + space amplification, compaction stalls |
+| **BRIN** | Tiny (KBs for GBs) on naturally ordered data (timestamps) | Useless when the column is random |
+| **GIN / inverted** | Full-text, JSONB, arrays | Slow updates (pending list) |
+| **HNSW / IVF** (doc 11) | Approximate nearest neighbor for embeddings | Approximate answers, high RAM, recall/latency knobs |
+| **No index** | Zero write cost | Every lookup is a full scan |
+
+### 10.6 Storage: Pages, Slotted Layout, Heap — docs 01, 02
+
+- **Simple explanation.** Data is stored in fixed-size boxes (pages); inside each box a small table
+  of contents (slot directory) says where each row starts.
+- **Analogy.** Identical shipping boxes with a packing list taped inside the lid.
+- **Problem it solves.** Rows have different lengths; disks and the OS move data in fixed blocks.
+- **Why exactly this way.**
+  - **Fixed-size pages** → `offset = page_id × page_size`, interchangeable buffer frames, alignment
+    with OS/SSD blocks, simple free-space tracking.
+  - **Slotted pages** → rows can move or be compacted *within* the page while their TID (page,
+    slot) stays stable, so indexes don't have to change.
+  - **Heap (unordered)** → inserts go anywhere with free space, which is the cheapest possible insert.
+- **Cost / trade-off.** Page size: small (4 KB) = less wasted I/O for point reads; large (16 KB
+  InnoDB, MBs in columnar) = fewer tree levels and better scans. Heap = no physical order, so range
+  scans on a non-clustered key are random reads.
+- **What if you change it.** Heap → **clustered** (InnoDB): rows ordered by PK, fast PK ranges,
+  slower secondary lookups. Row pages → **columnar** blocks (Parquet row groups ~128 MB, column
+  chunks with compression): scans read 5–10× fewer bytes, single-row updates become rewrites.
+  In-place pages → **append-only** files (LSM, lakehouse): no read-modify-write, immutable files,
+  cleanup by compaction.
+
+### 10.7 Buffer Pool — doc 01
+
+- **Simple explanation.** The DB's own RAM cache of pages; every layer reads pages only through it.
+- **Analogy.** The reading desk by the door: popular books stay on it, the least-used goes back to
+  the basement when space runs out.
+- **Problem it solves.** Disk latency (~80 µs NVMe, ~1 ms cloud disk) vs RAM (~100 ns).
+- **Why exactly this way (and not "just let the OS cache it").**
+  - **Eviction the DB controls** → one big sequential scan must not flush the whole hot set (scan
+    resistance: ring buffers, LRU-K, 2Q).
+  - **Write ordering the DB controls** → a dirty page may only go to disk after its WAL record
+    (§2.2 rule 1). The OS page cache writes back whenever it likes.
+  - **Pin counts** → a page in use by an operator can't be evicted mid-read.
+  - **Clock instead of true LRU** → LRU must move a list node (under a lock) on *every* hit; clock
+    only sets a bit.
+- **Cost / trade-off.** Postgres still goes through the OS page cache (double buffering), which is
+  why `shared_buffers` is typically ~25% of RAM, not 80%. Engines using `O_DIRECT` (InnoDB) size
+  their pool to ~70–80% of RAM.
+- **What if you change it.**
+
+| Change | Result |
+|---|---|
+| Buffer pool → **mmap** | Less code, but no control of eviction or write-back order, I/O stalls show up as page faults, error handling via signals. MongoDB replaced MMAPv1 with WiredTiger; see "Are You Sure You Want to Use MMAP in Your DBMS?" (CIDR 2022). LMDB makes it work by being copy-on-write and read-mostly |
+| Remove it (**in-memory**) | No page indirection; 10×+ faster, but dataset must fit in RAM and durability relies on log + snapshots |
+| **Pointer swizzling** (LeanStore, Umbra) | In-memory speed for hot data, disk capacity for cold |
+| Undersize it | Hit ratio falls from 99% to 90% → 10× more disk reads → latency cliff, not a slope |
+
+### 10.8 Write-Ahead Log — doc 14
+
+- **Simple explanation.** An append-only journal of every change, forced to disk at commit, from
+  which the database can rebuild itself.
+- **Analogy.** The librarian's logbook in the fire safe.
+- **Problem it solves.** Durable commits must be fast, and a crash can leave pages half-written.
+- **Why exactly this way.**
+  - **Append-only** → sequential I/O, the fastest thing a disk does.
+  - **One file to fsync** → the durability cost is one fsync per group of commits, not one per page.
+  - **Single source of truth** → the same stream feeds crash recovery, replicas (physical
+    replication), point-in-time recovery (archived WAL) and change-data-capture (logical decoding,
+    Debezium). One mechanism, four features.
+  - **Physiological records** ("on page 88, insert this tuple at slot 5") → small like logical
+    logging, but replayable page-by-page like physical logging.
+- **Cost / trade-off.** Every byte is written twice (log + page), and the log disk's fsync latency
+  becomes your commit latency floor.
+- **What if you change it.** WAL on the same slow disk as data → put it on its own low-latency
+  device. `fsync = off` → fast until the first power cut, then corruption. Shadow paging instead of
+  WAL (LMDB) → no log, but copy-on-write of every path to the root and one writer at a time. "The
+  log *is* the database" (Aurora, Neon, Kafka-style designs) → compute ships only log records;
+  storage materializes pages on demand.
+
+### 10.9 OS + Hardware — doc 00
+
+- **Simple explanation.** The physical rules every layer above is shaped around.
+- **Analogy.** The building's floor plan: where the library can put the stacks and how far the
+  basement is.
+- **Problem it solves.** Nothing — it *creates* the problems. Knowing it tells you *why* the layers
+  look the way they do.
+- **Why databases work this way because of it.** Flash erases in blocks → pages. The page cache
+  lies about durability → fsync. Random I/O is slower than sequential → WAL, LSM, columnar.
+  CPU cache misses cost ~100 cycles → vectorized execution and cache-friendly node layouts.
+- **What if you change it.**
+
+| Hardware | What changes above it |
+|---|---|
+| **HDD** (~10 ms seek) | Sequential is everything; big pages; B+Trees kept shallow; one I/O queue |
+| **NVMe** (~80 µs, deep queues) | Random reads are affordable; the bottleneck moves to CPU, latches and syscalls → io_uring, async I/O, lock-free buffer pools |
+| **Cloud network disk** (EBS, PD) | ~0.5–2 ms fsync, IOPS and throughput *quotas* → group commit and larger I/Os matter more than on local NVMe |
+| **Object storage** (S3) | ~10–100 ms per request, huge throughput, immutable objects, no in-place update → immutable files + metadata log (LSM, Iceberg/Delta, doc 22) |
+| **Lots of RAM** | Whole working set fits → in-memory engines (doc 10), buffer pool becomes a formality |
+
+### 10.10 Distribution — docs 12, 16, 19
+
+- **Simple explanation.** Copy the data to several machines (replication) and/or split it across
+  them (sharding), then agree on what happened when machines and networks fail.
+- **Analogy.** Branch libraries: copies of the logbook are mailed to each branch; for big
+  decisions, a majority of branches must agree.
+- **Problem it solves.** One machine has a ceiling on capacity, throughput and availability.
+- **Why exactly this way.**
+  - **Replicate the WAL**, not SQL statements → the log already exists, is deterministic, and
+    replays exactly (statements like `NOW()` or `RANDOM()` don't).
+  - **Majority quorums** (Raft/Paxos) → any two majorities overlap, so two leaders can never both
+    commit conflicting entries.
+  - **Suspicion-based failure detection** (phi-accrual, SWIM) → on a real network you can't tell
+    "slow" from "dead"; binary heartbeats flap.
+- **Cost / trade-off.** Every guarantee costs a network round trip, and the speed of light sets the
+  floor (~1 ms RTT per ~100 km of fiber). CAP/PACELC: under a partition choose consistency or
+  availability; otherwise choose latency or consistency.
+- **What if you change it.**
+
+| Choice | You get | You pay |
+|---|---|---|
+| **Async replicas** | Read scaling, cheap HA | Replication lag, stale reads, data loss (RPO > 0) on failover |
+| **Sync / quorum replication** | RPO = 0 | +1 RTT on every commit; availability depends on replicas being up |
+| **Sharding** | Write scaling and capacity | Cross-shard transactions (2PC), cross-shard joins, re-sharding, hot keys |
+| **Leaderless** (Dynamo-style) | Writes accepted anywhere, high availability | Conflicts → last-writer-wins (silent loss) or CRDTs; read repair; eventual consistency |
+| **Shared storage** (Aurora, Neon, Socrates) | Scale compute separately, fast failover, no data copy for replicas | Single-writer, vendor-specific storage layer |
+
+---
+
+## 11. What If the Architecture Changes? — the change matrix
+
+> **In plain words.** Every "new" database is the same stack with one or two layers swapped. This
+> table shows, for the most common swaps, which of the four pipelines (§2) change and what you win
+> and lose.
+
+| Architecture change | Read path | Write path | Commit path | Recovery path | You win | You lose | Example |
+|---|---|---|---|---|---|---|---|
+| B+Tree → **LSM** | Check memtable + several levels, bloom filters | Append WAL + memtable, no page RMW | Same (WAL fsync) | Replay WAL into memtable | 5–10× write throughput, better compression | Read amp, compaction stalls, space amp | RocksDB, Cassandra |
+| Row → **columnar** | Read only needed columns, skip blocks | Batched via delta store | Same or batch-level | Rebuild delta from log | 10–100× faster scans/aggregates | Slow point reads and single-row updates | ClickHouse, DuckDB |
+| Heap → **clustered** index | PK lookup = 1 tree walk; secondary = 2 | Insert into PK order; page splits | Same | Same | Fast PK ranges, no heap hop | Slower secondary lookups, random-PK splits | InnoDB |
+| Disk → **in-memory** | Pointer chase, no buffer pool | Memory write + log | Log fsync (or async/replica-based) | Snapshot + log replay | µs latency | Dataset ≤ RAM, slower restarts | Redis, VoltDB |
+| Buffer pool → **mmap** | Page faults instead of pool lookups | OS decides write-back | Must still fsync correctly | Hard: no control over what reached disk | Less code | Control, predictability, error handling | LMDB (works because CoW) |
+| MVCC → **2PL only** | Readers take shared locks | Same | Release locks at commit | Same | Simpler, serializable | Readers block writers | SQL Server default |
+| Single node → **async replica** | Optional stale reads on replica | Same | Unchanged latency | Failover = promote replica | Read scale, HA | Lag, possible data loss on failover | Postgres streaming |
+| → **Raft / sync quorum** | Leader reads (or lease reads) | Same, via leader | +1 quorum RTT | Leader election, no manual failover | RPO = 0, automatic failover | Write latency, needs 3+ nodes | etcd, CockroachDB |
+| → **Sharded** | Route to shard; scatter-gather for non-key queries | Route to shard | 2PC for multi-shard txns | Per shard | Write scale, capacity | Cross-shard txns/joins, rebalancing | Vitess, Citus, Spanner |
+| → **Shared storage** | Pages fetched from storage tier | Compute ships only log records | Storage write quorum | Storage applies redo continuously | Fast failover, independent scaling | Custom storage, single writer | Aurora, Neon |
+| Local disk → **object storage** (lakehouse) | Read Parquet + metadata; heavy caching | Write new immutable files + commit metadata | Atomic metadata swap (catalog CAS) | Nothing to replay; old snapshots remain | Cheap PB storage, open formats, compute separation | Latency, small-file problem, no row-level OLTP | Iceberg, Delta Lake |
+
+**A four-question method for any change you haven't seen before:**
+
+1. **Which primitive moves?** Every change shifts work between *read a page*, *write a page* and
+   *log an intention*. LSM moves "write a page" to background compaction; columnar moves "read a
+   row" to "read a column chunk".
+2. **Which amplification gets worse?** The **RUM conjecture**: you can optimize at most two of
+   **R**ead cost, **U**pdate cost and **M**emory/space cost. If a design claims to improve all
+   three, look for the hidden cost.
+3. **Where is the durability point now?** Local fsync? Replica ack? Quorum? Metadata commit on S3?
+   That decides both commit latency and what's lost on failure.
+4. **What new failure mode appears?** Stale reads (replicas), blocked 2PC (sharding), compaction
+   stalls (LSM), split brain (bad failure detection), lost writes (last-writer-wins).
+
+---
+
+## 12. Interview Questions and System Design Prompts
+
+> **In plain words.** In an interview, answer in this order: one plain sentence, one number, one
+> trade-off. The strongest signal for this chapter is that you reason *through the layers* —
+> "this is slow because the buffer pool misses, because the index is on a random UUID" — instead
+> of naming products.
+>
+> **Real-world example.** "Why doesn't a database write the data file on every commit?" → "Because
+> a commit touches pages all over the disk. Instead it appends ~100 bytes to a log and fsyncs just
+> that — one sequential write, ~20 µs on NVMe. The pages are written later in the background and,
+> after a crash, rebuilt from the log. The trade-off: every change is written twice, and recovery
+> time depends on how often we checkpoint."
+
+Each question names the sections it draws from and gives the answer structure an interviewer is
+listening for.
+
+### 12.1 Conceptual questions — "explain X"
+
+**Q: Walk me through what happens when I run `SELECT … WHERE id = 42`.**
+*Sections: Start here, §2.1, §7*
+Parse → analyze (catalog) → optimize (index vs seq scan from statistics) → executor → index walk
+(3–4 levels, top levels cached) → TID → buffer pool (hit ~1 µs / miss ~80 µs NVMe) → slotted page →
+MVCC visibility check → project → return. Strong half: say *where time goes* (buffer misses
+dominate cold queries) and that no lock and no WAL write happen on this path.
+
+**Q: Why write-ahead logging? Why not just write the page at commit?**
+*Sections: §2.2, §2.3, §10.8*
+A commit touches several random pages; the WAL turns that into one sequential append plus one
+fsync, and group commit shares that fsync across many transactions. Pages are flushed lazily and
+absorb repeated updates. Crash safety comes from replaying the log. Mention the rule: the log
+record must be durable before its page may be written, and before "COMMIT OK" is sent.
+
+**Q: What are steal and force, and why does everyone pick steal + no-force?**
+*Sections: §2.4*
+Steal = uncommitted pages may be flushed (needs undo). No-force = committed pages needn't be
+flushed at commit (needs redo). Together: fastest commits and a buffer pool that never has to hold
+a whole transaction. ARIES (analysis, redo, undo, CLRs) is what makes it safe.
+
+**Q: Why does a database have its own buffer pool instead of using the OS page cache / mmap?**
+*Sections: §10.7, §9 pitfall 2*
+The DB must control eviction (scan resistance), write ordering (WAL-before-page), and I/O errors;
+the OS controls none of these for you. mmap hides I/O as page faults and gives you no say in
+write-back. Note the nuance: Postgres still double-buffers through the OS, InnoDB uses O_DIRECT.
+
+**Q: Latch vs lock?**
+*Sections: §10.4, doc 17*
+Latch: protects an in-memory structure (a page, a hash bucket) for microseconds, no deadlock
+detection (avoided by ordering). Lock: protects a logical row/table for a transaction's lifetime,
+has modes and deadlock detection. Confusing them causes either corruption or stalls.
+
+**Q: MVCC vs 2PL — which and why?**
+*Sections: §10.4, §5.2*
+MVCC keeps versions so readers never block writers — the right default when long reads coexist
+with short writes. Writers still lock each other. Costs: version garbage (VACUUM), and snapshot
+isolation allows write skew → use SSI or explicit locks where invariants span rows.
+
+**Q: B+Tree vs LSM tree?**
+*Sections: §10.5, §11, doc 13*
+B+Tree: update in place, ~1 random I/O per read, write amplification from page rewrites; best for
+read-heavy OLTP. LSM: buffered sequential writes, great ingest and compression, pays with read
+amplification (mitigated by bloom filters) and compaction. Frame it with RUM: pick two.
+
+**Q: Why is a row store bad for analytics and a column store bad for OLTP?**
+*Sections: §10.6, §11, docs 07, 08*
+Analytics read few columns of many rows → a row store reads every column of every row. OLTP reads
+and writes all columns of one row → a column store touches one block per column and can't update
+compressed blocks in place. HTAP (doc 09) keeps both and syncs them.
+
+**Q: How does replication relate to the WAL?**
+*Sections: §2.3, §10.10*
+Physical replication *is* shipping the WAL over the network and replaying it on the replica — the
+same code as crash recovery, running continuously. Async: reply before the replica has it (lag,
+RPO > 0). Sync/quorum: reply after (RPO = 0, +1 RTT per commit).
+
+**Q: What does "committed" actually mean in Postgres, in Aurora, and in CockroachDB?**
+*Sections: §2.3*
+Postgres: commit record fsynced to local WAL (plus sync standbys if configured). Aurora: log
+records acknowledged by 4 of 6 storage nodes across 3 AZs. CockroachDB: Raft log entry replicated
+to a majority of the range's replicas. Same idea — the *durability point* — at different places.
+
+### 12.2 System design round
+
+**Q: Design the storage layer for an e-commerce order system: 50M orders/year, peak 2,000
+writes/s and 20,000 reads/s, a finance team running dashboards, RPO = 0 and RTO < 1 minute.**
+
+```
+1. CLARIFY
+   - Access pattern: point reads by order_id / user_id (OLTP) + aggregations (analytics).
+   - Consistency: orders + payments + stock must be transactional → ACID relational store.
+
+2. SIZE IT (Start here, §3)
+   - 50M orders × ~1 KB (+ line items) ≈ 50 GB/year of data; with indexes ≈ 100–150 GB/year.
+   - 2,000 writes/s × ~1 KB WAL ≈ 2 MB/s WAL — trivial bandwidth.
+   - Commit latency: 1 ms cloud-disk fsync; group commit keeps 2,000 commits/s far below limits.
+   → One well-sized primary handles this for years. Do NOT shard on day one.
+
+3. STORAGE ENGINE CHOICES (§10.5, §10.6)
+   - Postgres/MySQL, B+Tree indexes on (order_id), (user_id, created_at).
+   - Time-ordered keys (bigint sequence or UUIDv7), not UUIDv4 → no random page splits.
+   - Partition orders by month → old partitions drop/archive cheaply, VACUUM stays local.
+   - Buffer pool sized for the hot set (last ~3 months of orders + indexes).
+
+4. DURABILITY + HA (§2.3, §10.10)
+   - RPO = 0 → synchronous replica in another AZ (+~1 ms per commit), or Aurora-style quorum.
+   - RTO < 1 min → automated failover (Patroni / managed service), not WAL replay on a new box.
+   - PITR: archived WAL + daily base backup, restore tested monthly.
+
+5. READ SCALING (§2.1)
+   - 20,000 reads/s point lookups mostly hit the buffer pool → primary + 2 async read replicas.
+   - Read-your-writes paths (order confirmation page) go to the primary.
+
+6. ANALYTICS (§6, §11)
+   - Don't run dashboards on the primary: they evict the OLTP hot set and hold snapshots open
+     (blocking VACUUM). Stream WAL via CDC (logical decoding → Debezium) into a columnar store
+     (ClickHouse / warehouse / lakehouse).
+
+7. OBSERVABILITY + SECURITY
+   - Metrics: buffer hit ratio, replication lag, WAL fsync latency, dead tuples, lock waits, p99.
+   - TLS in transit, encryption at rest, least-privilege roles per service, PII columns
+     identified for GDPR deletion (and remember deletes must reach replicas, backups' retention
+     window and the analytics copy).
+
+8. GROWTH PLAN
+   - Phase 1: single primary + sync standby.  Phase 2: read replicas + CDC to analytics.
+   - Phase 3 (only if writes outgrow one node): shard by user_id (Citus/Vitess) or move to a
+     distributed SQL DB — accept 2PC for cross-shard transactions.
+```
+
+*What interviewers listen for:* numbers before architecture; "one node is enough" when it is;
+the durability point stated explicitly (sync replica = RPO 0); analytics separated from OLTP with
+the reason (buffer pool + VACUUM), not just "use a warehouse"; a growth plan instead of day-one
+sharding.
+
+**Q: Design a key-value store that ingests 500,000 writes/s of IoT readings (≈200 bytes each) and
+serves "last 24 h for device X".**
+*Sections: §6, §11, docs 13, 20*
+≈100 MB/s raw ingest → B+Tree random writes won't keep up; choose an **LSM** (or a time-series
+engine). Key = `(device_id, timestamp)` so one device's readings are contiguous in sorted runs →
+range scan per device. WAL with group commit; memtable flush to SSTables; time-window compaction so
+whole old files expire by TTL instead of being compacted. Bloom filters for point lookups. Scale
+out by sharding on `device_id` (hash) with replication factor 3. *Listen for:* write amplification
+and compaction strategy chosen for the TTL pattern, key design that turns the query into a range
+scan, and an honest note on read amplification.
+
+**Q: Your team wants to move from a single Postgres to a distributed SQL database. How do you
+decide?**
+*Sections: §10.10, §11*
+First prove the single node is the bottleneck (writes, storage, or regional latency — reads are
+solved by replicas). Then list what you pay: every commit gains a quorum round trip, cross-range
+transactions become 2PC-like, some Postgres features/extensions disappear, and hot keys still
+serialize on one range leader. Pilot with production-shaped traffic and compare p99, not averages.
+*Listen for:* "distributed" chosen for a measured reason, not as a default.
+
+### 12.3 Rapid-fire questions
+
+| Question | Strong answer | Section |
+|---|---|---|
+| What is the durability point of a commit? | The fsync of the WAL up to the commit record (or the replica/quorum ack if configured). | §2.3 |
+| Why does a B+Tree over 10M rows need only 3 levels? | ~400 keys per 8 KB page; 400³ = 64M. | Start here, §10.5 |
+| Why are the top B+Tree levels basically free? | Every lookup touches them, so they are always in the buffer pool. | §10.5 |
+| Buffer hit ratio drops from 99% to 90% — how much more disk I/O? | 10× (misses go from 1% to 10%). | §10.7 |
+| Why clock instead of LRU? | LRU updates a shared list on every hit (contention); clock sets a bit. | §10.7 |
+| What does group commit buy? | One fsync for many transactions → commits/s no longer capped by fsync latency. | §2.3 |
+| Async commit — can it corrupt data? | No. It can lose the last ~fraction of a second of commits. | §2.3 |
+| Why does ARIES redo uncommitted changes? | Repeating history is simple; undo then removes losers. `page_lsn` makes it idempotent. | §2.4 |
+| Why doesn't Postgres need an undo pass? | Uncommitted versions stay but are invisible (xid not committed in `pg_xact`); VACUUM removes them. | §2.4 |
+| What stops VACUUM from cleaning up? | A long-running (or idle-in-transaction) transaction holding an old snapshot. | §10.4, §9 |
+| UUIDv4 primary keys — what's the cost? | Random inserts → page splits everywhere, poor cache locality, bigger indexes. | §10.5 |
+| Index or seq scan for a query returning 40% of rows? | Seq scan: an index would do ~1 random read per row. | §10.3 |
+| LSM's main costs? | Read amplification, space amplification, compaction I/O and stalls. | §11 |
+| Why do lakehouse formats need a metadata log? | Object storage has no atomic multi-file rename; commit = atomic swap of a metadata pointer. | §11, doc 22 |
+| Sync replica in another region — cost per commit? | One cross-region RTT, ~30–100 ms. | §2.3, §10.10 |
+| Why 3 (or 5) nodes for Raft, not 2 (or 4)? | Majority of 3 tolerates 1 failure, of 5 tolerates 2; an even count adds cost without extra tolerance. | §10.10 |
+
+### 12.4 Debugging prompts — "here are the symptoms, diagnose"
+
+**"Commit latency jumped from 1 ms to 20 ms after we moved to a new cloud disk type."**
+The commit path's floor is WAL fsync latency (§2.3). Measure fsync latency on the new volume
+(`pg_test_fsync`, fio with `--fsync=1`); check IOPS/throughput quota exhaustion. Fixes: WAL on a
+low-latency volume, verify group commit is effective, or async commit for non-critical writes.
+
+**"A query that took 5 ms now takes 30 s. Nothing was deployed."**
+Plan flip (§10.2). `EXPLAIN (ANALYZE, BUFFERS)`: compare estimated vs actual rows. A 100× estimate
+error usually means stale statistics after a bulk load or a skewed value. Run `ANALYZE`, consider
+extended statistics; then check whether the new plan is a seq scan or nested loop over a large input.
+
+**"The table is 10 GB of live data but 80 GB on disk, and it keeps growing."**
+MVCC garbage (§10.4). Look for a long-running or idle-in-transaction session, an abandoned
+replication slot, or a stale prepared transaction pinning the oldest xmin. Fix the holder, then
+VACUUM (or `pg_repack` to reclaim space online).
+
+**"p99 read latency spikes every few minutes on a RocksDB-backed service."**
+Compaction or memtable-flush stalls (§11, doc 13). Check L0 file count vs slowdown/stop triggers,
+pending compaction bytes, and write stalls in the LOG. Fixes: more compaction threads, rate
+limiter, a compaction style that fits the workload, or a bigger memtable budget.
+
+**"After failover, customers see orders they placed 2 seconds ago disappear."**
+Async replication (§2.3, §10.10): the promoted replica was behind; commits acknowledged by the old
+primary never reached it. Fix: synchronous (or quorum) replication for that data, or accept the
+RPO explicitly and reconcile from the old primary's WAL if it's recoverable.
+
+**"The dashboard query made checkout slow."**
+Shared buffer pool (§10.7): a big scan evicts the OLTP hot set and competes for I/O, and its long
+snapshot holds back VACUUM. Move analytics to a replica or a columnar copy via CDC (§12.2).
+
+### 12.5 Common interview mistakes
+
+1. **Naming products instead of mechanisms.** "Use Cassandra" is not an answer; "write-heavy,
+   append-mostly → LSM, because sequential writes" is.
+2. **Saying `write()` means durable.** It only reaches the OS page cache; durability is `fsync`
+   (§2.2, §9 pitfall 3).
+3. **Sharding on day one.** Size the data first; most OLTP systems fit on one node plus replicas
+   for years (§12.2).
+4. **Confusing replication consistency with isolation.** Async replication ≠ read uncommitted —
+   different axes (§9 pitfall 11).
+5. **Forgetting the cost side of every index and every guarantee.** Each index is paid on every
+   write; each sync replica on every commit (§10.5, §2.3).
+6. **Treating MVCC as free.** No mention of VACUUM/purge or long-transaction risk (§10.4).
+7. **"Distributed" without a durability point.** Always say what a commit waits for: local fsync,
+   replica ack, or quorum (§2.3).
 
 ---
 
