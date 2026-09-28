@@ -305,6 +305,8 @@ exist?", jump to its card in [Key terms explained](#key-terms-explained-why-each
 
 ### Key terms explained: why each one exists
 
+**Jump to a term:** [Page](#page) · [Tuple (row)](#tuple-row) · [TID (tuple ID)](#tid-tuple-id) · [Buffer pool](#buffer-pool) · [Hit and miss (hit ratio)](#hit-and-miss-hit-ratio) · [Dirty page](#dirty-page) · [WAL (write-ahead log)](#wal-write-ahead-log) · [fsync](#fsync) · [LSN (log sequence number)](#lsn-log-sequence-number) · [Checkpoint](#checkpoint) · [Transaction](#transaction) · [MVCC (multi-version concurrency control)](#mvcc-multi-version-concurrency-control) · [Lock vs latch](#lock-vs-latch) · [Optimizer](#optimizer) · [Index](#index) · [Replica](#replica) · [Amplification (read, write, space)](#amplification-read-write-space)
+
 Each card has two parts:
 
 1. **A beginner walkthrough built on a real-world analogy.** Numbered steps with small diagrams,
@@ -558,7 +560,7 @@ pages*), sequential vs random I/O (reading pages *in order or not*) and the WAL 
   deleted rows leave holes until compaction.
 - *Alternatives:* variable-size blocks in LSM SSTables; immutable files on object storage.
 
-#### Tuple / row
+#### Tuple (row)
 
 A **tuple** (row) is best understood as **a parcel with a shipping label**.
 
@@ -640,7 +642,7 @@ Row = parcel with a label
  └── update             → new parcel, old one kept   → versions → VACUUM
 ```
 
-**Technical details — Tuple / row**
+**Technical details — Tuple (row)**
 
 - *Without it:* no unit to insert, lock, or version.
 - *Why this shape:* header (visibility info xmin/xmax, null bitmap, flags) + data. The header is
@@ -878,7 +880,7 @@ Buffer pool = kitchen counter; disk = basement pantry
   set grows past it.
 - *Alternatives:* mmap (gives up control), fully in-memory engines (no pool at all).
 
-#### Hit / miss (hit ratio)
+#### Hit and miss (hit ratio)
 
 The **hit ratio** is best understood as **train punctuality on your daily commute**.
 
@@ -938,7 +940,7 @@ Hit ratio = train punctuality
  └── fix: bigger pool, smaller working set, keep scans away
 ```
 
-**Technical details — Hit / miss (hit ratio)**
+**Technical details — Hit and miss (hit ratio)**
 
 - *Why track it:* it's the biggest single driver of read latency.
 - *Why the percentage misleads:* what matters is the *miss* rate. 99% → 90% hits sounds like a 9%
@@ -1209,8 +1211,8 @@ An **LSN** is best understood as **numbered cheques plus a "processed up to" sta
 
 **1. Picture an accountant updating a ledger 📒**
 
-Cheques are numbered 1, 2, 3, … Each ledger page has a stamp in the corner: *"cheques applied up to
-#4,800"*. The accountant picks up a pile of cheques:
+Cheques are numbered 1, 2, 3, … Each ledger page has a stamp in the corner:
+*"cheques applied up to no. 4,800"*. The accountant picks up a pile of cheques:
 
 ```text
 cheque #4,750  → stamp says 4,800 → already applied → SKIP
@@ -1857,7 +1859,7 @@ Replica = branch office receiving faxes (WAL)
   conflict with replayed cleanup (Postgres cancels the query or delays replay). Sync replication
   fixes loss but adds a network round trip to every commit.
 
-#### Amplification (read / write / space)
+#### Amplification (read, write, space)
 
 **Amplification** is best understood as **three everyday annoyances of moving stuff around**.
 
@@ -1928,7 +1930,7 @@ Amplification = extra work per byte you actually wanted
  └── RUM: pick two of read / update / space → every design is a trade
 ```
 
-**Technical details — Amplification (read / write / space)**
+**Technical details — Amplification (read, write, space)**
 
 - *Why the concept exists:* it's the common currency for comparing designs. *Read amplification*
   = bytes read ÷ bytes wanted (read a 16 KB page for a 100 B row = 160×). *Write amplification* =
