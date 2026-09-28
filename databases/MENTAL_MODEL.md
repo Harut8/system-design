@@ -10,11 +10,16 @@ Hands-on tasks for every chapter (predict, build, break, measure) are in [LABS.m
 
 ## Table of Contents
 
-- [Start here — the whole map in plain words](#start-here--the-whole-map-in-plain-words)
-  - [Where the numbers come from](#where-the-numbers-come-from) · [Key terms](#key-terms-in-this-chapter) · [Key terms explained — why each one exists](#key-terms-explained--why-each-one-exists)
+**Start here (beginner path):** [The whole map in plain words](#start-here-the-whole-map-in-plain-words)
+→ [Where the numbers come from](#where-the-numbers-come-from)
+→ [Key terms](#key-terms-in-this-chapter)
+→ [Key terms explained: why each one exists](#key-terms-explained-why-each-one-exists)
+
+**Main chapters:**
+
 1. [The One-Page Picture](#1-the-one-page-picture)
 2. [The Four Universal Pipelines](#2-the-four-universal-pipelines) — each with *why this path* and *what if it changes*
-3. [The Build Order: Phase 0 → Phase 16](#3-the-build-order-phase-0--phase-16)
+3. [The Build Order: Phase 0 to Phase 17](#3-the-build-order-phase-0-to-phase-17)
 4. [Component Responsibility Map](#4-component-responsibility-map)
 5. [Cross-Cutting Concerns (the 4 Hard Problems)](#5-cross-cutting-concerns-the-4-hard-problems)
 6. [Variant Decision Tree](#6-variant-decision-tree)
@@ -22,12 +27,12 @@ Hands-on tasks for every chapter (predict, build, break, measure) are in [LABS.m
 8. [Linear Reading Order](#8-linear-reading-order)
 9. [Common Pitfalls When Building Your Own](#9-common-pitfalls-when-building-your-own)
 10. [Layer by Layer: Why Exactly This Way](#10-layer-by-layer-why-exactly-this-way)
-11. [What If the Architecture Changes? — the change matrix](#11-what-if-the-architecture-changes--the-change-matrix)
+11. [What If the Architecture Changes? The change matrix](#11-what-if-the-architecture-changes-the-change-matrix)
 12. [Interview Questions and System Design Prompts](#12-interview-questions-and-system-design-prompts)
 
 ---
 
-## Start here — the whole map in plain words
+## Start here: the whole map in plain words
 
 **The problem.** A database makes two promises at once: *(1) once I say "saved", your data survives
 anything short of losing the disk*, and *(2) I answer quickly, even while thousands of people read
@@ -276,7 +281,7 @@ The whole folder is these nine steps, seen up close — plus what changes when y
 ### Key terms in this chapter
 
 Read the table for the one-line version. For any term where you're asking "why does this even
-exist?", jump to its card in [Key terms explained](#key-terms-explained--why-each-one-exists) below.
+exist?", jump to its card in [Key terms explained](#key-terms-explained-why-each-one-exists) below.
 
 | Term | Plain meaning | Everyday analogy | Why we need it (the problem without it) | Problems it creates |
 |---|---|---|---|---|
@@ -298,7 +303,7 @@ exist?", jump to its card in [Key terms explained](#key-terms-explained--why-eac
 | Replica | another machine holding a copy, fed from the WAL | a branch library receiving copies of the logbook | A single machine is a single point of failure and a read-throughput ceiling | Lag → stale reads; async failover can lose commits |
 | Amplification | extra bytes read/written/stored per byte the user asked for | carrying a whole box to read one page | Explains *where the cost of a design goes*; every design trades one kind for another | None itself, but you can't minimize read, write and space amplification all at once (RUM) |
 
-### Key terms explained — why each one exists
+### Key terms explained: why each one exists
 
 Each card has two parts:
 
@@ -2267,7 +2272,7 @@ the most flexible buffer pool. ARIES exists to make that choice safe:
 
 ---
 
-## 3. The Build Order: Phase 0 → Phase 16
+## 3. The Build Order: Phase 0 to Phase 17
 
 If you sat down to build a database from scratch, this is the order. Each phase depends on the previous ones. Skipping ahead is what makes the existing docs feel "messy" — they describe phase 12 features assuming you've internalized phase 3.
 
@@ -2780,7 +2785,7 @@ The list of mistakes you (and every textbook DB) will make on the first try.
 
 ---
 
-## 11. What If the Architecture Changes? — the change matrix
+## 11. What If the Architecture Changes? The change matrix
 
 > **In plain words.** Every "new" database is the same stack with one or two layers swapped. This
 > table shows, for the most common swaps, which of the four pipelines (§2) change and what you win
