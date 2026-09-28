@@ -300,18 +300,242 @@ exist?", jump to its card in [Key terms explained](#key-terms-explained--why-eac
 
 ### Key terms explained — why each one exists
 
-Each card starts with a **real-world analogy** (memorize this one first, then map each detail onto
-it), then answers the same questions: **What goes wrong without it? How does it fix that? Why this
-size/shape? What new problems does it create? What do others do instead?**
+Each card has two parts:
 
-**Page**
-- *Real-world analogy — shipping containers.* Before standard containers, every cargo item was
-  loaded by hand in its own shape; ports were slow and nothing fit anywhere. The fixed-size
-  container fixed that: every ship, crane and truck handles the same box, and you address it by
-  number. The price is the same as a page's: ship a whole container for one parcel (read
-  amplification), half-empty containers (fragmentation), oversized cargo that needs special
-  handling (TOAST), and a container dropped halfway onto the dock (torn write). Bigger containers
-  = fewer trips but more waste per small shipment — the page-size trade-off.
+1. **A beginner walkthrough built on a real-world analogy.** Numbered steps with small diagrams,
+   using the `users` table and the numbers from the walkthrough above. It ends with a
+   *Remember it like this* tree. Read this first and memorize the analogy; every detail maps onto it.
+2. **Technical details.** The same concept, answering: *What goes wrong without it? How does it fix
+   that? Why this size/shape? What new problems does it create? What do others do instead?*
+
+#### Page
+
+The best way to understand a **page** is as a **standard shipping container of fixed size** in
+which the database stores its data.
+
+**1. Picture shipping containers 🚢**
+
+Before standard containers, loading a ship looked like this:
+
+> "Here's a crate, here's a sack, here's a huge pipe — load it all by hand."
+
+The ship, the crane and the truck each had to deal with every item differently. Containerization
+said:
+
+> "It doesn't matter what's inside. Everything goes into a standard box."
+
+```text
+┌──────────────────────┐
+│      CONTAINER       │
+│        8 KB          │
+│                      │
+│   data data data     │
+│   data data          │
+└──────────────────────┘
+         = Page
+```
+
+A database does exactly the same with its files:
+
+```text
+users table file
+   │
+   ├── Page 0  → 8 KB   (bytes      0 –  8,191)
+   ├── Page 1  → 8 KB   (bytes  8,192 – 16,383)
+   ├── Page 2  → 8 KB   (bytes 16,384 – 24,575)
+   └── …                 page N starts at byte N × 8,192
+```
+
+The database never says *"give me bytes 137 to 236 from the disk"*. It says *"give me page 17"*.
+And finding page 17 needs no lookup table: it starts at byte 17 × 8,192 = 139,264.
+
+**2. Why is this even needed?**
+
+Because the hardware underneath doesn't work with arbitrary bytes either. Every layer has its own
+unit of work:
+
+```text
+Database     →  page          8 KB (Postgres) / 16 KB (InnoDB)
+   ↓
+OS           →  memory page   4 KB
+   ↓
+Filesystem   →  block         4 KB
+   ↓
+SSD          →  flash page    4–16 KB   (and it erases in blocks of several MB)
+```
+
+If you need just **100 bytes**, the SSD still physically reads at least one whole flash page. So
+the database reasons:
+
+> "The hardware works in blocks anyway — so let's organize our data in blocks too."
+
+**3. What a page looks like in practice**
+
+Our `users` table from the walkthrough, with ~64 rows per 8 KB page (see calculation A):
+
+```text
+users                              Page 0                        Page 1
+id | name | age                    ┌─────────────────────┐       ┌─────────────────────┐
+---+------+----                    │ user 1              │       │ user 65             │
+1  | Bob  | 25        ──stored──►  │ user 2              │       │ user 66             │
+2  | Ann  | 31          as         │ …                   │       │ …                   │
+3  | Joe  | 19                     │ user 64             │       │ user 128            │
+…  (10 million rows)               └─────────────────────┘       └─────────────────────┘
+                                   10,000,000 / 64 ≈ 156,000 pages
+```
+
+Inside, a page is a small organized box (the *slotted page*):
+
+```text
+Page 17 (8,192 bytes)
+┌──────────────────────────────────────────────────────┐
+│ header 24 B: page LSN, checksum, free-space pointers │
+│ slot directory: [1][2][3][4] … grows →               │
+│                                                      │
+│                   free space                         │
+│                                                      │
+│             ← rows grow from the end: │row 4│row 3│row 2│row 1│
+└──────────────────────────────────────────────────────┘
+```
+
+So a page is the **smallest standard chunk of data the storage engine works with**.
+
+**4. The most important consequence: read amplification**
+
+You need one row of **100 bytes**, and it lives in page 17. You can't say *"read exactly these 100
+bytes"*. What happens is:
+
+```text
+Disk
+ ↓
+Page 17 = 8,192 bytes
+ ↓
+Database
+ ↓
+the 100 bytes you wanted
+
+requested: 100 B
+read:      8,192 B      → 82× more than needed
+```
+
+That's **read amplification**: you wanted a small thing and had to bring the whole container. Like
+shipping one small TV — you still send a whole container.
+
+Why is this acceptable? Because neighbours come for free. A scan of `users` gets 64 rows per trip,
+and rows inserted together are often read together.
+
+**5. Fragmentation (wasted space)**
+
+Picture a half-empty container:
+
+```text
+┌──────────────────────┐
+│ 📦 📦                │
+│                      │
+│        empty         │
+│                      │
+└──────────────────────┘
+```
+
+The same happens to a page:
+
+```text
+INSERT × 64   → page full
+DELETE × 40   → 24 rows left, the page still takes 8 KB
+
+Page 17 — 8 KB
+┌──────────────────────┐
+│ row  row  row        │
+│                      │
+│        EMPTY  (~60%) │
+│                      │
+└──────────────────────┘
+```
+
+Lots of space, little useful data. The fix: VACUUM lets new rows reuse that space; `VACUUM FULL`
+or `pg_repack` rewrites the table into fewer, fuller pages (repacking the containers).
+
+**6. Oversized cargo → TOAST**
+
+A small TV fits in a container. A car doesn't — it needs special freight.
+
+```text
+Normal row (100 B)            →  fits in the page
+User's 50 KB profile JSON     →  cannot fit in an 8 KB page
+                                    ↓
+                              compress it; if still > ~2 KB,
+                              cut it into chunks, store them in a side table,
+                              and keep an ~18 B pointer in the row
+```
+
+In Postgres this is **TOAST**. Standard page = standard container; TOAST = special logistics for
+oversized cargo, with a claim ticket left in the container.
+
+**7. Torn write**
+
+Picture a crane lifting a container onto a ship, and the power goes out halfway: half the cargo is
+on the ship, half is still on the dock.
+
+A page is 8 KB, but most drives only guarantee that **4 KB** is written atomically. Power cut in
+the middle:
+
+```text
+Page 17 after the crash
+┌──────────────────────┐
+│ NEW DATA             │  ← first 4 KB written
+│ NEW DATA             │
+│ OLD DATA             │  ← second 4 KB never written
+│ OLD DATA             │
+└──────────────────────┘
+```
+
+The page is half new, half old: a **torn write**. The page **checksum** detects it. Postgres
+repairs it from a *full-page image* in the WAL; InnoDB from its *doublewrite buffer*.
+
+**8. Why not make the page tiny, or huge?**
+
+| Page size | Keys per index page | Index depth for 10M keys | Bytes read for one 100 B row | Typical use |
+|---|---|---|---|---|
+| 1 KB | ~50 | 5 levels (50⁴ = 6.25M < 10M) | 1 KB (10×) | too many I/Os and too much per-page bookkeeping |
+| **8 KB** | ~400 | **3 levels** | 8 KB (82×) | OLTP — Postgres |
+| 16 KB | ~800 | 3 levels | 16 KB (164×) | OLTP — InnoDB |
+| 1 MB | ~50,000 | 2 levels | 1 MB (10,000×) | scans / analytics (column chunks) |
+
+```text
+Small page                              Large page
+─────────────────────                   ─────────────────────
++ less waste                            + fewer pages, less overhead
++ less read amplification               + shallower trees
+- more pages to track                   + great for sequential scans
+- deeper trees, more I/O operations     - more read amplification
+                                        - more waste for small rows
+```
+
+So page size is a **compromise**, tuned to the workload: small-ish for point lookups (OLTP),
+large for scans (analytics).
+
+**9. Remember it like this**
+
+```text
+Page = the database's standard container
+ │
+ ├── fixed size (8 KB / 16 KB)
+ ├── DB reads and writes whole pages
+ │
+ ├── small request → reads a whole page       → read amplification
+ ├── rows deleted  → holes in the page        → fragmentation
+ ├── value too big → doesn't fit              → TOAST / overflow
+ └── write cut halfway                        → torn write
+```
+
+A page doesn't exist because database developers liked cutting data into squares. It exists
+because **the hardware and the OS already work in blocks**, so the storage engine builds its own
+fixed unit on top. Once this clicks, the buffer pool (a cache *of pages*), indexes (point *to
+pages*), sequential vs random I/O (reading pages *in order or not*) and the WAL (describes changes
+*to pages*) all fall into place.
+
+**Technical details — Page**
+
 - *Without it:* the DB would read arbitrary byte ranges. But the hardware never works that way:
   SSDs read and program in pages of 4–16 KB, and the OS caches in 4 KB pages. Reading 100 bytes
   still costs a whole block. Without a fixed unit you also can't address data simply, cache it in
@@ -329,11 +553,90 @@ size/shape? What new problems does it create? What do others do instead?**
   deleted rows leave holes until compaction.
 - *Alternatives:* variable-size blocks in LSM SSTables; immutable files on object storage.
 
-**Tuple / row**
-- *Real-world analogy — a parcel with a shipping label.* The contents are your data; the label
-  (sender, date sent, "returned?" flag) is the tuple header that tells the system who created it
-  and whether it's still valid. For a tiny parcel the label can be bigger than the contents — the
-  same reason a two-integer row costs ~36 bytes.
+#### Tuple / row
+
+A **tuple** (row) is best understood as **a parcel with a shipping label**.
+
+**1. Picture a parcel 📦**
+
+A parcel has two parts: the **contents** (what you actually wanted to send) and the **label**
+(who sent it, when, and a stamp like "RETURNED" if it was cancelled). The post office never opens
+the parcel to route it — it only reads the label.
+
+**2. What a row looks like in a database**
+
+A row is the same: a **header** (the label) plus the **data** (the contents).
+
+```text
+One Postgres row for user 42
+┌──────────── header (24 B) ─────────────┬──────── data ────────────┐
+│ xmin=107 │ xmax=0 │ flags │ null bitmap │ id=42 │ 'Ana' │ age=31   │
+└────────────────────────────────────────┴──────────────────────────┘
+  │          │                  │
+  │          │                  └─ which columns are NULL (so NULLs take no space)
+  │          └─ deleted by txn … (0 = not deleted)
+  └─ created by transaction 107
+```
+
+**3. Why does it need a label?**
+
+- `xmin` / `xmax` say **who created and who deleted this version** — that's what lets each
+  transaction decide "can I see this row?" without locking (MVCC).
+- The **null bitmap** records which columns are empty, so NULL values take no bytes.
+
+Without the label, every reader would need to ask a central authority about every row.
+
+**4. Problem: the label can be bigger than the contents**
+
+Like mailing a single stamp in a large padded envelope:
+
+```text
+Table with two int columns (8 B of data per row)
+
+  data          8 B
+  header       24 B
+  slot pointer  4 B
+  ─────────────────
+  total        36 B   → 78% of the space is overhead
+
+10,000,000 rows:  80 MB of data  →  ~360 MB on disk
+```
+
+That's why time-series and columnar engines drop per-row headers entirely.
+
+**5. Problem: padding**
+
+Columns are aligned to 2/4/8-byte boundaries, like packing a box badly with gaps between items.
+Order matters:
+
+```text
+(bool, bigint, bool, bigint)  →  1 + 7 pad + 8 + 1 + 7 pad + 8 = 32 B
+(bigint, bigint, bool, bool)  →  8 + 8 + 1 + 1                = 18 B
+```
+
+Put wide columns first, then narrower ones — pack big items first, fill the gaps with small ones.
+
+**6. Updates create new parcels**
+
+In Postgres, `UPDATE` doesn't rewrite the parcel. It stamps the old one "replaced by txn 311"
+(`xmax=311`) and sends a **new parcel** (`xmin=311`). Old parcels stay in the warehouse until
+VACUUM clears them — see the MVCC card.
+
+**7. Remember it like this**
+
+```text
+Row = parcel with a label
+ │
+ ├── label (header): who created it, who deleted it, which fields are empty
+ ├── contents (data): your columns
+ │
+ ├── tiny rows          → label bigger than contents → overhead
+ ├── badly ordered cols → gaps                       → padding
+ └── update             → new parcel, old one kept   → versions → VACUUM
+```
+
+**Technical details — Tuple / row**
+
 - *Without it:* no unit to insert, lock, or version.
 - *Why this shape:* header (visibility info xmin/xmax, null bitmap, flags) + data. The header is
   what makes MVCC and NULLs possible without touching other rows.
@@ -341,12 +644,105 @@ size/shape? What new problems does it create? What do others do instead?**
   so a row of two integers takes ~36 bytes, not 8. At billions of narrow rows this dominates →
   column stores and time-series engines strip per-row headers.
 
-**TID (tuple ID)**
-- *Real-world analogy — a street address with apartment numbers.* "Building 2,104, apartment 3."
-  Mail (the index) is addressed to the apartment, not to the person's description. Inside the
-  building the super can renumber the floors or move tenants between rooms as long as apartment 3
-  still points to them (the slot indirection). But if the tenant moves to *another building*,
-  every friend's address book (every index) must be updated — the cost of a non-HOT update.
+#### TID (tuple ID)
+
+A **TID** is best understood as **a street address with an apartment number**.
+
+**1. Picture a city 🏢**
+
+To send a letter to someone you don't write their full description ("tall, brown hair, likes
+tea"). You write an address: **building 2,104, apartment 3**. Short, exact, and the mail carrier
+goes straight there.
+
+A TID is exactly that: **(page number, slot number)**.
+
+```text
+TID (2104, 3)
+      │    └── slot 3 inside the page    = apartment
+      └─────── page 2,104 of the table   = building
+```
+
+**2. Why is it needed?**
+
+An index must say **where** the row lives. Two options:
+
+```text
+Option A: copy the whole row into every index
+  index on id    → {42, 'Ana', 31, 'ana@…', …}
+  index on email → {'ana@…', 42, 'Ana', 31, …}
+  → every update rewrites every copy; indexes as big as the table
+
+Option B: store the address (6 bytes in Postgres)
+  index on id    → 42      → (2104, 3)
+  index on email → 'ana@…' → (2104, 3)
+  → small indexes; the row exists once
+```
+
+Databases choose B: like an address book storing addresses, not photocopies of people.
+
+**3. Why an apartment number, not "the 3rd meter from the door"?**
+
+Because the slot is an **indirection**. The slot directory at the top of the page says where
+each row actually starts:
+
+```text
+Page 2104
+slot directory: [1 → byte 8000] [2 → byte 7900] [3 → byte 7800]
+                                                   │
+                        page compaction moves row 3 to byte 7850
+                                                   ▼
+slot directory: [1 → byte 8000] [2 → byte 7900] [3 → byte 7850]
+
+TID (2104, 3) is still correct — no index had to change.
+```
+
+The building manager can move tenants between rooms, as long as the apartment number on the
+mailbox still leads to them.
+
+**4. Problem: moving to another building**
+
+If an `UPDATE` makes the row not fit on its page, the new version goes to **another page**, so it
+gets a **new TID**. Every index now needs a new entry:
+
+```text
+UPDATE users SET bio = '…long text…' WHERE id = 42;
+old version: (2104, 3)   →  new version: (5001, 7)
+
+table with 6 indexes → 6 extra index inserts (+ their WAL)
+```
+
+Like moving to another building: every friend's address book must be updated.
+
+**The Postgres escape hatch — HOT updates.** If the new version fits on the **same page** and no
+indexed column changed, Postgres leaves a forwarding note on the old slot (a *HOT chain*) and
+touches **no index**. Tip: `fillfactor = 90` leaves 10% of each page free so updates can stay "in
+the same building".
+
+**5. The alternative: address by name, not location**
+
+InnoDB's secondary indexes store the **primary key** instead of a physical address, like
+addressing mail to "Ana, customer #42" and having the front desk look up the room:
+
+```text
+Postgres:  email index → TID (2104, 3)   → 1 hop,  but row moves change indexes
+InnoDB:    email index → PK 42 → PK tree → 2 tree walks, but row moves don't matter
+```
+
+**6. Remember it like this**
+
+```text
+TID = building + apartment number
+ │
+ ├── lets indexes point to the row instead of copying it
+ ├── slot = apartment number → row can move inside the page freely
+ │
+ ├── row moves to another page → new TID → every index updated
+ │       └── HOT update: stay on the same page → no index update
+ └── alternative: point by primary key (InnoDB) → stable, but an extra lookup
+```
+
+**Technical details — TID (tuple ID)**
+
 - *Without it:* each index would store a copy of the whole row (every update rewrites every copy)
   or the primary key (every secondary lookup becomes a second tree walk — which is exactly what
   InnoDB does, by choice).
@@ -358,13 +754,113 @@ size/shape? What new problems does it create? What do others do instead?**
   its TID changes and every index gets a new entry — the source of index write amplification
   (HOT updates avoid it when the new version fits on the same page and no indexed column changed).
 
-**Buffer pool**
-- *Real-world analogy — your kitchen countertop vs the basement pantry.* You keep what you're
-  cooking with on the counter (RAM); everything else is downstairs (disk). The counter is small,
-  so something must go back down when you need space (eviction), and you decide what — not the
-  landlord (the OS). After you move house, the counter starts empty and every ingredient needs a
-  trip downstairs (cold start). A bigger counter helps only until it holds everything you actually
-  cook with (the hot working set).
+#### Buffer pool
+
+The **buffer pool** is best understood as **your kitchen counter, while the disk is the pantry in
+the basement**.
+
+**1. Picture cooking 🍳**
+
+Your counter holds ~30 items. The basement pantry holds 1,000. Grabbing something from the
+counter takes 1 second; a trip to the basement takes 80 seconds. You'd never cook a meal by
+walking downstairs for every pinch of salt — you bring what you need up and keep it on the counter.
+
+```text
+Kitchen counter (small, fast)          Basement pantry (huge, slow)
+┌──────────────────────────┐           ┌───────────────────────────────┐
+│ salt  oil  onions  eggs  │  ◄──────  │ 1,000 items                   │
+│ (what you're using now)  │   80 s    │                               │
+└──────────────────────────┘           └───────────────────────────────┘
+      grab: 1 s
+
+Buffer pool: 256 MB = 32,768 frames    Disk: ~150,000 pages (table + index)
+      hit: ~1 µs                             miss: ~80 µs (NVMe)
+```
+
+**2. Why is it needed?**
+
+Without it, every page access is a disk read. A login touches 4 pages; 20,000 logins/s would be
+80,000 random disk reads per second, and each login would spend 320 µs waiting on I/O instead of
+~4 µs.
+
+**3. How it works**
+
+```text
+Buffer pool (32,768 frames)
+┌─────────┬─────────┬─────────┬─────────┬──────
+│ page 17 │ p. 2104 │ root    │ (free)  │ …
+│ pin = 1 │ pin = 0 │ pin = 3 │         │
+│ clean   │ DIRTY   │ clean   │         │
+│ used ✓  │ used ✗  │ used ✓  │         │
+└─────────┴─────────┴─────────┴─────────┴──────
+page table (hash map): {17 → frame 0, 2104 → frame 1, root → frame 2}
+
+fetch_page(2104):
+  in page table?  yes → pin it, return it                     (hit,  ~1 µs)
+                  no  → find a victim frame, read from disk   (miss, ~80 µs)
+```
+
+- **pin count** = "someone is holding this item right now, don't put it away".
+- **dirty flag** = "I changed this item; the pantry copy is out of date".
+- **used bit** = "touched recently" (for eviction).
+
+**4. The counter is full — what goes back down? (eviction)**
+
+The **clock** algorithm: every item has a "used recently" sticker. A hand walks around the
+counter: if an item has a sticker, remove the sticker and move on; the first item without a
+sticker (and not pinned) goes back to the pantry. If it's dirty, write it first.
+
+```text
+         ┌─► [salt ✓] → remove ✓, skip
+ hand ───┤   [oil  ✓] → remove ✓, skip
+         └─► [eggs  ] → no sticker, not pinned → evict
+```
+
+Why not perfect LRU? LRU must reorder a shared list on **every** hit (a lock on every read).
+Clock just sets a bit — much cheaper at 100,000 reads/s.
+
+**5. Why the database manages it, not the OS (the landlord)**
+
+- **Scan pollution.** A report that reads all 125,000 pages once would push every hot item off
+  the counter. The DB knows it's a scan and gives it a small separate tray (Postgres uses a
+  256 KB ring buffer for large sequential scans).
+- **Write order.** A dirty page may go back to the pantry only after its WAL record is safe
+  (§2.2). The OS doesn't know that rule.
+- **Pins.** The OS could evict a page in the middle of an index split.
+
+**6. Problem: cold start**
+
+After you move house, the counter is empty. The first hour of cooking is all basement trips.
+After a DB restart or failover, latency is high until the hot pages are loaded again. Tools like
+`pg_prewarm` reload them on purpose.
+
+**7. How big should the counter be?**
+
+Big enough for what you **actually cook with** (the hot working set), not the whole pantry.
+Beyond that, extra space gives no benefit.
+
+```text
+Postgres  shared_buffers ≈ 25% of RAM   (the OS cache is a second counter: double buffering)
+InnoDB    buffer pool    ≈ 70–80% of RAM (bypasses the OS cache with O_DIRECT)
+```
+
+**8. Remember it like this**
+
+```text
+Buffer pool = kitchen counter; disk = basement pantry
+ │
+ ├── hit  = item on the counter (~1 µs)
+ ├── miss = trip downstairs (~80 µs)
+ │
+ ├── counter full → clock sweep evicts an unused, unpinned item
+ ├── dirty item   → must be written back before its space is reused
+ ├── big scan     → separate small tray, so it doesn't evict everything
+ ├── restart      → empty counter → slow until warm
+ └── size it for the working set, not for the whole database
+```
+
+**Technical details — Buffer pool**
+
 - *Without it:* every page access is a disk read (~80 µs NVMe, ~1 ms cloud disk) instead of
   ~100 ns in RAM. A lookup touching 4 pages at 20,000 queries/s would need 80,000 random reads/s.
 - *Why the DB owns it (not just the OS):* it must control eviction (one big scan shouldn't evict
@@ -377,21 +873,142 @@ size/shape? What new problems does it create? What do others do instead?**
   set grows past it.
 - *Alternatives:* mmap (gives up control), fully in-memory engines (no pool at all).
 
-**Hit / miss (hit ratio)**
-- *Real-world analogy — commuting by train.* If the train is on time 99% of days, you're late
-  ~3 days a year. At 90% you're late ~36 days — a "9% drop" that feels 10× worse. What you feel
-  is the misses, not the hits.
+#### Hit / miss (hit ratio)
+
+The **hit ratio** is best understood as **train punctuality on your daily commute**.
+
+**1. Picture a commute 🚆**
+
+You commute 250 days a year. The railway boasts "99% on time!". Next year it's "90% on time". A
+9-point drop sounds small. But count the days you're **late**:
+
+```text
+99% on time  →  1% late  → 2.5 late days a year
+90% on time  → 10% late  →  25 late days a year   ← 10× worse
+```
+
+You don't feel the on-time days. You feel the late ones.
+
+**2. In the database**
+
+Every page request is a trip. A **hit** means the page was already in the buffer pool (the train
+was on time, ~1 µs). A **miss** means a disk read (the train was late, ~80 µs, 80× slower).
+
+**3. The math**
+
+```text
+average page latency = hit% × 1 µs + miss% × 80 µs
+
+99% hits:  0.99 × 1 + 0.01 × 80 = 0.99 + 0.8  ≈  1.8 µs
+90% hits:  0.90 × 1 + 0.10 × 80 = 0.90 + 8.0  ≈  8.9 µs   → 5× slower on average
+disk reads per second:                                     → 10× more
+```
+
+That's why OLTP systems aim for **> 99%**, and why a "small" drop is a big incident.
+
+**4. Problem: the average hides the painful part**
+
+A 99% average can hide one table that is **always** cold, like a railway that's punctual
+everywhere except on your line. If your checkout query hits that table, the average tells you
+nothing. Measure per table and per index (`pg_statio_user_tables`, `pg_statio_user_indexes`).
+
+**5. How to improve it**
+
+```text
+more RAM for the pool          → bigger counter
+smaller working set            → indexes instead of scans; archive or partition old data
+protect it from big scans      → run reports on a replica or a columnar copy
+```
+
+**6. Remember it like this**
+
+```text
+Hit ratio = train punctuality
+ │
+ ├── hit  = on time  (~1 µs)
+ ├── miss = late     (~80 µs)
+ │
+ ├── what hurts is the miss rate: 1% → 10% = 10× more disk reads
+ ├── averages hide a cold table → measure per table
+ └── fix: bigger pool, smaller working set, keep scans away
+```
+
+**Technical details — Hit / miss (hit ratio)**
+
 - *Why track it:* it's the biggest single driver of read latency.
 - *Why the percentage misleads:* what matters is the *miss* rate. 99% → 90% hits sounds like a 9%
   change, but misses go from 1% to 10% → **10× more disk reads**. OLTP systems aim for >99%.
 - *Problems it creates:* a high average can hide a cold table that one important query always misses.
 
-**Dirty page**
-- *Real-world analogy — a shopping list on the fridge.* You don't drive to the store every time
-  you run out of something; you write it down and go once a week, buying 20 things in one trip
-  (write absorption). The risk: if the list is lost before the trip (crash), you forget what you
-  needed — so you also keep the notes somewhere safe (the WAL). And if the list gets too long,
-  you're forced to go shopping at a bad moment (flushing dirty pages before eviction).
+#### Dirty page
+
+A **dirty page** is best understood as **a shopping list on the fridge**.
+
+**1. Picture running out of things at home 🛒**
+
+Monday you run out of milk, Tuesday eggs, Wednesday coffee… You could drive to the store every
+time: 20 trips a week. Instead you write each item on the list on the fridge and go **once** on
+Saturday, buying all 20 items in one trip.
+
+**2. In the database**
+
+`UPDATE` changes the page **in RAM** and marks it *dirty* ("the disk copy is out of date"). The
+page is written to disk later, in one go.
+
+```text
+RAM (buffer pool)                    Disk
+┌───────────────────────┐            ┌───────────────────────┐
+│ page 2104  DIRTY      │            │ page 2104  (old)      │
+│ id=42 name='Ana B.'   │   later    │ id=42 name='Ana'      │
+│ id=43 …  (changed)    │  ───────►  │ id=43 …               │
+└───────────────────────┘            └───────────────────────┘
+```
+
+**3. Why: write absorption**
+
+If 30 users on the same page update their rows before the page is flushed (calculation L):
+
+```text
+write every change immediately:  31 × 8 KB = 248 KB of random writes
+dirty page, flush once:           1 × 8 KB =   8 KB
+```
+
+One trip instead of 31.
+
+**4. Problem 1: the list can be lost**
+
+If the fridge list burns (power cut), you forget what you needed. Dirty pages vanish with RAM.
+That's why the database **also** keeps a durable note: every change is first written to the WAL.
+It's like texting each item to yourself. If the list is lost, you rebuild it from your messages.
+
+**5. Problem 2: forced trips at a bad moment**
+
+If the list gets so long that the fridge is full, you have to go shopping **right now**, in the
+middle of cooking. When the buffer pool is full of dirty pages, loading a new page first requires
+writing a dirty one out, and the query waits. The **background writer** is a helper who does
+small shopping trips during the week, so there's always a clean frame free.
+
+**6. Problem 3: the Saturday rush**
+
+A **checkpoint** must flush *all* dirty pages, which is one huge shopping trip causing an I/O
+spike. Databases spread it over the whole interval (`checkpoint_completion_target = 0.9`), like
+shopping a little each day instead of everything at once.
+
+**7. Remember it like this**
+
+```text
+Dirty page = item on the shopping list, not yet bought
+ │
+ ├── change in RAM now, write to disk later
+ ├── many changes → one write              → write absorption
+ │
+ ├── RAM lost on crash                     → WAL is required
+ ├── pool full of dirty pages              → queries wait → background writer
+ └── checkpoint flushes all of them        → spread it out to avoid spikes
+```
+
+**Technical details — Dirty page**
+
 - *Without it (write-through):* every update writes its page to disk immediately → random writes on
   the commit path, and a hot page updated 1,000×/s is written 1,000×/s.
 - *How it fixes it:* change in RAM, mark dirty, write once later → **write absorption**.
@@ -399,14 +1016,99 @@ size/shape? What new problems does it create? What do others do instead?**
   written before its frame can be reused, so a pool full of dirty pages makes reads wait on writes
   → background writers flush ahead of time. Checkpoints must flush them all → I/O bursts.
 
-**WAL (write-ahead log)**
-- *Real-world analogy — a ship's logbook / a bank teller's journal.* The teller doesn't
-  re-print every customer's passbook the instant money moves; they write one line in the journal
-  and update passbooks later. If the branch floods, the journal (kept in the safe) is enough to
-  rebuild every balance. The costs match too: everything is written twice (journal + passbook), a
-  journal nobody archives eventually fills the safe (disk full from a stuck replication slot), and
-  the teller can't say "done" faster than they can lock the journal page in the safe (fsync
-  latency).
+#### WAL (write-ahead log)
+
+The **WAL** is best understood as **a bank teller's journal kept in a fire safe**.
+
+**1. Picture a bank before computers 🏦**
+
+The bank has 10,000 customer passbooks in filing cabinets spread across the building. A customer
+deposits $100. Two ways to do it:
+
+```text
+Option A: walk to the right cabinet, find the passbook, update it, walk back
+          → for every single transaction, all day
+
+Option B: write one line in the journal on your desk
+          "#5001  account 42  +$100"
+          say "done", and update the passbooks in the evening in one pass
+```
+
+**2. Why option B wins**
+
+The journal is **right on the desk**, and you only ever add a line at the end (sequential). The
+passbooks are **all over the building** (random). In a database:
+
+```text
+WAL record:  ~150 B appended to the end of one file   (sequential, cheap)
+data pages:  8 KB each, scattered across the disk     (random, expensive)
+```
+
+**3. Durability: the journal lives in the fire safe**
+
+At the end of each transaction the journal page is locked in the safe (fsync). If the building
+burns at 3 pm, the passbooks may be ashes or out of date, but the journal survives. Next morning:
+
+```text
+time →
+ 09:00  checkpoint: all passbooks correct up to journal line #5000
+ 09:01  #5001  acct 42  +100
+ 09:02  #5002  acct 7   −50
+ …
+ 15:00  🔥 fire (crash)
+
+ recovery: take the passbooks as of 09:00 → replay #5001 … #N → exact state at 15:00
+```
+
+**4. The golden rule: journal first, passbook second**
+
+Imagine the teller updates the passbook first and the fire starts before the journal line is
+written. Now there's a passbook change nobody can explain. Was it part of a transfer that never
+finished? You can't tell. Hence: **the WAL record must be durable before the page it describes
+may be written**, and before the customer hears "done".
+
+**5. Cost 1: everything is written twice**
+
+Once in the journal, once in the passbook. Write-heavy tables can produce more WAL than data.
+
+**6. Cost 2: a journal nobody archives fills the safe**
+
+Old journal pages are kept until they're no longer needed: until the next checkpoint, until
+they're archived, and until every replica has received them. If an archiver breaks or a replica
+disconnects while its **replication slot** still holds the WAL, the safe fills up. The disk runs
+out, and the database stops.
+
+**7. Cost 3: "done" can't be faster than locking the safe**
+
+Commit latency ≥ fsync latency of the WAL device (20 µs – 2 ms). **Group commit** = when 50
+customers are waiting, put all 50 lines in the safe in one trip.
+
+**8. Bonus: the journal is useful for more than fires**
+
+```text
+same WAL stream ──┬─► crash recovery           (replay after a fire)
+                  ├─► replicas                  (branches get photocopies of the journal)
+                  ├─► point-in-time recovery    (keep all old journals → rebuild any moment)
+                  └─► change-data-capture       (Debezium / logical decoding → other systems)
+```
+
+**9. Remember it like this**
+
+```text
+WAL = teller's journal in the fire safe
+ │
+ ├── append one small line (sequential) instead of updating pages (random)
+ ├── fsync the journal at commit → durable
+ ├── rule: journal line before the page, and before "OK"
+ │
+ ├── written twice                    → extra I/O
+ ├── unarchived / stuck slot          → disk full → DB stops
+ ├── commit ≥ fsync latency           → group commit
+ └── same log → recovery, replicas, PITR, CDC
+```
+
+**Technical details — WAL (write-ahead log)**
+
 - *Without it:* either force every touched page at commit (slow, and a torn page still corrupts
   data) or accept losing data on crash.
 - *How it fixes it:* one small sequential append per change, one fsync per commit (shared by group
@@ -420,13 +1122,73 @@ size/shape? What new problems does it create? What do others do instead?**
   device's fsync latency.
 - *Bonus:* the same stream powers replicas, point-in-time recovery and change-data-capture.
 
-**fsync**
-- *Real-world analogy — handing a letter to the post office vs getting a signed delivery
-  receipt.* Dropping it in the mailbox (`write()`) feels done, but it can still be lost before it
-  arrives (power cut → page cache gone). A registered letter with a signature (fsync) is slow and
-  costs more, so you use it only for what truly matters (the commit record). And some couriers
-  sign for parcels they haven't actually delivered yet (consumer SSDs without power-loss
-  protection).
+#### fsync
+
+**fsync** is best understood as **the difference between dropping a letter in a mailbox and
+sending it by registered mail with a signed receipt**.
+
+**1. Picture sending an important contract ✉️**
+
+```text
+Mailbox:          drop it in → you walk away → feels done
+                  but it sits in the box until pickup; if the box is destroyed tonight,
+                  the letter is gone — and nobody tells you
+
+Registered mail:  wait at the counter until you get a signed receipt
+                  slow, costs more — but now you have proof it arrived
+```
+
+**2. In the computer**
+
+```text
+app ── write() ──► OS page cache (RAM)          ← write() returns here: "done"
+                        │                          (NOT safe: power cut = gone)
+                        │ kernel flushes "later", often after ~5–30 s
+                        ▼
+app ── fsync() ──► disk controller ──► flash     ← fsync() returns here: SAFE
+```
+
+`write()` = the mailbox. `fsync()` = the signed receipt.
+
+**3. Why only for the commit record?**
+
+A signed receipt costs **20–50 µs** on a datacenter NVMe and **0.5–2 ms** on a cloud disk. You
+wouldn't send every postcard by registered mail. The database fsyncs only what makes a commit
+durable: the WAL up to the commit record. Data pages are written lazily and are covered by
+checkpoints.
+
+**4. Problem: couriers who lie**
+
+Some consumer SSDs have a volatile cache. They report "delivered" while the letter is still in
+the van. Power cut → gone, even though fsync said OK. Enterprise drives have **power-loss
+protection** (capacitors): the van has a backup generator that finishes the delivery.
+
+**5. Problem: the courier who throws the letter away ("fsyncgate", 2018)**
+
+```text
+you:     fsync()        courier: "delivery FAILED"
+you:     fsync() again  courier: "delivered!"   ← because he threw the letter away
+```
+
+On Linux, after a failed fsync the kernel could drop the dirty data and mark it clean, so a
+*retry* reported success. Postgres learned this in 2018, and now **crashes and recovers from the
+WAL** instead of retrying.
+
+**6. Remember it like this**
+
+```text
+fsync = registered mail with a signed receipt
+ │
+ ├── write()  → in the OS cache (mailbox)  → lost on power cut
+ ├── fsync()  → on durable storage         → safe
+ │
+ ├── slow (µs–ms) → use only for the WAL at commit
+ ├── cheap SSDs may lie → use drives with power-loss protection
+ └── a failed fsync can't be retried safely → crash + WAL recovery
+```
+
+**Technical details — fsync**
+
 - *Without it:* `write()` returns once bytes are in the OS page cache. A power cut erases that
   cache — the "committed" transaction is gone.
 - *Why only at commit, only on the log:* it costs ~20–50 µs on datacenter NVMe with power-loss
@@ -436,12 +1198,74 @@ size/shape? What new problems does it create? What do others do instead?**
   Postgres learned that after a failed fsync, Linux could drop the dirty pages and a *retried*
   fsync would report success. Postgres now crashes and recovers from WAL instead of retrying.
 
-**LSN (log sequence number)**
-- *Real-world analogy — the "last read" bookmark in a series you're re-reading, or the version
-  number on a document.* If the page's sticker says "updated up to line 5,000" and the logbook
-  line is 4,800, you skip it — it's already applied. That's why replaying the log twice never
-  double-applies a change, exactly like a bank ignoring a cheque whose number it has already
-  processed.
+#### LSN (log sequence number)
+
+An **LSN** is best understood as **numbered cheques plus a "processed up to" stamp in the ledger**.
+
+**1. Picture an accountant updating a ledger 📒**
+
+Cheques are numbered 1, 2, 3, … Each ledger page has a stamp in the corner: *"cheques applied up to
+#4,800"*. The accountant picks up a pile of cheques:
+
+```text
+cheque #4,750  → stamp says 4,800 → already applied → SKIP
+cheque #4,900  → stamp says 4,800 → not applied yet → APPLY, update stamp to 4,900
+```
+
+Even if the same pile is processed twice, no cheque is ever counted twice.
+
+**2. In the database**
+
+- Every WAL record has an **LSN**: its byte position in the log (looks like `0/16B3748`).
+- Every page header stores **page_lsn**: the LSN of the last change applied to that page.
+
+```text
+Page 2104 header: page_lsn = 4,800
+
+WAL records during recovery:
+  LSN 4,750  "set slot 3 name='Ana'"     → 4,750 ≤ 4,800 → skip (already on the page)
+  LSN 4,900  "set slot 3 name='Ana B.'"  → 4,900 > 4,800 → apply, page_lsn = 4,900
+```
+
+**3. Why is it needed?**
+
+Without it, recovery can't know whether a page already contains a change. Replaying blindly could
+apply it twice:
+
+```text
+"insert row 42"     applied twice → duplicate row
+"balance += 100"    applied twice → +$200 instead of +$100
+```
+
+With LSNs, replay is **idempotent**: repeating it changes nothing. That's also why a crash
+*during* recovery is harmless. Just start recovery again.
+
+**4. Other jobs the LSN does**
+
+```text
+replication lag   = primary's current LSN − replica's replayed LSN   (bytes behind)
+the WAL rule      = a page may be written to disk only if page_lsn ≤ WAL flushed LSN
+point-in-time     = "restore up to LSN X" (or the timestamp that maps to it)
+```
+
+**5. Why 64 bits?**
+
+It's a byte offset into the log. Even at 1 GB/s of WAL, 2⁶⁴ bytes lasts about **585 years**, so it
+never wraps around in practice. The cost is 8 bytes per page.
+
+**6. Remember it like this**
+
+```text
+LSN = cheque number;  page_lsn = "processed up to" stamp
+ │
+ ├── record LSN ≤ page_lsn → skip;  > page_lsn → apply
+ ├── makes replay idempotent → recovery can be repeated safely
+ ├── measures replica lag in bytes
+ └── enforces "WAL before page"
+```
+
+**Technical details — LSN (log sequence number)**
+
 - *Without it:* after a crash you can't tell whether a page on disk already contains a change, so
   re-applying could apply it twice (e.g. insert the same row twice).
 - *How it fixes it:* each WAL record has a position; each page stores the LSN of the last change
@@ -450,13 +1274,70 @@ size/shape? What new problems does it create? What do others do instead?**
 - *Also used for:* measuring replication lag (primary LSN − replica LSN = bytes behind) and
   enforcing the WAL rule (a page can be flushed only if `page_lsn ≤ flushed_lsn`).
 
-**Checkpoint**
-- *Real-world analogy — saving your game.* Without saves, a crash sends you back to the very
-  start (replay the whole WAL). Save often and a crash costs little, but saving itself pauses the
-  game (checkpoint I/O). Save rarely and play is smooth, but a crash costs you a long replay. The
-  checkpoint interval is exactly this "how often do I save?" setting. Also like an accountant
-  closing the books monthly: older receipts can be archived once the month is closed (old WAL
-  recycled).
+#### Checkpoint
+
+A **checkpoint** is best understood as **saving your progress in a video game**.
+
+**1. Picture a long video game 🎮**
+
+No saves: the game crashes on level 9 and you start again from level 1. Autosave every 5
+minutes: a crash costs you at most 5 minutes of play.
+
+**2. In the database**
+
+A checkpoint = write all dirty pages to disk, then record *"everything up to LSN X is on disk"*.
+After a crash, recovery starts replaying from X, not from the beginning of time.
+
+```text
+WAL  ─────────────────────────────────────────────────────────────►
+      ▲ checkpoint           ▲ checkpoint                    ▲ crash
+      LSN 1,000              LSN X = 5,000                    LSN 6,200
+                             └── replay only 5,000 → 6,200 ───┘
+      └── WAL before 5,000 can be recycled or archived
+```
+
+**3. Why is it needed?**
+
+- **Bounds recovery time**: you only replay since the last save.
+- **Lets old WAL be deleted**: like an accountant closing the books for the month, after which
+  that month's receipts can go to the archive.
+
+**4. The trade-off: saving pauses the game**
+
+Each checkpoint writes many dirty pages (an I/O burst). Also, the **first** change to each page
+after a checkpoint logs a full 8 KB page image (torn-write protection), so WAL volume jumps right
+after every checkpoint.
+
+With 5 MB/s of WAL and a replay speed of 100–500 MB/s (calculation M):
+
+| Checkpoint every | WAL to replay (worst case) | Recovery time | Checkpoint I/O + extra WAL |
+|---|---|---|---|
+| 1 min | 300 MB | ~1–3 s | high |
+| **5 min** (Postgres default) | 1.5 GB | ~3–15 s | moderate |
+| 30 min | 9 GB | ~20–90 s | low |
+
+**5. Autosave in the background**
+
+Postgres doesn't flush everything at once. It spreads the writes over ~90% of the interval
+(`checkpoint_completion_target = 0.9`), like a game saving quietly in the background instead of
+freezing the screen.
+
+**6. Remember it like this**
+
+```text
+Checkpoint = save game
+ │
+ ├── flush dirty pages, record "safe up to LSN X"
+ ├── recovery replays only from X
+ ├── WAL older than X can be recycled
+ │
+ ├── save often  → fast recovery, more I/O, more WAL
+ ├── save rarely → less I/O, slow recovery, more WAL on disk
+ └── spread the writes to avoid I/O spikes
+```
+
+**Technical details — Checkpoint**
+
 - *Without it:* recovery would replay the WAL from the very beginning, and no WAL could ever be
   deleted.
 - *How it fixes it:* periodically flush all dirty pages, then record "everything before LSN X is
@@ -467,11 +1348,77 @@ size/shape? What new problems does it create? What do others do instead?**
   disk. Writes are spread across the interval (`checkpoint_completion_target`) to avoid a spike.
 - *Problems it creates:* I/O bursts and WAL volume spikes right after each checkpoint.
 
-**Transaction**
-- *Real-world analogy — a house purchase through escrow.* Money and keys change hands
-  together or not at all; nobody ends up with the money *and* the house, or neither. The costs
-  match too: while escrow is open the house is "held" for you (locks held by a long transaction),
-  and if a check fails the whole deal is cancelled and restarted (abort + retry).
+#### Transaction
+
+A **transaction** is best understood as **buying a house through escrow**.
+
+**1. Picture buying a house 🏠**
+
+You pay $300,000; the seller hands over the keys. Two dangers:
+
+```text
+you paid, but got no keys      ✗
+you got keys, seller got no money  ✗
+```
+
+Escrow fixes it: an agent holds both the money and the deed. At closing **both move at once**, or
+the deal is cancelled and everything goes back.
+
+**2. In the database**
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;   -- debit Ana
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;   -- credit Bob
+COMMIT;
+```
+
+```text
+without a transaction:  debit ✓ → 💥 crash → credit never happens → $100 vanished
+with a transaction:     debit ✓ → 💥 crash → recovery rolls back the debit → nothing happened
+```
+
+**3. ACID, mapped onto escrow**
+
+| Letter | Escrow | Database mechanism |
+|---|---|---|
+| **A**tomicity | both sides move, or neither | WAL + undo / invisible versions |
+| **C**onsistency | the deal can't close if it breaks the rules (no negative balance) | constraints, checks, foreign keys |
+| **I**solation | other buyers don't see a half-closed deal | MVCC + locks |
+| **D**urability | the signed deed is filed at the registry | WAL fsync at commit |
+
+**4. Problem 1: a long escrow blocks others**
+
+While escrow is open, the house is held for you. A transaction left open for an hour (e.g. an app
+that ran `BEGIN` and waits for user input, shown as *idle in transaction*) holds its row locks and
+its old snapshot. Others wait, and VACUUM can't clean up anything newer than that snapshot.
+
+**5. Problem 2: deals get cancelled → retry**
+
+Under stricter isolation (`SERIALIZABLE`), or after a deadlock, the database cancels one
+transaction. The app **must retry**, just as a buyer restarts a deal that fell through. Code
+without retry logic will surface random errors under load.
+
+**6. Problem 3: paperwork per deal**
+
+Every commit costs an fsync. A million single-row transactions = a million fsyncs; the same
+million rows in batches of 1,000 = 1,000 fsyncs.
+
+**7. Remember it like this**
+
+```text
+Transaction = escrow
+ │
+ ├── all changes happen together, or none do
+ ├── ACID: all-or-nothing, rules hold, others don't see half-done work, survives crash
+ │
+ ├── long transaction   → holds locks + old snapshot → blocks others and VACUUM
+ ├── aborts happen      → the app must retry
+ └── one fsync per commit → batch small writes
+```
+
+**Technical details — Transaction**
+
 - *Without it:* a crash or error between "debit A" and "credit B" leaves money missing, and every
   application has to write its own cleanup logic.
 - *How it fixes it:* all-or-nothing (atomicity via WAL/undo), isolation from others (MVCC/locks),
@@ -480,12 +1427,88 @@ size/shape? What new problems does it create? What do others do instead?**
   (blocking cleanup). Under stricter isolation some transactions abort and **must be retried by
   the app**. Each commit pays an fsync, so millions of tiny transactions are slower than batches.
 
-**MVCC (multi-version concurrency control)**
-- *Real-world analogy — Wikipedia page history / a newspaper's editions.* Readers see the
-  published edition while editors work on the next one; nobody waits for anybody. Old editions
-  must eventually be recycled (VACUUM), and one person still reading a very old edition forces the
-  library to keep every edition since then (a long transaction blocking cleanup). The counter on
-  the editions eventually wraps and must be reset before it runs out (xid wraparound).
+#### MVCC (multi-version concurrency control)
+
+**MVCC** is best understood as **newspaper editions** (or Wikipedia's page history).
+
+**1. Picture a newspaper 📰**
+
+Readers read **this morning's edition** while journalists write **tomorrow's**. Nobody waits for
+anybody: readers don't block writers, writers don't block readers.
+
+Compare with a single shared **whiteboard** (plain locking): while someone erases and rewrites
+it, readers must wait; while someone copies it down, the writer must wait.
+
+**2. In the database**
+
+`UPDATE` doesn't overwrite the row. It creates a **new version** and marks the old one as replaced:
+
+```text
+row id = 42
+  v1: name='Ana'      xmin=107   xmax=311   ← visible to snapshots taken before 311 committed
+  v2: name='Ana B.'   xmin=311   xmax=0     ← visible to snapshots taken after 311 committed
+```
+
+**3. Snapshots: which edition do I get?**
+
+Each transaction gets a **snapshot**: "which transactions had committed when I started".
+
+```text
+10:00  report starts (snapshot: 311 not committed)   → sees 'Ana' for the whole report
+10:01  txn 311 renames to 'Ana B.' and commits
+10:02  new login (snapshot: 311 committed)           → sees 'Ana B.'
+       the report, still running, still sees 'Ana' → consistent, and no one waited
+```
+
+(A snapshot lasts for one statement under the default READ COMMITTED, and for the whole
+transaction under REPEATABLE READ / SERIALIZABLE. A long report query is one statement, so it
+keeps one snapshot either way.)
+
+**4. Problem 1: old editions pile up (bloat)**
+
+Every update leaves an old version behind. **VACUUM** is the recycling truck that removes
+versions no snapshot can see anymore. If it can't keep up, a table with 10 GB of live data can
+take 80 GB on disk.
+
+**5. Problem 2: one slow reader keeps everything**
+
+The library can't recycle any edition someone might still be reading. One transaction open for 6
+hours means **6 hours of old versions of every updated row** stay on disk, for every table.
+
+**6. Problem 3: write skew**
+
+```text
+Rule: at least one doctor must be on call. Alice and Bob are both on call.
+Alice's txn: reads "2 on call" → sets Alice off call
+Bob's txn:   reads "2 on call" → sets Bob off call     (both read the old edition)
+both commit → 0 doctors on call ✗
+```
+
+Each saw a consistent edition, but the combination breaks the rule. Fix: `SERIALIZABLE`
+isolation, or lock the rows you read (`SELECT … FOR UPDATE`).
+
+**7. Problem 4: the edition counter wraps around (Postgres)**
+
+Transaction IDs are 32-bit, compared in a circle, so only ~2 billion are "in the past" at any
+time. Old rows must be **frozen** by VACUUM ("so old it's visible to everyone") before the counter
+comes around. Otherwise Postgres stops accepting writes to protect the data.
+
+**8. Remember it like this**
+
+```text
+MVCC = newspaper editions
+ │
+ ├── writers create new versions; readers read their snapshot's edition
+ ├── readers never block writers, writers never block readers
+ │
+ ├── old versions pile up          → VACUUM / purge
+ ├── long transaction              → nothing can be cleaned
+ ├── snapshot isolation            → write skew → SERIALIZABLE or FOR UPDATE
+ └── 32-bit xid (Postgres)         → freeze old rows before wraparound
+```
+
+**Technical details — MVCC (multi-version concurrency control)**
+
 - *Without it (plain locking):* a reader must lock rows so a writer can't change them mid-read. A
   10-minute report then blocks every update to the rows it touches.
 - *How it fixes it:* writers create new versions; each reader sees the versions that were committed
@@ -496,13 +1519,72 @@ size/shape? What new problems does it create? What do others do instead?**
   must be "frozen" by VACUUM or the DB stops accepting writes to protect itself.
 - *Alternatives:* 2PL (readers lock), OCC (validate at commit), SSI (MVCC + conflict tracking).
 
-**Lock vs latch**
-- *Real-world analogy — booking a meeting room vs holding the door.* A **lock** is a room
-  reservation: held for the whole meeting, visible on the calendar, and two people who each
-  booked the room the other needs next can block each other forever (deadlock → someone must
-  cancel). A **latch** is holding a door for a second while someone walks through: nobody books
-  it, it's released immediately, and a crowd at the one busy door (the right-most B+Tree leaf) is
-  the only way it becomes a problem.
+#### Lock vs latch
+
+**Locks and latches** are best understood as **booking a meeting room vs holding a door open**.
+
+**1. Picture an office 🚪**
+
+```text
+Meeting room booking (LOCK)              Holding a door (LATCH)
+─────────────────────────                ─────────────────────────
+on the calendar, visible to everyone     nobody records it
+held for the whole meeting (hours)       held for a second
+can conflict: two people want            only a problem when a crowd
+the same room                            needs the same door at once
+```
+
+**2. In the database**
+
+| | Lock | Latch |
+|---|---|---|
+| Protects | logical data: "row 42", "table users" | a memory structure: the bytes of page 2,104, a hash bucket |
+| Held by | a **transaction** | a **thread** |
+| Duration | ms → hours (until commit) | ns → µs |
+| Modes | many (shared, exclusive, intent, …) | read / write |
+| Deadlocks | possible → detected, a victim is aborted | avoided by always taking them in a fixed order |
+| Where you see it | `pg_locks`, lock waits | CPU profiles, `LWLock` wait events |
+
+**3. Why two different mechanisms?**
+
+- Using the room-booking system to hold a door would be absurdly slow. A lock manager does
+  hash-table work and bookkeeping on every acquire, and the database takes latches millions of
+  times per second.
+- Holding a door for a 2-hour meeting would block the whole building. A latch held for a whole
+  transaction would freeze every other thread touching that page.
+
+**4. Lock problem: deadlock**
+
+```text
+Alice books Room A, then wants Room B.
+Bob   books Room B, then wants Room A.   → both wait forever
+
+txn 1: UPDATE row 1 … then UPDATE row 2
+txn 2: UPDATE row 2 … then UPDATE row 1  → deadlock
+```
+
+The database's detector notices (Postgres checks after `deadlock_timeout` = 1 s) and aborts one
+of them. The fix in code: always update rows in the same order (e.g. by id).
+
+**5. Latch problem: the crowded door (hot spot)**
+
+With ever-increasing ids, **every insert** goes to the same right-most B+Tree leaf, so every
+thread queues at the same door. That's fine at thousands of inserts/s; at hundreds of thousands
+it becomes the bottleneck. The fix: spread the traffic (hash partitioning, several
+"doors").
+
+**6. Remember it like this**
+
+```text
+Lock  = meeting-room booking (transaction, long, logical data, can deadlock)
+Latch = holding a door       (thread, µs, memory structure, ordered → no deadlock)
+ │
+ ├── locks   → waiting, deadlocks → consistent update order, short transactions
+ └── latches → hot-spot contention → spread the load
+```
+
+**Technical details — Lock vs latch**
+
 - *Why two mechanisms:* two different dangers at two timescales. A **lock** protects a logical
   row from another *transaction* (held for ms to minutes, can deadlock → needs a deadlock
   detector). A **latch** protects a data structure in memory from another *thread* while it's being
@@ -513,12 +1595,91 @@ size/shape? What new problems does it create? What do others do instead?**
   threads queue on its latch. (That's the flip side of "sequential keys are good for cache
   locality" — both are true; at very high insert rates, hash-sharding or partitioning spreads it out.)
 
-**Optimizer**
-- *Real-world analogy — a navigation app (Google Maps / Waze).* You give the destination, it
-  picks the route from traffic data (statistics). With fresh data it finds the 10-minute route;
-  with stale data it confidently sends you onto a closed motorway (a plan flip). With 12+ stops it
-  stops trying every order and uses a heuristic, just like the planner switching to genetic search
-  for many-table joins.
+#### Optimizer
+
+The **optimizer** is best understood as **a navigation app like Google Maps or Waze**.
+
+**1. Picture planning a drive 🗺️**
+
+You type the destination. There are dozens of possible routes. The app uses **traffic data** to
+estimate each route's time and shows you the fastest. You never say *which* roads to take, only
+*where* you want to go.
+
+**2. In the database**
+
+SQL is the destination; a **plan** is a route.
+
+```sql
+SELECT o.*
+FROM orders o JOIN users u ON u.id = o.user_id
+WHERE u.country = 'AM' AND o.created_at > now() - interval '1 day';
+```
+
+```text
+Route A: filter users by country → for each, look up their recent orders via index
+Route B: take yesterday's orders  → for each, look up its user via index
+Route C: scan both tables fully   → hash join
+join method: nested loop? hash join? merge join?
+```
+
+**3. Traffic data = statistics**
+
+```text
+users:  10,000,000 rows,  country='AM' ≈ 0.5%      → 50,000 users
+orders: 200,000,000 rows, last day ≈ 0.1%           → 200,000 orders
+
+estimated cost:  Route A  ≈ 85,000   Route B  ≈ 1,200   Route C ≈ 2,400,000
+                                      ▲ picked
+```
+
+`ANALYZE` refreshes these statistics (row counts, histograms, most common values, distinct counts).
+
+**4. Problem 1: stale traffic data**
+
+You bulk-load 5M rows into a table the optimizer still thinks has 1,000 rows. It picks a nested
+loop "because the table is tiny", and a 50 ms query takes 30 s. It's the app confidently
+sending you onto a road that closed yesterday. Fix: `ANALYZE` after big loads (autovacuum does it
+eventually, but maybe not soon enough).
+
+**5. Problem 2: correlated columns**
+
+```text
+WHERE city = 'Yerevan' AND country = 'AM'
+city = 'Yerevan' ≈ 0.3% of users,  country = 'AM' ≈ 0.5% of users
+optimizer assumes independent:  0.3% × 0.5% = 0.0015% → ~150 rows
+reality: everyone in Yerevan is in AM   → 0.3%          → ~30,000 rows (200× more)
+```
+
+Like assuming two roads have independent traffic when one feeds into the other. Fix: extended
+statistics (`CREATE STATISTICS`).
+
+**6. Problem 3: too many stops**
+
+For n tables the number of join orders grows like n!: 5 tables → 120, 12 tables → 479 million.
+Like a route with 12 stops, the planner stops trying every order and uses a heuristic (Postgres
+switches to genetic search at 12 tables, `geqo_threshold`).
+
+**7. Why not a simple rule like "always use the index"?**
+
+Because the fastest route depends on traffic. For 1 row, the index wins (4 pages vs 125,000).
+For 40% of the table, the index would do ~4M random reads and a sequential scan wins easily.
+
+**8. Remember it like this**
+
+```text
+Optimizer = navigation app
+ │
+ ├── SQL = destination, plan = route, statistics = traffic data
+ ├── estimates cost of each route, picks the cheapest
+ │
+ ├── stale stats         → wrong route → ANALYZE
+ ├── correlated columns  → wrong estimate → extended statistics
+ ├── many tables         → too many routes → heuristics
+ └── check with EXPLAIN (ANALYZE): estimated rows vs actual rows
+```
+
+**Technical details — Optimizer**
+
 - *Without it:* the programmer writes the plan by hand, and it silently becomes wrong when the table
   grows from 1,000 to 100M rows.
 - *How it fixes it:* enumerate plans, estimate each one's cost from statistics (row counts,
@@ -530,12 +1691,83 @@ size/shape? What new problems does it create? What do others do instead?**
   Planning time grows fast with join count (Postgres switches to a genetic search at 12 tables,
   `geqo_threshold`).
 
-**Index**
-- *Real-world analogy — the index at the back of a textbook.* Look up "WAL" → pages 214, 380;
-  no need to read the whole book. Every time the author edits the book, every index entry that
-  moved must be updated (write cost), and the index adds pages to the book (space). A book with an
-  index for every word would be twice as thick and slow to revise — the "too many indexes"
-  problem.
+#### Index
+
+An **index** is best understood as **the index at the back of a textbook**.
+
+**1. Picture a 1,000-page textbook 📚**
+
+You want everything about "WAL". Without an index you read all 1,000 pages. With the index at the
+back: find "W", then "WAL → pages 214, 380", then open those two pages.
+
+**2. In the database**
+
+```text
+SELECT * FROM users WHERE id = 42;
+
+without an index:  read all ~125,000 pages      (~1 GB)
+with a B+Tree:     root → internal → leaf → row  (4 pages, ~32 KB)
+```
+
+**3. Why a sorted tree? Like a phone book with tabs**
+
+```text
+                    ROOT  [ 1 … 3.3M | 3.3M … 6.6M | 6.6M … 10M ]      ← letter tabs
+                           │
+            INTERNAL [ 1…8K | 8K…16K | … ]  (~400 children each)       ← page headers
+                           │
+            LEAF  [ 41 → (2103,9) | 42 → (2104,3) | 43 → (2104,4) … ]   ← the entries
+                                     │
+                              table page 2104, slot 3  → the row
+```
+
+~400 keys per page means 3 levels cover 64 million keys. Because the keys are sorted, the same
+tree also answers `BETWEEN`, `ORDER BY id` and `MIN(id)`.
+
+**4. Cost 1: every edit updates the index**
+
+When the author adds a paragraph, every index entry after it must be updated. Every
+`INSERT`/`UPDATE`/`DELETE` also changes every index on the table:
+
+```text
+INSERT into users with 6 indexes = 1 table write + 6 index writes (+ WAL for all 7)
+```
+
+**5. Cost 2: space**
+
+An index on `users.id` alone is ~200 MB (25,000 leaf pages) for a 1 GB table. Six indexes can be
+bigger than the table itself, and they compete for the buffer pool.
+
+**6. Cost 3: unused indexes are dead weight**
+
+A book with an index entry for every word would be twice as thick and slow to revise. Find
+indexes nobody uses (`pg_stat_user_indexes.idx_scan = 0`) and drop them.
+
+**7. Different kinds of index, different kinds of "back of the book"**
+
+| Index | Book analogy | Good for |
+|---|---|---|
+| B+Tree | the alphabetical index | `=`, ranges, sorting — the default |
+| Hash | a coat-check ticket: exact number → exact hook | `=` only |
+| GIN | a concordance: every word → every page it appears on | full-text, JSONB, arrays |
+| BRIN | "chapter 5 covers the years 2020–2021" | huge tables naturally ordered by time |
+| HNSW | a "books similar to this one" shelf | vector / similarity search |
+
+**8. Remember it like this**
+
+```text
+Index = the index at the back of the book
+ │
+ ├── find rows without reading the whole table
+ ├── B+Tree: sorted, ~400 keys/page, 3–4 levels, ranges + ORDER BY
+ │
+ ├── every write pays for every index
+ ├── takes space and buffer-pool memory
+ └── unused index = pure cost → drop it
+```
+
+**Technical details — Index**
+
 - *Without it:* finding one row among 10M means reading ~125,000 pages.
 - *Why a B+Tree by default:* ~400 keys per page → 3–4 levels for billions of rows, the top levels
   stay cached, and sorted order serves ranges and `ORDER BY` too.
@@ -543,13 +1775,74 @@ size/shape? What new problems does it create? What do others do instead?**
   and it bloats. Unused indexes are pure cost, so audit them (`pg_stat_user_indexes`). Too many
   indexes also give the optimizer more ways to pick badly.
 
-**Replica**
-- *Real-world analogy — a news ticker in another city / a branch office receiving faxed
-  updates.* The branch can answer customers locally (read scaling) and keeps working if head
-  office burns down (failover). But the faxes arrive with a delay, so the branch may quote
-  yesterday's price (replication lag, stale reads). If head office burns before the last fax was
-  sent, those updates are gone (async data loss). Waiting for "fax received" on every change makes
-  every change slower (sync replication).
+#### Replica
+
+A **replica** is best understood as **a branch office that receives every change from head office
+by fax**.
+
+**1. Picture a company with a branch office 🏢 → 🏢**
+
+Head office makes every decision and faxes each one to the branch. The branch applies each fax to
+its own copy of the files. Customers can ask the branch questions, and if head office burns down,
+the branch can take over.
+
+**2. In the database**
+
+```text
+PRIMARY (head office)                         REPLICA (branch)
+ writes WAL ── stream of WAL records ──────►  replays WAL continuously
+ (all writes)                                 (read-only queries)
+                                              = crash recovery that never ends
+```
+
+**3. Why is it needed?**
+
+- **Read scaling**: 20,000 reads/s can be spread across the primary and replicas.
+- **High availability**: if the primary dies, promote a replica in seconds.
+
+**4. Problem 1: fax delay (replication lag)**
+
+```text
+t = 0 ms    user posts a comment        → written on the primary
+t = 50 ms   page reloads, read replica  → replica is 200 ms behind → comment missing!
+```
+
+The branch quoted yesterday's price. Fixes: send "read your own writes" traffic to the primary,
+or wait until the replica has replayed past the commit's LSN.
+
+**5. Problem 2: head office burns before the last fax was sent**
+
+With **async** replication the primary says "OK" before the replica has the change. If it dies
+right then, the promoted replica never saw those commits, and they're **lost** (RPO > 0).
+
+**6. Problem 3: waiting for "fax received" slows every decision**
+
+With **sync** replication the primary waits for the replica's acknowledgement before "OK". No
+loss, but every commit pays a network round trip: ~0.5 ms in the same zone, 30–100 ms across
+regions.
+
+**7. Problem 4: the branch clerk is still reading a document the fax says to shred**
+
+A long query on the replica needs old row versions that the replayed WAL wants to remove. Postgres
+either **cancels the query** or **delays replay** (more lag). The knobs are
+`max_standby_streaming_delay` and `hot_standby_feedback`. The latter makes the primary keep the
+versions, which causes bloat there instead.
+
+**8. Remember it like this**
+
+```text
+Replica = branch office receiving faxes (WAL)
+ │
+ ├── scales reads, survives primary failure
+ │
+ ├── lag                 → stale reads → read-your-writes on primary
+ ├── async failover      → recent commits lost
+ ├── sync replication    → no loss, +1 round trip per commit
+ └── long replica query  → cancelled or delays replay
+```
+
+**Technical details — Replica**
+
 - *Without it:* one machine = one point of failure, and reads are capped at what one machine can
   serve.
 - *How it works:* the primary streams its WAL; the replica replays it (crash recovery that never
@@ -559,12 +1852,79 @@ size/shape? What new problems does it create? What do others do instead?**
   conflict with replayed cleanup (Postgres cancels the query or delays replay). Sync replication
   fixes loss but adds a network round trip to every commit.
 
-**Amplification (read / write / space)**
-- *Real-world analogy — shipping and moving house.* Read amplification: driving to a warehouse
-  and carrying back a whole box to get one screw. Write amplification: to change one line in a
-  printed book you reprint the page, the table of contents and the index. Space amplification:
-  keeping old versions of every document "just in case" until the cupboard is full. RUM: fast to
-  find, cheap to change, small to store — like "fast, cheap, good", pick two.
+#### Amplification (read / write / space)
+
+**Amplification** is best understood as **three everyday annoyances of moving stuff around**.
+
+**1. Picture three annoyances 🔩📖🗄️**
+
+```text
+READ amplification:   you need ONE screw → drive to the warehouse → carry back a box of 500
+WRITE amplification:  fix ONE typo on page 12 of a printed book → reprint the page,
+                      the table of contents and the index
+SPACE amplification:  keep every old draft "just in case" → the cupboard is full
+```
+
+**2. In the database, with numbers from this chapter**
+
+```text
+Read amplification  = bytes read / bytes needed
+  one row via a page:        8,192 B / 100 B          ≈ 82×
+  one row via index + page:  4 pages × 8 KB / 100 B   ≈ 330×   (if nothing is cached)
+
+Write amplification = bytes written to disk / bytes the user changed
+  UPDATE name (≈10 B changed):
+    WAL record ~150 B + page 8 KB (+ 8 KB full-page image after a checkpoint)
+    ≈ 8–16 KB / 10 B ≈ 800–1,600×  (less if many updates share one page flush)
+  LSM tree: each byte is rewritten once per level during compaction → ~10–30×
+
+Space amplification = bytes on disk / live data
+  bloated MVCC table:  80 GB / 10 GB = 8×
+  LSM with obsolete versions: ~1.1–2×
+```
+
+**3. The rule: RUM — you can't win all three**
+
+You can make at most **two** of **R**ead cost, **U**pdate cost and **M**emory/space cost small:
+
+```text
+                 Read cost low
+                      /\
+                     /  \
+          B+Tree ── /    \
+                   /  ✗   \        ✗ = "all three low" does not exist
+                  /________\
+   Update cost low          Space low
+        LSM                 compression, columnar
+```
+
+Like "fast, cheap, good: pick two".
+
+**4. How to use it**
+
+For any design, ask: **which amplification does it lower, and which does it raise?**
+
+```text
+add an index        → read ↓   write ↑   space ↑
+B+Tree → LSM        → write ↓  read ↑    (space depends on compaction)
+compression         → space ↓  CPU ↑     (reads of compressed blocks cost CPU)
+bigger pages        → fewer I/Os for scans, read amp ↑ for point lookups
+```
+
+**5. Remember it like this**
+
+```text
+Amplification = extra work per byte you actually wanted
+ │
+ ├── read  → carry a whole box for one screw
+ ├── write → reprint the book for one typo
+ ├── space → keep every old draft
+ │
+ └── RUM: pick two of read / update / space → every design is a trade
+```
+
+**Technical details — Amplification (read / write / space)**
+
 - *Why the concept exists:* it's the common currency for comparing designs. *Read amplification*
   = bytes read ÷ bytes wanted (read a 16 KB page for a 100 B row = 160×). *Write amplification* =
   bytes written to disk ÷ bytes changed (WAL + page + index pages; LSM compaction rewrites data
