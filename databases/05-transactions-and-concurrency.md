@@ -1,11 +1,12 @@
 # Database Transactions & Concurrency Control: A Deep Dive
 
-A comprehensive, staff-engineer-level reference covering ACID internals, every concurrency anomaly, isolation levels across major databases, locking protocols, MVCC implementations, distributed transactions, and practical concurrency patterns used in production systems.
+A comprehensive, staff-engineer-level reference covering ACID internals, every concurrency anomaly, isolation levels across major databases, locking protocols, MVCC implementations, distributed transactions, practical concurrency patterns, and the engine-specific lock internals (PostgreSQL row/table lock modes, MultiXacts, InnoDB gap and next-key locks) behind most production lock incidents.
 
 ---
 
 ## Table of Contents
 
+0. [Mental Model: Key Terms With Everyday Analogies](#0-mental-model-key-terms-with-everyday-analogies)
 1. [ACID Deep Dive](#1-acid-deep-dive)
 2. [Concurrency Anomalies (All of Them)](#2-concurrency-anomalies-all-of-them)
 3. [Isolation Levels](#3-isolation-levels)
@@ -14,6 +15,46 @@ A comprehensive, staff-engineer-level reference covering ACID internals, every c
 6. [Distributed Transactions](#6-distributed-transactions)
 7. [Transaction Implementation Details](#7-transaction-implementation-details)
 8. [Practical Concurrency Patterns](#8-practical-concurrency-patterns)
+9. [Advanced Locking Internals](#9-advanced-locking-internals)
+   - [9.1 PG row-lock modes: FOR KEY SHARE / FOR NO KEY UPDATE](#91-postgresql-row-lock-modes-for-key-share-and-for-no-key-update) · [9.2 Where row locks live](#92-where-row-locks-physically-live) · [9.3 MultiXacts](#93-multixacts-when-several-transactions-lock-one-row) · [9.4 Table lock modes](#94-postgresql-table-level-lock-modes) · [9.5 Lock queue pile-up & safe DDL](#95-the-lock-queue-pile-up-how-a-1-ms-alter-table-causes-an-outage) · [9.6 Timeouts](#96-where-timeouts-apply) · [9.7 EvalPlanQual](#97-read-committed-write-semantics-evalplanqual-and-semi-consistent-reads) · [9.8 InnoDB gap / next-key / insert-intention](#98-innodb-lock-types-record-gap-next-key-insert-intention-auto-inc) · [9.9 Write skew without SERIALIZABLE](#99-preventing-write-skew-and-phantoms-without-serializable) · [9.10 U locks & lock ordering](#910-lock-conversion-u-locks-and-lock-ordering) · [9.11 Hot rows](#911-hot-rows-when-one-row-is-the-bottleneck) · [9.12 Subtransactions](#912-subtransactions-the-hidden-scalability-cliff-postgresql)
+
+---
+
+## 0. Mental Model: Key Terms With Everyday Analogies
+
+Read this table first. Each row gives the one-line meaning, a real-world picture to hang it on, why the thing exists, and what it costs. Every later section is detail on one of these rows. (Same format as [MENTAL_MODEL.md](MENTAL_MODEL.md).)
+
+**The whole chapter in one picture: a busy shared office.** Rows are documents on desks, tables are rooms, a transaction is one employee's errand that must finish completely or be undone. Locks are "in use" signs; MVCC means readers get a photocopy so they never wait for the person editing the original.
+
+| Term | Plain meaning | Everyday analogy | Why we need it | Problems it creates |
+|---|---|---|---|---|
+| Transaction | changes that all happen or none happen | a bank transfer: debit and credit together | Crashes mid-change would leave half-done data | Long ones hold locks/snapshots; apps must retry aborts |
+| Undo log / rollback | before-images used to reverse changes | Ctrl-Z history | Atomicity: an abort must restore every changed row | Undo space grows with long transactions |
+| Isolation level | how much concurrent transactions can see of each other | how thick the walls between cubicles are | Full isolation is expensive; weaker levels are faster | Each weaker level allows specific anomalies (Section 2) |
+| Snapshot | the set of committed data a statement/transaction is allowed to see | a photo of the whiteboard taken when you walked in | Readers get a stable view without blocking writers | Old versions must be kept until no photo needs them (bloat) |
+| Dirty read | reading uncommitted data | reading a colleague's unsent draft email | -- (it's the anomaly) | You act on data that may be rolled back |
+| Lost update | two read-modify-writes, one overwrites the other | two people editing the same spreadsheet cell offline; last save wins | -- | Silent data loss; InnoDB RR does NOT prevent it |
+| Write skew | two transactions check a shared rule, then change *different* rows | two on-call doctors each see "2 on call" and both go home | -- | Invisible to row locks; needs constraints, a shared lock row, or SERIALIZABLE (9.9) |
+| Phantom | new rows appear in a repeated range query | a new guest walks in after you counted the room | -- | Needs predicate/gap locks or snapshots |
+| 2PL | acquire locks, never release until done | collect every key you need before returning any | Guarantees serializability with locks | Blocking, deadlocks |
+| MVCC | keep old row versions for readers | readers get a photocopy while the editor works on the original | Readers and writers stop blocking each other | Version cleanup (VACUUM/purge), write skew under SI |
+| SSI | snapshot isolation + a referee tracking read/write dependencies | a referee who cancels one move if the game could not have been played turn by turn | Serializable without read locks | False-positive aborts; everyone must retry |
+| Deadlock | a cycle of transactions waiting for each other | two cars nose-to-nose on a one-lane bridge | -- | One transaction is killed (40P01) and must retry |
+| Lock ordering | always take locks in the same global order | always pick up the lower-numbered chopstick first | Prevents most deadlocks by construction | Needs discipline across all code paths |
+| Row-lock modes (PG) | `FOR UPDATE` / `NO KEY UPDATE` / `SHARE` / `KEY SHARE` | demolish / repaint / inspect / mail carrier needs the address | Let FK checks run in parallel with normal updates (9.1) | ORMs default to the strongest mode |
+| MultiXact | a shared lock list stored when several txns lock one row | a sign-up sheet on the door, reprinted for every new name | `xmax` can hold only one XID | O(N²) growth on hot rows, its own wraparound (9.3) |
+| Table lock modes | 8 relation-level modes from ACCESS SHARE to ACCESS EXCLUSIVE | shop signs: open / restocking / stocktake / closed for renovation | DDL must not change a table under a running query | ACCESS EXCLUSIVE blocks even plain `SELECT` (9.4) |
+| Lock queue pile-up | queued DDL makes every later query wait | a wide load waiting at a single-lane bridge jams the whole road | Queue order prevents starvation | Tiny DDL behind a long query = outage; use `lock_timeout` (9.5) |
+| Gap / next-key lock | InnoDB locks on the *space between* index records | traffic cones across empty parking spaces | Stop phantom inserts without predicate locks | Insert deadlocks, locking far more than you read (9.8) |
+| Insert intention | InnoDB "I'm about to insert here" signal | a driver signalling for a parking spot | Inserts into one gap can proceed in parallel | Blocked by any gap lock |
+| EvalPlanQual | RC re-checks `WHERE` on the newest version after waiting | re-reading the price tag at the checkout | Lets RC updates see the latest committed data safely | Rows that newly match are never seen (9.7) |
+| SKIP LOCKED | skip rows another transaction has locked | a deli counter: take the next ticket nobody is serving | Parallel queue workers without contention | Deliberately inconsistent view; only for queues |
+| Advisory lock | app-defined lock on a number | a talking stick | Mutual exclusion for things that aren't rows | Only works if every code path uses it |
+| Hot row | one row every transaction updates | a shop with a single cash register | -- | Throughput = 1 / lock hold time (9.11) |
+| Subtransaction | savepoint / exception block inside a transaction | lines in a 64-line pocket notebook | Partial rollback | >64 overflows into a shared archive all sessions must visit (9.12) |
+| 2PC | prepare everywhere, then commit everywhere | a wedding: "do you?" "I do" → "I now pronounce you" | Atomic commit across nodes | Blocks if the coordinator dies after prepare |
+| Saga | chain of local transactions with compensations | a trip booking with cancellation policies | Cross-service workflows without distributed locks | No isolation; compensations must be designed |
+| Idempotency key | client-chosen ID that makes retries safe | a receipt number: the second time, the cashier just reprints | Network timeouts make "did it commit?" unknown | Key storage, retention, payload mismatch handling |
 
 ---
 
@@ -626,7 +667,33 @@ INSERT INTO t2 SELECT COUNT(*) FROM t1;
 | Serialization Anomaly | Any result impossible under serial execution | SERIALIZABLE |
 
 \* InnoDB's REPEATABLE READ uses gap locks, which also prevent phantoms in most cases.
-\** Depends on the database implementation: PostgreSQL's REPEATABLE READ (SI) detects lost updates; InnoDB prevents them via row locks.
+\** Depends on the database implementation: PostgreSQL's REPEATABLE READ (SI) detects lost updates and aborts with `40001` (first-updater-wins). InnoDB's REPEATABLE READ does **not**: a plain `SELECT` reads the snapshot, the later `UPDATE` reads the *latest committed* version and silently overwrites -- the lost update happens. InnoDB only prevents it if the read is a locking read (`FOR UPDATE`) or the update is atomic (`SET x = x + 1`).
+
+### 2.9 Beyond the Classic List
+
+Two more anomalies that the SQL standard's table leaves out but that matter in practice:
+
+**Dirty write (P0).** T2 overwrites a row T1 wrote but hasn't committed. If T1 then rolls back, what should the row contain? Every real database prevents this at *every* isolation level, including READ UNCOMMITTED, by holding write locks until commit. It's the reason even the weakest level still has writers blocking writers.
+
+**Read-only transaction anomaly (Fekete, O'Neil & O'Neil, 2004).** Under snapshot isolation, even a transaction that only *reads* can observe a state no serial order produces:
+
+```
+Accounts: checking = 0, savings = 0. Rule: withdrawing from checking when
+checking + savings < 0 after the withdrawal costs a $1 overdraft fee.
+
+T1 (withdraw 10 from checking):  reads checking=0, savings=0   (snapshot)
+T2 (deposit 20 to savings):      savings = 20; COMMIT
+T3 (read-only report):           reads checking=0, savings=20  → "total 20"
+T1: sees 0 + 0 - 10 < 0 → charges fee: checking = -11; COMMIT
+
+Final: checking=-11, savings=20 → T1 is serialized BEFORE T2 (it didn't see
+the deposit). But T3 already reported T2's deposit without T1's
+withdrawal, which is only possible if T2 ran BEFORE T1. Contradiction.
+```
+
+Without T3 the history is serializable (T1, T2). The read-only report is what makes it anomalous -- which is why PostgreSQL SSI tracks read-only transactions too, and why `SERIALIZABLE READ ONLY DEFERRABLE` exists: it waits for a snapshot where this cannot happen.
+
+For the precise, implementation-independent definitions (G0 dirty write, G1 dirty/aborted reads, G2 anti-dependency cycles), see Adya's thesis in Appendix B.
 
 ---
 
@@ -700,10 +767,10 @@ This is the **default in MySQL/InnoDB**.
 | Database | REPEATABLE READ Implementation | Phantoms? | Write Skew? |
 |----------|-------------------------------|-----------|-------------|
 | PostgreSQL | Snapshot Isolation (MVCC) | Prevented (snapshot) | ALLOWED |
-| MySQL/InnoDB | Gap locks + MVCC | Prevented (gap locks) | Prevented (by locks) |
-| SQL Server | Lock-based (by default) | ALLOWED | Prevented (by locks) |
+| MySQL/InnoDB | MVCC snapshot for plain reads + next-key locks for locking reads/writes | Plain reads: prevented (snapshot). Locking reads: prevented (next-key locks). **Mixing the two: allowed** (see 9.8) | ALLOWED with plain `SELECT`; prevented only if the check uses `FOR SHARE`/`FOR UPDATE` |
+| SQL Server | Lock-based (S locks held to commit) | ALLOWED | Mostly prevented: S locks on read rows turn the race into a deadlock (one victim aborts) |
 
-In PostgreSQL, REPEATABLE READ is really Snapshot Isolation. It does not use locks for reads, so it cannot prevent write skew. In InnoDB, REPEATABLE READ uses next-key locks (row lock + gap lock), which prevent both phantoms and some forms of write skew but can cause more lock contention and deadlocks.
+In PostgreSQL, REPEATABLE READ is really Snapshot Isolation. It does not use locks for reads, so it cannot prevent write skew. In InnoDB, plain `SELECT` statements at REPEATABLE READ are *consistent non-locking reads* -- they take **no locks at all**, so they cannot prevent write skew or lost updates either. Next-key locks (row lock + gap lock) apply only to locking reads (`FOR SHARE`/`FOR UPDATE`), `UPDATE`, and `DELETE`. InnoDB also has **no write-write conflict check** at commit: an `UPDATE` simply operates on the latest committed row version, even if that version is newer than the transaction's snapshot.
 
 ### 3.4 SERIALIZABLE
 
@@ -770,6 +837,8 @@ Snapshot Isolation: First-Committer-Wins Rule
                                   due to concurrent update
 ```
 
+**First-committer-wins vs first-updater-wins:** The textbook SI rule (Berenson et al.) checks for write-write conflicts at commit. PostgreSQL, Oracle, and most real engines implement the *first-updater-wins* variant shown above: the second writer blocks on the row lock at `UPDATE` time, and when the first writer commits, the second gets the error immediately (if the first aborts, the second proceeds). Same guarantees, but the conflict surfaces earlier and costs less wasted work.
+
 **SI vs SERIALIZABLE:**
 
 SI prevents dirty reads, non-repeatable reads, phantoms, lost updates, and read skew. It does **not** prevent write skew or all serialization anomalies. This is why some databases (PostgreSQL) offer SSI as a level above SI.
@@ -788,7 +857,7 @@ SI prevents dirty reads, non-repeatable reads, phantoms, lost updates, and read 
 
 ### 3.6 Serializable Snapshot Isolation (SSI)
 
-SSI adds write-skew detection on top of Snapshot Isolation. It was first described by Cahill, Ronsher, and Fekete (2008) and implemented in PostgreSQL 9.1.
+SSI adds write-skew detection on top of Snapshot Isolation. It was first described by Cahill, Röhm, and Fekete (SIGMOD 2008) and implemented in PostgreSQL 9.1.
 
 **How SSI works:**
 
@@ -849,13 +918,15 @@ SSI typically adds 5-10% overhead compared to SI for read-heavy workloads. For w
 ├──────────────────┼───────────┼────────────┼──────────┼──────────┼──────────┼──────────┼──────────┤
 │ READ UNCOMMITTED │ Possible  │ Possible   │ Possible │ Possible │ Possible │ Possible │ Possible │
 │ READ COMMITTED   │ Prevented │ Possible   │ Possible │ Possible │ Possible │ Possible │ Possible │
-│ REPEATABLE READ  │ Prevented │ Prevented  │ Possible*│ Prev.**  │ Possible │ Prevented│ Possible │
+│ REPEATABLE READ  │ Prevented │ Prevented  │ Possible*│ Depends**│ Possible │ Prevented│ Possible │
 │ SNAPSHOT ISOL.   │ Prevented │ Prevented  │ Prevented│ Prevented│ Possible │ Prevented│ Possible │
 │ SERIALIZABLE     │ Prevented │ Prevented  │ Prevented│ Prevented│ Prevented│ Prevented│ Prevented│
 └──────────────────┴───────────┴────────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
 
-* InnoDB's REPEATABLE READ prevents phantoms via gap locks
-** InnoDB prevents lost updates via row locks; PostgreSQL's SI detects them at commit
+*  InnoDB's REPEATABLE READ prevents phantoms for plain reads (snapshot) and
+   locking reads (gap locks); PostgreSQL's RR prevents them via the snapshot
+** PostgreSQL's RR (SI) aborts the second writer (40001). InnoDB's RR does NOT
+   detect lost updates for read-then-write with a plain SELECT (see 2.8)
 ```
 
 ---
@@ -974,8 +1045,13 @@ Lock Escalation:
   Cons: Reduced concurrency (blocks entire table)
 
   SQL Server escalates at ~5000 locks per table by default.
-  PostgreSQL does NOT escalate; it has no page-level locks for data.
-  InnoDB does NOT escalate; row locks are stored in the index structure.
+  PostgreSQL does NOT escalate row locks: they live in the tuple header
+    (xmax + infomask bits), not in the lock table, so they cost no shared
+    memory. (Only SSI predicate locks escalate: tuple → page → relation.)
+  InnoDB does NOT escalate: row locks are a bitmap per (transaction, page)
+    in the lock_sys hash table -- one lock_t covers every locked row on a
+    page, so thousands of row locks cost a few KB.
+  See Section 9.2 for where each engine physically stores row locks.
 ```
 
 **Deadlock Detection:**
@@ -996,8 +1072,13 @@ Wait-For Graph:
   Resolution: Abort the "youngest" transaction (lowest cost to redo)
               or the transaction that has done the least work.
 
-  PostgreSQL: Checks for deadlocks every deadlock_timeout (default 1s).
-  InnoDB: Checks on every lock wait (immediate detection).
+  PostgreSQL: A waiter sleeps for deadlock_timeout (default 1s), THEN runs
+              the detector once. Most lock waits resolve before that, so
+              the (expensive) graph walk is usually skipped.
+  InnoDB: Checks on every lock wait (immediate detection). Under extreme
+          contention on hot rows this check itself becomes the bottleneck;
+          innodb_deadlock_detect=OFF + a short innodb_lock_wait_timeout is
+          the documented escape hatch.
   Oracle: Uses a background process that periodically checks.
 ```
 
@@ -1057,8 +1138,10 @@ PostgreSQL stores all row versions (tuples) directly in the table heap. Each tup
 PostgreSQL Tuple Header:
 ┌─────────────────────────────────────────────────────────────┐
 │  xmin    │ Transaction ID that created this tuple version    │
-│  xmax    │ Transaction ID that deleted/updated this tuple    │
-│          │ (0 if tuple is still live)                        │
+│  xmax    │ Transaction ID that deleted/updated this tuple,   │
+│          │ OR that merely row-LOCKED it (FOR UPDATE/SHARE),  │
+│          │ OR a MultiXactId if several txns hold locks       │
+│          │ (0 if never deleted or locked)                    │
 │  cmin    │ Command ID within xmin's transaction              │
 │  cmax    │ Command ID within xmax's transaction              │
 │  ctid    │ Physical location (page, offset) of next version  │
@@ -1092,6 +1175,9 @@ def is_visible(tuple, snapshot):
         if is_committed(tuple.xmax):
             return False  # deleted before our snapshot
     # else: deleter is still active or started after us → tuple still visible
+    # (Real code first checks HEAP_XMAX_LOCK_ONLY: if xmax is only a row
+    #  locker -- SELECT FOR UPDATE / FOR KEY SHARE -- the tuple is visible
+    #  regardless. See Section 9.2.)
 
     return True
 ```
@@ -1104,15 +1190,20 @@ PostgreSQL maintains a commit log (`pg_xact`) -- a bitmap where each transaction
 pg_xact structure:
 ┌───────────────────────────────────────────────────────┐
 │  TxID  │  Status bits                                 │
-│  100   │  COMMITTED  (11)                             │
-│  101   │  COMMITTED  (11)                             │
-│  102   │  ABORTED    (10)                             │
-│  103   │  IN_PROGRESS(00)                             │
-│  104   │  COMMITTED  (11)                             │
+│  100   │  COMMITTED     (01)                          │
+│  101   │  COMMITTED     (01)                          │
+│  102   │  ABORTED       (10)                          │
+│  103   │  IN_PROGRESS   (00)                          │
+│  104   │  SUB_COMMITTED (11)  (subxact, parent open)  │
 │  ...                                                  │
 └───────────────────────────────────────────────────────┘
-  Stored in 8KB pages under pg_xact/ directory.
-  Cached in shared memory for fast lookups.
+  Stored in 8KB pages under pg_xact/ directory (4 xids per byte,
+  32K xids per page). Cached in a shared-memory SLRU buffer.
+
+  Hint bits: after the first lookup, the reader sets HEAP_XMIN_COMMITTED /
+  HEAP_XMAX_INVALID etc. in the tuple's infomask so later readers skip
+  pg_xact. Side effect: a plain SELECT can DIRTY pages (and, with
+  checksums/wal_log_hints, write WAL) -- "why is my read query writing?".
 ```
 
 **Visibility Map:**
@@ -1316,7 +1407,7 @@ Forward Validation:
 | Long transactions | Poor | Higher chance of conflict, more wasted work |
 | Short transactions | Good | Less time to accumulate conflicts |
 
-**Real-world usage:** Google's Percolator (used in Google Spanner) and TiDB use OCC-style concurrency control for distributed transactions.
+**Real-world usage:** Google's Percolator (built for incremental web indexing on Bigtable) uses snapshot isolation with optimistic, lock-at-commit writes; TiDB's original transaction model is Percolator-based (TiDB now defaults to *pessimistic* mode because OCC abort rates surprised MySQL-migrated apps). Spanner, by contrast, uses pessimistic 2PL with wound-wait for read-write transactions. Application-level OCC (a `version` column checked in `UPDATE ... WHERE version = :v`) is the most common form in practice.
 
 ### 4.4 Timestamp Ordering
 
@@ -1494,9 +1585,14 @@ Lock Entry for Row orders.id=42:
 │ Modes: shared, exclusive    │ Modes: S, X, IS, IX, SIX,       │
 │ (sometimes just exclusive)  │ key-range locks, predicate locks │
 ├─────────────────────────────┼──────────────────────────────────┤
-│ WAL interaction: NOT logged │ WAL interaction: logged           │
-│ (latches are never recovered│ (locks are re-acquired during    │
-│ after crash)                │ crash recovery)                  │
+│ WAL interaction: NOT logged │ WAL interaction: generally NOT   │
+│ (latches are never recovered│ logged either -- after a crash   │
+│ after crash)                │ all in-flight txns are rolled    │
+│                             │ back, so their locks vanish.     │
+│                             │ Exceptions: PREPAREd (2PC) txns  │
+│                             │ re-acquire locks on recovery; PG │
+│                             │ logs AccessExclusiveLocks so hot │
+│                             │ standbys can replay them.        │
 └─────────────────────────────┴──────────────────────────────────┘
 ```
 
@@ -1828,8 +1924,8 @@ Hybrid-Logical Clock:
 
 | Approach | Isolation | Latency | Clock Requirement | Interactive Txns |
 |----------|-----------|---------|-------------------|-----------------|
-| 2PC | Serializable | 2 RTT + lock hold | None | Yes |
-| 3PC | Serializable | 3 RTT | None | Yes |
+| 2PC | N/A -- atomic commit only; isolation comes from each node's local CC | 2 RTT + lock hold | None | Yes |
+| 3PC | N/A (same as 2PC) | 3 RTT | None | Yes |
 | Saga | None (eventual) | 1 RTT per step | None | N/A |
 | Calvin | Serializable | 1 RTT (batch) | None | Limited |
 | Spanner (TrueTime) | External Consistency | 1 RTT + commit-wait | GPS/Atomic | Yes |
@@ -1855,8 +1951,12 @@ PostgreSQL XID (32-bit):
   │  If VACUUM falls behind → transaction ID wraparound →        │
   │    database shuts down to prevent data corruption!           │
   │                                                              │
-  │  PostgreSQL 14+: 64-bit XIDs (no more wraparound panic)     │
-  │  But internal storage still uses 32-bit epoch + 32-bit xid  │
+  │  On-disk tuple xmin/xmax are STILL 32-bit in every release.  │
+  │  FullTransactionId (32-bit epoch + 32-bit xid) exists only   │
+  │  in memory/some catalogs. Wraparound is a live risk: monitor │
+  │  age(datfrozenxid) and mxid_age(datminmxid) (Section 9.3).  │
+  │  Emergency guards: PG14+ vacuum_failsafe_age (default 1.6B)  │
+  │  makes VACUUM skip index cleanup to freeze faster.           │
   └──────────────────────────────────────────────────────────────┘
 
 InnoDB Transaction ID (48-bit):
@@ -1980,7 +2080,8 @@ Problems caused by long-running transactions:
 -- 1. Set statement and transaction timeouts
 SET statement_timeout = '30s';          -- PostgreSQL
 SET idle_in_transaction_session_timeout = '60s';  -- PostgreSQL
-SET innodb_lock_wait_timeout = 50;      -- MySQL (seconds)
+SET innodb_lock_wait_timeout = 50;      -- MySQL: row-lock wait only (seconds)
+SET max_execution_time = 30000;         -- MySQL: SELECT timeout (ms)
 
 -- 2. Monitor long transactions
 -- PostgreSQL:
@@ -2013,7 +2114,8 @@ BEGIN
         );
         GET DIAGNOSTICS deleted = ROW_COUNT;
         EXIT WHEN deleted = 0;
-        COMMIT;  -- release locks between batches (requires procedure in PG14+)
+        COMMIT;  -- release locks between batches (PG11+: allowed in DO/procedures
+                 -- only when NOT called inside an outer transaction block)
     END LOOP;
 END $$;
 ```
@@ -2146,6 +2248,10 @@ Timeline with FOR UPDATE:
   -- Final: qty = 8 (correct! no lost update)
 ```
 
+**What T2 actually sees depends on isolation level.** At READ COMMITTED, PostgreSQL does *not* re-run T2's query from scratch; it re-fetches the newest version of the row it was waiting on and re-evaluates the `WHERE` clause against it (EvalPlanQual, Section 9.7) -- so T2 sees `qty: 9`. At REPEATABLE READ / SERIALIZABLE, T2 instead fails with `40001 could not serialize access due to concurrent update` and must retry. InnoDB locking reads always read the latest committed version, at any isolation level.
+
+**Prefer `FOR NO KEY UPDATE` in PostgreSQL** when you will not change the primary key / unique columns (the normal read-modify-write case). `FOR UPDATE` also blocks concurrent `INSERT`s into child tables whose foreign key references this row; `FOR NO KEY UPDATE` does not. See Section 9.1.
+
 ### 8.2 SELECT FOR SHARE
 
 Acquire a shared lock. Multiple transactions can hold shared locks on the same rows. Prevents other transactions from UPDATE or DELETE, but allows concurrent reads.
@@ -2173,6 +2279,10 @@ COMMIT;
 | Concurrent plain SELECT | Allowed (MVCC) | Allowed (MVCC) |
 | Concurrent UPDATE/DELETE | Blocks | Blocks |
 | Use case | Read-modify-write | Protect referenced data |
+
+This two-mode picture is the MySQL/SQL-standard view. **PostgreSQL has four row-lock modes** -- `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE` -- and for the "make sure the parent still exists" use case above, `FOR KEY SHARE` is the right tool (it's what PostgreSQL's own foreign-key checks use): it blocks `DELETE` and key changes but still lets others `UPDATE` non-key columns of `users`. Full matrix in Section 9.1.
+
+**Caveat for FOR SHARE as a write-skew fix:** two transactions can both take `FOR SHARE` on the same row, then both try to `UPDATE` it → each waits for the other's shared lock → deadlock. If you intend to write, lock with `FOR UPDATE` / `FOR NO KEY UPDATE` from the start (the classic "lock upgrade" deadlock; SQL Server solves it with U locks, Section 9.10).
 
 ### 8.3 SKIP LOCKED (Queue-Like Patterns)
 
@@ -2212,6 +2322,13 @@ SKIP LOCKED in Action:
 
   All four workers process different jobs in parallel, zero contention.
 ```
+
+**Production notes for SKIP LOCKED queues:**
+
+- Setting `status = 'processing'` inside the *same* transaction that holds the lock is invisible to other sessions until commit -- the row lock is what actually claims the job. That's fine for short jobs.
+- For long jobs, don't hold a transaction open for minutes (it pins VACUUM and a pooled connection). Use a **claim-and-lease** pattern: a short transaction that `UPDATE jobs SET status='processing', locked_until = now() + interval '5 min' WHERE id = (SELECT id ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *`, commit, do the work, then mark done. A reaper re-queues rows whose lease expired.
+- Index the predicate: `CREATE INDEX ON jobs (created_at) WHERE status = 'pending'`. Without it, every worker scans (and skips) the same locked rows.
+- SKIP LOCKED returns an intentionally *inconsistent* view of the table. Use it for queues, never for reads that must be complete.
 
 **Why SKIP LOCKED is superior to polling with application locks:**
 
@@ -2277,7 +2394,8 @@ def execute_with_retry(conn_params, operation, max_retries=5):
                 operation(cur)
             conn.commit()
             return  # Success
-        except psycopg2.errors.SerializationFailure:
+        except (psycopg2.errors.SerializationFailure,   # 40001
+                psycopg2.errors.DeadlockDetected):      # 40P01
             conn.rollback()
             if attempt == max_retries - 1:
                 raise  # Final attempt failed
@@ -2327,6 +2445,14 @@ execute_with_retry(conn_params, transfer_funds)
    40P01 - deadlock_detected
 
 6. Keep transactions SHORT to minimize conflict probability.
+
+7. Never retry a transaction that had external side effects (sent an
+   email, called a payment API). Keep side effects outside the retried
+   block, or make them idempotent (Section 8.6).
+
+8. A COMMIT that fails with a network error has UNKNOWN outcome -- it may
+   have committed. Blind retry can double-apply; this is exactly what
+   idempotency keys solve.
 ```
 
 ### 8.6 Idempotency Keys
@@ -2334,13 +2460,14 @@ execute_with_retry(conn_params, transfer_funds)
 Ensure that retrying an operation (due to network timeout, serialization failure, etc.) doesn't apply the effect twice.
 
 ```sql
--- Idempotency key table
+-- Idempotency key table. Scope keys per user: a client-generated key
+-- must not collide with (or reveal) another user's request.
 CREATE TABLE idempotency_keys (
-    key         UUID PRIMARY KEY,
     user_id     BIGINT NOT NULL,
-    response    JSONB,
+    key         UUID   NOT NULL,
+    response    JSONB,                       -- NULL while in flight
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT uq_idempotency_user UNIQUE (key, user_id)
+    PRIMARY KEY (user_id, key)
 );
 
 -- Pattern: idempotent payment processing
@@ -2353,17 +2480,23 @@ DECLARE
     v_existing JSONB;
     v_result JSONB;
 BEGIN
-    -- Check if this request was already processed
-    SELECT response INTO v_existing
-    FROM idempotency_keys
-    WHERE key = p_idempotency_key AND user_id = p_user_id;
+    -- 1. CLAIM the key first. The unique index serializes concurrent
+    --    duplicates: the second INSERT blocks on the first's uncommitted
+    --    index entry, then sees the conflict once the first commits.
+    INSERT INTO idempotency_keys (user_id, key)
+    VALUES (p_user_id, p_idempotency_key)
+    ON CONFLICT DO NOTHING;
 
-    IF v_existing IS NOT NULL THEN
-        -- Already processed, return cached response
+    IF NOT FOUND THEN
+        -- Duplicate request: return the stored response.
+        SELECT response INTO v_existing
+        FROM idempotency_keys
+        WHERE user_id = p_user_id AND key = p_idempotency_key;
         RETURN v_existing;
     END IF;
 
-    -- Process the payment
+    -- 2. Process the payment (same transaction as the claim, so a
+    --    failure rolls back both and the key can be retried).
     UPDATE accounts SET balance = balance - p_amount
     WHERE id = p_user_id AND balance >= p_amount;
 
@@ -2375,14 +2508,16 @@ BEGIN
         v_result := '{"status": "success"}'::jsonb;
     END IF;
 
-    -- Store the result for future duplicate requests
-    INSERT INTO idempotency_keys (key, user_id, response)
-    VALUES (p_idempotency_key, p_user_id, v_result);
+    -- 3. Store the result for future duplicate requests.
+    UPDATE idempotency_keys SET response = v_result
+    WHERE user_id = p_user_id AND key = p_idempotency_key;
 
     RETURN v_result;
 END;
 $$ LANGUAGE plpgsql;
 ```
+
+**Why claim-first:** the naive "`SELECT` key → if missing, process → `INSERT` key" version has a check-then-act race. Two concurrent retries both see "missing", both debit, and the second one's `INSERT` hits a unique violation -- which rolls back its debit, so money is safe, but the client gets a 500 instead of the cached response. Claiming first turns the unique index into the lock. Also store a hash of the request body with the key and reject a reused key with a different payload (`422`), and expire keys after a retention window (e.g. 24h) -- they are personal-data-adjacent and should not live forever (GDPR storage limitation).
 
 ```
 Idempotency Flow:
@@ -2418,6 +2553,10 @@ Idempotency Flow:
 | Optimistic UI with conflict detection | Version column + `WHERE version = :expected` | Application-level OCC |
 | Read-heavy, tolerate slight staleness | `SET TRANSACTION READ ONLY` at READ COMMITTED | Enables read-only optimizations |
 | Long analytical query on live DB | Read replica or `pg_export_snapshot()` | No impact on OLTP workload |
+| Read-modify-write of a parent row (PG) | `SELECT ... FOR NO KEY UPDATE` | Doesn't block concurrent FK inserts into child tables (9.1) |
+| No overlapping reservations | `EXCLUDE USING gist (...)` constraint | Race-free at any isolation level (9.9) |
+| Lock several rows | One `SELECT ... WHERE id IN (...) ORDER BY id FOR UPDATE` | Consistent lock order prevents deadlocks (9.10) |
+| Schema migration on a busy table | `SET lock_timeout` + retry; `CONCURRENTLY` / `NOT VALID` | Avoids the lock queue pile-up (9.5) |
 
 ### 8.8 Anti-Patterns to Avoid
 
@@ -2464,6 +2603,622 @@ Anti-Pattern 5: Not setting lock_timeout or statement_timeout
      SET idle_in_transaction_session_timeout = '60s';
 ```
 
+## 9. Advanced Locking Internals
+
+Sections 4-5 describe locking in textbook terms (S, X, intent locks, one lock table). Real engines diverge sharply from that model, and most production lock incidents come from the divergence: foreign keys that block updates, `ALTER TABLE` that takes the site down, gap-lock deadlocks on inserts, `SELECT` statements that write WAL. This section covers what each engine actually does.
+
+### 9.1 PostgreSQL Row-Lock Modes: FOR KEY SHARE and FOR NO KEY UPDATE
+
+> **Everyday analogy: an apartment building and its mail carrier.**
+> The row is an apartment; its primary key is the **street address**. Child rows (orders pointing at a user) are **letters addressed to that apartment**.
+>
+> 1. `FOR UPDATE` = *"I'm demolishing or re-numbering the apartment."* Nobody else may do anything, not even deliver mail.
+> 2. `FOR NO KEY UPDATE` = *"I'm repainting inside; the address stays the same."* Other painters wait, but mail can still be delivered.
+> 3. `FOR SHARE` = *"Building inspector: nothing inside may change while I look."*
+> 4. `FOR KEY SHARE` = *the mail carrier:* *"I just need this address to keep existing until I've dropped the letter."* Painting inside is fine.
+>
+> ```
+> Remember it like this
+> ├─ the key is the ADDRESS, not the furniture
+> ├─ FK checks are mail carriers → FOR KEY SHARE
+> ├─ normal UPDATE is repainting → FOR NO KEY UPDATE (carriers not blocked)
+> └─ DELETE / change the id is demolition → FOR UPDATE (blocks carriers)
+> ```
+
+PostgreSQL has **four** row-level lock modes, not two. The extra two exist to solve one specific problem: foreign keys.
+
+```sql
+SELECT ... FOR UPDATE;          -- strongest: I will delete this row or change its key
+SELECT ... FOR NO KEY UPDATE;   -- I will update non-key columns
+SELECT ... FOR SHARE;           -- nobody may change this row at all
+SELECT ... FOR KEY SHARE;       -- weakest: nobody may delete it or change its key
+```
+
+A **"key"** here means any column set covered by a unique index that a foreign key could reference (no partial or expression indexes) -- typically the primary key.
+
+**Conflict matrix (X = conflicts):**
+
+```
+                        Lock already held by another transaction
+Requested            │ KEY SHARE │ SHARE │ NO KEY UPDATE │ UPDATE │
+─────────────────────┼───────────┼───────┼───────────────┼────────┤
+FOR KEY SHARE        │           │       │               │   X    │
+FOR SHARE            │           │       │       X       │   X    │
+FOR NO KEY UPDATE    │           │   X   │       X       │   X    │
+FOR UPDATE           │     X     │   X   │       X       │   X    │
+```
+
+**Which statements take which lock implicitly:**
+
+| Statement | Row lock taken |
+|-----------|----------------|
+| `UPDATE` that does not modify any key column | `FOR NO KEY UPDATE` |
+| `UPDATE` that modifies a key column | `FOR UPDATE` |
+| `DELETE` | `FOR UPDATE` |
+| FK check on `INSERT`/`UPDATE` of a child row (locks the parent row) | `FOR KEY SHARE` |
+| `SELECT ... FOR <mode>` | That mode |
+
+**Why this exists -- the pre-9.3 foreign key disaster:**
+
+```
+Before PostgreSQL 9.3, FK checks took FOR SHARE on the parent row.
+
+  T1 (child insert)                   T2 (parent update)
+  ──────────────────────────────────  ──────────────────────────────────
+  BEGIN;
+  INSERT INTO orders (user_id, ...)
+    VALUES (42, ...);
+  -- FK check: SELECT 1 FROM users
+  --   WHERE id = 42 FOR SHARE
+                                      BEGIN;
+                                      UPDATE users SET last_login = now()
+                                        WHERE id = 42;
+                                      -- BLOCKS: UPDATE vs SHARE conflict
+                                      -- Updating last_login cannot break
+                                      -- the FK, yet it waits.
+
+Since 9.3:
+  FK check takes FOR KEY SHARE; the UPDATE takes FOR NO KEY UPDATE.
+  They are compatible → no wait. Only DELETE or changing users.id blocks.
+```
+
+**Practical rules:**
+
+1. **Application read-modify-write: use `FOR NO KEY UPDATE`, not `FOR UPDATE`.** Most ORMs emit `FOR UPDATE` by default. On a parent table with busy children (e.g., `accounts` ← `transactions`), `FOR UPDATE` blocks every concurrent child insert for the duration of your transaction. `FOR NO KEY UPDATE` gives you the same protection against concurrent writers of that row without blocking FK checks.
+2. **Checking existence of a referenced row: use `FOR KEY SHARE`.** It guarantees the row won't be deleted or re-keyed, while allowing normal updates.
+3. **MySQL/InnoDB has no equivalent.** FK checks take a shared record lock (S) on the parent row, which conflicts with any X lock on it -- including an `UPDATE` of an unrelated column. Hot parent rows + child inserts are a classic InnoDB deadlock source.
+
+### 9.2 Where Row Locks Physically Live
+
+> **Everyday analogy: where do you put the "occupied" sign?**
+> - **PostgreSQL** writes the name of the occupant *on the door itself* (the tuple header). Unlimited doors can carry names, but writing a name means touching the door: a paint job (page write + WAL) even if you only wanted to reserve it.
+> - **InnoDB** keeps a **seating chart per floor** at the front desk: one sheet (bitmap) per page lists which seats are taken. Cheap, compact.
+> - **Oracle** has a small **sign-in sheet on each floor's wall** (ITL slots); if the sheet is full, newcomers wait for a slot.
+> - **SQL Server** gives out a **physical key card per lock** from a central desk; when the desk runs low on cards, it hands you the whole floor instead (escalation).
+>
+> ```
+> Remember it like this
+> ├─ PG: name on the door → no lock memory, but locking = writing
+> ├─ InnoDB: seating chart per page → cheap, implicit for fresh inserts
+> ├─ Oracle: sign-in sheet in the block → full sheet = ITL waits
+> └─ SQL Server: key cards from a desk → too many cards = escalation
+> ```
+
+The "lock table" diagram in 5.1 is a useful model, but only SQL Server stores row locks that way. The storage location explains each engine's scaling behavior:
+
+| Engine | Where a row lock is stored | Consequences |
+|--------|---------------------------|--------------|
+| **PostgreSQL** | In the tuple header: `xmax` = locker's XID, plus infomask bits (`HEAP_XMAX_LOCK_ONLY`, `HEAP_XMAX_KEYSHR_LOCK`, `HEAP_XMAX_EXCL_LOCK`, `HEAP_XMAX_IS_MULTI`) | Unlimited row locks, zero lock-table memory, no escalation. But **locking a row writes the page**: dirties the buffer, emits a WAL record, can trigger a full-page image. `SELECT ... FOR UPDATE` on 1M rows writes 1M tuple headers. Impossible on a read-only standby. |
+| **InnoDB** | `lock_t` structs in the `lock_sys` hash, one per (transaction, page, mode), with a **bitmap** indexed by heap number of rows on the page. Fresh inserts use **implicit locks** (no struct at all -- the row's `DB_TRX_ID` of an active transaction *is* the lock). | Thousands of row locks cost a few KB, so no escalation. Implicit locks are converted to explicit ones only when someone else asks for a conflicting lock. |
+| **Oracle** | A lock byte in the row header pointing at an **ITL** (Interested Transaction List) slot in the block header, which holds the XID. | No lock memory at all. Waiters enqueue on the holder's transaction (`enq: TX - row lock contention`). A block with too few free ITL slots causes `enq: TX - allocate ITL entry` waits (tune `INITRANS`). |
+| **SQL Server** | Lock manager memory (~100 bytes per lock). | Memory pressure → **lock escalation** to table level at ~5,000 locks per statement per object. Tune with `ALTER TABLE ... SET (LOCK_ESCALATION = AUTO | TABLE | DISABLE)`. |
+
+**How a PostgreSQL row-lock wait actually works:**
+
+Because row locks aren't in the lock table, a waiter can't queue *on the row*. Instead:
+
+```
+T1 holds a row lock (its XID is in the tuple's xmax).
+
+T2 wants the row:
+  1. Acquire a heavyweight TUPLE lock on (relation, page, offset)
+     → establishes T2 as "next in line" for this row
+  2. Wait on T1's TRANSACTIONID lock (every txn holds an exclusive lock
+     on its own XID until it ends)
+  3. When T1 ends: re-check the tuple, set xmax = T2, release tuple lock
+
+T3 arrives while T2 is waiting:
+  1. Tries the TUPLE lock → held by T2 → T3 waits on the tuple lock
+
+What pg_locks shows:
+  T2: locktype = transactionid, transactionid = T1, granted = false
+  T3: locktype = tuple,        (rel, page, tuple), granted = false
+```
+
+This is why row-lock contention appears in `pg_locks` as `transactionid` waits, and why `pg_blocking_pids()` (Appendix A) is the easiest way to read it.
+
+**Other PostgreSQL lock types worth recognizing in `pg_locks`:**
+
+| `locktype` | What it protects | When you see it waiting |
+|------------|------------------|-------------------------|
+| `relation` | Table/index (8 modes, 9.4) | DDL vs DML, lock queue pile-ups |
+| `transactionid` | A transaction's lifetime | Row-lock waits; unique-index insert waits on an uncommitted duplicate |
+| `tuple` | Queue position for one row | Second+ waiter on a hot row |
+| `virtualxid` | A transaction's lifetime (before it has an XID) | `CREATE INDEX CONCURRENTLY` waiting for *every* older transaction -- one idle-in-transaction session stalls it forever |
+| `extend` | Adding pages to a relation | Many concurrent bulk inserts into one table |
+| `spectoken` | Speculative insertion | `INSERT ... ON CONFLICT` racing on the same key |
+| `advisory` | Application-defined | Section 7.6 |
+| `object` | Non-relation catalog objects | e.g. concurrent `DROP`/`ALTER` of the same type or schema |
+
+### 9.3 MultiXacts: When Several Transactions Lock One Row
+
+> **Everyday analogy: a sign-up sheet that must be retyped for every new name.**
+> One name fits on the door (`xmax`). When a second person wants to share the room, PostgreSQL puts up a **sign-up sheet** (MultiXact) and writes the sheet's number on the door. The rule is that sheets are never edited: each new name means **printing a fresh sheet with all old names plus the new one**. 100 people signing up = 100 sheets with 1, 2, ..., 100 names = ~5,000 names printed. The sheets are numbered with a counter that eventually wraps around, so old sheets must be archived (frozen) by VACUUM.
+>
+> ```
+> Remember it like this
+> ├─ one locker → XID on the door; many lockers → sheet number on the door
+> ├─ sheets are immutable → N lockers cost O(N²) entries
+> ├─ hot parent row + many FK inserts = the sheet printer never stops
+> └─ sheet numbers wrap too → watch mxid_age(), not only age()
+> ```
+
+`xmax` holds one XID. What if two transactions both hold `FOR KEY SHARE` on the same parent row (two concurrent child inserts), or one holds `FOR KEY SHARE` while another does a `NO KEY UPDATE`? PostgreSQL stores a **MultiXactId** in `xmax` instead, with `HEAP_XMAX_IS_MULTI` set.
+
+```
+Tuple header:  xmax = MultiXactId 7001  (HEAP_XMAX_IS_MULTI)
+                         │
+                         ▼
+pg_multixact/offsets:  7001 → offset 55200
+pg_multixact/members:  55200: { xid 900: ForKeyShare,
+                                 xid 901: ForKeyShare,
+                                 xid 905: NoKeyUpdate }
+```
+
+**MultiXacts are immutable.** Adding a locker creates a *new* MultiXact containing all previous members plus the new one, and rewrites `xmax`. So N concurrent lockers of one row generate N MultiXacts with 1, 2, ..., N members -- **O(N²) member entries**.
+
+**Where it hurts in production:**
+
+1. **Hot parent rows.** A `tenants` or `accounts` row referenced by high-rate child inserts (`events.tenant_id → tenants.id`) gets `FOR KEY SHARE` from every insert. Symptoms: `LWLock: MultiXactOffsetSLRU` / `MultiXactMemberSLRU` (PG13+ names) wait events, the `pg_multixact/` directory growing, and the parent row's page being rewritten constantly.
+2. **MultiXact wraparound.** MultiXactIds are 32-bit, and so is the members address space. They need freezing exactly like XIDs, governed by `autovacuum_multixact_freeze_max_age` (default 400M). Member-space exhaustion can force emergency anti-wraparound vacuums even when the MultiXactId count looks fine.
+3. **Savepoints + row locks.** Locking a row in a subtransaction when the parent transaction already locked or updated it records both XIDs → a MultiXact from a single session (9.12).
+
+**Monitoring and mitigation:**
+
+```sql
+-- Wraparound headroom for both counters
+SELECT datname,
+       age(datfrozenxid)       AS xid_age,
+       mxid_age(datminmxid)    AS multixact_age
+FROM pg_database ORDER BY multixact_age DESC;
+
+-- SLRU cache health (PG13+): high blks_read = cache thrashing
+SELECT name, blks_hit, blks_read FROM pg_stat_slru
+WHERE name IN ('MultiXactOffset', 'MultiXactMember', 'Subtransaction');
+
+-- Who holds locks on rows of a table (needs the pgrowlocks extension)
+CREATE EXTENSION IF NOT EXISTS pgrowlocks;
+SELECT * FROM pgrowlocks('tenants');   -- shows multi = true + member xids/modes
+```
+
+Mitigations, in order of preference: avoid FK checks against a single hot row (e.g., don't FK high-volume event tables to a tenants table, or validate asynchronously); keep transactions that insert children short; on PG17+ enlarge `multixact_offset_buffers` / `multixact_member_buffers`; make sure autovacuum keeps up on tables with high `mxid_age`.
+
+### 9.4 PostgreSQL Table-Level Lock Modes
+
+> **Everyday analogy: a shop's door signs.** Customers browsing (`SELECT`) only need the shop to be open. Staff restocking shelves (`INSERT/UPDATE`) can work alongside customers. Stocktaking (`CREATE INDEX`, non-concurrent) says *"browse all you like, but nobody moves stock."* A renovation (`ALTER TABLE`, `DROP`, `TRUNCATE` → ACCESS EXCLUSIVE) **closes the shop entirely**.
+>
+> ```
+> Remember it like this
+> ├─ ACCESS SHARE = browsing          → blocked only by "closed for renovation"
+> ├─ ROW EXCLUSIVE = restocking       → normal writes, run together
+> ├─ SHARE (CREATE INDEX) = stocktake → readers OK, writers wait
+> └─ ACCESS EXCLUSIVE = renovation    → everyone out
+> ```
+
+Every statement takes a table-level ("relation") lock, including plain `SELECT`. There are eight modes; the names are historical and misleading (`ROW EXCLUSIVE` is a *table* lock).
+
+```
+Requested \ Held   │ AS  RS  RE  SUE  S   SRE  E   AE
+───────────────────┼──────────────────────────────────
+ACCESS SHARE  (AS) │                               X
+ROW SHARE     (RS) │                           X   X
+ROW EXCL.     (RE) │                  X   X    X   X
+SHARE UPD EX (SUE) │             X    X   X    X   X
+SHARE          (S) │         X   X        X    X   X
+SHARE ROW EX (SRE) │         X   X    X   X    X   X
+EXCLUSIVE      (E) │     X   X   X    X   X    X   X
+ACCESS EXCL.  (AE) │ X   X   X   X    X   X    X   X
+```
+
+| Mode | Taken by | Blocks plain `SELECT`? | Blocks writes? |
+|------|----------|------|------|
+| ACCESS SHARE | `SELECT` | No | No |
+| ROW SHARE | `SELECT ... FOR UPDATE/NO KEY UPDATE/SHARE/KEY SHARE` | No | No |
+| ROW EXCLUSIVE | `INSERT`, `UPDATE`, `DELETE`, `MERGE` | No | No |
+| SHARE UPDATE EXCLUSIVE | `VACUUM` (non-FULL), `ANALYZE`, `CREATE INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`, `ALTER TABLE ... VALIDATE CONSTRAINT`, `... SET STATISTICS`, `ATTACH PARTITION` (on parent) | No | No (self-conflicting: one at a time) |
+| SHARE | `CREATE INDEX` (non-concurrent) | No | **Yes** |
+| SHARE ROW EXCLUSIVE | `CREATE TRIGGER`, `ALTER TABLE ... ADD FOREIGN KEY` (on both tables) | No | **Yes** |
+| EXCLUSIVE | `REFRESH MATERIALIZED VIEW CONCURRENTLY` | No | **Yes** |
+| ACCESS EXCLUSIVE | `DROP`, `TRUNCATE`, `VACUUM FULL`, `CLUSTER`, `REINDEX` (non-concurrent), `REFRESH MATERIALIZED VIEW`, most `ALTER TABLE` (`ADD COLUMN`, `ALTER TYPE`, `SET NOT NULL`...), `LOCK TABLE` (default) | **Yes** | **Yes** |
+
+Rule of thumb: **only ACCESS EXCLUSIVE blocks readers.** Everything with "SHARE" in its name from SHARE upward blocks writers.
+
+### 9.5 The Lock Queue Pile-Up (How a 1 ms ALTER TABLE Causes an Outage)
+
+> **Everyday analogy: a single-lane bridge with a strict "wait your turn" line.**
+> A slow tractor (a 5-minute report) is crossing. A wide load (`ALTER TABLE`, needs the whole bridge) arrives and waits. Every car behind it -- even ones that could have squeezed past the tractor -- must also wait, because nobody may jump the wide load. The wide load would cross in one second, but the whole road is jammed for five minutes.
+> `lock_timeout` is the wide-load driver saying *"if I can't go within 3 seconds, I'll pull over and try again later"* -- the line keeps moving.
+>
+> ```
+> Remember it like this
+> ├─ queue order is strict: new requests wait behind the QUEUED lock
+> ├─ a fast DDL behind a slow query = everyone waits for the slow query
+> ├─ always: SET lock_timeout + retry with jitter
+> └─ prefer CONCURRENTLY / NOT VALID + VALIDATE / INSTANT variants
+> ```
+
+Lock requests on a relation are granted in **queue order**: a new request that is compatible with the *held* locks still waits if it conflicts with a lock *already queued* (Section 5.2, anti-starvation). Combine that with ACCESS EXCLUSIVE:
+
+```
+t=0   T1: long analytics SELECT on orders      → holds ACCESS SHARE (runs 5 min)
+t=1   T2: ALTER TABLE orders ADD COLUMN note text;
+          wants ACCESS EXCLUSIVE → conflicts with T1 → QUEUED
+          (the ALTER itself would take ~1 ms -- it's metadata only)
+t=2   T3..T500: ordinary SELECT/INSERT on orders
+          want ACCESS SHARE / ROW EXCLUSIVE
+          compatible with T1, but conflict with QUEUED AE → QUEUED
+          → every query on orders now waits for T1 to finish
+          → connection pool exhausted → site down
+```
+
+**The fix: never run DDL without `lock_timeout`, and retry.**
+
+```sql
+-- Migration session
+SET lock_timeout = '3s';          -- give up quickly instead of blocking the queue
+SET statement_timeout = '15min';  -- for the actual work, if it rewrites
+ALTER TABLE orders ADD COLUMN note text;
+-- On 55P03 (lock_not_available): sleep with jitter, retry N times.
+```
+
+**Zero-downtime migration toolkit (PostgreSQL):**
+
+| Goal | Unsafe | Safe |
+|------|--------|------|
+| Add index | `CREATE INDEX` (SHARE: blocks writes for the whole build) | `CREATE INDEX CONCURRENTLY` (SUE). Can't run in a transaction block; on failure leaves an `INVALID` index -- drop and retry. Waits for all older transactions (`virtualxid`) twice. |
+| Add FK | `ADD FOREIGN KEY` (SRE on both tables + full validation scan) | `ADD ... NOT VALID` (brief lock, no scan), then `VALIDATE CONSTRAINT` (SUE -- writes continue) |
+| Add CHECK / NOT NULL | `ADD CHECK (...)` / `SET NOT NULL` (AE + full scan) | `ADD CHECK (col IS NOT NULL) NOT VALID` → `VALIDATE` → PG12+: `SET NOT NULL` skips the scan when a valid CHECK proves it |
+| Add column with default | PG ≤10: rewrites table under AE | PG11+: non-volatile default is metadata-only (still takes AE briefly -- still needs `lock_timeout`) |
+| Change column type | `ALTER COLUMN TYPE` (AE + full rewrite, unless binary-coercible) | New column → dual-write → backfill in batches → swap |
+
+**Fast-path locks and the partition trap.** Weak relation locks (AS, RS, RE) don't touch the shared lock table: each backend records up to 16 of them in its own `PGPROC` fast-path slots. A query that touches more than 16 relations -- **each partition and each of its indexes counts** -- spills into the shared lock table, which is split into 16 partitions guarded by LWLocks. High-QPS queries on a partitioned table without plan-time pruning then serialize on `LWLock: LockManager`. PostgreSQL 18 sizes the fast-path array from `max_locks_per_transaction`; on older versions, keep pruning effective and index counts low. Separately, the shared lock table has room for `max_locks_per_transaction × (max_connections + max_prepared_transactions)` locks -- exceeding it gives `out of shared memory, HINT: You might need to increase max_locks_per_transaction` (common with `pg_dump` or transactions touching thousands of partitions).
+
+**MySQL's counterpart: metadata locks (MDL).** Every statement takes a shared MDL on the tables it touches for the **whole transaction**. DDL needs an exclusive MDL → same pile-up, visible as `Waiting for table metadata lock` in `SHOW PROCESSLIST`. The default `lock_wait_timeout` is **one year**; set it to a few seconds in migration sessions. Prefer `ALGORITHM=INSTANT` (8.0+: add/drop column) or `ALGORITHM=INPLACE, LOCK=NONE`, and tools like `gh-ost` / `pt-online-schema-change` for rebuilds. Inspect with `performance_schema.metadata_locks`.
+
+### 9.6 Where Timeouts Apply
+
+> **Everyday analogy: kitchen timers.** `lock_timeout` = how long you'll wait in line; `statement_timeout` = how long one dish may cook; `idle_in_transaction_session_timeout` = how long you may hold a table while not ordering; `transaction_timeout` = the maximum length of the whole dinner. Without timers, one forgotten customer can hold a table all night.
+
+| Setting | Engine | Bounds | Default |
+|---------|--------|--------|---------|
+| `lock_timeout` | PG | Any single lock wait (row, table, advisory) | 0 (forever) |
+| `statement_timeout` | PG | One statement's total runtime | 0 |
+| `idle_in_transaction_session_timeout` | PG | Time idle *inside* an open transaction | 0 |
+| `transaction_timeout` | PG17+ | Whole transaction | 0 |
+| `deadlock_timeout` | PG | Wait before running the deadlock detector; also the `log_lock_waits` threshold | 1s |
+| `innodb_lock_wait_timeout` | MySQL | InnoDB row-lock waits only | 50s |
+| `lock_wait_timeout` | MySQL | Metadata-lock waits (DDL, `LOCK TABLES`) | 31,536,000s (1 year) |
+| `max_execution_time` | MySQL | `SELECT` statements only (ms) | 0 |
+
+Set them per role so batch jobs and web requests get different budgets: `ALTER ROLE web_app SET lock_timeout = '2s';`. Turn on `log_lock_waits = on` in PostgreSQL -- it logs every wait longer than `deadlock_timeout` with the blocking PIDs, which is the cheapest lock-contention telemetry available.
+
+### 9.7 READ COMMITTED Write Semantics: EvalPlanQual and Semi-Consistent Reads
+
+> **Everyday analogy: re-reading the price tag at the checkout.**
+> You picked a jacket because the tag said "€80, fits my €80 budget". At the till, the cashier is busy with the customer before you, who is changing the same jacket's price. When it's your turn, you **look at the tag again** (EPQ re-checks the `WHERE` on the newest version). If it now says €120, you put it back. But you never go back to the shop floor to look for *other* jackets that became cheaper in the meantime -- rows that newly match are never seen.
+>
+> ```
+> Remember it like this
+> ├─ READ COMMITTED: wait for the row, re-check WHERE on its newest version
+> ├─ still matches → update it; no longer matches → skip it
+> ├─ rows that START matching mid-statement are never found
+> └─ REPEATABLE READ / SERIALIZABLE: no re-check, you get 40001 instead
+> ```
+
+At READ COMMITTED, what happens when an `UPDATE` finds a row that a concurrent transaction is modifying? PostgreSQL waits, then runs **EvalPlanQual (EPQ)**: it fetches the *newest committed version* of that one row and re-evaluates the `WHERE` clause against it. If it still matches, the update proceeds on the new version; if not, the row is skipped.
+
+**When EPQ gives the right answer:**
+
+```
+accounts: id=1, balance=100
+
+T1: UPDATE accounts SET balance = balance - 80
+      WHERE id = 1 AND balance >= 80;         -- balance → 20 (uncommitted)
+T2: same statement                             -- blocks on row id=1
+T1: COMMIT
+T2: EPQ re-checks new version: 20 >= 80? No → 0 rows updated.   ✓ no overdraft
+```
+
+This is why the atomic conditional `UPDATE` in 8.7 is safe at READ COMMITTED.
+
+**When EPQ surprises you** (example from the PostgreSQL docs):
+
+```
+website: rows with hits = 9 and hits = 10
+
+T1: UPDATE website SET hits = hits + 1;        -- 9→10, 10→11 (uncommitted)
+T2: DELETE FROM website WHERE hits = 10;
+      row (hits=9 in T2's snapshot):  doesn't match → skipped, never re-checked
+      row (hits=10 in T2's snapshot): matches → waits for T1
+T1: COMMIT
+T2: EPQ re-checks: now 11 ≠ 10 → skipped
+    → DELETE 0, although a row with hits=10 existed both before AND after T1.
+```
+
+**EPQ rules to remember:**
+
+- Only rows found in the statement's *original* snapshot are re-checked. Rows that start matching the predicate because of a concurrent update or insert are **never seen** -- a single `UPDATE ... WHERE <predicate>` is not atomic with respect to that predicate.
+- Only the locked target rows are re-fetched; rows from other joined tables keep their snapshot values.
+- At REPEATABLE READ / SERIALIZABLE, PostgreSQL does not do EPQ; it raises `40001 could not serialize access due to concurrent update`.
+
+**InnoDB's equivalent -- semi-consistent read:** at READ COMMITTED, an `UPDATE` that hits a row locked by another transaction reads the latest *committed* version to decide whether it matches the `WHERE`. If not, it skips the row without waiting; if so, it waits for the lock and re-reads. Combined with InnoDB releasing locks on non-matching rows at RC, this is why RC dramatically reduces lock waits and deadlocks in MySQL.
+
+### 9.8 InnoDB Lock Types: Record, Gap, Next-Key, Insert Intention, AUTO-INC
+
+> **Everyday analogy: a car park with numbered spaces.** Records are **parked cars**; the empty stretches between them are **gaps**.
+> - **Record lock** = a clamp on one car.
+> - **Gap lock** = cones across the empty stretch between two cars: *"nobody parks here."* Two people can put cones on the same stretch -- cones don't fight each other; they only stop *new cars*.
+> - **Next-key lock** = a clamp on a car **plus** cones on the stretch in front of it.
+> - **Insert intention** = a driver signalling *"I'm about to park in that stretch."* Several drivers can signal for different spots in the same stretch, but any cones there stop them.
+> - The famous deadlock: two people each put cones on the same stretch, then each tries to park there. Each waits for the other's cones.
+>
+> ```
+> Remember it like this
+> ├─ InnoDB locks what it SCANS, not what it returns → index your WHERE
+> ├─ gap locks only block INSERTS, never each other
+> ├─ "SELECT FOR UPDATE, then INSERT if missing" = cone deadlock
+> └─ READ COMMITTED removes most cones (gap locks)
+> ```
+
+InnoDB locks **index records**, not rows -- a statement locks every index record it *scans*, not just the ones it returns. A `FOR UPDATE` on an unindexed column locks every row of the table (and every gap) at REPEATABLE READ.
+
+Example index on `id`: records `10, 20, 30`, plus the `supremum` pseudo-record after the last one. Gaps: `(-∞,10) (10,20) (20,30) (30,+∞)`.
+
+| Lock | Covers | `data_locks.LOCK_MODE` | Taken by (at RR) |
+|------|--------|------------------------|------------------|
+| **Record lock** | One index record | `X,REC_NOT_GAP` / `S,REC_NOT_GAP` | Unique-index equality search that finds a row: `WHERE id = 20 FOR UPDATE` |
+| **Gap lock** | The open interval before a record | `X,GAP` / `S,GAP` | Equality search that finds nothing: `WHERE id = 25 FOR UPDATE` locks gap (20,30) |
+| **Next-key lock** | Record + the gap before it: `(10,20]` | `X` / `S` | Range scans and non-unique index searches: `WHERE id BETWEEN 15 AND 25 FOR UPDATE` → `(10,20]` and a gap/next-key on 30 |
+| **Insert intention** | A point inside a gap | `X,GAP,INSERT_INTENTION` | Every `INSERT`, momentarily, before inserting into a gap |
+| **AUTO-INC** | The table's auto-increment counter | (table lock) | `INSERT` into tables with `AUTO_INCREMENT`, depending on `innodb_autoinc_lock_mode` |
+
+**Compatibility (for conflicting S/X modes; S vs S never conflicts):**
+
+```
+                          Held by another transaction
+Requested          │ Gap │ Insert Intention │ Record │ Next-Key │
+───────────────────┼─────┼──────────────────┼────────┼──────────┤
+Gap                │  ✓  │        ✓         │   ✓    │    ✓     │
+Insert Intention   │  ✗  │        ✓         │   ✓    │    ✗     │
+Record             │  ✓  │        ✓         │   ✗    │    ✗     │
+Next-Key           │  ✓  │        ✓         │   ✗    │    ✗     │
+```
+
+Two facts drive almost every InnoDB lock incident:
+
+- **Gap locks never conflict with each other** (even X,GAP vs X,GAP). They exist only to stop *inserts*.
+- **Insert intention conflicts with any gap lock**, but not with other insert intentions (two inserts of different keys into the same gap proceed in parallel).
+
+**Classic deadlock 1: "lock-then-insert" upsert**
+
+```
+Index: 10, 20, 30.   Both sessions: "if id doesn't exist, insert it."
+
+T1: SELECT * FROM t WHERE id = 25 FOR UPDATE;   -- empty; X,GAP on (20,30)
+T2: SELECT * FROM t WHERE id = 26 FOR UPDATE;   -- empty; X,GAP on (20,30) ✓ compatible
+T1: INSERT INTO t (id) VALUES (25);             -- insert intention vs T2's gap → WAIT
+T2: INSERT INTO t (id) VALUES (26);             -- insert intention vs T1's gap → DEADLOCK
+
+Fix: INSERT ... ON DUPLICATE KEY UPDATE (or INSERT first and handle the
+duplicate-key error), or run at READ COMMITTED where these gap locks aren't taken.
+```
+
+**Classic deadlock 2: duplicate-key on concurrent inserts**
+
+On a duplicate-key error, InnoDB puts a **shared** lock on the existing record (for the duplicate check). Three sessions insert the same key: S1 succeeds (holds X), S2 and S3 hit the duplicate and queue for S locks. S1 rolls back → S2 and S3 both get S → both now try to take X to insert → deadlock. Seen in practice with "insert, catch duplicate, retry" loops under high concurrency.
+
+**READ COMMITTED turns gap locking off** for searches and index scans. Gap locks remain only for foreign-key and duplicate-key checks. Locks on rows that don't match the `WHERE` are released after evaluation. This is why many large MySQL shops run at RC (with row-based binlog).
+
+**The InnoDB RR "phantom that isn't supposed to exist":** plain `SELECT` reads the snapshot; `UPDATE`/`DELETE`/locking reads read the *latest committed* data. Mixing them breaks the snapshot illusion:
+
+```
+T1: BEGIN;  SELECT COUNT(*) FROM t WHERE c = 1;     -- 2 (snapshot)
+T2: INSERT INTO t (c) VALUES (1); COMMIT;
+T1: SELECT COUNT(*) FROM t WHERE c = 1;             -- 2 (still snapshot: fine)
+T1: UPDATE t SET c = 2 WHERE c = 1;                 -- "3 rows affected"  ← current read
+T1: SELECT COUNT(*) FROM t WHERE c = 2;             -- 3: T2's row now visible,
+                                                    --    because T1 modified it
+```
+
+At PostgreSQL REPEATABLE READ, T1's `UPDATE` uses the same snapshot as its `SELECT`, so it updates 2 rows and T2's row is untouched. Neither behavior violates the SQL standard; they are different designs, and code ported between the two can change behavior silently.
+
+**AUTO-INC lock modes (`innodb_autoinc_lock_mode`):**
+
+| Mode | Behavior | Trade-off |
+|------|----------|-----------|
+| 0 traditional | Table-level AUTO-INC lock held to **end of statement** | Consecutive IDs, serializes all inserts |
+| 1 consecutive (default ≤5.7) | Lightweight mutex for simple inserts; table lock only for bulk inserts of unknown size (`INSERT ... SELECT`) | Consecutive within a statement |
+| 2 interleaved (default 8.0+) | Mutex only, never a statement-long lock | Fastest; IDs in one bulk insert may interleave with others; requires row-based binlog |
+
+In every mode, rolled-back inserts leave **gaps**: auto-increment values are not transactional. Never use them as "no gaps" invoice numbers.
+
+**Inspecting InnoDB locks:**
+
+```sql
+SELECT engine_transaction_id AS trx, object_name, index_name,
+       lock_type, lock_mode, lock_status, lock_data
+FROM performance_schema.data_locks;
+-- lock_data = 'supremum pseudo-record' → gap lock past the last row
+
+SELECT * FROM sys.innodb_lock_waits\G       -- who waits for whom, with KILL hints
+SHOW ENGINE INNODB STATUS\G                  -- "LATEST DETECTED DEADLOCK" section
+```
+
+### 9.9 Preventing Write Skew and Phantoms Without SERIALIZABLE
+
+> **Everyday analogy: two doctors and the on-call roster.**
+> Alice and Bob each glance at the roster ("two of us on call, I can leave"), and each crosses out *their own* line. Nobody touched the same line, so row locks never fired, and now nobody is on call.
+> The fixes map one-to-one:
+> 1. **Constraint** = the hospital's software refuses the change if it would leave zero doctors.
+> 2. **Materialized conflict** = there is one physical **roster clipboard**; you must hold it while you check and edit.
+> 3. **Advisory lock** = a "talking stick" everyone agrees to hold before editing the roster -- works only if everyone follows the rule.
+> 4. **SERIALIZABLE** = a referee who watches who read what and cancels one change if the combination could not have happened one-at-a-time.
+>
+> ```
+> Remember it like this
+> ├─ write skew = different rows, shared assumption
+> ├─ best: express the rule as a constraint (UNIQUE / EXCLUDE)
+> ├─ else: make everyone grab the same row ("the clipboard")
+> └─ or: SERIALIZABLE everywhere + retry
+> ```
+
+Row locks can't protect rows that don't exist yet (Section 2.5). Four production techniques, in rough order of preference:
+
+**1. Let a constraint do it.** Constraints are checked by the index, which serializes concurrent inserts at every isolation level.
+
+```sql
+-- No overlapping bookings per room -- the meeting-room example from 2.5
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE bookings ADD CONSTRAINT no_overlap
+  EXCLUDE USING gist (room_id WITH =, tstzrange(start_time, end_time) WITH &&);
+-- The second concurrent insert waits for the first, then fails with
+-- SQLSTATE 23P01 (exclusion_violation).
+
+-- "At most one active subscription per user": partial unique index
+CREATE UNIQUE INDEX one_active_sub ON subscriptions (user_id)
+  WHERE status = 'active';
+```
+
+**2. Materialize the conflict.** Pick an existing row that represents the predicate and lock it, so the two transactions collide on a row.
+
+```sql
+-- On-call example: lock the shift row before counting doctors on it
+BEGIN;
+SELECT 1 FROM shifts WHERE id = :shift_id FOR NO KEY UPDATE;  -- serializes per shift
+SELECT count(*) FROM doctors WHERE shift_id = :shift_id AND on_call;
+UPDATE doctors SET on_call = false WHERE id = :me;
+COMMIT;
+```
+
+**3. Advisory lock on the predicate** when there's no natural row to lock:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('room:5:2025-03-15', 0));
+-- check + insert; released automatically at COMMIT/ROLLBACK
+COMMIT;
+```
+
+Every code path that writes must take the same lock -- it is a convention, not an enforced constraint.
+
+**4. SERIALIZABLE with retries.** The most general option; no lock design needed.
+
+| Technique | Isolation needed | Enforced by DB? | Cost |
+|-----------|------------------|-----------------|------|
+| Unique / exclusion constraint | Any | Yes, always | Index maintenance; only for invariants expressible as a constraint |
+| Materialized conflict (`FOR NO KEY UPDATE`) | READ COMMITTED | Only if every writer does it | Serializes per locked row |
+| Advisory lock | READ COMMITTED | Only if every writer does it | Hash collisions serialize unrelated work (harmless) |
+| SERIALIZABLE (SSI) | SERIALIZABLE | Yes | False-positive aborts; every caller must retry |
+
+**Making PostgreSQL SSI work well in practice:**
+
+- **All** transactions touching the data must run at SERIALIZABLE. A READ COMMITTED writer is invisible to SSI's conflict tracking, and the guarantee silently disappears.
+- SIREAD locks (`mode = 'SIReadLock'` in `pg_locks`) are taken on tuples and **index pages** for index scans, but on the **whole relation** for sequential scans. A seq scan makes any concurrent write to that table a potential conflict → false-positive aborts. SERIALIZABLE works best when queries are index-driven.
+- Promotion thresholds (tuple → page → relation) are `max_pred_locks_per_transaction` (64), `max_pred_locks_per_relation` (-2 → half of that), and `max_pred_locks_per_page` (2). Raise them if you see many relation-level SIReadLocks and high abort rates.
+- SIREAD locks outlive the transaction until all overlapping transactions finish, so long transactions increase aborts for everyone.
+- Declare read-only work `READ ONLY` (lets PostgreSQL drop predicate locks early); use `READ ONLY DEFERRABLE` for long reports -- they never abort.
+- Hot standbys can't run SERIALIZABLE (the max there is REPEATABLE READ).
+- PostgreSQL chooses the abort victim so that an immediate retry won't fail on the *same* conflict -- blind retry loops do converge.
+
+### 9.10 Lock Conversion, U Locks, and Lock Ordering
+
+> **Everyday analogy: two people, one pen, one notebook.** Both are *reading* the notebook (shared locks). Both decide to *write* and each waits for the other to stop reading -- forever. SQL Server's **U lock** is a "next to write" badge: only one reader may hold it, so the other waits *before* reading.
+> **Lock ordering** is the dining-philosophers fix: always pick up the lower-numbered chopstick first, and nobody can end up holding one while waiting for the other.
+
+**Conversion (upgrade) deadlock:** both transactions read with a shared lock, then both try to upgrade to exclusive.
+
+```
+T1: S lock on row A      T2: S lock on row A     (compatible)
+T1: wants X on A → waits for T2's S
+T2: wants X on A → waits for T1's S              → DEADLOCK
+```
+
+- **SQL Server** has an **Update (U) lock** for exactly this: U is compatible with S but not with another U or X, so only one transaction at a time can be "reading with intent to write". `UPDATE` takes U while searching, then converts to X; apps can request it with `WITH (UPDLOCK)`.
+- **PostgreSQL/InnoDB** have no U lock; the equivalent is to take the exclusive lock at read time (`FOR UPDATE` / `FOR NO KEY UPDATE`), not `FOR SHARE`.
+
+**SQL Server key-range locks** (`RangeS-S`, `RangeS-U`, `RangeI-N`, `RangeX-X`) are its analog of next-key/gap locks, used only at SERIALIZABLE. Its row-versioning levels -- `READ_COMMITTED_SNAPSHOT` (RC reads a version instead of taking S locks) and `SNAPSHOT` (SI with update-conflict error 3960) -- store versions in tempdb, or in the database itself with Accelerated Database Recovery (2019+).
+
+**Lock ordering eliminates most deadlocks.** Acquire multiple row locks in one statement, in a deterministic order:
+
+```sql
+-- Transfer between accounts :a and :b -- always lock the lower id first
+SELECT id, balance FROM accounts
+WHERE id IN (:a, :b)
+ORDER BY id
+FOR NO KEY UPDATE;
+-- PostgreSQL locks rows as they come out of the sort, i.e. in id order.
+```
+
+Two separate `SELECT ... FOR UPDATE` statements in "from, to" order deadlock as soon as A→B and B→A transfers run concurrently.
+
+### 9.11 Hot Rows: When One Row Is the Bottleneck
+
+> **Everyday analogy: a single cash register.** However big the shop, if every customer must pay at register #1, throughput is one customer per payment time. Speed up each payment (shorter lock hold), open more registers (sharded counters), give each customer a receipt and total up later (append-only ledger), or pre-bag the goods so people grab a bag without queueing (pre-sliced inventory + SKIP LOCKED).
+
+Row locks are held until commit, so a single hot row caps throughput at roughly `1 / (lock hold time)`. At 2 ms per transaction that's ~500 updates/s on that row, no matter how big the server is.
+
+| Technique | How | When |
+|-----------|-----|------|
+| Shrink the hold time | One statement: `UPDATE ... SET n = n - 1 WHERE id = :id AND n > 0 RETURNING n`; no app round-trips while holding the lock; commit immediately | Always first |
+| Sharded counter | N rows per counter (`counter_id, slot`); increment a random slot; `SUM` on read | Likes, view counts, rate limits |
+| Append-only ledger | Insert a `ledger_entry` row per change; derive balance by `SUM` + periodic snapshot row | Balances, wallets (also gives an audit trail) |
+| Pre-sliced inventory | One row per unit (or per batch of units); claim with `FOR UPDATE SKIP LOCKED LIMIT 1` | Flash sales, ticketing, seat maps |
+| Single-writer queue | Funnel updates for the hot key through one worker that batches them | Extreme contention on one key |
+
+### 9.12 Subtransactions: The Hidden Scalability Cliff (PostgreSQL)
+
+> **Everyday analogy: a pocket notebook with 64 lines.** Every savepoint writes a line in your pocket notebook, and anyone checking "is this row visible?" glances at it -- instant. On line 65 the notebook is full, so you start filing entries in the **archive room downstairs** (`pg_subtrans`). Now *everyone in the building*, for every visibility check that might involve you, has to walk to the archive room and queue at its one door. One transaction's habit slows the whole building -- replicas worst of all.
+>
+> ```
+> Remember it like this
+> ├─ SAVEPOINT / EXCEPTION block / ORM nested atomic = one notebook line
+> ├─ > 64 lines in one transaction = "suboverflowed"
+> ├─ overflow makes EVERY session read pg_subtrans → SubtransSLRU waits
+> └─ fix: no EXCEPTION blocks in write loops, no per-statement savepoints
+> ```
+
+Subtransactions come from `SAVEPOINT`, **every PL/pgSQL `BEGIN ... EXCEPTION` block**, and many drivers/ORMs (pgjdbc `autosave`, Django nested `atomic()`, Rails `requires_new`). Each one that writes gets its own XID.
+
+```
+Each backend's PGPROC caches up to 64 subtransaction XIDs.
+
+  ≤ 64 subxacts:  snapshots list them directly → visibility check is cheap
+  > 64 subxacts:  backend marked "suboverflowed"
+                  → EVERY snapshot taken anywhere while this txn is open
+                    must consult pg_subtrans (an SLRU) to map subxid → parent
+                  → cluster-wide contention on LWLock: SubtransSLRU
+                    (PG13+ name; formerly SubtransControlLock)
+                  → replicas are hit hardest
+```
+
+Also costly: a row locked or updated in a subtransaction after the parent locked it creates a MultiXact (9.3).
+
+**Guidance:**
+
+- Don't put `EXCEPTION` blocks inside loops that write; validate first, or handle errors outside the loop.
+- Avoid driver modes that wrap every statement in a savepoint in high-throughput paths.
+- Diagnose with `SELECT * FROM pg_stat_get_backend_subxact(<backend_id>)` (PG16+: `subxact_count`, `subxact_overflowed`) and `pg_stat_slru` (`name = 'Subtransaction'`). PG17 adds `subtransaction_buffers` to enlarge the cache.
+
 ---
 
 ## Appendix A: Quick Reference
@@ -2509,8 +3264,10 @@ SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED;
 -- InnoDB lock wait timeout (default: 50 seconds)
 SET innodb_lock_wait_timeout = 10;
 
--- Deadlock detection (default: ON)
-SET innodb_deadlock_detect = ON;
+-- Deadlock detection (default: ON; global-only variable)
+SET GLOBAL innodb_deadlock_detect = ON;
+-- Log every deadlock to the error log, not just the latest one
+SET GLOBAL innodb_print_all_deadlocks = ON;
 
 -- View current locks (MySQL 8.0+)
 SELECT * FROM performance_schema.data_locks;
@@ -2520,7 +3277,18 @@ SELECT * FROM performance_schema.data_lock_waits;
 ### Monitoring Queries
 
 ```sql
--- PostgreSQL: find blocked queries
+-- PostgreSQL 9.6+: who blocks whom (simplest, handles all lock types
+-- including row locks that surface as transactionid waits)
+SELECT pid,
+       pg_blocking_pids(pid)      AS blocked_by,
+       wait_event_type, wait_event,
+       now() - query_start        AS waiting_for,
+       left(query, 80)            AS query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0
+ORDER BY waiting_for DESC;
+
+-- PostgreSQL: the same via a raw pg_locks self-join (pre-9.6 style)
 SELECT
     blocked.pid AS blocked_pid,
     blocked.query AS blocked_query,
@@ -2573,3 +3341,8 @@ ORDER BY n_dead_tup DESC;
 | *An Empirical Evaluation of In-Memory MVCC* (Wu et al., 2017) | Performance comparison of MVCC variants |
 | PostgreSQL documentation: Chapter 13 (Concurrency Control) | Authoritative reference for PostgreSQL specifics |
 | MySQL documentation: InnoDB Locking and Transaction Model | Authoritative reference for InnoDB specifics |
+| PostgreSQL source: `src/backend/access/heap/README.tuplock` | Row-lock modes, MultiXacts, and why FOR KEY SHARE exists |
+| PostgreSQL source: `src/backend/storage/lmgr/README` | Heavyweight lock manager, fast-path locks, deadlock detector |
+| *A Read-Only Transaction Anomaly Under Snapshot Isolation* (Fekete, O'Neil, O'Neil, 2004) | Why read-only transactions are not automatically safe under SI |
+| *Weak Consistency: A Generalized Theory...* (Adya, 1999) | G0/G1/G2 phenomena -- the precise definitions behind isolation levels |
+| Jepsen analyses (jepsen.io) | Empirical isolation bugs in real databases |
