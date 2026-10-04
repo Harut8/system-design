@@ -1,12 +1,12 @@
 # 19 — Bytecode and code objects: reading what the compiler actually emitted
 
-> **Tier 3, doc 19.** Prerequisites: [`18-lexer-parser-ast.md`](18-lexer-parser-ast.md)
+> **Tier 3, doc 19.** Prerequisites: `18-lexer-parser-ast.md`
 > (tokenizer → PEG parser → AST → symbol table → CFG),
-> [`14-pyobject-and-types.md`](14-pyobject-and-types.md) (everything on the stack is a
+> `14-pyobject-and-types.md` (everything on the stack is a
 > `PyObject*`), [`16-object-memory-layout.md`](16-object-memory-layout.md) (what a
 > pointer dereference costs). Feeds into: [`20-eval-loop.md`](20-eval-loop.md),
-> [`21-tier2-and-jit.md`](21-tier2-and-jit.md),
-> [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md),
+> `21-tier2-and-jit.md`,
+> `23-tracing-and-runtime-hooks.md`,
 > [`42-runtime-code-manipulation.md`](42-runtime-code-manipulation.md).
 >
 > **THESIS: a code object is not "the bytecode". It is a fixed-layout C struct whose
@@ -1162,9 +1162,9 @@ Nothing you can do prevents this; the surface is genuinely unstable by policy.
 
 **The engineering conclusion.** For *reading*: `dis` is a first-class, stable, supported
 API — use it constantly. For *writing*: prefer AST transformation (stable, documented,
-covered in [`18-lexer-parser-ast.md`](18-lexer-parser-ast.md) and
+covered in `18-lexer-parser-ast.md` and
 [`42-runtime-code-manipulation.md`](42-runtime-code-manipulation.md)) or `sys.monitoring`
-(PEP 669, [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md)) over
+(PEP 669, `23-tracing-and-runtime-hooks.md`) over
 bytecode rewriting. Almost everything people reach for bytecode patching to do — coverage,
 profiling, tracing, instrumentation — has a supported mechanism now that did not exist when
 those libraries were written.
@@ -1268,7 +1268,7 @@ answer.
 - [PEP 626 — Precise line numbers for debugging](https://peps.python.org/pep-0626/) — `co_linetable`. **Verdict: read the Specification section; note it explicitly refuses to specify the byte format (§9).**
 - [PEP 657 — Fine-grained error locations in tracebacks](https://peps.python.org/pep-0657/) — `co_positions()`. **Verdict: short. Read the Examples section; it's the best advertisement for the feature.**
 - [PEP 709 — Inlined comprehensions](https://peps.python.org/pep-0709/) — source of the pre-3.12 disassembly quoted in §10. **Verdict: read the Specification and Backwards Compatibility sections — the latter is the list of tools it broke.**
-- [PEP 669 — Low impact monitoring](https://peps.python.org/pep-0669/) — the supported alternative to bytecode patching (§13). Covered in [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md).
+- [PEP 669 — Low impact monitoring](https://peps.python.org/pep-0669/) — the supported alternative to bytecode patching (§13). Covered in `23-tracing-and-runtime-hooks.md`.
 
 **Tools you should have used by the end of §14**
 
@@ -1279,9 +1279,9 @@ answer.
 
 **Sibling docs**
 
-- [`18-lexer-parser-ast.md`](18-lexer-parser-ast.md) — where code objects come from, and the *stable* place to do program transformation.
+- `18-lexer-parser-ast.md` — where code objects come from, and the *stable* place to do program transformation.
 - [`20-eval-loop.md`](20-eval-loop.md) — what executes all of this; §4 and §5 are its prologue.
-- [`21-tier2-and-jit.md`](21-tier2-and-jit.md) — `co_executors` from §1, and what `JUMP_BACKWARD_NO_JIT` in §5 was recording.
+- `21-tier2-and-jit.md` — `co_executors` from §1, and what `JUMP_BACKWARD_NO_JIT` in §5 was recording.
 - [`42-runtime-code-manipulation.md`](42-runtime-code-manipulation.md) — `types.CodeType`, `code.replace()`, and §13 in anger.
 - [`24-the-gil.md`](24-the-gil.md) §1 — why `LOAD_FAST_BORROW` (§12) exists at all.
 

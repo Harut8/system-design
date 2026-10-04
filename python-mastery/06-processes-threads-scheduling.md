@@ -184,7 +184,7 @@ that starts a Python process per unit of work has a 10 ms floor before your code
 itself no matter how parallel the work is; you need a *persistent* pool, and the pool
 creation cost must be amortized over the process lifetime, not the task. This is the
 quantitative version of the advice in
-[`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md).
+`27-multiprocessing-and-subinterpreters.md`.
 
 ---
 

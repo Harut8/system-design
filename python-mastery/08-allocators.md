@@ -7,7 +7,7 @@
 > Feeds into: [`16-object-memory-layout.md`](16-object-memory-layout.md),
 > [`24-the-gil.md`](24-the-gil.md), [`26-free-threading.md`](26-free-threading.md),
 > [`35-memory-optimization.md`](35-memory-optimization.md),
-> [`46-production-python.md`](46-production-python.md).
+> `46-production-python.md`.
 >
 > **THESIS: `malloc` is not a system call, and that is the whole subject.** Between your
 > `list.append` and the kernel's page tables sit two user-space programs — CPython's

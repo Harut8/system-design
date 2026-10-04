@@ -1,14 +1,14 @@
 # 42 — Runtime code manipulation: decorators, exec, the import system, and knowing when to stop
 
-> **Tier 7, doc 42.** Prerequisites: [`40-data-model-and-descriptors.md`](40-data-model-and-descriptors.md)
+> **Tier 7, doc 42.** Prerequisites: `40-data-model-and-descriptors.md`
 > (descriptors, attribute lookup — decorators and `functools` are built on them),
-> [`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md)
+> `41-metaclasses-and-class-construction.md`
 > (class creation is the other half of metaprogramming),
-> [`18-lexer-parser-ast.md`](18-lexer-parser-ast.md) (the AST is the thing we transform),
+> `18-lexer-parser-ast.md` (the AST is the thing we transform),
 > [`19-bytecode-and-code-objects.md`](19-bytecode-and-code-objects.md) (code objects are
 > what `compile` emits). Feeds into: [`43-testing-strategy.md`](43-testing-strategy.md)
-> (pytest's assertion rewriting is an import hook), [`45-supply-chain-and-security.md`](45-supply-chain-and-security.md)
-> (`eval`/`pickle`/import hooks are attack surface), [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md)
+> (pytest's assertion rewriting is an import hook), `45-supply-chain-and-security.md`
+> (`eval`/`pickle`/import hooks are attack surface), `23-tracing-and-runtime-hooks.md`
 > (PEP 669 monitoring is the sanctioned instrumentation path).
 >
 > **THESIS: every technique in this document lets you change what code *does* without
@@ -51,7 +51,7 @@
 A decorator is not a language feature so much as a syntax convenience: `@d` above `def f`
 means `f = d(f)`. Everything interesting is in what `d` returns, and the machinery that
 makes it return a *usable* function is the closure — see
-[`40-data-model-and-descriptors.md`](40-data-model-and-descriptors.md) for why the returned
+`40-data-model-and-descriptors.md` for why the returned
 object still binds as a method.
 
 ### The cell object is the mechanism
@@ -167,7 +167,7 @@ live: forgetting the middle layer, or forgetting `@wraps` on the innermost.
 ### Class decorators
 
 `@d` above `class C` is `C = d(C)`. It receives the fully-built class (after the metaclass
-has run — see [`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md))
+has run — see `41-metaclasses-and-class-construction.md`)
 and returns anything. `dataclasses.dataclass` is the canonical example: it reads
 `__annotations__`, synthesizes `__init__`/`__repr__`/`__eq__` as source strings, `exec`s
 them, and attaches them. A class decorator is strictly weaker than a metaclass (it can't
@@ -208,7 +208,7 @@ performance-optimization costume. The correct tools:
 - **`functools.cached_property`** for per-instance memoization — it stores the result in the
   instance `__dict__`, so it dies with the instance. Measured: after `del o; gc.collect()`
   the weakref is dead — **no leak** *(measured)*. It needs `__set_name__` to learn its
-  attribute name (see [`40-data-model-and-descriptors.md`](40-data-model-and-descriptors.md)).
+  attribute name (see `40-data-model-and-descriptors.md`).
 - A per-instance cache, or a `WeakValueDictionary`, if you genuinely need method-level
   memoization with lifetime tied to the instance.
 
@@ -330,7 +330,7 @@ The correct posture: **never `eval`/`exec` untrusted input.** For expressions ov
 `ast.literal_eval` (parses literals only, no calls, no attribute access). For real sandboxing,
 the boundary must be the OS or a separate interpreter with dropped privileges — a subprocess
 with seccomp/landlock, a container, a WASM runtime — not a dictionary. See
-[`45-supply-chain-and-security.md`](45-supply-chain-and-security.md).
+`45-supply-chain-and-security.md`.
 
 ---
 
@@ -736,7 +736,7 @@ Service().price()      # 999   (measured)
 
 The class `__dict__` is a writable mapping; you replaced an entry. Every instance sees it
 immediately because attribute lookup goes through the class
-([`40-data-model-and-descriptors.md`](40-data-model-and-descriptors.md)).
+(`40-data-model-and-descriptors.md`).
 
 ### It fails on C types — by design
 
@@ -748,7 +748,7 @@ list.append = ...  # same TypeError
 ```
 
 Static (C-defined) types have no writable `tp_dict` for Python code — their method tables are
-fixed C structures ([`14-pyobject-and-types.md`](14-pyobject-and-types.md)), and CPython
+fixed C structures (`14-pyobject-and-types.md`), and CPython
 refuses the write to protect every other user of `int` in the process. This is the wall the
 `forbiddenfruit` package famously circumvents with C-level hacks, and the fact that it *needs*
 C-level hacks is the point: the interpreter is telling you no. (Heap types created with `type()`
@@ -832,7 +832,7 @@ now *also* an annotations cost, not just a signature cost, and the fix is the sa
 `FORWARDREF`/`STRING` formats would not. Tools that walk annotations for documentation or
 serialization should prefer `annotationlib` with `FORWARDREF` to survive partially-defined
 modules. See [`37-generics-and-protocols.md`](37-generics-and-protocols.md) and
-[`38-type-checking-in-practice.md`](38-type-checking-in-practice.md).
+`38-type-checking-in-practice.md`.
 
 ---
 
@@ -857,7 +857,7 @@ modules. See [`37-generics-and-protocols.md`](37-generics-and-protocols.md) and
 
 For instrumenting *execution* — call counts, coverage, line tracing — the modern, low-overhead
 mechanism is PEP 669 monitoring (3.12+), covered in depth in
-[`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md). Its defining trick is the
+`23-tracing-and-runtime-hooks.md`. Its defining trick is the
 `DISABLE` return value: a callback can tell the interpreter "never fire this event at *this
 code location* again," so a hot call site is instrumented once and then costs nothing. Measured
 *(measured)*:
@@ -910,7 +910,7 @@ Reject — or demand a written justification — when you see:
 
 1. **A metaclass or import hook where a class decorator, `__init_subclass__`, or an explicit
    function call would do.** Reach for the weakest tool that works
-   ([`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md)).
+   (`41-metaclasses-and-class-construction.md`).
    Weakest-tool-that-works is the entire heuristic.
 2. **A decorator without `functools.wraps`.** It silently breaks `inspect.signature`,
    `help()`, annotations (§9), and type checking. There is no upside to omitting it.
@@ -980,7 +980,7 @@ source and observe which `.pyc` variants recompile and which don't under
 **8 — `sys.monitoring` vs `settrace`.** Instrument function calls two ways: `sys.settrace` and
 PEP 669 monitoring with `DISABLE`. Measure the steady-state overhead of each in a hot loop.
 Explain why `DISABLE` makes monitoring near-free and `settrace` isn't. *Proves §10 and connects
-to [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md).*
+to `23-tracing-and-runtime-hooks.md`.*
 
 ---
 
@@ -1050,11 +1050,11 @@ Staff-level. If you can't answer from your own model, the section to reread is n
 - `coverage.py` and py-spy/austin/Scalene — for how real tools moved from `settrace`/bytecode toward `sys.monitoring` (§7, §10).
 
 **Sibling docs**
-- [`40-data-model-and-descriptors.md`](40-data-model-and-descriptors.md) — why decorated functions still bind as methods; `cached_property`'s `__set_name__`.
-- [`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md) — the weaker-tool ladder that §11 invokes.
-- [`18-lexer-parser-ast.md`](18-lexer-parser-ast.md), [`19-bytecode-and-code-objects.md`](19-bytecode-and-code-objects.md) — what §6 and §7 manipulate.
-- [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md) — PEP 669 in depth (§10).
-- [`45-supply-chain-and-security.md`](45-supply-chain-and-security.md) — §3's "no safe eval" as attack surface, plus `pickle` and import-hook risks.
+- `40-data-model-and-descriptors.md` — why decorated functions still bind as methods; `cached_property`'s `__set_name__`.
+- `41-metaclasses-and-class-construction.md` — the weaker-tool ladder that §11 invokes.
+- `18-lexer-parser-ast.md`, [`19-bytecode-and-code-objects.md`](19-bytecode-and-code-objects.md) — what §6 and §7 manipulate.
+- `23-tracing-and-runtime-hooks.md` — PEP 669 in depth (§10).
+- `45-supply-chain-and-security.md` — §3's "no safe eval" as attack surface, plus `pickle` and import-hook risks.
 
 ---
 

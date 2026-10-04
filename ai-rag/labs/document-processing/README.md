@@ -141,7 +141,7 @@ the silent hybrid-search regression §4.3 warns about.
 **Every chunk is a span, never a string.** `chunk.text == canonical[span.start:span.end]`
 is asserted for all four strategies across the whole corpus. That is what makes
 citation-with-highlighting possible, and it is what lets the sibling
-[`golden-set`](../golden-set/) lab score any of these chunkings against the same span
+[`golden-set`](../golden-set/README.md) lab score any of these chunkings against the same span
 labels without re-labelling.
 
 `ChunkRecord` is §8.1's metadata table as a schema, with `assert_no_leakage()`
@@ -819,7 +819,7 @@ In this order, because each step's answer changes the next:
 4. **`bakeoff.py --only splitters`** to see what your current splitter does to your
    tables and your code. If you ship a mixed corpus, the answer is usually "route by
    type" rather than "tune one number".
-5. **Only then** build the golden set ([`../golden-set/`](../golden-set/)) and start
+5. **Only then** build the golden set ([`../golden-set/`](../golden-set/README.md)) and start
    comparing chunkings on quality. Everything before this point is measurable without a
    model; nothing after it is.
 
@@ -971,7 +971,7 @@ the ones you judged fine. The thresholds here are placeholders and a threshold c
 from a document is a number you invented.
 
 **To make any chunking comparison valid**, you need the sibling lab:
-[`../golden-set/`](../golden-set/) builds span-labelled ground truth, which is the
+[`../golden-set/`](../golden-set/README.md) builds span-labelled ground truth, which is the
 artifact §11.2 says every chunking comparison requires and most published ones lack.
 This lab's chunks carry `(char_start, char_end)` into canonical text precisely so that
 its labels apply to all four strategies without re-labelling. Wiring the two together

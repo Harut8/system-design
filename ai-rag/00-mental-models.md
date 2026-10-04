@@ -14,10 +14,10 @@
 > [`04-retrieval-hybrid-and-reranking.md`](04-retrieval-hybrid-and-reranking.md) (§7),
 > [`06-context-engineering.md`](06-context-engineering.md) (§11),
 > [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (§4, §6),
-> [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md) (§13),
-> [`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md) (§9),
-> [`13-agents-and-tool-calling.md`](13-agents-and-tool-calling.md) and
-> [`14-agent-evaluation.md`](14-agent-evaluation.md) (§12).
+> `10-llm-observability-and-tracing.md` (§13),
+> `11-token-accounting-and-cost.md` (§9),
+> `13-agents-and-tool-calling.md` and
+> `14-agent-evaluation.md` (§12).
 >
 > **THESIS:** an LLM pipeline is a data system. Correctness, measurability and unit cost
 > are engineering properties of the pipeline, not afterthoughts bolted on once the demo
@@ -1375,7 +1375,7 @@ criterion: every record has at least one verified chunk id, and you can regenera
 deterministically if the corpus is re-chunked (i.e., chunk ids are stable identifiers, not
 array indices).
 
-> **Worked: [`labs/golden-set/`](labs/golden-set/)** — 60 questions over the four chapters
+> **Worked: [`labs/golden-set/`](labs/golden-set/README.md)** — 60 questions over the four chapters
 > in this folder, with the builder that produces the labels and the 20-assertion test
 > suite that keeps them from rotting. Read that directory's README for the full method
 > and build log, including what a production golden set does differently. The four
@@ -1839,7 +1839,7 @@ the answer (§12).
 
 ---
 
-**Rung ledger.** Exercise 1 is built: [`labs/golden-set/`](labs/golden-set/) is **rung 2 —
+**Rung ledger.** Exercise 1 is built: [`labs/golden-set/`](labs/golden-set/README.md) is **rung 2 —
 implemented** (60 labelled queries over this folder's four chapters, a deterministic
 builder, and a test suite that fails when the labels go stale). It produces labels, not
 quality numbers — the first rung-1 figure arrives when exercise 2 runs a retriever against

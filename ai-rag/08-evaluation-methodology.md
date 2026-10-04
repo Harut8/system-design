@@ -12,14 +12,14 @@
 > [`04-retrieval-hybrid-and-reranking.md`](04-retrieval-hybrid-and-reranking.md) §13 — both defer
 > their metric definitions here, and both state a trap this chapter generalizes.
 >
-> **Feeds into:** [`09-eval-infrastructure-and-ci.md`](09-eval-infrastructure-and-ci.md) (this
+> **Feeds into:** `09-eval-infrastructure-and-ci.md` (this
 > chapter defines *what* to measure; `09` is the pipeline that runs it on every commit),
-> [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md) (§15 — an eval score
+> `10-llm-observability-and-tracing.md` (§15 — an eval score
 > with no trace behind it can't be debugged, and a trace with no eval label attached can't be
-> aggregated), [`14-agent-evaluation.md`](14-agent-evaluation.md) (§12 is its foundation),
-> [`appendix-b-metric-definitions.md`](appendix-b-metric-definitions.md) (every formula here,
+> aggregated), `14-agent-evaluation.md` (§12 is its foundation),
+> `appendix-b-metric-definitions.md` (every formula here,
 > extracted and stated once),
-> [`appendix-c-eval-recipe-book.md`](appendix-c-eval-recipe-book.md) (the copy-pasteable versions),
+> `appendix-c-eval-recipe-book.md` (the copy-pasteable versions),
 > and **P0 in the README's project ladder**, which is the artifact this chapter exists to unblock.
 >
 > **THESIS:** an eval is a measurement instrument, and the instrument has its own error bar.

@@ -35,7 +35,7 @@ If you only remember one sentence from this chapter: **a StatefulSet is a number
 23. [Diagnosing "Pod Pending: PVC Unbound"](#23-diagnosing-pod-pending-pvc-unbound)
 24. [Disaster Recovery: Losing Pod-0](#24-disaster-recovery-losing-pod-0)
 25. [Migration Patterns for Stateful Data](#25-migration-patterns-for-stateful-data)
-26. [`whenDeleted=Delete`: The Auto-Cleanup Option](#26-whendeletedelete-the-auto-cleanup-option)
+26. [`whenDeleted=Delete`: The Auto-Cleanup Option](#26-whendeleteddelete-the-auto-cleanup-option)
 27. [The "Ordinal 0 Is Leader" Myth](#27-the-ordinal-0-is-leader-myth)
 28. [`minReadySeconds` and Rollout Pacing](#28-minreadyseconds-and-rollout-pacing)
 29. [Observability: Metrics, Conditions, Alerts](#29-observability-metrics-conditions-alerts)

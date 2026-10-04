@@ -3,8 +3,8 @@
 > **Tier 1, doc 07.** Prerequisites: [`01-memory-hierarchy-and-caches.md`](01-memory-hierarchy-and-caches.md)
 > (cache lines, the TLB, 16 KB pages), [`06-processes-threads-scheduling.md`](06-processes-threads-scheduling.md).
 > Feeds into: [`08-allocators.md`](08-allocators.md), [`16-object-memory-layout.md`](16-object-memory-layout.md),
-> [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md),
-> [`35-memory-optimization.md`](35-memory-optimization.md), [`46-production-python.md`](46-production-python.md).
+> `27-multiprocessing-and-subinterpreters.md`,
+> [`35-memory-optimization.md`](35-memory-optimization.md), `46-production-python.md`.
 >
 > **THESIS: every number your process reports about its own memory is a claim about
 > page tables, and most of those claims are answers to a different question than the one

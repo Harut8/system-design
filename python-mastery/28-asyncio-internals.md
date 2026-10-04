@@ -8,7 +8,7 @@
 > (check points, the convoy effect). Feeds into:
 > [`29-async-patterns-and-pitfalls.md`](29-async-patterns-and-pitfalls.md),
 > [`30-concurrency-correctness.md`](30-concurrency-correctness.md),
-> [`46-production-python.md`](46-production-python.md).
+> `46-production-python.md`.
 >
 > **THESIS: asyncio is not a concurrency primitive. It is a *scheduler written in
 > Python* on top of two much older mechanisms — the generator's resumable frame and the

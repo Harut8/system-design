@@ -855,7 +855,7 @@ attribution (thread names show up in `py-spy`).
 
 `ProcessPoolExecutor` via `run_in_executor` is the answer for CPU-bound work, and its cost
 is dominated by pickling, not by the pool. See
-[`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md).
+`27-multiprocessing-and-subinterpreters.md`.
 The asyncio-specific caveat: the default executor is *never* a process pool, and
 `asyncio.to_thread` has no process equivalent.
 
@@ -1227,7 +1227,7 @@ in §5 gets you most of the way, and is one fewer dependency.
 - [`28-asyncio-internals.md`](28-asyncio-internals.md) — the mechanism behind every pattern here; §13 (cancellation), §14 (TaskGroup), §17 (debug mode), §18 (uvloop).
 - [`30-concurrency-correctness.md`](30-concurrency-correctness.md) §13 — the 306 ms vs 7.6 ms measurement §9 rests on; §14 — why deadlines must be monotonic.
 - [`31-measurement-methodology.md`](31-measurement-methodology.md) — read before believing §10.2, including the negative number I threw away.
-- [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md) — where CPU-bound work actually goes.
+- `27-multiprocessing-and-subinterpreters.md` — where CPU-bound work actually goes.
 
 ---
 

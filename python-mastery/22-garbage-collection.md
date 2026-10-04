@@ -5,7 +5,7 @@
 > (`PyGC_Head`, which objects carry one), [`01-memory-hierarchy-and-caches.md`](01-memory-hierarchy-and-caches.md)
 > §10 (pointer chasing, cache lines). Feeds into: [`26-free-threading.md`](26-free-threading.md),
 > [`32-profiling.md`](32-profiling.md), [`35-memory-optimization.md`](35-memory-optimization.md),
-> [`46-production-python.md`](46-production-python.md).
+> `46-production-python.md`.
 >
 > **THESIS: CPython does not have "a garbage collector." It has a deallocator
 > (reference counting) that handles ~all objects, plus a *cycle detector* that exists
@@ -1114,6 +1114,6 @@ Staff-level. Section references are where to reread if your model can't produce 
 
 ---
 
-*Next: [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md) — `gc.callbacks`
+*Next: `23-tracing-and-runtime-hooks.md` — `gc.callbacks`
 generalized: PEP 669 monitoring, audit hooks, and watching a running interpreter without
 paying for it.*

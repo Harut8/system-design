@@ -1,6 +1,6 @@
 # 15 — Reference counting and ownership
 
-> **Tier 2, doc 15.** Prerequisites: [`14-pyobject-and-types.md`](14-pyobject-and-types.md),
+> **Tier 2, doc 15.** Prerequisites: `14-pyobject-and-types.md`,
 > [`01-memory-hierarchy-and-caches.md`](01-memory-hierarchy-and-caches.md) §5 (MESI — you
 > need to know what a write to shared memory costs). Feeds into:
 > [`16-object-memory-layout.md`](16-object-memory-layout.md),

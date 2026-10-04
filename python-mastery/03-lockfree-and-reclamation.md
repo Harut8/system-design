@@ -5,7 +5,7 @@
 > [`02-atomics-and-memory-models.md`](02-atomics-and-memory-models.md) (CAS, LL/SC,
 > acquire/release, why ARM is not x86-TSO). Feeds into:
 > [`24-the-gil.md`](24-the-gil.md) §8, [`22-garbage-collection.md`](22-garbage-collection.md) §10,
-> [`25-threads-and-synchronization.md`](25-threads-and-synchronization.md),
+> `25-threads-and-synchronization.md`,
 > [`26-free-threading.md`](26-free-threading.md),
 > [`30-concurrency-correctness.md`](30-concurrency-correctness.md).
 >
@@ -113,7 +113,7 @@ it is narrow:
   "leaked memory" instead of "deadlocked forever."
 - A **profiler or debugger** reading another thread's state at an arbitrary instant.
   This is exactly the constraint behind PEP 768's remote debugging interface
-  ([`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md)).
+  (`23-tracing-and-runtime-hooks.md`).
 
 Notice that "we want more throughput" is not on that list. §8 measures why.
 
@@ -1864,7 +1864,7 @@ Staff-level. If you cannot answer from your own model, the section to reread is 
 
 ---
 
-*Next: [`04-binary-abi-and-linking.md`](04-binary-abi-and-linking.md) — but if you came
+*Next: `04-binary-abi-and-linking.md` — but if you came
 here from Tier 4, go straight to [`24-the-gil.md`](24-the-gil.md) §8 and reread it with
 §7 and §11 of this document in hand. The GIL doc explains what PEP 703 replaced the GIL
 *with*; this one explains what it had to build underneath to make that legal.*

@@ -1,14 +1,14 @@
 # 17 — The C API and extensions: ownership, ABI tiers, and the boundary where Python stops
 
-> **Tier 2, doc 17.** Prerequisites: [`14-pyobject-and-types.md`](14-pyobject-and-types.md)
+> **Tier 2, doc 17.** Prerequisites: `14-pyobject-and-types.md`
 > (`PyObject`, `PyTypeObject`, the `tp_*` slots),
 > [`15-refcounting-and-ownership.md`](15-refcounting-and-ownership.md) (borrowed vs new vs
 > stolen at the *concept* level — this doc makes it a compiler problem),
 > [`16-object-memory-layout.md`](16-object-memory-layout.md) §2 (the free-threading header)
 > and §4 (the three allocation domains), [`24-the-gil.md`](24-the-gil.md) §3 (what
 > `Py_BEGIN_ALLOW_THREADS` is *for*). Feeds into:
-> [`26-free-threading.md`](26-free-threading.md), [`34-going-native.md`](34-going-native.md),
-> [`44-packaging-and-environments.md`](44-packaging-and-environments.md).
+> [`26-free-threading.md`](26-free-threading.md), `34-going-native.md`,
+> `44-packaging-and-environments.md`.
 >
 > **THESIS: the C API is not "Python with more typing" — it is a contract in which the
 > compiler enforces nothing that matters.** Ownership, error state, thread state, and
@@ -264,7 +264,7 @@ real) tells the story: the full-API build links against **CPython's private data
 `Py_None` is a macro for `&_Py_NoneStruct`. `Py_DECREF` inlines a call to `_Py_Dealloc`.
 Those are the exact things the Limited API hides behind function calls so that CPython can
 change them. **The Stable ABI's cost is one indirect call per operation; its benefit is
-that CPython can move the furniture.** See [`04-binary-abi-and-linking.md`](04-binary-abi-and-linking.md)
+that CPython can move the furniture.** See `04-binary-abi-and-linking.md`
 for the general form of this trade.
 
 ---
@@ -1360,7 +1360,7 @@ opens that door.
 
 - **`memoryview`** is the buffer protocol wearing a Python costume. Slicing it is O(1).
 - **NumPy** is a buffer exporter and consumer; `np.frombuffer` and `np.asarray` of a
-  buffer-exporting object are zero-copy. [`34-going-native.md`](34-going-native.md) covers
+  buffer-exporting object are zero-copy. `34-going-native.md` covers
   strides, dtypes and views properly.
 - **Arrow** deliberately went further, defining its own C data interface rather than using
   PEP 3118, because PEP 3118 has no notion of nulls, nested types, or dictionary encoding.
@@ -2067,7 +2067,7 @@ It costs a couple of seconds and it converts a class of bug that manifests as
 a loop detects leaks *of any object*), `Py_TRACE_REFS` (a linked list of all live objects),
 assertions throughout the interpreter, and `PYTHONMALLOC=debug` on by default. It is
 roughly 2–3× slower and **ABI-incompatible with release builds** — extensions must be
-rebuilt against it (the `d` ABI flag). See [`13-cpython-source-map.md`](13-cpython-source-map.md)
+rebuilt against it (the `d` ABI flag). See `13-cpython-source-map.md`
 for building one.
 
 The leak test it enables is worth writing down:
@@ -2292,14 +2292,14 @@ Staff-level. If you can't answer from your own model, the section to reread is n
 - lldb: `help bt`, `help frame`. There is no well-maintained lldb equivalent of CPython's `Tools/gdb/libpython.py`; see §14.
 
 **Sibling docs**
-- [`14-pyobject-and-types.md`](14-pyobject-and-types.md) — the `tp_*` slots §7 fills in.
+- `14-pyobject-and-types.md` — the `tp_*` slots §7 fills in.
 - [`15-refcounting-and-ownership.md`](15-refcounting-and-ownership.md) — §4 at the concept level.
 - [`16-object-memory-layout.md`](16-object-memory-layout.md) §2 (the +16 header, confirmed at the C level in §2 here) and §4 (the domains, exercised in §14).
 - [`22-garbage-collection.md`](22-garbage-collection.md) — why `tp_traverse` is correctness, not performance.
 - [`24-the-gil.md`](24-the-gil.md) §3 (the handoff protocol §10 hooks into), §9 (the migration risk §11 measures).
 - [`26-free-threading.md`](26-free-threading.md) — the full migration; §11 is its C-side chapter.
-- [`34-going-native.md`](34-going-native.md) — NumPy strides, Arrow, and choosing §13's tool for a real workload.
-- [`44-packaging-and-environments.md`](44-packaging-and-environments.md) — wheels, ABI tags, and shipping what §2 and §3 describe.
+- `34-going-native.md` — NumPy strides, Arrow, and choosing §13's tool for a real workload.
+- `44-packaging-and-environments.md` — wheels, ABI tags, and shipping what §2 and §3 describe.
 
 ---
 
@@ -2355,8 +2355,8 @@ GitHub/PyPI APIs, not from building anything):
 
 ---
 
-*Next: [`18-lexer-parser-ast.md`](18-lexer-parser-ast.md) begins Tier 3 and goes back up the
+*Next: `18-lexer-parser-ast.md` begins Tier 3 and goes back up the
 stack — but if this document was interesting, the two docs that actually continue it are
 [`26-free-threading.md`](26-free-threading.md) (§11 at service scale) and
-[`34-going-native.md`](34-going-native.md) (§9 and §13 applied to a real numerical
+`34-going-native.md` (§9 and §13 applied to a real numerical
 workload). And do Lab 5 before you ship a free-threaded extension.*

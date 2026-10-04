@@ -298,7 +298,7 @@ If you sat down to build a Kubernetes-equivalent system from scratch, this is th
 
 | Phase | What you build | Why now | Chapter |
 |---|---|---|---|
-| **0** | Linux primitives: namespaces, cgroups, capabilities, seccomp, OverlayFS, veth/bridge, netfilter, eBPF basics | A container is just a process with namespaces + cgroups + LSM profile. You can't reason about anything above without this. | [00](#chapter-plan-the-roadmap) |
+| **0** | Linux primitives: namespaces, cgroups, capabilities, seccomp, OverlayFS, veth/bridge, netfilter, eBPF basics | A container is just a process with namespaces + cgroups + LSM profile. You can't reason about anything above without this. | [00](#4-chapter-plan-the-roadmap) |
 | **1** | OCI runtime: take a rootfs + config.json, produce a running process. Reimplement a subset of runc. | This is what "running a container" actually means. K8s never does this directly — it talks to a CRI shim that talks to an OCI runtime. | 01 |
 | **2** | OCI image spec + registry: layered tar+json, content-addressable, manifest lists. Pull from a registry, unpack with overlayfs. | Without this, no image distribution. Also: supply-chain security starts here (Sigstore, SBOM). | 02 |
 | **3** | A higher-level container runtime (containerd-equivalent): image management + snapshotter + a CRI gRPC server. | Decouples kubelet from runc. This is where CRI lives. | 01, 02 |

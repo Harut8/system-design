@@ -7,9 +7,9 @@
 > (fd inheritance, `PEP 446`, what a forked child gets). Reads well next to
 > [`02-atomics-and-memory-models.md`](02-atomics-and-memory-models.md) — §12 of this
 > document is that document's problem, moved across a process boundary and made worse.
-> Feeds into: [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md),
+> Feeds into: `27-multiprocessing-and-subinterpreters.md`,
 > [`28-asyncio-internals.md`](28-asyncio-internals.md) (the self-pipe),
-> [`46-production-python.md`](46-production-python.md) (worker models).
+> `46-production-python.md` (worker models).
 >
 > **THESIS: there are exactly two kinds of IPC, and every API in this document is one
 > of them wearing a costume.** Either you **copy the bytes through the kernel** — a
@@ -1760,7 +1760,7 @@ Stated plainly, because the alternative is quiet over-claiming:
 ---
 
 *Next in Tier 1: [`12-*.md`](README.md) — closing out the operating-system tier.*
-*Sideways: [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md)
+*Sideways: `27-multiprocessing-and-subinterpreters.md`
 takes §6 and §9 and asks what changes when the "processes" are interpreters in one
 address space — where `Py_buffer` sharing (PEP 734) makes family 2 available without any
 of §7's setup, and where the refcount argument of §9 becomes the whole design problem.*

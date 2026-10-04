@@ -14,7 +14,7 @@
 > [`03-indexing-and-vector-stores.md`](03-indexing-and-vector-stores.md) (quantized vectors are
 > what actually gets indexed), [`04-retrieval-hybrid-and-reranking.md`](04-retrieval-hybrid-and-reranking.md)
 > (rescoring is the second stage of the quantization trick in §7), [`08-evaluation-methodology.md`](08-evaluation-methodology.md)
-> (recall@k, the metric this whole chapter keeps deferring to), [`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md)
+> (recall@k, the metric this whole chapter keeps deferring to), `11-token-accounting-and-cost.md`
 > (the cost formulas in §13 get their own full treatment there).
 >
 > **THESIS:** the embedding model *defines what "similar" means* for your system. It is not a

@@ -20,13 +20,13 @@
 > more candidates, which means a harder context-budgeting problem — §12's pipeline is the input to
 > `06`'s token budget), [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (§13's ablation
 > methodology is the only honest way to answer "did the rewrite help?"),
-> [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md) (every LLM call in
+> `10-llm-observability-and-tracing.md` (every LLM call in
 > query understanding is a span that must be traced — if you cannot see the rewritten query in your
 > traces, you cannot debug retrieval failures),
-> [`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md) (§10's cost model is where
+> `12-serving-latency-and-caching.md` (§10's cost model is where
 > your latency budget comes from, and §11's caching strategy is the main lever for amortizing the
 > added LLM calls),
-> [`13-agents-and-tool-calling.md`](13-agents-and-tool-calling.md) (agentic RAG runs query
+> `13-agents-and-tool-calling.md` (agentic RAG runs query
 > understanding in a loop — everything here multiplies),
 > [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md) (a
 > rewritten query is an LLM output used as a retrieval input — it is an injection surface, and §14

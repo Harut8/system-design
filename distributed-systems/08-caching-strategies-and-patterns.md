@@ -10,11 +10,11 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 
 0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Mental Models](#1-mental-models)
-2. [Caching Strategies — The Big Five](#2-caching-strategies--the-big-five)
+2. [Caching Strategies — The Big Five](#2-caching-strategies----the-big-five)
 3. [Cache Invalidation](#3-cache-invalidation)
 4. [Thundering Herd and Cache Stampede](#4-thundering-herd-and-cache-stampede)
 5. [Cache Eviction Policies](#5-cache-eviction-policies)
-6. [Redis as a Cache — Deep Dive](#6-redis-as-a-cache--deep-dive)
+6. [Redis as a Cache — Deep Dive](#6-redis-as-a-cache----deep-dive)
 7. [Distributed Caching Architecture](#7-distributed-caching-architecture)
 8. [Consistent Hashing](#8-consistent-hashing)
 9. [Cache in System Design Interviews](#9-cache-in-system-design-interviews)

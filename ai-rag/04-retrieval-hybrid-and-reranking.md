@@ -23,11 +23,11 @@
 > chapter's token budget; they are the same budget seen from two sides),
 > [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (§13's stage-wise ablation protocol
 > is the honest version of "did that help?"),
-> [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md) (a span per branch per
+> `10-llm-observability-and-tracing.md` (a span per branch per
 > stage — the cascade in §1 *is* the span tree),
-> [`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md) (§10's budget is where
+> `12-serving-latency-and-caching.md` (§10's budget is where
 > timeouts, fallback and streaming get their numbers),
-> [`13-agents-and-tool-calling.md`](13-agents-and-tool-calling.md) (multi-hop retrieval runs this
+> `13-agents-and-tool-calling.md` (multi-hop retrieval runs this
 > cascade N times, so everything here multiplies).
 >
 > **THESIS:** retrieval is a **cascade**, and a cascade has exactly one property that governs its

@@ -5,10 +5,10 @@
 > (copy-on-write, page tables). Reads well next to
 > [`24-the-gil.md`](24-the-gil.md) §4 (the eval breaker) and §8 (signals/fork), because
 > Python's signal design *is* an eval-breaker design. Feeds into:
-> [`25-threads-and-synchronization.md`](25-threads-and-synchronization.md),
-> [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md),
+> `25-threads-and-synchronization.md`,
+> `27-multiprocessing-and-subinterpreters.md`,
 > [`28-asyncio-internals.md`](28-asyncio-internals.md) §self-pipe,
-> [`46-production-python.md`](46-production-python.md) (graceful shutdown).
+> `46-production-python.md` (graceful shutdown).
 >
 > **THESIS: signals, `fork()`, and `exec()` are the three places where the kernel
 > reaches into a running process and changes it out from under the code that is
@@ -389,7 +389,7 @@ ValueError: signal only works in main thread of the main interpreter
 
 This is also why signals are useless as a subinterpreter notification channel: a
 subinterpreter is not the main interpreter, so it can neither install nor run handlers.
-See [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md).
+See `27-multiprocessing-and-subinterpreters.md`.
 
 ---
 

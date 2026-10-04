@@ -387,7 +387,7 @@ same code fails — and fails rarely, non-deterministically, and under load, whi
 worst possible failure profile.
 
 The right-hand column also explains something in
-[`24-the-gil.md` §9](24-the-gil.md#9-free-threadings-new-cost-model): the free-threading
+[`24-the-gil.md` §9](24-the-gil.md#13-free-threadings-new-cost-model): the free-threading
 single-thread overhead is reported at roughly **1% on macOS aarch64 and 8% on x86-64
 Linux**. That spread is not noise and it is not "ARM is faster". It is that AArch64's
 acquire/release instructions are *individually ordered* — `ldar` and `stlr` are single
@@ -1055,7 +1055,7 @@ cost went from 1.96 ns to 19.05 ns *(measured)*: a 10× penalty per operation, o
 getting no parallelism for it.
 
 This is exactly the shape of the Gilectomy's first failure —
-[`24-the-gil.md` §7](24-the-gil.md#7-the-gilectomy-larry-hastings-seven-core-lesson):
+[`24-the-gil.md` §7](24-the-gil.md#11-the-gilectomy-larry-hastings-seven-core-lesson):
 *"roughly a 30% slowdown — and it got worse with more threads."* Larry Hastings made
 `ob_refcnt` atomic and got this table. You have now reproduced it in 60 lines of C.
 
@@ -1202,7 +1202,7 @@ behaviour — the entire program, not just the racy access.**
 A **race condition** is different and is not necessarily a bug in the language-semantics
 sense: it is an outcome that depends on timing. `x += 1` from two threads under the GIL
 is a race condition (you lose updates) but not a data race (the GIL orders the accesses).
-[`24-the-gil.md` §6](24-the-gil.md#6-what-the-gil-does-and-does-not-guarantee) draws
+[`24-the-gil.md` §6](24-the-gil.md#9-what-the-gil-does-and-does-not-guarantee) draws
 exactly this line, and it is the distinction that makes the atomicity table there make
 sense.
 
@@ -1366,7 +1366,7 @@ So on this machine, `_Py_atomic_load_ptr_acquire` compiles to `ldapr` and
 `_Py_atomic_store_ptr_release` to `stlr` (§7.2), and on x86-64 both compile to a plain
 `mov`. Everything in §7 applies directly to CPython's source.
 
-> **A note for readers of [`24-the-gil.md` §3](24-the-gil.md#3-the-eval-loop-where-the-gil-is-dropped).**
+> **A note for readers of [`24-the-gil.md` §3](24-the-gil.md#4-the-eval-loop-where-the-gil-is-actually-dropped).**
 > That document quotes eval-loop code using a *generic* `_Py_atomic_load_relaxed(...)`.
 > In 3.14.6 the names are **type-suffixed** — `_Py_atomic_load_int_relaxed`,
 > `_Py_atomic_load_uintptr_relaxed`, and so on. The generic spelling is from an older
@@ -1458,7 +1458,7 @@ not just a lock-elision trick.
 
 Reclaiming the memory those lock-free readers might still be looking at is a separate,
 harder problem, solved with **QSBR** in `Python/qsbr.c` (borrowed from FreeBSD, per
-[`24-the-gil.md` §8.6](24-the-gil.md#86-the-design-is-almost-entirely-borrowed--and-thats-the-point)).
+[`24-the-gil.md` §8.6](24-the-gil.md#126-the-design-is-almost-entirely-borrowed--and-thats-the-point)).
 That is [`03-lockfree-and-reclamation.md`](03-lockfree-and-reclamation.md)'s subject.
 
 ---
@@ -1553,7 +1553,7 @@ Read those three tables together, because together they *are* §16.1:
 lost **zero** updates in five consecutive runs — the race is real, the bytecode is still
 `LOAD/ADD/STORE`, but the interleaving window essentially never opened at this scale. The
 free-threaded build lost **three quarters of all updates, every single run.** This is
-[`24-the-gil.md` §6](24-the-gil.md#6-what-the-gil-does-and-does-not-guarantee)'s claim —
+[`24-the-gil.md` §6](24-the-gil.md#9-what-the-gil-does-and-does-not-guarantee)'s claim —
 *"free-threading doesn't create new race conditions in Python code so much as it raises
 the probability of ones you already had from 'once a month in prod' to 'immediately'"* —
 measured, and the measurement is more violent than the prose suggests. Not "more likely."
@@ -1627,7 +1627,7 @@ counters 8 bytes apart. Sweep N from 1 to your core count. **Predict the shape o
 curves before you run it.** Then explain why (b) *loses total throughput* as you add
 cores. *Proves §12, and it is the same experiment as
 [doc 01 lab 4](01-memory-hierarchy-and-caches.md#11-lab-exercises) and
-[`24-the-gil.md` lab 1](24-the-gil.md#10-lab-exercises) — do it once, use it three times.*
+[`24-the-gil.md` lab 1](24-the-gil.md#18-lab-exercises) — do it once, use it three times.*
 
 **4 — Read the assembly for all five orderings, both ISAs.** Write the twelve one-line
 functions from §7.2, compile with `clang -O2 -S` for arm64 and `-arch x86_64`, and build
@@ -1679,7 +1679,7 @@ Staff-level. If you can't answer from your own model, the section to reread is n
 9. Explain spurious failure of `compare_exchange_weak` in terms of hardware. On which targets does it actually occur? *(§10)*
 10. You have a CAS loop and a `fetch_add` available for the same operation. Give the asymptotic argument for `fetch_add`, and then the progress-guarantee argument. *(§11)*
 11. An uncontended atomic RMW costs ~2 ns on this machine. A contended one costs ~19 ns. What changed, and what is the *only* class of fix? *(§12.3)*
-12. Eight cores incrementing one shared atomic have *less* aggregate throughput than one core. Explain the mechanism, and name the CPython project that discovered this the expensive way. *(§12.2, [`24-the-gil.md` §7](24-the-gil.md#7-the-gilectomy-larry-hastings-seven-core-lesson))*
+12. Eight cores incrementing one shared atomic have *less* aggregate throughput than one core. Explain the mechanism, and name the CPython project that discovered this the expensive way. *(§12.2, [`24-the-gil.md` §7](24-the-gil.md#11-the-gilectomy-larry-hastings-seven-core-lesson))*
 13. What happens to a misaligned atomic on x86-64? On AArch64? Why is the AArch64 behaviour better engineering? *(§13)*
 14. Why is a data race undefined behaviour rather than "you get a stale value"? Give a concrete optimization that exploits it. *(§14.2)*
 15. State SC-DRF as a two-sided contract. Which side do you break when you write `memory_order_relaxed`? *(§14.3)*

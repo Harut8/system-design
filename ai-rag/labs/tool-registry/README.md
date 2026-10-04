@@ -1,7 +1,7 @@
 # Lab: Tool Registry & Crate (`tool-platform-design.md` §3–§6)
 
 A production-shaped Tool Registry crate for AI Agents — the control plane from
-[`solutions/tool-platform-design.md`](../../solutions/tool-platform-design.md) §3–§6,
+`solutions/tool-platform-design.md` §3–§6,
 implemented as a set of pure Python modules with zero external dependencies.
 
 **Status: rung 2 — implemented.** The code runs, 7 terminal report acts execute, and 16

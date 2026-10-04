@@ -8,9 +8,9 @@
 > Useful but not required: [`24-the-gil.md`](24-the-gil.md) §6 and §9,
 > [`26-free-threading.md`](26-free-threading.md) §5,
 > [`30-concurrency-correctness.md`](30-concurrency-correctness.md).
-> Feeds into: [`44-packaging-and-environments.md`](44-packaging-and-environments.md),
-> [`45-supply-chain-and-security.md`](45-supply-chain-and-security.md),
-> [`46-production-python.md`](46-production-python.md).
+> Feeds into: `44-packaging-and-environments.md`,
+> `45-supply-chain-and-security.md`,
+> `46-production-python.md`.
 >
 > **THESIS: a test suite is a *measuring instrument*, and almost nobody measures the
 > instrument.** Coverage tells you which lines ran, which is a statement about your tests'
@@ -999,7 +999,7 @@ The path that works, in order:
    possible property; catches an embarrassing number of `TypeError`s on unusual input.
 3. Add an **oracle** wherever you have optimized something: keep the naive implementation
    as a test-only reference and assert agreement. This is also the correct way to test any
-   optimization from [`33-optimizing-python.md`](33-optimizing-python.md) — it is the only
+   optimization from `33-optimizing-python.md` — it is the only
    thing that will tell you your fast path is wrong on the cases the slow path handled.
 4. Only then reach for stateful testing, and only on the components that carry real risk.
 
@@ -1663,7 +1663,7 @@ property true?" Atheris asks "can I make this crash?"
   fuzzing you can do in the Python ecosystem, and it connects directly to
   [`17-c-api-and-extensions.md`](17-c-api-and-extensions.md).
 - **`pickle` and any deserialization boundary** —
-  [`45-supply-chain-and-security.md`](45-supply-chain-and-security.md) territory.
+  `45-supply-chain-and-security.md` territory.
 - **Differential fuzzing.** Feed the same bytes to two implementations and assert
   agreement. This is an oracle property (§6.2) with a coverage-guided generator, and it is
   how a startling number of parser bugs get found.
@@ -2037,7 +2037,7 @@ fast-moving ones say so.
 
 ---
 
-*Next: [`44-packaging-and-environments.md`](44-packaging-and-environments.md) — because a
+*Next: `44-packaging-and-environments.md` — because a
 suite that passes on your machine and cannot be installed on the deployment target has
 measured the wrong system. Wheels, ABI tags (including the free-threaded and `abi3t` ones),
 lockfiles, and reproducibility are what make "it passed CI" mean anything at all.*

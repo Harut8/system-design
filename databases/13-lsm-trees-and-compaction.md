@@ -13,10 +13,10 @@ A comprehensive guide to Log-Structured Merge Trees -- the dominant write-optimi
 5. [Write Amplification Analysis](#5-write-amplification-analysis)
 6. [RocksDB Deep Dive](#6-rocksdb-deep-dive)
 7. [LevelDB](#7-leveldb)
-8. [Cassandra's LSM Implementation](#8-cassandras-lsm-implementation)
-9. [Bloom Filters in LSM Trees](#9-bloom-filters-in-lsm-trees)
-10. [LSM Tree Optimizations and Research](#10-lsm-tree-optimizations-and-research)
-11. [Comparison Tables](#11-comparison-tables)
+8. Cassandra's LSM Implementation *(not yet written)*
+9. Bloom Filters in LSM Trees *(not yet written)*
+10. LSM Tree Optimizations and Research *(not yet written)*
+11. Comparison Tables *(not yet written)*
 
 ---
 

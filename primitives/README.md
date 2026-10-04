@@ -1,6 +1,6 @@
 # Design Primitives
 
-A compounding layer over [`tasks/`](../tasks/) and [`solutions/`](../solutions/).
+A compounding layer over [`tasks/`](../tasks/README.md) and [`solutions/`](../solutions/README.md).
 
 A worked solution teaches you *one design*. A primitive sheet extracts the
 reusable part, so the next design costs less than the last one. Memorising

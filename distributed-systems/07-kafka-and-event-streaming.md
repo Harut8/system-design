@@ -9,11 +9,11 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 ## Table of Contents
 
 0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
-1. [Mental Models -- Kafka Is Not a Message Queue](#1-mental-models--kafka-is-not-a-message-queue)
+1. [Mental Models -- Kafka Is Not a Message Queue](#1-mental-models----kafka-is-not-a-message-queue)
 2. [Core Architecture](#2-core-architecture)
 3. [Producers](#3-producers)
 4. [Consumers](#4-consumers)
-5. [Partition Key Design -- The Most Important Decision](#5-partition-key-design--the-most-important-decision)
+5. [Partition Key Design -- The Most Important Decision](#5-partition-key-design----the-most-important-decision)
 6. [Exactly-Once Semantics](#6-exactly-once-semantics)
 7. [Kafka Streams and ksqlDB](#7-kafka-streams-and-ksqldb)
 8. [Kafka Connect](#8-kafka-connect)
@@ -21,7 +21,7 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 10. [Common Interview Patterns](#10-common-interview-patterns)
 11. [Capacity Planning](#11-capacity-planning)
 12. [Failure Modes and Operational Concerns](#12-failure-modes-and-operational-concerns)
-13. [Kafka vs Alternatives -- Decision Matrix](#13-kafka-vs-alternatives--decision-matrix)
+13. [Kafka vs Alternatives -- Decision Matrix](#13-kafka-vs-alternatives----decision-matrix)
 14. [Real-world cases — incidents with numbers](#14-real-world-cases--incidents-with-numbers)
 
 ---

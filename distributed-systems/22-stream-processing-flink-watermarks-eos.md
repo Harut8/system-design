@@ -12,7 +12,7 @@ Prerequisites: Kafka fundamentals from `07-kafka-and-event-streaming.md`, cachin
 1. [Stream Processing Fundamentals](#1-stream-processing-fundamentals)
 2. [Apache Flink Architecture](#2-apache-flink-architecture)
 3. [Windowing Deep Dive](#3-windowing-deep-dive)
-4. [Watermarks -- The Key to Event-Time Processing](#4-watermarks--the-key-to-event-time-processing)
+4. [Watermarks -- The Key to Event-Time Processing](#4-watermarks----the-key-to-event-time-processing)
 5. [State Management](#5-state-management)
 6. [Checkpointing and Exactly-Once Semantics](#6-checkpointing-and-exactly-once-semantics)
 7. [Flink + Kafka Integration](#7-flink--kafka-integration)

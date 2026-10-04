@@ -19,12 +19,12 @@
 > **Feeds into:** [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (§10–§11 — the
 > structured output schemas defined here are what LLM-judge evaluators parse; §11.5's
 > justification-before-verdict is a generation-side constraint),
-> [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md) (a generation call is
+> `10-llm-observability-and-tracing.md` (a generation call is
 > the most expensive span in the trace, and every retry doubles it — tracing is how you detect
 > that),
-> [`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md) (prompt caching and
+> `12-serving-latency-and-caching.md` (prompt caching and
 > streaming are generation concerns that dominate the latency budget),
-> [`13-agents-and-tool-calling.md`](13-agents-and-tool-calling.md) (tool calling is structured
+> `13-agents-and-tool-calling.md` (tool calling is structured
 > output under a different name, and every tool-call schema in that chapter inherits this chapter's
 > validation discipline),
 > [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md)

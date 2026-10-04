@@ -2,7 +2,7 @@
 
 The Service is the single abstraction that makes Kubernetes networking *useful*. Pods come and go — they crash, get rescheduled, scale up, scale down, and recycle IPs. If clients had to track those IPs directly, no Kubernetes deployment would survive its first rolling update. The Service interposes a **stable virtual IP** and a **DNS name** between clients and a churning fleet of pod IPs, and **kube-proxy** is the per-node agent that programs the kernel so that traffic to that VIP actually reaches one of the backing pods.
 
-This chapter is about the data plane of cluster-internal load balancing: how a packet leaves a pod with `dst = 10.96.42.10:80` and ends up in another pod with `dst = 10.244.7.13:8080`, at the level of netfilter chains, conntrack entries, IPVS hash tables, and eBPF socket-lookup programs. It is the kernel-side complement to [chapter 11 (Pods)](11-pod-internals.md), which described what makes a pod *reachable*, and a precursor to [chapter 15 (CNI)](15-cni-deep-dive.md), which describes pod-to-pod networking — the layer kube-proxy sits *on top of*. The eBPF replacement story (Cilium's kube-proxy-free mode) is forward-referenced to [chapter 16](16-cilium-ebpf.md); DNS resolution of Service names to VIPs is [chapter 18](18-dns-coredns.md); L7 (Ingress / Gateway API) is [chapter 17](17-ingress-gateway.md).
+This chapter is about the data plane of cluster-internal load balancing: how a packet leaves a pod with `dst = 10.96.42.10:80` and ends up in another pod with `dst = 10.244.7.13:8080`, at the level of netfilter chains, conntrack entries, IPVS hash tables, and eBPF socket-lookup programs. It is the kernel-side complement to [chapter 11 (Pods)](11-pod-internals.md), which described what makes a pod *reachable*, and a precursor to chapter 15 (CNI), which describes pod-to-pod networking — the layer kube-proxy sits *on top of*. The eBPF replacement story (Cilium's kube-proxy-free mode) is forward-referenced to chapter 16; DNS resolution of Service names to VIPs is chapter 18; L7 (Ingress / Gateway API) is chapter 17.
 
 The kernel mechanics (netfilter hooks, conntrack, NAT, the `iptables` vs `nftables` vs IPVS subsystems) were introduced in [databases ch 00 §netfilter](../databases/00-os-and-hardware-internals.md) for a different reason; we will lean on them heavily here and re-introduce only what is necessary.
 
@@ -54,7 +54,7 @@ A Service is, in the spec, just three things:
 In the cluster it becomes four things:
 
 1. A **stable virtual IP** (the ClusterIP), allocated by the apiserver out of `--service-cluster-ip-range`, written into `spec.clusterIP`.
-2. A **DNS name** (`<svc>.<ns>.svc.cluster.local`) maintained by CoreDNS, resolving to that VIP. See [ch 18](18-dns-coredns.md).
+2. A **DNS name** (`<svc>.<ns>.svc.cluster.local`) maintained by CoreDNS, resolving to that VIP. See ch 18.
 3. An **Endpoints** (legacy) and one or more **EndpointSlice** objects, kept in sync by the endpoints-controller and endpointslice-controller, listing the pod IPs that currently match the selector and are Ready.
 4. A set of **kernel forwarding rules** on every node, programmed by kube-proxy from the EndpointSlices, that DNAT the VIP to a chosen backend.
 
@@ -268,7 +268,7 @@ metadata:
     service.beta.kubernetes.io/aws-load-balancer-backend-protocol: tcp
 ```
 
-We discuss this stack in [ch 37 (cloud controllers)](37-cloud-controllers.md).
+We discuss this stack in ch 37 (cloud controllers).
 
 ### 2.4 ExternalName
 
@@ -1137,7 +1137,7 @@ For HA, roll one node at a time and monitor.
 
 The most radical option is to **not run kube-proxy at all**. Cilium (and to a lesser degree Calico's eBPF dataplane) replaces kube-proxy with a set of eBPF programs that perform Service load balancing at a *completely different layer* of the kernel: the `connect(2)` syscall, before any packet is constructed.
 
-We cover this in depth in [ch 16 (Cilium eBPF)](16-cilium-ebpf.md). Here is the executive summary.
+We cover this in depth in ch 16 (Cilium eBPF). Here is the executive summary.
 
 ### 10.1 The Idea: Socket-Level Load Balancing
 
@@ -1947,7 +1947,7 @@ Solutions:
 - **kube-vip**: lighter-weight option for small clusters.
 - **Patch the status manually** for testing: not recommended in prod but works in dev.
 
-See [ch 37 (cloud controllers)](37-cloud-controllers.md) for the deep dive on CCMs.
+See ch 37 (cloud controllers) for the deep dive on CCMs.
 
 ---
 
@@ -2453,7 +2453,7 @@ Multi-port Service, two pods, but only one ever receives traffic? Often a port-n
 
 ### 27.16 NetworkPolicy Blocking Service Traffic
 
-Service VIPs are not in any pod-network CIDR; NetworkPolicy egress rules that match on IP block don't see VIPs as anything special. But the *real* destination after DNAT is a pod IP — so an egress rule that allows `to.podSelector` matching the backend should work. If it doesn't, check whether NetworkPolicy is enforced on the source or destination (CNI-specific) and whether the DNAT happens before or after the NetworkPolicy hook. See [ch 20 (NetworkPolicy)](20-network-policy.md).
+Service VIPs are not in any pod-network CIDR; NetworkPolicy egress rules that match on IP block don't see VIPs as anything special. But the *real* destination after DNAT is a pod IP — so an egress rule that allows `to.podSelector` matching the backend should work. If it doesn't, check whether NetworkPolicy is enforced on the source or destination (CNI-specific) and whether the DNAT happens before or after the NetworkPolicy hook. See ch 20 (NetworkPolicy).
 
 ### 27.17 Multiple kube-proxy Modes Running Simultaneously
 

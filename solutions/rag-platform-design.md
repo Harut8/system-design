@@ -22,7 +22,7 @@ This solution is best studied alongside the curriculum chapters that explain the
 ## Table of Contents
 
 1. [Requirements Clarification](#1-requirements-clarification)
-2. [Architecture by Scale](#2-architecture-by-scale)
+2. [Architecture by Scale](#2-architecture-by-scale-1k-docs--500m-docs)
 3. [Capacity Estimates](#3-capacity-estimates)
 4. [High-Level Architecture](#4-high-level-architecture)
 5. [Data Source Connectors](#5-data-source-connectors)

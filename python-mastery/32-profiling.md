@@ -4,9 +4,9 @@
 > (you must know your noise floor before a profile means anything),
 > [`01-memory-hierarchy-and-caches.md`](01-memory-hierarchy-and-caches.md) §10,
 > [`20-eval-loop.md`](20-eval-loop.md). Feeds into:
-> [`33-optimizing-python.md`](33-optimizing-python.md),
+> `33-optimizing-python.md`,
 > [`35-memory-optimization.md`](35-memory-optimization.md),
-> [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md).
+> `23-tracing-and-runtime-hooks.md`.
 >
 > **THESIS: a deterministic profiler does not measure your program — it measures your
 > program plus itself, and it does not add that overhead evenly.** On this machine
@@ -30,7 +30,7 @@
 3. [Sampling profilers, and what they trade away](#3-sampling-profilers-and-what-they-trade-away)
 4. [`sys.monitoring` vs `sys.setprofile` — measured](#4-sysmonitoring-vs-syssetprofile--measured)
 5. [The tool inventory](#5-the-tool-inventory)
-6. ["60% in `_PyEval_EvalFrameDefault`" and other useless answers](#6-60-in-_pyevalevalframedefault-and-other-useless-answers)
+6. ["60% in `_PyEval_EvalFrameDefault`" and other useless answers](#6-60-in-_pyeval_evalframedefault-and-other-useless-answers)
 7. [Memory profiling is a different problem](#7-memory-profiling-is-a-different-problem)
 8. [Profiling what isn't CPU: I/O, locks, and off-CPU time](#8-profiling-what-isnt-cpu-io-locks-and-off-cpu-time)
 9. [Profiling in production](#9-profiling-in-production)
@@ -206,7 +206,7 @@ debuggers are migrating to it.
 The bigger win isn't in this table: `sys.monitoring` supports `DISABLE`, letting a
 callback say *"never call me for this location again."* A coverage tool can mark each line
 once and then run at nearly full speed — impossible with `setprofile`, where every event
-costs forever. See [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md).
+costs forever. See `23-tracing-and-runtime-hooks.md`.
 
 ---
 
@@ -463,6 +463,6 @@ requests. *Proves §9's caveat, which is the most common production profiling er
 
 ---
 
-*Next: [`33-optimizing-python.md`](33-optimizing-python.md) — you can now find the hot spot
+*Next: `33-optimizing-python.md` — you can now find the hot spot
 and trust the finding. What you do about it is ordered by effect size, and "rewrite it in
 C" is fifth on that list, not first.*

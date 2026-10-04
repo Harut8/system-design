@@ -11,7 +11,7 @@ Prerequisites: familiarity with distributed system fundamentals from `00-primiti
 0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why Partition Data](#1-why-partition-data)
 2. [Partitioning Strategies](#2-partitioning-strategies)
-3. [Consistent Hashing -- The Core Algorithm](#3-consistent-hashing--the-core-algorithm)
+3. [Consistent Hashing -- The Core Algorithm](#3-consistent-hashing----the-core-algorithm)
 4. [Virtual Nodes (Vnodes)](#4-virtual-nodes-vnodes)
 5. [Consistent Hashing Variants](#5-consistent-hashing-variants)
 6. [Partition Assignment and Rebalancing](#6-partition-assignment-and-rebalancing)

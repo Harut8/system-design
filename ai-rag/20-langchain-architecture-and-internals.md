@@ -16,12 +16,12 @@
 >
 > **Feeds into:** [`07-generation-and-structured-output.md`](07-generation-and-structured-output.md)
 > (planned — `with_structured_output` and output parsers are the generation-side mechanism that
-> chapter will formalize), [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md)
+> chapter will formalize), `10-llm-observability-and-tracing.md`
 > (planned — LangChain's callback tree in §10 here is a proprietary pre-cursor to the OTEL GenAI
 > semantic conventions that chapter covers; know both so you can explain why the industry moved),
-> [`13-agents-and-tool-calling.md`](13-agents-and-tool-calling.md) (planned — §9's agent-loop mechanics
+> `13-agents-and-tool-calling.md` (planned — §9's agent-loop mechanics
 > and §8's tool-schema mechanics are the concrete substrate that chapter's abstract treatment of
-> planning and idempotency sits on top of), [`19-build-vs-buy.md`](19-build-vs-buy.md) (planned —
+> planning and idempotency sits on top of), `19-build-vs-buy.md` (planned —
 > §10's LangSmith discussion and §14's alternatives survey are direct inputs to that build-vs-buy
 > decision).
 >

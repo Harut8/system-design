@@ -1,10 +1,10 @@
 # 16 — Object memory layout: headers, pymalloc, and the real cost of an object
 
 > **Tier 2, doc 16.** Prerequisites: [`01-memory-hierarchy-and-caches.md`](01-memory-hierarchy-and-caches.md)
-> (cache lines, pointer chasing), [`14-pyobject-and-types.md`](14-pyobject-and-types.md),
+> (cache lines, pointer chasing), `14-pyobject-and-types.md`,
 > [`15-refcounting-and-ownership.md`](15-refcounting-and-ownership.md). Feeds into:
 > [`22-garbage-collection.md`](22-garbage-collection.md), [`26-free-threading.md`](26-free-threading.md),
-> [`33-optimizing-python.md`](33-optimizing-python.md), [`35-memory-optimization.md`](35-memory-optimization.md).
+> `33-optimizing-python.md`, [`35-memory-optimization.md`](35-memory-optimization.md).
 >
 > **THESIS: in CPython, the object header is the dominant memory cost, and `sys.getsizeof`
 > lies to you about it.** An `int` holding the value `1` costs 28 bytes on a normal build —
@@ -372,7 +372,7 @@ objects for fast reuse — you can see them in `_debugmallocstats` output *(meas
 Note tuples get a free list **per length**. That's a deliberate bet that programs reuse
 tuple shapes, and it's why tuple-heavy code allocates cheaply. Since 3.12 these live in
 per-interpreter state rather than in C globals — which is what makes them safe under
-subinterpreters ([`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md)),
+subinterpreters (`27-multiprocessing-and-subinterpreters.md`),
 and the free-threaded build shards them per thread again.
 
 **3. `malloc` didn't return it either.** Above 512 bytes you're in the platform

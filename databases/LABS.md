@@ -14,7 +14,7 @@ ends in a number, an output or a file you can check.
 - Tick the `- [ ]` boxes as you finish tasks.
 - Keep a `lab-notebook.md` with one row per task: `task | prediction | result | why they differ`.
 - Spacing: redo each chapter's checkpoint questions closed-book 1 day, 1 week and 1 month after you finish the chapter. Reread only the sections you missed.
-- The chapters' own code is referenced, not repeated: [simpledb.py](simpledb.py) (DiskManager, SlottedPage, BufferPool, WALManager, BPlusTree, LSMTree, Volcano operators) and the `failure_detection_*.py` scripts.
+- The chapters' own code is referenced, not repeated: [simpledb.py](https://github.com/Harut8/system-design/blob/main/databases/simpledb.py) (DiskManager, SlottedPage, BufferPool, WALManager, BPlusTree, LSMTree, Volcano operators) and the `failure_detection_*.py` scripts.
 
 ## Setup
 
@@ -157,7 +157,7 @@ Stats views are flushed lazily. If a counter in `pg_stat_user_tables` or `pg_sta
   - **Verify:** The error text (`page verification failed, calculated checksum ... but expected ...`). Then try `SET ignore_checksum_failure = on;` and write one sentence on why that is dangerous.
 - [ ] **01.5 Sequential flooding** *(Level: Stretch)*
   - **Goal:** Show why plain LRU fails under scans (§6).
-  - **Do:** Write a buffer-pool simulator (or extend `BufferPool` in [simpledb.py](simpledb.py)) with LRU, Clock and LRU-2. Trace: Zipf(1.1) point reads over 100k pages, with a full sequential scan of 50k pages injected every 200k requests. Pool size 5k pages.
+  - **Do:** Write a buffer-pool simulator (or extend `BufferPool` in [simpledb.py](https://github.com/Harut8/system-design/blob/main/databases/simpledb.py)) with LRU, Clock and LRU-2. Trace: Zipf(1.1) point reads over 100k pages, with a full sequential scan of 50k pages injected every 200k requests. Pool size 5k pages.
   - **Predict:** Hit ratio of each policy.
   - **Verify:** A table of hit ratios. LRU should drop sharply after each scan and LRU-2 should barely move.
 
@@ -287,7 +287,7 @@ Setup: `CREATE TABLE cust AS SELECT g AS id, (g % 50) AS city, (g % 50) * 1000 +
   - **Verify:** `external merge Disk: N kB` vs `quicksort`, HashAggregate `Batches:` > 1, and `top-N heapsort` for the LIMIT query regardless of `work_mem`.
 - [ ] **04.4 Volcano vs vectorized** *(Level: Core)*
   - **Goal:** Measure the per-tuple overhead that §6.2 removes.
-  - **Do:** In Python, implement `Scan → Filter(x > 0.5) → Sum` twice: as generator iterators yielding one tuple at a time (the `SeqScanOp`/`FilterOp` shape in [simpledb.py](simpledb.py)), and as operators passing numpy batches of 2,048. Run on 10M floats.
+  - **Do:** In Python, implement `Scan → Filter(x > 0.5) → Sum` twice: as generator iterators yielding one tuple at a time (the `SeqScanOp`/`FilterOp` shape in [simpledb.py](https://github.com/Harut8/system-design/blob/main/databases/simpledb.py)), and as operators passing numpy batches of 2,048. Run on 10M floats.
   - **Predict:** The speedup of the batch version.
   - **Verify:** ns per tuple for both, and the speedup at batch sizes 1, 64, 2,048 and 65,536.
 - [ ] **04.5 The generic-plan trap** *(Level: Stretch)*
@@ -717,7 +717,7 @@ Also do §11.4 (the failure drill) against the setup below. The tasks here are d
 
 - [ ] **13.1 Build a tiny LSM and measure write amplification** *(Level: Core)*
   - **Goal:** Derive §5's numbers from your own code.
-  - **Do:** Python (extend `LSMTree` in [simpledb.py](simpledb.py) or write your own): dict memtable flushed at 4 MB to sorted SSTable files; leveled compaction with fanout 10, and size-tiered compaction merging 4 similar-size runs. Count every byte written to SSTables. Load 2M random 16 B keys with 100 B values, 50% overwrites.
+  - **Do:** Python (extend `LSMTree` in [simpledb.py](https://github.com/Harut8/system-design/blob/main/databases/simpledb.py) or write your own): dict memtable flushed at 4 MB to sorted SSTable files; leveled compaction with fanout 10, and size-tiered compaction merging 4 similar-size runs. Count every byte written to SSTables. Load 2M random 16 B keys with 100 B values, 50% overwrites.
   - **Predict:** Write amplification for leveled and tiered.
   - **Verify:** WA, read amplification (SSTables probed per GET, no Bloom filter), and space amplification (bytes on disk / live bytes) for both strategies.
 - [ ] **13.2 Read RocksDB's own accounting** *(Level: Core)*
@@ -781,7 +781,7 @@ Also do §11.4 (the failure drill) against the setup below. The tasks here are d
   - **Goal:** Retrieve §5 (ARIES) and §7 (CLRs) by building them.
   - **Do:** Python: append records `(lsn, txid, page_id, before, after, crc32)` to a file with `os.fsync` at commit. Recovery scans until the first bad CRC, redoes records whose LSN is above the page's pageLSN, and undoes losers while writing CLRs. Test harness: 1,000 runs, each truncating the log at a random byte and also crashing during undo.
   - **Predict:** Which invariant fails first if you drop the CRC check or the pageLSN check.
-  - **Verify:** All 1,000 runs recover exactly the committed prefix. Compare with `WALManager` in [simpledb.py](simpledb.py) and [write-ahead-log-deep-dive.md](../solutions/write-ahead-log-deep-dive.md).
+  - **Verify:** All 1,000 runs recover exactly the committed prefix. Compare with `WALManager` in [simpledb.py](https://github.com/Harut8/system-design/blob/main/databases/simpledb.py) and [write-ahead-log-deep-dive.md](../solutions/write-ahead-log-deep-dive.md).
 - [ ] **14.6 Break it: a forgotten replication slot** *(Level: Stretch)*
   - **Goal:** See §8 WAL retention go wrong and §12 logical decoding.
   - **Do:** `SELECT pg_create_logical_replication_slot('forgot', 'test_decoding');` Run pgbench for 5 minutes. Watch `SELECT slot_name, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;` and `du -sh /var/lib/postgresql/data/pg_wal` in the container. Peek at the changes with `SELECT * FROM pg_logical_slot_peek_changes('forgot', NULL, 5);`, then drop the slot.
@@ -860,7 +860,7 @@ docker exec etcd1 etcdctl --endpoints=etcd1:2379,etcd2:2379,etcd3:2379 endpoint 
 
 - [ ] **16.1 Tune the phi-accrual detector** *(Level: Core)*
   - **Goal:** Measure §3.2's detection-time vs false-positive trade-off.
-  - **Do:** Run [failure_detection_phi_accrual.py](failure_detection_phi_accrual.py) as is, then vary `phi_threshold` (1, 3, 8, 12) and the congestion multiplier (3× to 6×). Also run [failure_detection_push.py](failure_detection_push.py), [failure_detection_pull.py](failure_detection_pull.py) and [failure_detection_gossip.py](failure_detection_gossip.py) and count messages per round.
+  - **Do:** Run [failure_detection_phi_accrual.py](https://github.com/Harut8/system-design/blob/main/databases/failure_detection_phi_accrual.py) as is, then vary `phi_threshold` (1, 3, 8, 12) and the congestion multiplier (3× to 6×). Also run [failure_detection_push.py](https://github.com/Harut8/system-design/blob/main/databases/failure_detection_push.py), [failure_detection_pull.py](https://github.com/Harut8/system-design/blob/main/databases/failure_detection_pull.py) and [failure_detection_gossip.py](https://github.com/Harut8/system-design/blob/main/databases/failure_detection_gossip.py) and count messages per round.
   - **Predict:** Detection delay after the crash at threshold 8, and the lowest threshold with no false positive during congestion.
   - **Verify:** A table of threshold × congestion → detection ticks and false positives, and messages/round for the other three detectors.
 - [ ] **16.2 Time a Raft election** *(Level: Core)*
@@ -1164,7 +1164,7 @@ Also do §11 (build MiniTSDB). The tasks below measure and break what you built.
 ## Capstone projects
 
 - [ ] **C1 — A crash-safe key-value engine** (2–3 days; chapters 00, 01, 06 or 13, 14)
-  - **Spec:** A single-node KV store with `put/get/delete/scan`, built as either a B+tree over a buffer pool or an LSM (memtable, SSTables, compaction, Bloom filters). Every write goes through a CRC-checked WAL with group commit. Recovery replays the WAL. Start from your 14.5 code and the structure of [simpledb.py](simpledb.py); [key-value-store-design.md](../solutions/key-value-store-design.md) shows the distributed version.
+  - **Spec:** A single-node KV store with `put/get/delete/scan`, built as either a B+tree over a buffer pool or an LSM (memtable, SSTables, compaction, Bloom filters). Every write goes through a CRC-checked WAL with group commit. Recovery replays the WAL. Start from your 14.5 code and the structure of [simpledb.py](https://github.com/Harut8/system-design/blob/main/databases/simpledb.py); [key-value-store-design.md](../solutions/key-value-store-design.md) shows the distributed version.
   - **Acceptance:** A harness runs 200 cycles of "write with random keys, `kill -9` at a random moment, restart, verify". No acknowledged write is lost and no unacknowledged write appears half-applied. `scan` returns keys in order after every recovery.
   - **Measure:** Write, read and space amplification. fsyncs per committed put at 1 and 32 client threads. p50/p99 put latency. Recovery time per GB of WAL.
 - [ ] **C2 — Postgres performance forensics** (1–2 days; chapters 03, 04, 05, 06, 07, 15, 17)

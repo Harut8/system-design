@@ -189,8 +189,8 @@ Related code in this repo: [KV store design](../solutions/key-value-store-design
 [job scheduler on Postgres](../solutions/job-scheduler-postgres-deep-dive.md),
 [workflow orchestration](../solutions/workflow-orchestration-design.md),
 [WAL deep dive](../solutions/write-ahead-log-deep-dive.md),
-[distributed counter](../implementation/distributed-counter/distributed-counter-10m/),
-[Kafka fan-out feed](../implementation/instagram-feed/instagram-feed-10m/).
+[distributed counter](../implementation/distributed-counter/distributed-counter-10m/README.md),
+[Kafka fan-out feed](../implementation/instagram-feed/instagram-feed-10m/README.md).
 
 ---
 
@@ -458,7 +458,7 @@ Related code in this repo: [KV store design](../solutions/key-value-store-design
   - **Goal:** §5.4: one key can pin one consumer.
   - **Do:** 6 partitions, 3 consumers, 60% of messages keyed `tenant-1`. Watch
     `$KT/kafka-consumer-groups.sh --bootstrap-server kafka1:29092 --describe --group g` every 10 s.
-    Mitigate with a key suffix `tenant-1#<n % 4>` and re-measure. Compare with [the feed fan-out implementation](../implementation/instagram-feed/instagram-feed-10m/).
+    Mitigate with a key suffix `tenant-1#<n % 4>` and re-measure. Compare with [the feed fan-out implementation](../implementation/instagram-feed/instagram-feed-10m/README.md).
   - **Verify:** before: one partition's LAG grows while others stay ~0; after: max lag / mean lag < 2. Note which ordering guarantee you gave up.
 
 **Checkpoint (closed book):**
@@ -539,7 +539,7 @@ Related code in this repo: [KV store design](../solutions/key-value-store-design
   - **Goal:** §6.4 and §13.4: vnodes do not fix a hot key.
   - **Do:** Zipf(1.2) traffic over 100k keys on the V = 256 ring; max/mean load per node. Mitigate
     (a) by splitting the top 10 keys into 8 sub-keys (writes pick one, reads fan in; compare with
-    [the sharded counter](../implementation/distributed-counter/distributed-counter-10m/app/services/sharded_counter.py)),
+    [the sharded counter](https://github.com/Harut8/system-design/blob/main/implementation/distributed-counter/distributed-counter-10m/app/services/sharded_counter.py)),
     (b) with bounded-load consistent hashing (§5.5, c = 1.25) applied to key placement.
   - **Predict:** max/mean traffic before and after each.
   - **Verify:** before: the hottest node carries well above the mean; (a) brings max/mean under ~1.3;
@@ -748,7 +748,7 @@ Related code in this repo: [KV store design](../solutions/key-value-store-design
 ---
 
 ## 33 — Resilience Patterns: Circuit Breakers, Bulkheads, Retries  ([chapter](33-resilience-patterns-circuit-breakers.md))
-**Time:** ~6 h · **Needs:** Python asyncio + FastAPI, compose toxiproxy. **Also do §11** (eight simulator experiments in [`../ai-rag/labs/llm-resilience/simulator.html`](../ai-rag/labs/llm-resilience/simulator.html)); the tasks below use real processes instead.
+**Time:** ~6 h · **Needs:** Python asyncio + FastAPI, compose toxiproxy. **Also do §11** (eight simulator experiments in [`../ai-rag/labs/llm-resilience/simulator.html`](https://github.com/Harut8/system-design/blob/main/ai-rag/labs/llm-resilience/simulator.html)); the tasks below use real processes instead.
 
 - [ ] **33.1 A retry storm on real sockets** *(Level: Core)*
   - **Goal:** §2.1–§2.4 and §2.7 with a real server.

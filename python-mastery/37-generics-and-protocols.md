@@ -1,10 +1,10 @@
 # 37 — Generics and protocols: variance, structure, and the holes left on purpose
 
-> **Tier 6, doc 37.** Prerequisites: [`36-type-system-foundations.md`](36-type-system-foundations.md)
-> (gradual typing, nominal vs structural, assignability), [`40-data-model-and-descriptors.md`](40-data-model-and-descriptors.md)
-> for §15's runtime machinery. Feeds into: [`38-type-checking-in-practice.md`](38-type-checking-in-practice.md)
-> (rollout, stubs, strictness), [`39-api-and-abstraction-design.md`](39-api-and-abstraction-design.md)
-> (ABC vs Protocol as a design decision), [`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md).
+> **Tier 6, doc 37.** Prerequisites: `36-type-system-foundations.md`
+> (gradual typing, nominal vs structural, assignability), `40-data-model-and-descriptors.md`
+> for §15's runtime machinery. Feeds into: `38-type-checking-in-practice.md`
+> (rollout, stubs, strictness), `39-api-and-abstraction-design.md`
+> (ABC vs Protocol as a design decision), `41-metaclasses-and-class-construction.md`.
 >
 > **THESIS: Python's generics are a *specification* that four independent programs
 > implement differently, over a runtime that erases almost all of it.** Three separate
@@ -594,7 +594,7 @@ registration, and no import of your protocol at all. That last point is the desi
 argument: an ABC forces every implementer to depend on you, which inverts your dependency
 graph in the wrong direction. A Protocol lets *consumers* declare the shape they need,
 which is Dependency Inversion actually implemented rather than merely diagrammed. See
-[`39-api-and-abstraction-design.md`](39-api-and-abstraction-design.md) for when to pick
+`39-api-and-abstraction-design.md` for when to pick
 which.
 
 **Protocol variance follows exactly the §2 rules, inferred**, with no `_co` suffixes:
@@ -678,7 +678,7 @@ matters if the check is in a hot loop — it walks the protocol's member list on
 **Rule:** `@runtime_checkable` is acceptable for coarse dispatch on a single-method
 protocol you also control. It is not a validation boundary. If you need real validation at
 a trust boundary, use pydantic or explicit checks — see
-[`38-type-checking-in-practice.md`](38-type-checking-in-practice.md).
+`38-type-checking-in-practice.md`.
 
 ---
 
@@ -987,7 +987,7 @@ Sub.__orig_bases__            = (list[int],)
 ```
 
 This is the same mechanism that lets `class C(Protocol[T])` work at all. See
-[`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md).
+`41-metaclasses-and-class-construction.md`.
 
 ### Erasure
 
@@ -1284,7 +1284,7 @@ call site.
 
 Running two checkers in CI is not paranoia; rows 1–5 are each a real bug class one of them
 misses. Cost/benefit for a large codebase is in
-[`38-type-checking-in-practice.md`](38-type-checking-in-practice.md).
+`38-type-checking-in-practice.md`.
 
 ---
 
@@ -1397,13 +1397,13 @@ valuable artifact.*
 
 **Sibling docs**
 
-- [`36-type-system-foundations.md`](36-type-system-foundations.md) — gradual typing and assignability, which §2 and §16 assume.
-- [`38-type-checking-in-practice.md`](38-type-checking-in-practice.md) — strictness ladder, stubs, and rolling this into a large codebase.
-- [`39-api-and-abstraction-design.md`](39-api-and-abstraction-design.md) — Protocol vs ABC as a *design* decision rather than a typing one.
-- [`40-data-model-and-descriptors.md`](40-data-model-and-descriptors.md) and [`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md) — `__class_getitem__`, `__mro_entries__`, and the machinery under §15.
+- `36-type-system-foundations.md` — gradual typing and assignability, which §2 and §16 assume.
+- `38-type-checking-in-practice.md` — strictness ladder, stubs, and rolling this into a large codebase.
+- `39-api-and-abstraction-design.md` — Protocol vs ABC as a *design* decision rather than a typing one.
+- `40-data-model-and-descriptors.md` and `41-metaclasses-and-class-construction.md` — `__class_getitem__`, `__mro_entries__`, and the machinery under §15.
 
 ---
 
-*Next: [`38-type-checking-in-practice.md`](38-type-checking-in-practice.md) — where §17's
+*Next: `38-type-checking-in-practice.md` — where §17's
 divergence table stops being trivia and becomes a tooling decision for a codebase you can't
 rewrite.*

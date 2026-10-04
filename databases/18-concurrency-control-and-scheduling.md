@@ -14,11 +14,11 @@ A staff-engineer-level deep dive into the theoretical foundations and practical 
 4. [MVCC Implementation Internals](#4-mvcc-implementation-internals)
 5. [Pessimistic vs Optimistic Locking: Complete Analysis](#5-pessimistic-vs-optimistic-locking-complete-analysis)
 6. [Deadlock Handling: Prevention, Detection, Resolution](#6-deadlock-handling-prevention-detection-resolution)
-7. [Lock-Free Database Architectures](#7-lock-free-database-architectures)
-8. [Database Threading Models](#8-database-threading-models)
-9. [Async I/O Semantics in Databases](#9-async-io-semantics-in-databases)
-10. [Deterministic Databases](#10-deterministic-databases)
-11. [Production Concurrency Control Comparison](#11-production-concurrency-control-comparison)
+7. Lock-Free Database Architectures *(not yet written)*
+8. Database Threading Models *(not yet written)*
+9. Async I/O Semantics in Databases *(not yet written)*
+10. Deterministic Databases *(not yet written)*
+11. [Production Concurrency Control Comparison](#11-transactions-as-operations-on-data-items)
 
 ---
 

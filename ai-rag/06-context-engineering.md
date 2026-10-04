@@ -22,12 +22,12 @@
 > [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (context precision / recall /
 > relevance are that chapter's generation-stage metrics, and the measurement requires knowing what
 > went into the prompt, not just what came out),
-> [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md) (every context
+> `10-llm-observability-and-tracing.md` (every context
 > assembly decision is a span: what was considered, what was admitted, what was truncated, what was
 > summarized — without those spans, debugging a bad answer is guesswork),
-> [`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md) (context size is the dominant
+> `11-token-accounting-and-cost.md` (context size is the dominant
 > input to the cost function; §14 here is the arithmetic that chapter operationalizes),
-> [`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md) (§12's prompt caching is
+> `12-serving-latency-and-caching.md` (§12's prompt caching is
 > that chapter's primary mechanism),
 > [`25-memory-and-state-management.md`](25-memory-and-state-management.md) (§9 here is the
 > interface; `25` is the implementation).
@@ -1918,7 +1918,7 @@ response = client.messages.create(
 Anthropic's cache has a minimum cacheable prefix length (1,024 tokens for many Sonnet/Opus
 models; higher for some others — check the docs for your model) and a default TTL of 5 minutes,
 refreshed on each hit. A longer 1-hour TTL is available at a higher cache-write price. See
-[`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md) for the full caching
+`12-serving-latency-and-caching.md` for the full caching
 architecture.
 
 ### 12.4 The cache-aware context engineering pattern
@@ -2267,7 +2267,7 @@ For a 20-turn conversation at 400 tokens per turn:
 ```
 
 History management is not just a context-quality optimization; it is a cost optimization. See
-§8 and [`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md).
+§8 and `11-token-accounting-and-cost.md`.
 
 ---
 
@@ -2565,7 +2565,7 @@ A context engineering system should expose the following metrics for every reque
 | `citation_fidelity` | verified_citations / total_citations | < 0.80 |
 | `compaction_ratio` | original_tokens / compacted_tokens | monitored, not alerted |
 
-Wire these to [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md)'s
+Wire these to `10-llm-observability-and-tracing.md`'s
 tracing infrastructure. Every request should carry these numbers on its trace span, and every
 bad answer should be debuggable by inspecting them.
 
@@ -2761,7 +2761,7 @@ per query (from the provider's usage data), and latency. Compute the savings.
 savings at your query volume.
 *Success criterion:* you can state the ROI of cache-aware prompt design in dollars per month.
 *Time:* ~3 hours.
-*Unblocks:* [`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md)'s caching
+*Unblocks:* `12-serving-latency-and-caching.md`'s caching
 architecture.
 
 **Lab 9 — The full context engineering pipeline, end to end.**

@@ -451,7 +451,7 @@ per thread and combine, or make the object immortal so nobody writes at all.
 
 That last option is exactly what PEP 703 does for `None`, `True`, `False`, small ints and
 interned strings. Immortalization means those lines sit in **S** state on every core
-forever — never invalidated, never ping-ponged. See [`24-the-gil.md` §8.1](24-the-gil.md#81-immortalization--the-dont-count-at-all-tier).
+forever — never invalidated, never ping-ponged. See [`24-the-gil.md` §8.1](24-the-gil.md#121-immortalization--the-dont-count-at-all-tier).
 It is a coherence optimization dressed up as a refcounting optimization.
 
 ---
@@ -771,7 +771,7 @@ the caveat in §6. **Do not trust this document's answer over your own measureme
 counters, (b) separate counters sharing a line, (c) one shared *atomic* counter. Plot
 throughput vs thread count. You should get flat, collapsed, and collapsed-worse — and
 (c) *getting worse as you add cores* is precisely the 30% regression that killed
-atomic refcounting ([`24-the-gil.md` §7](24-the-gil.md#7-the-gilectomy-larry-hastings-seven-core-lesson)).
+atomic refcounting ([`24-the-gil.md` §7](24-the-gil.md#11-the-gilectomy-larry-hastings-seven-core-lesson)).
 
 **5 — The power-of-two trap.** Sum one column of an N×N matrix for N = 1024 and N = 1025.
 Explain the difference using §4. Then find another N that's *slower* than a larger N.

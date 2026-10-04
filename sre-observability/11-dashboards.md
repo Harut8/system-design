@@ -24,7 +24,7 @@ This chapter is the staff-engineer view of how to build dashboards that survive 
 12. [The Grafana Object Model in Depth](#12-the-grafana-object-model-in-depth)
 13. [Other Dashboard Tools — When Each Shines](#13-other-dashboard-tools)
 14. [RUM and Synthetic Dashboards](#14-rum-and-synthetic-dashboards)
-15. [Mobile / On-Call Dashboard Pattern](#15-mobile-on-call-dashboard-pattern)
+15. [Mobile / On-Call Dashboard Pattern](#15-mobile--on-call-dashboard-pattern)
 16. [Incident-Time Dashboard Hygiene](#16-incident-time-dashboard-hygiene)
 17. [Worked Example: `/checkout`](#17-worked-example-checkout)
 18. [Pitfalls](#18-pitfalls)

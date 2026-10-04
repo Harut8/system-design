@@ -10,12 +10,12 @@ Prerequisites: familiarity with distributed system failure models from `00-primi
 
 0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)
 1. [Why Resilience Patterns Exist](#1-why-resilience-patterns-exist)
-2. [Retry Patterns — The Deceptively Dangerous Pattern](#2-retry-patterns--the-deceptively-dangerous-pattern)
+2. [Retry Patterns — The Deceptively Dangerous Pattern](#2-retry-patterns----the-deceptively-dangerous-pattern)
    - [2.7 Retry Budgets as Shipped: gRPC, AWS SDKs, Envoy](#27-retry-budgets-as-shipped-grpc-aws-sdks-envoy) *(includes the November 2026 AWS SDK retry-default change)*
-3. [Circuit Breaker Pattern — Deep Dive](#3-circuit-breaker-pattern--deep-dive)
+3. [Circuit Breaker Pattern — Deep Dive](#3-circuit-breaker-pattern----deep-dive)
 4. [Bulkhead Pattern](#4-bulkhead-pattern)
 5. [Timeout Patterns](#5-timeout-patterns)
-6. [Combining Patterns — The Full Defense Stack](#6-combining-patterns--the-full-defense-stack)
+6. [Combining Patterns — The Full Defense Stack](#6-combining-patterns----the-full-defense-stack)
    - [6.4 Pattern Comparison — When to Use What](#64-pattern-comparison--when-to-use-what) *(includes Bulkhead vs. Rate Limiter, Little's Law math)*
 7. [Testing Resilience Patterns](#7-testing-resilience-patterns)
 8. [Production Tradeoff Matrix](#8-production-tradeoff-matrix)

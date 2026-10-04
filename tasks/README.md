@@ -1,7 +1,7 @@
 # System Design Tasks
 
 Twenty-one interview-style design problems. Each has a full reference solution in
-[`../solutions/`](../solutions/) and ends with an **Interview Kit**: what to read first,
+[`../solutions/`](../solutions/README.md) and ends with an **Interview Kit**: what to read first,
 curveballs an interviewer would throw, must-answer security and privacy questions, and a
 phased delivery plan.
 
@@ -70,9 +70,9 @@ below 3.
 
 ## Reference material
 
-The chapters these tasks draw on: [`../distributed-systems/`](../distributed-systems/),
-[`../databases/`](../databases/), [`../ai-rag/`](../ai-rag/) and
-[`../sre-observability/`](../sre-observability/). Pattern references with no matching task:
+The chapters these tasks draw on: [`../distributed-systems/`](../distributed-systems/README.md),
+[`../databases/`](../databases/MENTAL_MODEL.md), [`../ai-rag/`](../ai-rag/README.md) and
+[`../sre-observability/`](../sre-observability/ROADMAP.md). Pattern references with no matching task:
 [API design patterns](../solutions/api-design-patterns.md),
 [API message patterns](../solutions/api-message-patterns.md),
 [Big-tech API standards](../solutions/big-tech-api-standards.md),

@@ -16,9 +16,9 @@
 > what you put in the prompt — §7 is where that split begins),
 > [`08-evaluation-methodology.md`](08-evaluation-methodology.md) (§11's span-labeled golden set is a
 > hard prerequisite for evaluating anything in this chapter),
-> [`15-ingestion-pipelines-and-freshness.md`](15-ingestion-pipelines-and-freshness.md) (§9's chunk
+> `15-ingestion-pipelines-and-freshness.md` (§9's chunk
 > identity scheme is what makes incremental update possible at all),
-> [`16-multi-tenancy-and-isolation.md`](16-multi-tenancy-and-isolation.md) (§8's metadata is where
+> `16-multi-tenancy-and-isolation.md` (§8's metadata is where
 > tenant and ACL keys get attached, once, at ingest).
 >
 > **THESIS:** the chunk is the unit of retrieval, and *choosing it is a second schema decision* —

@@ -75,7 +75,7 @@ PEP 659 (specializing interpreter), 703 (free-threading), 683 (immortal objects)
 | **Java Concurrency in Practice**, Goetz | **🎯 SKIM** ch. 2–5, 10. Yes, Java. It is still the clearest book ever written on the *discipline* of shared-state concurrency — publication, safe construction, deadlock avoidance. Directly applicable to free-threaded Python. | Phase 3, doc 30 |
 
 > **Nothing published covers free-threading properly yet.** For docs 24 and 26, the
-> sources in [`24-the-gil.md` §12](24-the-gil.md#12-sources) — PEP 703, the free-threading
+> sources in [`24-the-gil.md` §12](24-the-gil.md#20-sources) — PEP 703, the free-threading
 > HOWTO, Stinner's blog, the LWN articles, and Hastings' Gilectomy talks — *are* the
 > literature. Books will lag this by years.
 

@@ -6,7 +6,7 @@
 > vs false sharing), [`16-object-memory-layout.md`](16-object-memory-layout.md) §2 (the
 > +16-byte header finding this document develops),
 > [`17-c-api-and-extensions.md`](17-c-api-and-extensions.md) (borrowed vs strong refs).
-> Feeds into: [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md),
+> Feeds into: `27-multiprocessing-and-subinterpreters.md`,
 > [`31-measurement-methodology.md`](31-measurement-methodology.md),
 > [`22-garbage-collection.md`](22-garbage-collection.md) §10, `44-packaging-and-environments.md`.
 >
@@ -971,7 +971,7 @@ The fixes are the ones doc 01 §6 already told you, translated into Python:
 - **Pass messages, not objects.** `queue.Queue` of small immutable payloads keeps ownership
   moving rather than shared.
 - **Consider whether you wanted processes or subinterpreters** — see
-  [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md).
+  `27-multiprocessing-and-subinterpreters.md`.
   Free-threading is not automatically the right answer just because it is the newest one.
 
 ### 7.5 The case where free-threading buys you nothing
@@ -1262,7 +1262,7 @@ how I would actually decide in 2026.
   GIL is not your problem; see doc 24 §5 for what actually is.
 - **`multiprocessing` already works and your data is naturally partitioned.** Processes give
   you fault isolation and memory-limit isolation for free. Free-threading gives you shared
-  memory you may not want. See [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md).
+  memory you may not want. See `27-multiprocessing-and-subinterpreters.md`.
 - **You run many short-lived processes.** The startup tax (§3.5, +17–26%) is paid per
   invocation and there is nothing to amortise it against.
 - **You have one hand-written C extension you cannot change.** It will re-enable the GIL and
@@ -1379,7 +1379,7 @@ was wrong; that is the actual bar.
    object and watch which column collapses. **This single artifact is worth more in an
    interview than any three chapters of reading**, and it is the only honest way to answer
    "should we move?" for your specific system. Cross-ref
-   [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md).
+   `27-multiprocessing-and-subinterpreters.md`.
 
 ---
 
@@ -1495,7 +1495,7 @@ support claim, including mine.*
   explanation.
 - [`22-garbage-collection.md`](22-garbage-collection.md) §10 — the collector this document
   measures in §8.
-- [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md) —
+- `27-multiprocessing-and-subinterpreters.md` —
   the alternatives §11 tells you to consider first.
 - [`31-measurement-methodology.md`](31-measurement-methodology.md) — why the provenance block
   at the top of this document is longer than most people's entire methodology section.
@@ -1517,7 +1517,7 @@ support claim, including mine.*
 
 ---
 
-*Next: [`27-multiprocessing-and-subinterpreters.md`](27-multiprocessing-and-subinterpreters.md)
+*Next: `27-multiprocessing-and-subinterpreters.md`
 — the other two answers to the same question, and the only way to complete Lab 8's four-way
 table. Then [`31-measurement-methodology.md`](31-measurement-methodology.md), because
 everything in this document is a claim about a number, and numbers are the easiest thing in

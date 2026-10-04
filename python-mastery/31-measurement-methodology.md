@@ -6,7 +6,7 @@
 > *first* iterations of any loop are systematically different from the rest),
 > [`22-garbage-collection.md`](22-garbage-collection.md) (why "GC off" is a semantic change,
 > not a noise reduction). Feeds into: [`32-profiling.md`](32-profiling.md),
-> [`33-optimizing-python.md`](33-optimizing-python.md), [`34-going-native.md`](34-going-native.md),
+> `33-optimizing-python.md`, `34-going-native.md`,
 > [`35-memory-optimization.md`](35-memory-optimization.md), and every
 > before/after claim in [`26-free-threading.md`](26-free-threading.md).
 >
@@ -886,7 +886,7 @@ Note that `--rigorous` multiplies **processes**, not values-per-process. `pyperf
 agree with §7.1: the marginal sample is worth more in a new process than in an old one.
 (With a JIT — PyPy — the defaults invert to 6 processes × 10 values × 10 warmups, because
 JIT warmup dominates and is per-process. As CPython's own JIT matures
-[`21-tier2-and-jit.md`](21-tier2-and-jit.md), expect this trade-off to shift for CPython too.)
+`21-tier2-and-jit.md`, expect this trade-off to shift for CPython too.)
 
 **Calibration** is the automatic solution to §6.2: `pyperf` grows `loops` until one raw
 value takes ≥ 100 ms, so the 41.7 ns clock quantum (§2) contributes < 1 part in 2 million.
@@ -1294,7 +1294,7 @@ actual cost of two `LOAD_GLOBAL`s and a specialized `BINARY_OP_ADD_INT`.
 - **Sanity-check the magnitude.** Anything that comes back at exactly your empty-loop cost
   was eliminated. Always measure your empty loop and know that number.
 
-This gets far more dangerous in [`34-going-native.md`](34-going-native.md), where a C or
+This gets far more dangerous in `34-going-native.md`, where a C or
 Rust compiler at `-O2` will delete your entire benchmark kernel if its result is unused —
 and unlike CPython, it will do so silently and completely.
 
@@ -1438,7 +1438,7 @@ substituting one for the other.
 | Instrument | microbenchmark, `pyperf`, A/B | RED/USE metrics, distributed traces, sampling profilers |
 | Statistic | ratio of medians + CI | full latency distribution over time, per-dependency |
 | Failure mode | confounding (§7.5, §10) | **measuring the wrong layer** |
-| Doc | this one | [`32-profiling.md`](32-profiling.md), [`46-production-python.md`](46-production-python.md) |
+| Doc | this one | [`32-profiling.md`](32-profiling.md), `46-production-python.md` |
 
 A microbenchmark can tell you a function got 2× faster. Only production can tell you the
 function was 0.4% of your latency budget.
@@ -1597,7 +1597,7 @@ All of these must hold:
 Typical legitimate uses: comparing two ways to spell the same loop; measuring
 attribute-lookup hoisting; sizing the constant factor of a data structure choice; verifying
 that a specialization actually fires. That is most of
-[`33-optimizing-python.md`](33-optimizing-python.md).
+`33-optimizing-python.md`.
 
 ### 12.2 When you need a macrobenchmark
 
@@ -1611,7 +1611,7 @@ When the change crosses a boundary a microbenchmark cannot model:
   program ([`24`](24-the-gil.md), [`26-free-threading.md`](26-free-threading.md)).
 - **Startup / import path changes** → page cache and import graph, not steady state.
 - **Native extension boundaries** → GIL release, buffer copies, batching effects
-  ([`34-going-native.md`](34-going-native.md)).
+  (`34-going-native.md`).
 
 A macrobenchmark means: run the **real workload** (a replayed request trace is ideal), in
 a **realistically-sized process**, for long enough to reach steady state, and measure the

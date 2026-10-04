@@ -1,17 +1,17 @@
 # 21 — LangGraph deep dive: agent orchestration as a state machine
 
 > **Prerequisites:** [`00-mental-models.md`](00-mental-models.md) (§12, "the 2026 shape: from
-> pipeline to loop" — this chapter is that loop, fully specified), [`13-agents-and-tool-calling.md`](13-agents-and-tool-calling.md)
+> pipeline to loop" — this chapter is that loop, fully specified), `13-agents-and-tool-calling.md`
 > (function-calling schemas, parallel tool calls, and the tool-error-handling contract that
 > `ToolNode` in §9 here is a specific, opinionated implementation of),
-> [`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md) (every cycle a graph takes is
+> `11-token-accounting-and-cost.md` (every cycle a graph takes is
 > another full context window billed — §12's recursion limits and §13's multi-agent fan-out are
 > that cost model applied), [`../python-mastery/29-async-patterns-and-pitfalls.md`](../python-mastery/29-async-patterns-and-pitfalls.md)
 > (nodes run concurrently when the graph fans out, and §3's reducers exist because concurrent writes
 > to shared state are the same hazard as any other race).
 >
-> **Feeds into:** [`14-agent-evaluation.md`](14-agent-evaluation.md) (a graph's checkpoint history in
-> §5 is the trace format that multi-turn agent eval is built on), [`16-multi-tenancy-and-isolation.md`](16-multi-tenancy-and-isolation.md)
+> **Feeds into:** `14-agent-evaluation.md` (a graph's checkpoint history in
+> §5 is the trace format that multi-turn agent eval is built on), `16-multi-tenancy-and-isolation.md`
 > (§5's `thread_id` is a tenant/session boundary the moment you put it behind an API, and getting
 > that boundary wrong is a cross-user data leak), [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md)
 > (§6's human-in-the-loop interrupts are the primary technical control for "don't let the agent take
@@ -564,7 +564,7 @@ most commonly, structured output from an LLM call that a downstream node trusts 
 and exactly wrong for a long-running thread's token budget: a support conversation that runs for two
 hundred turns eventually has a `messages` list that alone exceeds the context window before the model
 even sees the system prompt or the current question, a direct instance of
-[`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md)'s budget problem playing out
+`11-token-accounting-and-cost.md`'s budget problem playing out
 inside a single state field. There are three standard mitigations, and they compose rather than
 compete.
 
@@ -858,7 +858,7 @@ app.invoke({"messages": [HumanMessage("What did I just say?")]}, config)   # sam
 Every checkpoint under a `thread_id` forms a linear (or, after time-travel edits, branching) history —
 conceptually identical to a git log for that conversation. This is what makes LangGraph naturally
 multi-tenant: `thread_id` is the isolation boundary, and it is your application's job (per
-[`16-multi-tenancy-and-isolation.md`](16-multi-tenancy-and-isolation.md)) to derive it from something
+`16-multi-tenancy-and-isolation.md`) to derive it from something
 you actually trust — a session ID tied to an authenticated user, never a client-suppliable value taken
 at face value, because a `thread_id` collision or forgery is a cross-user state leak, not a cosmetic
 bug.
@@ -1777,7 +1777,7 @@ def check_limits(state: State) -> dict:
 Tying termination to `total_cost_usd` rather than only to a step count is the right generalization for
 any graph where nodes have wildly different costs (a cheap classifier node versus an expensive
 multi-document synthesis node) — a step-count limit treats them as equivalent when the actual resource
-you're protecting is spend, per [`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md).
+you're protecting is spend, per `11-token-accounting-and-cost.md`.
 
 ### 12.4 Detecting a stuck loop directly, not just counting iterations
 
@@ -2221,7 +2221,7 @@ code changes beyond setting `LANGSMITH_TRACING=true` (older name: `LANGCHAIN_TRA
 already emit the same callback events every LangChain runnable does. For a team not using LangSmith,
 `stream_mode="events"` (§7.4) is the raw material to build an equivalent trace view against your own
 observability stack (OpenTelemetry spans per node and per model call is the natural mapping), matching
-the general discipline from [`10-llm-observability-and-tracing.md`](10-llm-observability-and-tracing.md)
+the general discipline from `10-llm-observability-and-tracing.md`
 of "a span per branch per stage" applied to a graph's nodes instead of a retrieval cascade's branches.
 Concretely, wrapping node execution in a span is a thin decorator, and the payoff is that a graph's
 trace shows up in whatever backend your organization already standardized on (Datadog, Honeycomb,

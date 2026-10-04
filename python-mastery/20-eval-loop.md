@@ -6,8 +6,8 @@
 > [`00-cpu-execution-model.md`](00-cpu-execution-model.md) (branch prediction, indirect
 > branches, µop cache), [`15-refcounting-and-ownership.md`](15-refcounting-and-ownership.md)
 > (owned vs borrowed), [`16-object-memory-layout.md`](16-object-memory-layout.md) (what a
-> pointer dereference costs). Feeds into: [`21-tier2-and-jit.md`](21-tier2-and-jit.md),
-> [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md),
+> pointer dereference costs). Feeds into: `21-tier2-and-jit.md`,
+> `23-tracing-and-runtime-hooks.md`,
 > [`28-asyncio-internals.md`](28-asyncio-internals.md),
 > [`32-profiling.md`](32-profiling.md). Cross-reference:
 > [`24-the-gil.md`](24-the-gil.md) §4 owns the eval-breaker / `gil_drop_request` handoff;
@@ -331,7 +331,7 @@ From `Makefile.pre.in`, `make regen-cases` runs eight generators over `bytecodes
 | `opcode_id_generator.py` | `Include/opcode_ids.h` — the opcode *numbers* (doc 19 §13: they move every release) |
 | `target_generator.py` | `Python/opcode_targets.h` — the computed-goto jump table (§3) |
 | `tier1_generator.py` | `Python/generated_cases.c.h` |
-| `tier2_generator.py` | the tier-2 micro-op interpreter ([`21-tier2-and-jit.md`](21-tier2-and-jit.md)) |
+| `tier2_generator.py` | the tier-2 micro-op interpreter (`21-tier2-and-jit.md`) |
 | `optimizer_generator.py` | `Python/optimizer_cases.c.h`, from `bytecodes.c` **+** `Python/optimizer_bytecodes.c` |
 | `opcode_metadata_generator.py` | `Include/internal/pycore_opcode_metadata.h` |
 | `uop_id_generator.py`, `uop_metadata_generator.py` | `Include/internal/pycore_uop_ids.h`, `pycore_uop_metadata.h` |
@@ -995,7 +995,7 @@ mostly obsolete because `LOAD_GLOBAL_BUILTIN` already turned it into two compare
 > execution time**, not a watcher callback. I did not audit `Python/specialize.c` or
 > `Objects/dictobject.c` for a watcher-based invalidation path, so I cannot say whether one
 > exists elsewhere (the tier-2 optimizer is a plausible home for it —
-> [`21-tier2-and-jit.md`](21-tier2-and-jit.md)). Treat "dict watchers guard LOAD_GLOBAL" as
+> `21-tier2-and-jit.md`). Treat "dict watchers guard LOAD_GLOBAL" as
 > **unconfirmed** and grep your own checkout.
 
 **3. Object shape.** `_CHECK_MANAGED_OBJECT_HAS_VALUES` tests
@@ -1241,7 +1241,7 @@ Three facts in three lines. In an **optimized** scope (`CO_OPTIMIZED`, doc 19 §
 the local (`x` was `1`, the function returned `99`). At **module** scope, `f_locals` *is* the
 globals dict, identity-equal. And in a class body — the third case — it is the real mapping
 the class body executes in, which is why `__init_subclass__` machinery works at all
-([`41-metaclasses-and-class-construction.md`](41-metaclasses-and-class-construction.md)).
+(`41-metaclasses-and-class-construction.md`).
 
 The supporting fields are on `PyFrameObject`, not on `_PyInterpreterFrame`:
 `f_extra_locals` (*"Dict for locals set by users using f_locals, could be NULL"*) and
@@ -1293,7 +1293,7 @@ pointer that a frame evaluator can hang its compiled artifact on.
 The living users are **debuggers and profilers**, not JITs: `pydevd`/PyCharm and `debugpy`
 use it to install per-code-object breakpoint trampolines with zero cost on code that has no
 breakpoint. (PEP 768's remote debugging and PEP 669's `sys.monitoring` are the newer,
-supported answers — [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md).)
+supported answers — `23-tracing-and-runtime-hooks.md`.)
 
 ### The tax it imposes on everyone
 
@@ -1961,8 +1961,8 @@ verbatim source quotation from the `3.14` branch or output from a live 3.14.6 in
 - [PEP 590 — Vectorcall](https://peps.python.org/pep-0590/) (Shannon & Demeyer, Final, 3.8). **Verdict: read the Specification and the `PY_VECTORCALL_ARGUMENTS_OFFSET` section. It explains a bytecode stack-layout decision from doc 19 §12 that otherwise looks arbitrary.**
 - [PEP 667 — Consistent views of namespaces](https://peps.python.org/pep-0667/) (Shannon & Gao, 3.13) — **the one that shipped.** **Verdict: read the Rationale; it is the clearest available account of why the old snapshot design lost writes.**
 - [PEP 558 — Defined semantics for `locals()`](https://peps.python.org/pep-0558/) (Coghlan) — **Withdrawn** *(verified)*. **Verdict: read only if you want the history. Cite 667.**
-- [PEP 744 — JIT Compilation](https://peps.python.org/pep-0744/) and PEP 836 — tier 2. **Verdict: deferred entirely to [`21-tier2-and-jit.md`](21-tier2-and-jit.md).**
-- [PEP 669 — Low impact monitoring](https://peps.python.org/pep-0669/), [PEP 768 — Safe external debugger interface](https://peps.python.org/pep-0768/) — the supported alternatives to PEP 523. See [`23-tracing-and-runtime-hooks.md`](23-tracing-and-runtime-hooks.md).
+- [PEP 744 — JIT Compilation](https://peps.python.org/pep-0744/) and PEP 836 — tier 2. **Verdict: deferred entirely to `21-tier2-and-jit.md`.**
+- [PEP 669 — Low impact monitoring](https://peps.python.org/pep-0669/), [PEP 768 — Safe external debugger interface](https://peps.python.org/pep-0768/) — the supported alternatives to PEP 523. See `23-tracing-and-runtime-hooks.md`.
 
 **Secondary — read with the baseline question in mind**
 
@@ -1980,7 +1980,7 @@ verbatim source quotation from the `3.14` branch or output from a live 3.14.6 in
 **Sibling docs**
 
 - [`19-bytecode-and-code-objects.md`](19-bytecode-and-code-objects.md) — everything this document executes. §4's `CACHE` entries are §4–§7 here; its §12 open question is answered in §13 here.
-- [`21-tier2-and-jit.md`](21-tier2-and-jit.md) — where the micro-ops (`op(...)`) from §2 go next, and what `JUMP_BACKWARD_JIT` / `co_executors` are for.
+- `21-tier2-and-jit.md` — where the micro-ops (`op(...)`) from §2 go next, and what `JUMP_BACKWARD_JIT` / `co_executors` are for.
 - [`24-the-gil.md`](24-the-gil.md) §4 — the eval breaker downstream of §12's `_CHECK_PERIODIC`.
 - [`15-refcounting-and-ownership.md`](15-refcounting-and-ownership.md) — why §13 exists at all.
 - [`32-profiling.md`](32-profiling.md) — §11 and §14 are the mechanism behind its `_PyEval_EvalFrameDefault` non-answer.
@@ -1988,6 +1988,6 @@ verbatim source quotation from the `3.14` branch or output from a live 3.14.6 in
 
 ---
 
-*Next: [`21-tier2-and-jit.md`](21-tier2-and-jit.md) — what happens when the counter in
+*Next: `21-tier2-and-jit.md` — what happens when the counter in
 `JUMP_BACKWARD` reaches zero, how the `op(...)` micro-ops from §2 become a trace, and why the
 copy-and-patch JIT's numbers should be read with §3 in mind.*

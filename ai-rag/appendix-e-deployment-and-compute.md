@@ -7,11 +7,11 @@
 > [`03-indexing-and-vector-stores.md`](03-indexing-and-vector-stores.md) (index internals — the
 > vector store is the one stateful component and it constrains the whole topology).
 >
-> **Feeds into:** [`15-ingestion-pipelines-and-freshness.md`](15-ingestion-pipelines-and-freshness.md)
+> **Feeds into:** `15-ingestion-pipelines-and-freshness.md`
 > (the chapter this appendix front-runs: §8's pipeline taxonomy and §8.4's DAG are its skeleton),
-> [`11-token-accounting-and-cost.md`](11-token-accounting-and-cost.md) (per-request cost
+> `11-token-accounting-and-cost.md` (per-request cost
 > attribution — §9 gives the infrastructure side of the same ledger),
-> [`12-serving-latency-and-caching.md`](12-serving-latency-and-caching.md) (§7.2's prefill math is
+> `12-serving-latency-and-caching.md` (§7.2's prefill math is
 > where RAG latency budgets actually get spent).
 >
 > **Do not rewrite the substrate.** Kubernetes mechanics, Compose mechanics, autoscaling internals,
