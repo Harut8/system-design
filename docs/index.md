@@ -1,3 +1,10 @@
+---
+description: >-
+  Free system design notes from the internals up: CPython, database storage
+  engines, distributed systems, Kubernetes, SRE and GPU observability, and RAG,
+  with hands-on labs and 21 worked design problems.
+---
+
 # System Design Notes
 
 Working notes on systems engineering, written while learning each topic from

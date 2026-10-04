@@ -54,6 +54,10 @@ theme:
         icon: material/brightness-4
         name: Switch to system preference
 
+# Per-page meta descriptions for search engines (see hooks/seo.py).
+hooks:
+  - hooks/seo.py
+
 plugins:
   - search
   - awesome-nav
