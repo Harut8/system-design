@@ -1,8 +1,7 @@
 site_name: System Design Notes
 site_description: >-
-  Working notes on systems engineering -- CPython and OS internals, database
-  and storage engines, distributed systems, Kubernetes, SRE and GPU
-  observability, and retrieval-augmented generation.
+  System design from the internals up: CPython, storage engines, distributed
+  systems, Kubernetes, SRE and GPU observability, and RAG, with hands-on labs.
 site_url: https://harut8.github.io/system-design/
 repo_url: https://github.com/Harut8/system-design
 repo_name: Harut8/system-design
@@ -58,6 +57,9 @@ theme:
 plugins:
   - search
   - awesome-nav
+  # Per-page Open Graph / Twitter preview images, so links shared on LinkedIn,
+  # X or Slack show the page title instead of a blank card.
+  - social
 
 markdown_extensions:
   - abbr

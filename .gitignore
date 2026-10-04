@@ -34,3 +34,6 @@ personal-roadmap.md
 # Note: *.pdf is deliberately NOT ignored. ai-rag/labs/document-processing/corpus/
 # contains generated PDF fixtures that must be committed for the lab to run without a
 # generation step.
+
+# --- MkDocs plugin caches (social cards) ---------------------------------------
+.cache/
