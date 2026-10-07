@@ -90,7 +90,7 @@ NVMe SSD (~**100 µs** per random 8 KB read). All numbers are derived in
    - **Miss**: pick a victim frame with the clock algorithm (§6). If the victim is *dirty*,
      it must be written first. Then `pread()` 8 KB at file offset 2,104 × 8,192 = 17,235,968.
      ~100 µs.
-4. Inside the page, slot 3 of the line-pointer array says "row starts at byte 7,720, length
+4. Inside the page, slot 3 of the line-pointer array says "row starts at byte 7,784, length
    128" (§3). The tuple header says which transaction created it, so MVCC (doc 05) can decide
    whether you may see it.
 5. Return `'Ana'`. Total: ~5 µs if every page was hot, ~100–200 µs with one or two misses.
@@ -149,7 +149,7 @@ one row on disk      = 23 B tuple header → padded to 24 B (8-byte alignment)
 
 rows per page        = 8,168 / 132 ≈ 61
 pages for the table  = 10,000,000 / 61 ≈ 164,000 pages
-table size on disk   = 164,000 × 8 KB ≈ 1.25 GB   (vs 1.0 GB of "raw" data: 25% overhead)
+table size on disk   = 164,000 × 8 KB ≈ 1.25 GB   (vs 10⁹ B ≈ 0.93 GB of "raw" data: ~34% overhead)
 ```
 
 Lesson: per-row overhead matters. With 40-byte rows the 28 bytes of header + slot would be
@@ -337,7 +337,7 @@ anyone told "box 2,104, doc 3" still finds it.
 ```
 ┌──────────────────────────────────────────────────────┐
 │ header (24 B): page_lsn, checksum, free-space bounds │
-│ slots: [1:8040,128][2:7912,128][3:7720,192] → grows  │
+│ slots: [1:8040,128][2:7912,128][3:7784,128] → grows  │
 │                    free space                        │
 │               ← rows grow backwards: │row3│row2│row1│ │
 └──────────────────────────────────────────────────────┘
@@ -381,7 +381,8 @@ with a new TID, and `VACUUM FULL` rewrites the table. Never store `ctid` in appl
 
 **Definition.** The tuple header is the metadata stored in front of every row. In PostgreSQL it is
 23 bytes: `xmin` (transaction that created this version), `xmax` (transaction that deleted or
-replaced it, 0 if alive), the row's current TID, flag bits, and a null bitmap.
+replaced it, 0 if alive), a command ID, the row's current TID, flag bits and the header length,
+followed by an optional null bitmap.
 
 **Real-world example.** Every document in the archive carries a stamp: "filed by clerk 107" and,
 later, "voided by clerk 311". A reader checks the stamps to decide whether this version is the
@@ -442,8 +443,9 @@ visibility, and every VACUUM would read the whole table.
 **In real databases.** PostgreSQL stores them as separate files next to the table (`_fsm`, `_vm`).
 VACUUM keeps both up to date. InnoDB tracks free space per extent/segment instead.
 
-**Common confusion.** The FSM is approximate on purpose: it may under-report free space, never
-over-report.
+**Common confusion.** The FSM is approximate on purpose: it stores free space in coarse 32-byte
+steps and is not WAL-logged, so it can be stale in either direction; an insert re-checks the page
+itself and corrects the FSM if it was wrong.
 
 **Remember it like this.** *FSM answers "where can I write?"; VM answers "can I skip this page?".*
 
@@ -944,7 +946,7 @@ WHY PAGES, NOT ROWS?
   3. I/O AMORTIZATION
      ─────────────────
      One page read brings in many rows. A point query for 1 row
-     loads ~100 neighboring rows into cache for free.
+     loads ~60 neighboring rows into cache for free.
      → Subsequent queries on nearby rows are instant (buffer pool hit).
 
   4. CRASH RECOVERY
@@ -1053,7 +1055,7 @@ The dominant page layout in row-oriented databases is the **slotted page**. It d
 │  ┌───────────┬───────────┬───────────┬───────────┬──── ...      │
 │  │ Slot 1    │ Slot 2    │ Slot 3    │ Slot 4    │              │
 │  │ offset:   │ offset:   │ offset:   │ offset:   │              │
-│  │ 8040      │ 7880      │ 7720      │ 7560      │              │
+│  │ 8032      │ 7872      │ 7712      │ 7552      │              │
 │  │ len: 160  │ len: 160  │ len: 160  │ len: 160  │              │
 │  └───────────┴───────────┴───────────┴───────────┴──── ...      │
 │                                                                   │
@@ -1107,15 +1109,15 @@ SQL Server:  RID = (FileID:PageID:SlotID) for heap tables
              For clustered index tables: the clustered key IS the locator.
 ```
 
-The distinction matters: PostgreSQL's heap-based TIDs are physical pointers that can become stale after VACUUM moves tuples. InnoDB's clustered index approach means secondary index lookups always require a "double lookup" (index → PK → clustered index → row) but the row pointer never goes stale.
+The distinction matters: PostgreSQL's heap-based TIDs are physical pointers that go stale when an UPDATE writes a new row version or VACUUM FULL / CLUSTER rewrites the table (plain VACUUM never moves tuples between pages). InnoDB's clustered index approach means secondary index lookups always require a "double lookup" (index → PK → clustered index → row) but the row pointer never goes stale.
 
 ### Page Header Fields (PostgreSQL 8 KB Page)
 
 | Field | Size | Purpose |
 |-------|------|---------|
 | `pd_lsn` | 8 bytes | LSN of last WAL record that modified this page. Used by recovery to determine if a page is already up-to-date. |
-| `pd_checksum` | 2 bytes | CRC checksum (optional, enabled with `initdb --data-checksums`) |
-| `pd_flags` | 2 bytes | Page flags (has free lines, is full, has dead tuples, etc.) |
+| `pd_checksum` | 2 bytes | 16-bit FNV-1a-based checksum (enabled with `initdb --data-checksums`; default since PG 18) |
+| `pd_flags` | 2 bytes | Page flags (has free line pointers, page full, all-visible) |
 | `pd_lower` | 2 bytes | Offset to start of free space (end of line pointer array) |
 | `pd_upper` | 2 bytes | Offset to end of free space (start of newest tuple) |
 | `pd_special` | 2 bytes | Offset to special space (used by index pages) |
@@ -1134,7 +1136,7 @@ Each tuple also has its own header, carrying MVCC information:
 │                     TUPLE HEADER (23 bytes)                    │
 ├──────────┬──────────┬──────────┬──────────┬─────────────────┤
 │ t_xmin   │ t_xmax   │ t_cid    │ t_ctid   │ t_infomask     │
-│ (4 B)    │ (4 B)    │ (4 B)    │ (6 B)    │ (4 B) + pad    │
+│ (4 B)    │ (4 B)    │ (4 B)    │ (6 B)    │ (2+2 B)+hoff(1)│
 │ Creating │ Deleting │ Command  │ Current  │ Null bitmap,   │
 │ txn ID   │ txn ID   │ ID       │ TID      │ has nulls,     │
 │          │ (0 if    │          │ (may     │ has varlen,    │
@@ -1252,8 +1254,9 @@ PostgreSQL FSM (base/16384/24576_fsm):
   4. Insert tuple
   5. Update FSM if the page's free category changed
 
-  The FSM is intentionally approximate -- it may report less
-  free space than actually exists, but never more (conservative).
+  The FSM is intentionally approximate -- it is coarse (32-byte
+  categories) and not WAL-logged, so it can be stale either way.
+  The inserter re-checks the page and fixes the FSM entry if wrong.
   VACUUM updates the FSM with accurate free-space information.
 ```
 
@@ -1504,16 +1507,18 @@ Latch types in the buffer pool:
 Large databases use multiple buffer pool instances to reduce latch contention:
 
 ```
-MySQL/InnoDB:  innodb_buffer_pool_instances = 8 (default for pools > 1 GB)
-               Each instance manages ~1/8 of total pool size.
+MySQL/InnoDB:  innodb_buffer_pool_instances: 1 for pools <= 1 GB; above that,
+               8.0 defaulted to 8, 8.4 auto-sizes it (min of pool/chunk
+               hint and 1/4 of logical CPUs, capped at 64).
+               Each instance manages an equal share of the pool.
                Pages are assigned to instances by hash(space_id, page_no).
 
 PostgreSQL:    Uses 128 buffer partitions (BufMappingLock partitions)
                for page table lookups, reducing contention on the
                central hash table.
 
-               PG 16+ also has per-backend I/O combining and async
-               prefetching improvements to reduce buffer pool bottlenecks.
+               PG 17 added read streams with I/O combining, and PG 18
+               added asynchronous I/O (io_method = worker / io_uring).
 ```
 
 ---
@@ -1699,7 +1704,7 @@ Anti-flooding mechanism:
 >
 > **Real-world example.** On a cloud volume rated at 3,000 IOPS, a query that needs 30,000 random
 > page reads takes at least 10 seconds no matter how fast the CPU is. The same 30,000 pages read
-> sequentially (≈ 240 MB) take well under a second at typical 250+ MB/s throughput.
+> sequentially (≈ 240 MB) take about one second at a typical 250 MB/s throughput.
 
 ### The Storage Hierarchy
 
@@ -1753,7 +1758,7 @@ RANDOM I/O: Reading/writing scattered disk blocks.
         Bottleneck: seek time (4-10 ms per seek)
 
   SSD:  ~10,000-1,000,000 IOPS  (80-8000 MB/s for 8 KB pages)
-        Much better, but still ~100x slower than sequential.
+        Much better; at low queue depth still several times slower.
 ```
 
 This is why:
@@ -1824,9 +1829,9 @@ When a database issues a read or write, the request passes through multiple laye
 | `fsync()` / `fdatasync()` | Force flush to stable storage. `fdatasync` skips metadata flush. | Critical for WAL durability |
 | `open(O_DIRECT)` | Bypass OS page cache. Database manages its own caching. | InnoDB, Oracle, some PostgreSQL configs |
 | `open(O_DSYNC)` | Every write is implicitly durable (like write + fdatasync). | Some WAL implementations |
-| `mmap()` | Map file directly into process address space. OS manages paging. | SQLite (optional), MongoDB (WiredTiger mmapv1 legacy), LMDB |
-| `io_uring` | Async I/O interface (Linux 5.1+). Batch submissions, kernel-side polling. | Newer databases: ScyllaDB, TiKV, PostgreSQL 16+ (experimental) |
-| `posix_fadvise()` | Hint to OS about access patterns (sequential, random, willneed, dontneed). | PostgreSQL (for sequential scans and prefetching) |
+| `mmap()` | Map file directly into process address space. OS manages paging. | SQLite (optional), MongoDB (legacy MMAPv1 engine, removed in 4.2), LMDB |
+| `io_uring` | Async I/O interface (Linux 5.1+). Batch submissions, kernel-side polling. | Newer databases: ScyllaDB, TiKV, PostgreSQL 18+ (`io_method = io_uring`) |
+| `posix_fadvise()` | Hint to OS about access patterns (sequential, random, willneed, dontneed). | PostgreSQL (WILLNEED prefetch for bitmap heap scans and non-sequential read streams) |
 
 ### Direct I/O vs Buffered I/O
 
@@ -1897,9 +1902,9 @@ WITH PREFETCH (asynchronous):
 ```
 
 PostgreSQL examples:
-- `effective_io_concurrency`: tells PG how many concurrent I/O requests to issue for bitmap heap scans (default 1; set to 200 for NVMe SSDs).
-- Sequential scans use `posix_fadvise(POSIX_FADV_WILLNEED)` to hint the OS to read ahead.
-- PG 16+ introduced `io_combine_limit` for batching I/O requests.
+- `effective_io_concurrency`: tells PG how many concurrent I/O requests to issue for prefetching (bitmap heap scans, and read streams since PG 17) (default 16 since PG 18, 1 before; set to 200 for NVMe SSDs).
+- Sequential scans rely on the kernel's own read-ahead; non-sequential prefetching uses `posix_fadvise(POSIX_FADV_WILLNEED)` (or real async I/O in PG 18).
+- PG 17 introduced `io_combine_limit` for combining adjacent block reads into one larger I/O.
 
 ---
 
@@ -2016,10 +2021,11 @@ InnoDB:
 
   PAGE CLEANER THREADS (innodb_page_cleaners)
   ────────────────────────────────────────────
-  - Multiple threads (default = 4)
+  - Multiple threads (default = 4 in 8.0;
+    = innodb_buffer_pool_instances since 8.4)
   - Continuously flush dirty pages
   - Adaptive flushing: flush rate increases as dirty page
-    percentage approaches innodb_max_dirty_pages_pct (75%)
+    percentage approaches innodb_max_dirty_pages_pct (90%)
   - Also handles the "sharp checkpoint" at shutdown
 ```
 
@@ -2261,11 +2267,11 @@ CORRUPTION SOURCES:
 
 | Database | Checksum Method | Enabled By Default? | Notes |
 |----------|----------------|---------------------|-------|
-| PostgreSQL | CRC-32C (hardware-accelerated) | No (`initdb --data-checksums`) | Cannot be enabled after creation without `pg_checksums` (offline) |
+| PostgreSQL | 16-bit, FNV-1a-based (vectorizable) | Yes since PG 18 (`initdb --data-checksums`; earlier versions: off) | Cannot be enabled after creation without `pg_checksums` (offline) |
 | InnoDB | CRC-32C (default), or innodb_checksum_algorithm | Yes | Stored in FIL header and trailer |
 | SQL Server | Page checksum | Yes (after 2005) | `CHECKSUM` option per database |
 | SQLite | Per-page checksum in WAL mode | Optional | Compile-time option |
-| Oracle | DB_BLOCK_CHECKSUM | Configurable (TYPICAL/FULL/OFF) | TYPICAL checks only on writes |
+| Oracle | DB_BLOCK_CHECKSUM | Configurable (TYPICAL/FULL/OFF) | TYPICAL (default): computed on write, verified on read; FULL also verifies in memory |
 
 ### How Page Checksums Work
 
@@ -2283,8 +2289,9 @@ READ PATH:
   3. Compare with stored checksum
   4. If mismatch → DATA CORRUPTION DETECTED
      - PostgreSQL: ERROR "invalid page in block X of relation Y"
-     - InnoDB: attempts to read from doublewrite buffer;
-       if that fails, reports corruption error
+     - InnoDB: during crash recovery, restores a torn page from
+       the doublewrite buffer; at runtime, reports corruption
+       (and typically crashes the server deliberately)
   5. If match → page is intact, continue
 ```
 
@@ -2343,9 +2350,9 @@ Page checksums only protect data at rest. For full protection, checksums should 
 │ Read path    │ B-Tree traversal →    │ Check memtable → check L0    │
 │              │ leaf page → row       │ SSTables → L1 → ... → Ln    │
 ├──────────────┼───────────────────────┼───────────────────────────────┤
-│ Write amp.   │ Moderate (page-level  │ High (compaction rewrites     │
-│              │ writes for small      │ data multiple times)          │
-│              │ changes)              │                               │
+│ Write amp.   │ Higher (whole-page    │ Lower (compaction rewrites    │
+│              │ writes for small      │ data a few times, but         │
+│              │ changes)              │ sequentially)                 │
 ├──────────────┼───────────────────────┼───────────────────────────────┤
 │ Read amp.    │ Low (single B-Tree    │ Higher (may check multiple    │
 │              │ traversal)            │ levels; Bloom filters help)   │
@@ -2402,8 +2409,12 @@ LSM-TREE WRITE AMPLIFICATION:
   ... and so on for each level
 
   With 10:1 size ratio and 5 levels:
-  Total rewrites: 150 + 100 × 5 = 650 bytes
-  Write amplification = ~6.5x (much lower than B-Tree!)
+  Lower bound (each byte rewritten once per level):
+    150 + 100 × 5 = 650 bytes → ~6.5x
+  Real leveled compaction also rewrites ~10 overlapping bytes of
+  the next level per byte pushed down, so measured RocksDB WA is
+  typically ~10-30x: similar to amortized B-Tree, but sequential
+  and far below the B-Tree's per-small-update worst case.
 
   But: compaction is bursty and uses significant I/O bandwidth.
 ```
