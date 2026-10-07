@@ -160,6 +160,8 @@ Every datum a CPU processes must ultimately reach a register. The hierarchy exis
 | Network round-trip (same DC) | 500,000 ns (0.5 ms) | 500,000x |
 | Network round-trip (cross-region) | 100,000,000 ns (100 ms) | 100,000,000x |
 
+> The ~10 μs NVMe figure is for low-latency drives (Optane, Z-NAND, XL-FLASH). Mainstream TLC NVMe drives take ~50–100 μs for a 4 KB random read at queue depth 1, because the NAND read itself takes ~50 μs. The walk-throughs below use 10 μs to keep the arithmetic round. On a TLC drive the hardware share is larger and the software overhead is relatively smaller.
+
 ### Cache Lines: The Atomic Unit of Memory Transfer
 
 The CPU never reads a single byte from memory. It reads an entire **cache line** (typically 64 bytes) at once. This is fundamental to database design:
@@ -562,8 +564,8 @@ Context Switch Costs:
 **The indirect cost dominates**: After switching, Thread B's data and code are not in L1/L2 caches or the TLB. The first thousand memory accesses are all cache misses.
 
 **Why databases minimize context switches:**
-- Thread-per-connection model (PostgreSQL): 1000 connections = 1000 threads = constant context switching.
-- Thread pool model (MySQL, modern systems): Small number of worker threads, multiplex connections.
+- Process-per-connection model (PostgreSQL): 1000 connections = 1000 backend processes = constant context switching.
+- Thread-per-connection (MySQL Community default) has the same problem; thread pools (MySQL Enterprise, Percona Server, MariaDB, SQL Server) multiplex many connections onto a small number of worker threads.
 - Coroutine/fiber model: Userspace scheduling, avoid kernel context switches entirely.
 
 ---
@@ -675,7 +677,8 @@ Step 4: Return immediately to application
 
 Later (asynchronously):
   Kernel writeback daemon (pdflush / kworker):
-  - Triggers when dirty pages > dirty_ratio threshold
+  - Triggers when dirty pages > dirty_background_ratio (default 10%)
+    (at dirty_ratio, default 20%, writers themselves are throttled)
   - Or when dirty page age > dirty_expire_centisecs
   - Or when sync/fsync is called
   - Writes dirty pages to disk
@@ -762,10 +765,10 @@ pread(fd, buf, 4096, 0);           // offset aligned, size aligned
 
 | Database | O_DIRECT Usage | Why |
 |----------|---------------|-----|
-| **PostgreSQL** | Off by default, configurable | Historically relied on OS page cache, moving toward direct I/O |
-| **MySQL/InnoDB** | On by default (`innodb_flush_method=O_DIRECT`) | InnoDB has its own buffer pool, double buffering wastes RAM |
+| **PostgreSQL** | Not supported for production (only the developer option `debug_io_direct`, PG 16+) | Relies on the OS page cache; AIO in PG 18 is a step toward direct I/O |
+| **MySQL/InnoDB** | Default since 8.4 (`innodb_flush_method=O_DIRECT`; `fsync` before) | InnoDB has its own buffer pool, double buffering wastes RAM |
 | **Oracle** | Async direct I/O by default | Has managed its own cache since the 1980s |
-| **ScyllaDB** | Always O_DIRECT + io_uring | Seastar framework bypasses OS entirely |
+| **ScyllaDB** | Always O_DIRECT + linux-aio (io_uring backend optional) | Seastar bypasses the page cache and does its own caching and I/O scheduling |
 | **RocksDB** | O_DIRECT for reads/writes (configurable) | LSM compaction generates huge I/O, would thrash page cache |
 | **SQLite** | Off by default | Designed for simplicity, relies on OS cache |
 
@@ -1117,9 +1120,9 @@ Mode 3: IOPOLL (polling completion instead of interrupts)
 
 | Database / System | io_uring Usage | Impact |
 |-------------------|---------------|--------|
-| **ScyllaDB** | Core I/O engine (Seastar) | ~2x IOPS improvement over libaio |
+| **ScyllaDB** | Optional Seastar reactor backend (linux-aio is the default) | Fewer syscalls, supports buffered I/O |
 | **RocksDB** | Optional (MultiRead, compaction) | Reduced compaction latency |
-| **PostgreSQL** | Under development (PG 16+) | Async WAL writes, prefetch |
+| **PostgreSQL** | PG 18: `io_method = io_uring` (default is `worker`) | Async reads for seq scans, bitmap heap scans, VACUUM; WAL writes still synchronous |
 | **TiKV** | Uses via tokio-uring | Reduced tail latency |
 | **Ceph** | BlueStore backend | Higher throughput for OSD |
 | **liburing** | C wrapper library by Jens Axboe | Simplifies io_uring usage |
@@ -1190,8 +1193,8 @@ After fsync(fd) completes:
 
 | Call | What It Flushes | Metadata Updated? | Typical Use |
 |------|----------------|-------------------|------------|
-| `fsync(fd)` | All dirty pages of fd + metadata | Yes (size, mtime, etc.) | WAL commit |
-| `fdatasync(fd)` | All dirty pages of fd + essential metadata | Only if size changed | Data files |
+| `fsync(fd)` | All dirty pages of fd + metadata | Yes (size, mtime, etc.) | Data files at checkpoint |
+| `fdatasync(fd)` | All dirty pages of fd + essential metadata | Only if needed to read the data back (size, block allocation) | WAL commit (PostgreSQL's default `wal_sync_method` on Linux) |
 | `sync_file_range()` | Specific byte range, non-blocking option | No | Async writeback hints |
 | `sync()` | ALL dirty pages system-wide | Yes | Don't use in databases |
 
@@ -1210,10 +1213,13 @@ fdatasync: Skips metadata IF file size hasn't changed.
              → Same cost as fsync
 
 WAL optimization:
-  Pre-allocate WAL file to 64 MB (fallocate)
-  Write WAL records into pre-allocated space (no size change)
+  Pre-allocate the WAL segment by writing zeros (PostgreSQL: 16 MB segments,
+  wal_init_zero = on). fallocate is NOT enough: it creates "unwritten"
+  extents, and the first write to each one is a metadata change that
+  fdatasync must journal.
+  Write WAL records into the zero-filled space (no size or extent change)
   fdatasync → only flushes WAL data, not metadata
-  When WAL fills up, allocate new file (one fsync for metadata)
+  When the segment fills up, create the next one (one fsync for metadata)
 ```
 
 ### The Disk Write Cache Trap
@@ -1227,7 +1233,8 @@ write() → OS page cache → device driver → disk controller DRAM cache
                                                     ▼
                                               DATA LOST
 
-fsync() forces a cache flush (FUA - Force Unit Access):
+fsync() sends a cache FLUSH command to the device (or uses FUA,
+Force Unit Access, writes for specific blocks):
   → Disk controller writes cache contents to stable media
   → Returns only when data is on NAND/platter
 
@@ -1369,8 +1376,8 @@ SATA/AHCI (legacy):                    NVMe:
 │                       │               │ ...                       │
 │ Bottleneck: single   │               │ Queue N (I/O, core N)   │
 │ queue, high latency  │               │                           │
-│ ~6 GB/s max (SATA    │               │ Directly on PCIe bus     │
-│ III: 600 MB/s)       │               │ ~7-14 GB/s (PCIe 4/5)   │
+│ 6 Gb/s link (SATA    │               │ Directly on PCIe bus     │
+│ III: ~600 MB/s)      │               │ ~7-14 GB/s (PCIe 4/5)   │
 └─────────────────────┘               └─────────────────────────┘
 
 NVMe command submission (no syscall with io_uring SQPOLL!):
@@ -1439,9 +1446,10 @@ In multi-socket servers, each CPU socket has its own local DRAM. Accessing memor
 Scenario: PostgreSQL with shared_buffers = 64 GB on 2-socket NUMA server
 
 Default (NUMA-unaware):
-  Linux interleaves pages across NUMA nodes (round-robin)
-  Every other buffer pool page access crosses the interconnect
-  Average latency: ~130 ns (mix of local and remote)
+  Linux uses "first touch": a page is placed on the node of the CPU
+  that first faults it in. Shared buffers end up spread unpredictably
+  (or piled onto one node), so a backend's hit is local or remote by luck.
+  Average latency: ~130 ns at best, with uneven per-node pressure
 
 NUMA-aware (pin buffer pool to local node):
   All buffer pool pages on Node 0's DRAM
@@ -1453,7 +1461,7 @@ Best practice:
     Instance 0: pinned to Node 0 cores + Node 0 memory
     Instance 1: pinned to Node 1 cores + Node 1 memory
 
-  Or: NUMA interleave for buffer pool (predictable ~130 ns everywhere)
+  Or: explicit NUMA interleave for buffer pool (predictable ~130 ns everywhere)
     numactl --interleave=all postgres
 ```
 
@@ -1565,7 +1573,8 @@ Node* traverse(Node* root, Key key) {
 // Software CRC32: ~1 GB/s
 // Hardware CRC32C: ~20+ GB/s (single core)
 
-// PostgreSQL: data page checksums use CRC32C when available
+// PostgreSQL: WAL records use CRC32C (data page checksums use a
+//             16-bit FNV-1a-based algorithm, vectorized with SIMD)
 // RocksDB: block checksums use CRC32C
 // ScyllaDB: all checksums use hardware CRC32C
 ```
@@ -1578,7 +1587,8 @@ Node* traverse(Node* root, Key key) {
 // AES-NI: ~5-10 GB/s (10-20x speedup)
 
 // Used for:
-// - Transparent Data Encryption (TDE) in Oracle, SQL Server, PostgreSQL
+// - Transparent Data Encryption (TDE) in Oracle, SQL Server, MySQL
+//   (community PostgreSQL has no TDE; forks/extensions such as pg_tde add it)
 // - SSL/TLS connections to the database
 // - Encrypted backups
 // - Encrypted WAL
@@ -1673,7 +1683,7 @@ Results:
 
 | System | Bypass Method | Use Case |
 |--------|--------------|----------|
-| **ScyllaDB** | SPDK + Seastar | Full userspace I/O for all data |
+| **ScyllaDB** | DPDK (optional, network only) + Seastar | Storage still goes through the kernel (O_DIRECT + linux-aio/io_uring) |
 | **Ceph** | SPDK optional backend | High-performance OSD nodes |
 | **RocksDB** | SPDK plugin (experimental) | Extreme IOPS workloads |
 | **DPDK** | Network bypass (not storage) | Used with databases for network I/O |
@@ -1727,7 +1737,8 @@ A database reads page 42 from an NVMe SSD using direct I/O. Here is every step t
    5b. FTL translates LBA 0x1A3F00 → physical NAND location
        - Die 2, Plane 0, Block 157, Page 43
    5c. Issue NAND read command on appropriate channel
-   5d. NAND read latency: ~50-75 μs (raw NAND)
+   5d. NAND read latency: ~50-75 μs on mainstream TLC; ~5-10 μs on
+       low-latency media (the 10 μs totals below assume the latter)
        - Charge sensing on floating gate transistors
        - ECC decoding (LDPC): ~5-10 μs
    5e. Data transferred to controller DRAM: 8192 bytes
@@ -1764,7 +1775,8 @@ A database reads page 42 from an NVMe SSD using direct I/O. Here is every step t
    When query executor accesses buf[0]:
    9a. CPU: virtual address 0x7f001234000
    9b. TLB lookup for virtual page 0x7f0012340
-       - TLB HIT (likely — we just wrote to this address during DMA)
+       - TLB HIT likely if the frame was touched recently (DMA itself
+         goes through the IOMMU, not the CPU's TLB)
        - Physical frame: 0x3A2F1
    9c. L1 cache check for cache line at physical address
        - L1 MISS (new data, never accessed by CPU)
@@ -1873,8 +1885,8 @@ Data Structure: Red-Black Tree (sorted by vruntime)
   Thread C: LOWEST vruntime → RUNS NEXT             │
                                                       │
 Time Slice (scheduling granularity):                  │
-  Default: ~4 ms (sysctl kernel.sched_min_granularity_ns) │
-  With 4 runnable threads: each gets ~4 ms before preemption │
+  Default: ~3 ms min granularity on 8+ CPUs (pre-6.6 CFS)   │
+  With 4 runnable threads: each gets ~6 ms before preemption │
   This is NOT a fixed quantum — CFS adapts based on load     │
 ```
 
@@ -1922,7 +1934,8 @@ Linux scheduling classes (highest to lowest priority):
 ├────────────────────┼─────────────────────────────────────────────────┤
 │  SCHED_OTHER (CFS) │ Default for all normal threads                  │
 │  (aka SCHED_NORMAL)│ Nice value: -20 (highest) to +19 (lowest)      │
-│                    │ Nice -20 gets ~20x more CPU than nice +19       │
+│                    │ Each nice step ≈ 1.25x weight; nice -20 vs +19  │
+│                    │ is ~6000x (weights 88761 vs 15)                 │
 ├────────────────────┼─────────────────────────────────────────────────┤
 │  SCHED_BATCH       │ Like CFS but hints "I'm not interactive"       │
 │                    │ Scheduler gives slightly less preemption         │
@@ -2033,8 +2046,11 @@ Schedule latency = time from "thread becomes runnable" to "thread runs on CPU"
 
 Tuning scheduler latency for databases:
   # Reduce minimum time slice (more preemptions, but lower schedule latency)
+  # Kernels < 5.13 (sysctl); 5.13-6.5 moved these to /sys/kernel/debug/sched/
   sysctl kernel.sched_min_granularity_ns = 1000000    # 1ms (default: 3ms)
   sysctl kernel.sched_wakeup_granularity_ns = 500000  # 0.5ms (default: 4ms)
+  # Kernel 6.6+ (EEVDF): /sys/kernel/debug/sched/base_slice_ns, or a
+  # per-thread slice via sched_setattr(sched_runtime)
 
   # Or: use isolcpus to reserve cores exclusively for the database
   # Boot parameter: isolcpus=4-15
@@ -2410,7 +2426,7 @@ Databases implement **application-level scheduling** to make these decisions.
 │       ├── WAL Writer (flushes WAL)                                 │
 │       ├── Checkpointer (periodic checkpoint)                       │
 │       ├── Autovacuum Launcher → Autovacuum Workers                 │
-│       └── Stats Collector                                           │
+│       └── (Stats Collector: removed in PG 15, stats in shared mem) │
 │                                                                     │
 │  Problems with 1000 connections:                                   │
 │  - 1000 processes × 10 MB private memory = 10 GB overhead         │
@@ -2425,11 +2441,11 @@ Databases implement **application-level scheduling** to make these decisions.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Thread Model 2: Thread Pool (MySQL, Oracle)
+### Thread Model 2: Thread Pool (MySQL Enterprise / Percona / MariaDB, SQL Server)
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  MySQL / Oracle: Thread Pool                                       │
+│  MySQL thread pool (Community MySQL is thread-per-connection)     │
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────┐      │
 │  │               Connection Queue                            │      │
@@ -2455,12 +2471,14 @@ Databases implement **application-level scheduling** to make these decisions.
 │  │  Context switches: only 8 (not 10,000!)                     │     │
 │  └──────────────────────────────────────────────────────────┘     │
 │                                                                     │
-│  Oracle thread pool adds:                                          │
-│  - Short-query queue (< 100 μs) vs long-query queue               │
-│  - If a query runs too long → moved to long queue                  │
-│  - Short queries never starved by long analytics scans             │
+│  MySQL thread pool adds:                                           │
+│  - High-priority queue (statements of already-open transactions)   │
+│    vs low-priority queue (new transactions)                        │
+│  - Low-priority items are kicked up after                          │
+│    thread_pool_prio_kickup_timer, so nothing starves               │
 │                                                                     │
-│  MySQL thread_pool_size = number of worker groups (default: CPUs)  │
+│  MySQL thread_pool_size = number of worker groups                  │
+│    (default 16 in MySQL Enterprise; #CPUs in Percona/MariaDB)      │
 │  MySQL thread_pool_stall_limit = time before creating new thread   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -2491,7 +2509,7 @@ Databases implement **application-level scheduling** to make these decisions.
 │  Each shard is a single-threaded event loop:                       │
 │                                                                     │
 │  while (true) {                                                    │
-│      // 1. Poll for completed I/O (io_uring / SPDK)               │
+│      // 1. Poll for completed I/O (linux-aio / io_uring)          │
 │      // 2. Poll for network events (epoll / io_uring)             │
 │      // 3. Run ready tasks from task queue                         │
 │      // 4. Run timer callbacks                                     │
@@ -2564,7 +2582,8 @@ This is why modern databases increasingly use coroutines:
 | Database | Approach | Details |
 |----------|---------|---------|
 | **ScyllaDB** | Seastar futures/promises | Continuations + coroutines (C++20). Every I/O is async, never blocks. |
-| **TiDB/TiKV** | Go goroutines | Go runtime multiplexes goroutines onto OS threads. ~2KB per goroutine. |
+| **TiDB** | Go goroutines | Go runtime multiplexes goroutines onto OS threads. ~2KB per goroutine. |
+| **TiKV** | Rust async (yatp / Tokio) | Futures on work-stealing thread pools; storage I/O via RocksDB. |
 | **CockroachDB** | Go goroutines | Same Go model. Scheduler work-steals across threads. |
 | **PostgreSQL** | Traditional processes | No coroutines. Each backend is a full process. Actively discussed for future. |
 | **MySQL** | Thread pool + async | No coroutines yet. Thread pool reduces OS scheduling cost. |
@@ -2642,18 +2661,19 @@ Solution: Each core has its OWN task queue. Idle cores STEAL from busy cores.
   Core 2 queue:  [T7] [T8]                    ← moderate
   Core 3 queue:  []                            ← idle → STEAL from Core 0!
 
-  Core 3 steals T5 from Core 0's queue (take from the TAIL, not head).
+  (T1 is the oldest task, T5 the newest.)
+  Core 3 steals T1 from Core 0's queue (the OLD end, not the end the owner uses).
 
   After stealing:
-  Core 0 queue:  [T1] [T2] [T3] [T4]
+  Core 0 queue:  [T2] [T3] [T4] [T5]
   Core 1 queue:  [T6]
   Core 2 queue:  [T7] [T8]
-  Core 3 queue:  [T5]  ← stolen work
+  Core 3 queue:  [T1]  ← stolen work
 
-Why steal from the tail?
-  - Owner processes from head (LIFO — recently added, cache-warm)
-  - Thief steals from tail (oldest tasks, larger chunks of work)
-  - This minimizes cache conflicts between owner and thief
+Why steal from the old end?
+  - Owner pushes and pops at the new end (LIFO: recently added, cache-warm)
+  - Thief steals from the old end (oldest tasks, often larger chunks of work)
+  - Owner and thief work on opposite ends, so they rarely contend
 
 Database adoption:
   - Go runtime: goroutine scheduler uses work stealing
@@ -2993,9 +3013,10 @@ What actually happens (e.g., PostgreSQL + WAL):
 
 1. Executor calls transaction_commit()
 
-2. WAL Writer:
-   ├── Serialize WAL record (in shared memory WAL buffer)
-   │   Contents: transaction ID, table OID, tuple data, LSN
+2. The committing backend itself (not the WAL writer process):
+   ├── Insert commit WAL record (in shared memory WAL buffers)
+   │   Contents: transaction ID, commit timestamp (row changes were
+   │   logged earlier, as each statement ran)
    │   Time: ~200 ns (memcpy to shared WAL buffer)
    │
    ├── write(wal_fd, wal_buffer, wal_size)  [buffered or O_DIRECT]
@@ -3013,7 +3034,7 @@ What actually happens (e.g., PostgreSQL + WAL):
    Total commit latency: ~20-100 μs (NVMe) or ~5-10 ms (HDD)
 
 4. LATER (asynchronously):
-   ├── Dirty data pages written by background writer (checkpoint)
+   ├── Dirty data pages written by checkpointer / background writer
    ├── This is NOT latency-critical — WAL guarantees recovery
    └── If crash before data page write:
        Recovery replays WAL → data is reconstructed
@@ -3052,7 +3073,6 @@ Group Commit Optimization:
 │                                │ no huge page control                  │
 │ read()/write()               │ Per-call syscall overhead, blocking   │
 │ Filesystem readahead          │ Generic, can't predict DB patterns   │
-│ I/O scheduler                │ Doesn't know query priorities         │
 │ Thread scheduler              │ Context switch overhead, no workload │
 │                                │ awareness, no query prioritization   │
 │ I/O scheduler                 │ Doesn't know query priorities,        │
