@@ -193,7 +193,9 @@ PostgreSQL Ring Buffer for Large Scans:
   Pages from the scan cycle through 32 slots.
   Hot OLTP pages are never touched → no eviction.
 
-  Also used for: VACUUM, bulk writes (COPY), large sorts.
+  Also used for: VACUUM (ring = vacuum_buffer_usage_limit, 2 MB
+  default in PG 17+) and bulk writes such as COPY FROM / CREATE
+  TABLE AS (16 MB ring). Sorts don't use it (work_mem + temp files).
 ```
 
 ### Synchronized Scans
@@ -376,10 +378,13 @@ INDEX-ONLY SCAN (PostgreSQL):
 
 InnoDB covering index:
 
-  InnoDB doesn't have this problem because secondary index entries
-  carry enough info for visibility via the undo log. If all needed
-  columns are in the secondary index, InnoDB skips the clustered
-  index lookup entirely. No visibility map needed.
+  InnoDB has the same problem: secondary index records carry no
+  transaction IDs. Instead, each secondary index page stores
+  PAGE_MAX_TRX_ID (the newest trx that modified the page). If it is
+  older than the read view's oldest active trx, the entry is
+  visible and InnoDB skips the clustered index lookup. Otherwise it
+  must check the clustered record (and undo log) -- a per-page
+  analogue of PostgreSQL's visibility map.
 
   CREATE INDEX idx_email ON users(email) INCLUDE (name);  -- PG 11+
   -- or --
@@ -504,7 +509,7 @@ LOSSY BITMAP (large result set, bitmap exceeds work_mem):
   │       Before: Page 7 [slots: 3, 8, 12, 45, 67, 99, ...]  │
   │       After:  Page 7 [ALL — recheck needed]                │
   │                                                              │
-  │ EXPLAIN shows: "Recheck Cond: (status = 'pending')"       │
+  │ EXPLAIN always lists "Recheck Cond" (used on lossy pages)  │
   │ If all pages are exact: "Heap Blocks: exact=300"           │
   │ If some are lossy:      "Heap Blocks: exact=200 lossy=100"│
   └────────────────────────────────────────────────────────────┘
@@ -541,8 +546,10 @@ Query: SELECT * FROM orders
   └──────────────────────────────────────────────────────┘
 
   BitmapOr works similarly for OR conditions:
-  WHERE status = 'pending' OR status = 'failed'
+  WHERE status = 'pending' OR region = 'US'
   → bitmap A OR bitmap B → union of pages
+  (OR on the SAME column, e.g. status = 'pending' OR status = 'failed',
+  becomes status = ANY('{pending,failed}') in PG 18 → one index scan.)
 ```
 
 ---
@@ -571,12 +578,12 @@ TID SCAN:
 | Use Case | Details |
 |----------|---------|
 | Explicit ctid query | `SELECT * FROM t WHERE ctid = '(0,1)'` — rare in application code |
-| Self-join dedup | Used internally for deduplication: `DELETE FROM t WHERE ctid NOT IN (SELECT min(ctid) FROM t GROUP BY key)` |
+| Self-join dedup | ctid as a row identifier: `DELETE FROM t WHERE ctid NOT IN (SELECT min(ctid) FROM t GROUP BY key)` (planned as Seq Scan + hashed SubPlan, not a Tid Scan) |
 | HOT chain following | Internally, PostgreSQL follows HOT chains via ctid pointers |
 | Cursor updates | `WHERE CURRENT OF cursor_name` resolves to a TID |
 | Debugging | Useful for inspecting specific physical tuples |
 
-**Caution**: TIDs are physical addresses. They change after VACUUM FULL, CLUSTER, or pg_repack. Never store ctids in application code as stable row identifiers.
+**Caution**: TIDs are physical addresses. They change on every UPDATE (the new row version gets a new ctid, even with HOT) and after VACUUM FULL, CLUSTER, or pg_repack. Never store ctids in application code as stable row identifiers.
 
 ### InnoDB Equivalent
 
@@ -680,14 +687,15 @@ PARALLEL SEQUENTIAL SCAN:
                        ▼
   ┌───────────────────────────────────────────────────────────┐
   │  SHARED BLOCK COUNTER                                      │
-  │  Atomic counter. Each process grabs the next block number. │
+  │  Atomic counter. Each process grabs the next CHUNK of      │
+  │  blocks (PG 14+; before 14 it was one block at a time).    │
   │                                                             │
-  │  Leader:   "I'll take block 0"                             │
-  │  Worker 1: "I'll take block 1"                             │
-  │  Worker 2: "I'll take block 2"                             │
-  │  Leader:   "I'll take block 3"                             │
-  │  Worker 1: "I'll take block 4"                             │
+  │  Leader:   "I'll take blocks 0-63"                         │
+  │  Worker 1: "I'll take blocks 64-127"                       │
+  │  Worker 2: "I'll take blocks 128-191"                      │
   │  ...                                                        │
+  │  Chunk ≈ nblocks/2048 (power of 2, max 8192 blocks),       │
+  │  shrinking near the end of the table to balance the tail.  │
   │                                                             │
   │  No locks, no coordination beyond the atomic counter.      │
   │  Pages are distributed dynamically (work-stealing-like).   │
@@ -752,7 +760,7 @@ PARALLEL BITMAP SCAN (PostgreSQL 10+):
 | `min_parallel_index_scan_size` | 512 KB | Index must be this big for parallel index scan |
 | `parallel_tuple_cost` | 0.1 | Cost of transferring one tuple from worker to leader |
 | `parallel_setup_cost` | 1000 | Cost of launching a parallel worker |
-| `force_parallel_mode` | off | Force parallel execution (for testing) |
+| `debug_parallel_query` | off | Force parallel execution (for testing; named `force_parallel_mode` before PG 16) |
 
 ### Amdahl's Law Applied to Parallel Scans
 
@@ -771,7 +779,7 @@ Example: query is 90% scan, 10% overhead
   8 workers:  speedup = 1 / (0.1 + 0.9/8) = 4.71x
   16 workers: speedup = 1 / (0.1 + 0.9/16) = 6.40x
 
-  Diminishing returns: going from 8→16 workers adds only 1.7x.
+  Diminishing returns: doubling 8→16 workers only goes 4.71x → 6.40x (1.36x faster).
   The serial fraction (10%) becomes the dominant bottleneck.
 
   In practice, disk I/O bandwidth is often the bottleneck,
@@ -781,7 +789,7 @@ Example: query is 90% scan, 10% overhead
 
 ### MySQL/InnoDB Parallel Reads
 
-MySQL 8.0 added parallel read threads for `CHECK TABLE` and some internal scans, but general parallel query execution is limited compared to PostgreSQL. InnoDB's `innodb_parallel_read_threads` controls the number of threads for partition scans and some bulk operations.
+MySQL 8.0 (8.0.14+) added parallel read threads for `CHECK TABLE` and unfiltered `SELECT COUNT(*)`, but general parallel query execution is limited compared to PostgreSQL. InnoDB's `innodb_parallel_read_threads` (default 4) controls how many threads scan subtrees of the clustered index in parallel for these operations.
 
 ---
 
@@ -813,7 +821,7 @@ Key statistics in pg_class:
 ### Column Statistics (pg_stats)
 
 ```
-SELECT attname, null_frac, n_distinct, most_common_vals, histogram_bounds
+SELECT attname, null_frac, n_distinct, most_common_vals, most_common_freqs, histogram_bounds
 FROM pg_stats WHERE tablename = 'users' AND attname = 'status';
 
   attname:          status
@@ -825,7 +833,8 @@ FROM pg_stats WHERE tablename = 'users' AND attname = 'status';
 
 For numeric/date columns:
   histogram_bounds: {1, 100, 200, ..., 9900, 10000}
-  (100 equally-spaced boundary values for estimating range selectivity)
+  (101 boundaries = 100 equal-frequency buckets, each holding ~1% of
+   the non-MCV rows; default_statistics_target = 100)
   correlation: 0.95  (physical order correlates with logical order)
 ```
 
@@ -841,7 +850,7 @@ EQUALITY SELECTIVITY (status = 'active'):
     estimated rows = 1,000,000 × 0.60 = 600,000
 
   If value not in MCV list:
-    remaining_frac = 1.0 - sum(mcv_freqs)
+    remaining_frac = 1.0 - sum(mcv_freqs) - null_frac
     remaining_distinct = n_distinct - len(mcv_list)
     selectivity = remaining_frac / remaining_distinct
 
@@ -861,7 +870,8 @@ AND SELECTIVITY (status = 'active' AND age > 30):
 
   This can be wildly wrong if columns are correlated!
   PostgreSQL 10+ has extended statistics (CREATE STATISTICS)
-  for multi-column correlation and MCV lists.
+  for multi-column correlation (ndistinct, dependencies);
+  multi-column MCV lists were added in PG 12.
 ```
 
 ### Cost Model: Sequential Scan
@@ -897,15 +907,16 @@ INDEX SCAN COST:
              + (CPU per tuple)
 
   For WHERE email = 'alice@ex.com' (selectivity = 0.000001, 1 row):
-    Index pages read: ~3 (tree height)
-    Index I/O cost = random_page_cost × 3 = 4.0 × 3 = 12.0
+    Index descent  = CPU only (upper levels assumed cached):
+                     ~50 × cpu_operator_cost per level ≈ 0.42 (startup)
+    Index leaf I/O = random_page_cost × 1 = 4.0 × 1 = 4.0
     Heap page fetch: 1 page
     Heap I/O cost  = random_page_cost × 1 = 4.0 × 1 = 4.0
-    CPU cost       = 0.01 × 1 = 0.01
+    CPU cost       = 0.005 (index tuple) + 0.0025 (op) + 0.01 ≈ 0.02
     ─────────────────────────────────────────
-    Total          ≈ 16.01
+    Total          ≈ 8.44   (EXPLAIN: cost=0.42..8.44)
 
-  Compare to seq scan total of 20,834.0 → index scan wins by ~1300x!
+  Compare to seq scan total of 20,834.0 → index scan wins by ~2500x!
 
   But for WHERE status = 'active' (selectivity = 0.60, 600K rows):
     Heap pages to fetch ≈ up to 8334 (many pages have active rows)
@@ -984,37 +995,43 @@ Option 1: Sequential Scan
   TOTAL: 208,000
 
 Option 2: Index Scan
-  Index pages: ~4 levels × random_page_cost = 4 × 4.0 = 16
+  Index: half the leaf pages (~13,500 of ~27,000) × random_page_cost
+         = 13,500 × 4.0 = 54,000
+  Index CPU: (cpu_index_tuple_cost + cpu_operator_cost) × 5M
+         = 0.0075 × 5,000,000 = 37,500
   Heap fetches: 5,000,000 rows.
     With correlation 0.05 (essentially random):
     Estimated distinct pages = 83,000 × (1 - (1 - 0.5)^(10M/83000))
                              ≈ 83,000 (almost all pages touched)
     Heap I/O: 83,000 × random_page_cost = 83,000 × 4.0 = 332,000
   CPU: 0.01 × 5,000,000 = 50,000
-  TOTAL: 382,016
+  TOTAL: 473,500
 
 Option 3: Bitmap Scan
-  Bitmap Index Scan: ~83,000 index leaf pages (covering 50% of keys)
-    I/O: random_page_cost × ~1000 (index pages) = 4,000
+  Bitmap Index Scan: same ~13,500 index leaf pages (50% of keys)
+    I/O: random_page_cost × 13,500 = 54,000
+    CPU: 0.0075 × 5,000,000 = 37,500
   Bitmap Heap Scan: read ~83,000 heap pages in PHYSICAL order
     I/O: seq_page_cost × 83,000 = 83,000  (sequential now!)
-  CPU: same as index scan ≈ 50,000
+  CPU: cpu_tuple_cost × 5,000,000 = 50,000
   Recheck: 0.0025 × 5,000,000 = 12,500
-  TOTAL: 149,500
+  TOTAL: ~237,000
 
-WINNER: Bitmap Scan (149,500) < Seq Scan (208,000) < Index Scan (382,016)
+WINNER: Seq Scan (208,000) < Bitmap Scan (~237,000) < Index Scan (473,500)
 
-The planner correctly chooses bitmap scan:
+The planner chooses the seq scan (often a Parallel Seq Scan):
   - Index scan is worst because of random heap I/O for 5M rows
   - Bitmap scan converts random I/O to sequential → beats index scan
-  - Seq scan reads all rows but avoids index overhead
-  - Bitmap scan reads same pages as seq scan but skips non-matching
-    pages? Actually at 50% selectivity it touches almost all pages,
-    so it's close to seq scan cost. The win comes from not evaluating
-    filter on the non-matching 50% of tuples.
+  - But at 50% selectivity the bitmap scan touches almost every heap
+    page anyway, AND pays for reading half the index plus 5M index
+    entries. Skipping the filter on the other 5M tuples doesn't
+    cover that, so the plain seq scan wins.
 
-If selectivity were 1% (100K rows), index scan would win.
-If selectivity were 80%, seq scan would win.
+If selectivity were 1% (100K rows): ~62,000 distinct heap pages.
+  Bitmap scan ≈ 90,000 (pages read in order, near-sequential cost)
+  beats seq scan (208,000). A plain index scan would still lose
+  (~62,000 random pages ≈ 250,000) at correlation 0.05; it wins only
+  for far fewer rows or a highly correlated column.
 ```
 
 ---
