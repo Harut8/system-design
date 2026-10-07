@@ -90,7 +90,7 @@ Every SQL statement passes through a multi-stage pipeline before a single row is
 
 ### Pipeline Variations Across Systems
 
-- **PostgreSQL**: Classic pipeline. Parser produces a parse tree (not AST), which the analyzer converts to a Query tree. The planner/optimizer is a single combined stage. No JIT by default (optional LLVM JIT for expressions since PG 11).
+- **PostgreSQL**: Classic pipeline. Parser produces a parse tree (not AST), which the analyzer converts to a Query tree. The planner/optimizer is a single combined stage. Optional LLVM JIT for expressions and tuple deforming since PG 11; `jit = on` by default since PG 12, but it only kicks in for plans costlier than `jit_above_cost` and when the server is built with LLVM.
 - **MySQL**: Parser produces a tree, then the optimizer does both logical and physical optimization in one pass. Historically had a very simple optimizer; 8.0 added hash joins, histograms, and a proper cost model.
 - **DuckDB**: Uses a Binder (analyzer) that resolves names, then a logical planner, then a physical planner with vectorized execution.
 - **CockroachDB**: Parser (Go-based) produces AST, then optbuilder constructs a normalized expression tree, then the Cascades-style optimizer (called "opt") searches for the best physical plan.
@@ -131,12 +131,12 @@ Key lexer challenges:
 
 - **Keyword vs Identifier ambiguity**: Is `value` a keyword or a column name? Most databases maintain a reserved word list, and allow non-reserved keywords as identifiers based on context.
 - **Quoted identifiers**: `"order"` (double-quoted in PostgreSQL/standard SQL) vs `` `order` `` (backtick-quoted in MySQL) allows reserved words as identifiers.
-- **String escaping**: Standard SQL uses `''` for literal single quotes inside strings. PostgreSQL supports `E'...'` for C-style escapes. MySQL supports `\"` with `BACKSLASH_ESCAPES` mode.
+- **String escaping**: Standard SQL uses `''` for literal single quotes inside strings. PostgreSQL supports `E'...'` for C-style escapes. MySQL treats backslash as an escape character by default (`\'`, `\"`, `\n`) unless the `NO_BACKSLASH_ESCAPES` SQL mode is enabled.
 - **Multi-byte characters**: UTF-8 identifiers, emoji in string literals, etc.
 
 ### 2.2 Parsing and the Abstract Syntax Tree
 
-The parser consumes the token stream and produces an Abstract Syntax Tree (AST) according to the SQL grammar. Most production databases use hand-written recursive descent parsers (PostgreSQL, CockroachDB) or parser generators like Bison/Yacc (MySQL, older PostgreSQL versions).
+The parser consumes the token stream and produces an Abstract Syntax Tree (AST) according to the SQL grammar. Many production databases use LALR parser generators -- Bison/Yacc (PostgreSQL's `gram.y`, MySQL's `sql_yacc.yy`), goyacc (CockroachDB), Lemon (SQLite) -- while others use hand-written recursive descent parsers (e.g., ClickHouse).
 
 **Simplified BNF-like grammar for SELECT:**
 
@@ -258,7 +258,8 @@ The analyzer (also called the binder or semantic analyzer) takes the raw AST and
 │  5. Resolve output aliases                                  │
 │     "order_count" in ORDER BY → refers to                   │
 │     the SELECT-list alias COUNT(o.id) AS order_count        │
-│     (PostgreSQL allows this; standard SQL does not)         │
+│     (standard SQL allows this in ORDER BY only; PostgreSQL  │
+│      also allows it in GROUP BY, but never in WHERE)        │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -285,8 +286,12 @@ Coercion examples:
 **Common type-checking errors:**
 
 ```sql
--- ERROR: operator does not exist: integer = text
+-- ERROR: invalid input syntax for type integer: "abc"
+-- (the untyped literal is coerced to integer and fails to parse)
 SELECT * FROM users WHERE id = 'abc';
+
+-- ERROR: operator does not exist: integer = text
+SELECT * FROM users WHERE id = 'abc'::text;
 
 -- OK with implicit cast (PostgreSQL): string parsed as integer
 SELECT * FROM users WHERE id = '42';
@@ -587,8 +592,8 @@ For a given logical plan, the optimizer must choose:
 │     ├── Left-deep tree (only left-deep plans)                   │
 │     ├── Right-deep tree                                         │
 │     ├── Bushy tree (any shape)                                  │
-│     └── For N tables: N! orderings (left-deep), Catalan         │
-│         number of bushy trees                                   │
+│     └── For N tables: N! orderings (left-deep),                 │
+│         N! * Catalan(N-1) bushy trees                           │
 │                                                                 │
 │  3. JOIN ALGORITHM for each join:                               │
 │     ├── Nested Loop Join (+ index lookup on inner)              │
@@ -724,7 +729,7 @@ Methods for estimating NDV:
 4. PostgreSQL approach:
    ANALYZE samples ~30,000 rows (300 * default_statistics_target).
    Computes n_distinct from the sample.
-   Stores as positive number (exact count) or negative fraction
+   Stores as positive number (absolute count) or negative fraction
    (-0.5 means "50% of rows are distinct").
 ```
 
@@ -761,7 +766,8 @@ Methods for estimating NDV:
 │  5. FUNCTION SELECTIVITY                                        │
 │     WHERE my_function(column) = 'value'                         │
 │     Optimizer has no statistics for function output.             │
-│     Falls back to magic constants (0.33 for equality, etc.)     │
+│     Falls back to magic constants (PG: 0.005 for equality,      │
+│     0.333 for range comparisons)                                │
 │                                                                 │
 │  6. MISSING STATISTICS                                          │
 │     Foreign tables, CTEs, complex subqueries.                   │
@@ -773,7 +779,7 @@ Methods for estimating NDV:
 **Mitigations for estimation errors:**
 
 - **Multi-column statistics** (PostgreSQL 10+): `CREATE STATISTICS` for correlated columns.
-- **Adaptive execution** (discussed in 4.7): Re-optimize mid-query when actual cardinalities diverge from estimates.
+- **Adaptive execution** (discussed in 4.8): Re-optimize mid-query when actual cardinalities diverge from estimates.
 - **Plan hints** (Oracle, MySQL, SQL Server): Override the optimizer's choices.
 - **Plan stability** (baselines, pinned plans): Prevent plan regressions.
 
@@ -913,7 +919,7 @@ after Phase 2 (because the Hash Join plan was cheaper for {A,B}).
 
 For N > 10-12 tables, even DP becomes too slow. Solutions:
 
-- **Genetic Query Optimizer (GEQO)**: PostgreSQL uses a genetic algorithm for queries joining more than `geqo_threshold` tables (default: 12).
+- **Genetic Query Optimizer (GEQO)**: PostgreSQL uses a genetic algorithm for queries with at least `geqo_threshold` FROM items (default: 12).
 - **Randomized algorithms**: Simulate annealing, iterative improvement.
 - **Greedy heuristics**: Always join the two cheapest relations next.
 - **Cascades/Volcano optimizer**: Memo-based top-down search with pruning (used by SQL Server, CockroachDB).
@@ -925,12 +931,12 @@ Number of possible join orderings:
 
 Tables (N)  │ Left-Deep  │ Bushy Trees      │ With 3 Join Algos
 ────────────┼────────────┼──────────────────┼───────────────────
-     3      │      6     │       12         │        324
+     3      │      6     │       12         │        108
      5      │    120     │     1,680        │      ...
-     8      │  40,320    │   2,027,025      │      ...
+     8      │  40,320    │   17,297,280     │      ...
     10      │ 3,628,800  │  17,643,225,600  │      ...
-    15      │  1.3 * 10^12│  ≈ 10^17         │      ...
-    20      │  2.4 * 10^18│  ≈ 10^23         │      ...
+    15      │  1.3 * 10^12│  ≈ 3.5 * 10^18   │      ...
+    20      │  2.4 * 10^18│  ≈ 4.3 * 10^27   │      ...
 
 Clearly exhaustive search is impossible beyond ~10-12 tables.
 ```
@@ -979,21 +985,22 @@ WHERE table_name = 'users';
 PREPARE user_lookup(int) AS SELECT * FROM users WHERE id = $1;
 EXECUTE user_lookup(42);
 
--- PostgreSQL 12+ behavior:
+-- PostgreSQL behavior (since 9.2; plan_cache_mode = auto, the PG 12+ default):
 -- First 5 executions: generate custom plan each time (using parameter values)
--- After 5 executions: if generic plan cost <= 1.1 * avg(custom plan cost),
---   switch to a cached generic plan.
+-- After 5 executions: if generic plan cost < avg(custom plan cost), where the
+--   custom cost includes an estimated replanning charge, switch to a cached
+--   generic plan.
 -- Otherwise: continue generating custom plans.
 
 -- Why this matters:
 -- Generic plan for: WHERE status = $1
 --   Uses average selectivity -- could be very wrong for skewed data.
---   status = 'active' (72% of rows) vs status = 'banned' (0.1% of rows)
+--   status = 'active' (72% of rows) vs status = 'banned' (2% of rows)
 --   need very different plans (seq scan vs index scan).
 ```
 
 ```
-Plan Cache Decision Flow (PostgreSQL 12+):
+Plan Cache Decision Flow (PostgreSQL, plan_cache_mode = auto):
 
   PREPARE stmt(...)
        │
@@ -1007,7 +1014,7 @@ Plan Cache Decision Flow (PostgreSQL 12+):
               Cost = g
                          │
                          ▼
-              g <= 1.1 * avg(c1..c5) ?
+              g < avg(c1..c5) ?
               ┌──── YES ────┐──── NO ────┐
               ▼             ▼            │
         Use generic     Use custom      │
@@ -1234,10 +1241,10 @@ Space: O(sort buffer size) or O(1) if pre-sorted
 │ Handles skew     │ Yes               │ Poorly (hot      │ Yes                 │
 │                  │                    │ bucket problem)  │                     │
 ├──────────────────┼────────────────────┼──────────────────┼─────────────────────┤
-│ Parallelizable   │ Inner side only    │ Both sides       │ Both sides          │
+│ Parallelizable   │ Outer side only    │ Both sides       │ Both sides          │
 │                  │ (partition outer)  │ (partition both) │ (parallel sort)     │
 ├──────────────────┼────────────────────┼──────────────────┼─────────────────────┤
-│ Supports OUTER   │ Yes (all types)   │ Yes (all types)  │ Yes (with care)     │
+│ Supports OUTER   │ No FULL (PG)       │ Yes (all types)  │ Yes (with care)     │
 │ joins            │                    │                  │                     │
 ├──────────────────┼────────────────────┼──────────────────┼─────────────────────┤
 │ Supports SEMI /  │ Yes (early        │ Yes (mark        │ Yes                 │
@@ -1292,12 +1299,14 @@ Properties:
 - Right-deep: good for hash joins. Build hash tables on all base tables,
   then probe in sequence. All hash tables must fit in memory simultaneously.
 
-- Bushy: most flexible, smallest search space to find optimal plan,
-  but exponentially more plans to consider. Allows maximum parallelism
-  (independent subtrees can execute concurrently).
+- Bushy: most flexible, the only search space guaranteed to contain
+  the optimal plan, but exponentially more plans to consider.
+  Allows maximum parallelism (independent subtrees can execute
+  concurrently).
 
-PostgreSQL: considers left-deep trees by default.
-  With enable_bushy_joins or GEQO: considers bushy trees.
+PostgreSQL: the standard DP search (standard_join_search) considers
+  bushy trees too (within join_collapse_limit = 8). Above
+  geqo_threshold, GEQO searches a much smaller, mostly left-deep space.
 
 SQL Server (Cascades optimizer): considers all tree shapes.
 ```
@@ -1495,7 +1504,7 @@ Speedup: 10-16x for simple predicates (limited by memory bandwidth)
 | Velox (Meta) | 1024 | Varies | Execution engine used by Presto, Spark |
 | DataFusion (Apache) | 8192 | Via Arrow | Rust-based, uses Apache Arrow format |
 | Photon (Databricks) | Varies | AVX2 | C++ vectorized engine for Spark |
-| PostgreSQL 16+ | (limited) | (limited) | Some vectorized decompression, not full |
+| PostgreSQL | N/A | (limited) | Tuple-at-a-time executor; SIMD only in internal helpers (e.g., XID array search, JSON lexing) |
 
 ### 6.3 Push-Based / Compiled Execution
 
@@ -1566,8 +1575,8 @@ Generated code for Pipeline 2:
 |----------|-----------------|----------------|---------|
 | Pure interpretation (Volcano) | 0 ms | Slowest | Most OLTP databases |
 | Vectorized interpretation | 0 ms | 5-10x faster | DuckDB, ClickHouse |
-| JIT compilation (LLVM) | 10-100 ms | 10-50x faster | PostgreSQL (optional), Spark (Tungsten) |
-| Ahead-of-time compilation | N/A (pre-compiled) | Fastest | Hyper/Umbra (C++ codegen) |
+| JIT compilation (LLVM) | 10-100 ms | 10-50x faster | PostgreSQL (`jit`), HyPer; Spark Tungsten (Java codegen, not LLVM) |
+| Ahead-of-time compilation | N/A (pre-compiled) | Fastest | SQL Server Hekaton (natively compiled procedures) |
 | Adaptive (interpret first, JIT hot paths) | Variable | Best of both | Umbra, some JVMs |
 
 **Trade-off:** JIT compilation has a startup cost. For short OLTP queries (< 1ms), the compilation time dominates. For long OLAP queries (seconds to hours), compilation time is negligible and execution speed dominates.
@@ -1601,7 +1610,7 @@ Introduced by the HyPer system (Leis et al., 2014). Combines compiled execution 
 ```
 Key Concepts:
 
-MORSEL: A fixed-size chunk of input data (~10,000 rows).
+MORSEL: A fixed-size chunk of input data (~100,000 rows).
          Small enough for L2/L3 cache. Large enough to amortize
          scheduling overhead.
 
@@ -1739,13 +1748,15 @@ work_mem = 256MB (default 4MB -- increase for large sorts!)
 
 Sort method selection:
   Data fits in work_mem → In-memory quicksort
-  Data exceeds work_mem → External sort with polyphase merge
-  Data is small (< ~1000 tuples) → Insertion sort or heapsort
+  Data exceeds work_mem → External sort (balanced k-way merge since
+                          PG 15; polyphase merge before)
+  Bounded by LIMIT (top-N fits in work_mem) → top-N heapsort
 
 External sort temp files:
   Written to: temp_tablespaces (or default tablespace)
-  PostgreSQL uses replacement selection for initial run generation
-  (produces runs of ~2x work_mem on average for nearly-sorted data)
+  PostgreSQL quicksorts work_mem-sized batches to form initial runs;
+  replacement selection (runs of ~2x memory on random input) was
+  dropped in PG 11
 ```
 
 ### 7.2 Hash-Based Aggregation
@@ -1849,10 +1860,12 @@ Top-N with Heap:
   Space: O(K)           -- only 10 rows in memory
 
   vs full sort: O(N * log(N)) time, O(N) space
-  For N=1,000,000 and K=10: ~20x faster
+  For N=1,000,000 and K=10: log2(N)/log2(K) ≈ 20/3.3 ≈ 6x fewer
+  comparisons worst case (more in practice: most rows are rejected
+  by a single comparison against heap.min())
 ```
 
-PostgreSQL recognizes this pattern and uses an "Incremental Sort" or "Top-N Heapsort" plan node.
+PostgreSQL recognizes this pattern: the Sort node under a Limit reports `Sort Method: top-N heapsort` (a sort strategy, not a separate plan node; Incremental Sort is a different optimization for partially presorted input).
 
 ### 7.5 Spilling to Disk
 
@@ -1868,7 +1881,7 @@ Hash Aggregation Spill Strategy:
 
 Spill Trigger:
   PostgreSQL: when hash table exceeds work_mem
-  hash_mem_multiplier (PG 13+): allows hash aggs to use
+  hash_mem_multiplier (PG 13+): allows hash aggs and hash joins to use
     work_mem * hash_mem_multiplier before spilling
 
 Sort Spill Strategy:
@@ -2106,9 +2119,10 @@ Shuffle (Repartition) Deep Dive:
 
   Performance bottleneck: network bisection bandwidth
   If each node has 10 Gbps NIC and there are 100 nodes:
-    Max shuffle throughput = 10 Gbps per node
-    For 1 TB shuffle: 1TB / 10Gbps = ~800 seconds
-    With compression (3x): ~270 seconds
+    Max shuffle throughput = 10 Gbps per node (1 Tbps aggregate)
+    For 1 TB shuffle: ~10 GB per node / 10Gbps = ~8 seconds
+    (ideal full-bisection network; one 10 Gbps link: ~800 s)
+    With compression (3x): ~2.7 seconds
     With overlap (pipeline): less wall-clock time
 
 Optimizations:
@@ -2247,7 +2261,7 @@ EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT ...
 │  4. BUFFERS                                                     │
 │     shared hit=4234: pages found in buffer cache (fast)         │
 │     shared read=4000: pages read from disk (slow)               │
-│     shared written=50: dirty pages written (background)         │
+│     shared written=50: dirty pages this backend had to write    │
 │     temp read/written: spill to temp files (very slow)          │
 │                                                                 │
 │  5. SORT METHOD                                                 │
@@ -2363,7 +2377,7 @@ EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT ...
 
 3. NESTED LOOP WITH HIGH LOOPS AND NO INDEX
 
-   ->  Nested Loop  (actual time=0.1..45000.0 rows=1000 loops=1)
+   ->  Nested Loop  (actual time=0.1..45000.0 rows=500000 loops=1)
          ->  Seq Scan on orders  (actual rows=100000 loops=1)
          ->  Seq Scan on order_items  (actual rows=5 loops=100000)
                Filter: (order_id = orders.id)
@@ -2388,7 +2402,7 @@ EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT ...
          ->  Hash  (actual time=567..567 rows=2000000)
                Buckets: 65536  Batches: 16  Memory: 32768kB
    ─────────────────────────────────────────────
-   16 batches = hash table spilled to disk 16 times.
+   16 batches = hash table split 16 ways; 15 batches spilled to temp files.
    Fix: Increase work_mem or hash_mem_multiplier.
 
 6. GATHER WITH FEW PARALLEL WORKERS
@@ -2397,9 +2411,10 @@ EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT ...
          Workers Planned: 4  Workers Launched: 1
    ─────────────────────────────────────────────
    Only 1 of 4 planned workers launched.
-   Fix: Increase max_parallel_workers_per_gather.
    Fix: Check max_parallel_workers system-wide limit.
-   Fix: Check if table has parallel_workers storage parameter.
+   Fix: Check max_worker_processes (the background-worker slot pool).
+   (Planned vs launched gap = no free worker slots at run time;
+    max_parallel_workers_per_gather only caps the planned count.)
 
 7. INDEX SCAN WITH LOW CORRELATION
 
