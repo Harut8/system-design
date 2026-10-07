@@ -99,7 +99,7 @@ Example: 10 million user rows, 200 bytes average row size
 | Columns used with functions: `WHERE UPPER(email) = ...` | Index on `email` is unusable (need expression index) |
 | Tables that are bulk-loaded and then dropped | Index rebuilds slow down bulk inserts massively |
 | Columns with very high NULL ratio that are never queried on NULLs | Wasted space (use partial index instead) |
-| Heap-only tuple (HOT) updates in PostgreSQL | Extra indexes prevent HOT optimization |
+| Heap-only tuple (HOT) updates in PostgreSQL | An index on a frequently updated column prevents HOT for those updates |
 
 **Rule of thumb**: If a query returns more than ~5-15% of the table, the query planner will often prefer a sequential scan even when an index exists.
 
@@ -131,7 +131,7 @@ Index on: user_id (values: 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60)
                               └──/─────|─────\────┘
                                /       |       \
                 ┌─────────────┐  ┌─────────────┐  ┌──────────────┐
-                │  [10 | 20]  │  │  [30 | 40]  │  │  [50 | 55]   │   ← INTERNAL NODES
+                │  [10 | 15]  │  │  [30 | 35]  │  │  [50 | 55]   │   ← INTERNAL NODES
                 │  / |  \     │  │  / |  \     │  │  / |  \      │
                 └─/──|───\────┘  └─/──|───\────┘  └─/──|───\─────┘
                 /    |    \      /    |    \      /    |    \
@@ -158,10 +158,10 @@ Index on: user_id (values: 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60)
 Step 1: Start at ROOT [25 | 45]
         35 >= 25 and 35 < 45  →  follow MIDDLE pointer
 
-Step 2: Arrive at INTERNAL NODE [30 | 40]
-        35 >= 30 and 35 < 40  →  follow MIDDLE pointer
+Step 2: Arrive at INTERNAL NODE [30 | 35]
+        35 >= 35              →  follow RIGHT pointer
 
-Step 3: Arrive at LEAF NODE [30 | 35 | 40]
+Step 3: Arrive at LEAF NODE [35 | 40]
         Linear scan within leaf: found 35!
         Follow row pointer → fetch actual row from data page
 
@@ -238,10 +238,10 @@ AFTER DELETE:
 
   [22|25] becomes [25] -- only 1 key (below minimum occupancy of 2)
 
-  Option A: REDISTRIBUTE from sibling
-    Borrow 28 from right sibling [28|29]
-    [25|28] → [29] → [30|35]
-    Update parent key accordingly
+  Option A: REDISTRIBUTE from sibling (only if the sibling has a spare key)
+    Not possible here: [28|29] and [15|20] are both at the minimum (2 keys);
+    borrowing 28 would leave [29] under-full too
+    → so the tree must MERGE
 
   Option B: MERGE with sibling
     Merge [25] with [28|29] → [25|28|29]
@@ -616,12 +616,14 @@ Enforcement mechanism:
 
   1. Search B+Tree for 'alice@example.com'
   2. If found:
-       → Check if existing row is visible to current transaction (MVCC)
-       → If visible: ERROR: duplicate key value violates unique constraint
-       → If not visible (deleted by concurrent txn): allow insert
+       → Check if the existing row is still LIVE (a "dirty" snapshot,
+         not the inserting transaction's own MVCC snapshot)
+       → If live (committed): ERROR: duplicate key value violates unique constraint
+       → If its inserter/deleter is still in progress: WAIT for it, then recheck
+       → If dead (deleter committed): allow insert
   3. If not found:
-       → Insert into B+Tree
-       → Lock the index entry to prevent concurrent duplicates
+       → Insert into B+Tree (the leaf page stays locked from the
+         check through the insert, preventing concurrent duplicates)
 
   Note: In PostgreSQL, unique checks acquire a short-lived lock on the
   index page. Under heavy concurrent inserts to the same key range,
@@ -764,11 +766,10 @@ Only double the directory (cheap), not the buckets.
   ├────┤           │                └──────────────┘
   │ 01 │ ─────────────────────────► ┌──────────────┐
   ├────┤           │                │ k2           │  bucket B (local depth 2)
-  │ 10 │ ─────────────────────────► └──────────────┘
-  ├────┤           │                ┌──────────────┐
-  │ 11 │ ───────────────┐          │ k3, k5       │  bucket C (local depth 2)
-  └────┴───────────┘    │          └──────────────┘
-                        └────────►  (same bucket C or new)
+  │ 10 │ ───────────────┐           └──────────────┘
+  ├────┤           │    │           ┌──────────────┐
+  │ 11 │ ───────────────┴─────────► │ k3, k5       │  bucket C (local depth 1:
+  └────┴───────────┘                └──────────────┘   10 and 11 both point here)
 
   When bucket A overflows:
     1. Split bucket A into A1, A2
@@ -820,7 +821,7 @@ Key insight: Split buckets ONE AT A TIME in round-robin order.
 | System | Usage |
 |--------|-------|
 | PostgreSQL | `CREATE INDEX ... USING hash` -- WAL-logged since v10. Useful only for `=` lookups. Not widely used since B+Tree handles equality efficiently too. |
-| MySQL/InnoDB | Adaptive Hash Index (AHI) -- InnoDB automatically builds in-memory hash indexes on frequently accessed B+Tree pages. Not user-controllable. |
+| MySQL/InnoDB | Adaptive Hash Index (AHI) -- when enabled, InnoDB automatically builds in-memory hash indexes on frequently accessed B+Tree pages. You can only switch it on/off (`innodb_adaptive_hash_index`, OFF by default since MySQL 8.4), not define hash indexes yourself. |
 | Memcached | Core data structure: hash table for all key lookups |
 | Redis | Hash tables for the main keyspace and for Hash data type |
 | Oracle | Hash clusters (rarely used in practice) |
@@ -912,15 +913,15 @@ ROARING BITMAPS (used by Lucene, Spark, ClickHouse, Druid):
   ┌──────────────────────────────────────────────────────────────┐
   │  Container Type     │ When Used              │ Storage       │
   ├─────────────────────┼────────────────────────┼───────────────┤
-  │  Array Container    │ < 4096 values in chunk │ Sorted array  │
-  │  Bitmap Container   │ >= 4096 values         │ 8KB bitmap    │
+  │  Array Container    │ <= 4096 values in chunk│ Sorted array  │
+  │  Bitmap Container   │ > 4096 values          │ 8KB bitmap    │
   │  Run Container      │ Consecutive runs       │ Run-length    │
   └──────────────────────────────────────────────────────────────┘
 
   Example: Roaring bitmap for set {1, 2, 3, 100, 200, 65536, 65537, 65538}
 
   Chunk 0 (values 0-65535):
-    Values: {1, 2, 3, 100, 200}  → 5 values < 4096 → Array Container
+    Values: {1, 2, 3, 100, 200}  → 5 values <= 4096 → Array Container
     Storage: [1, 2, 3, 100, 200]  (sorted u16 array, 10 bytes)
 
   Chunk 1 (values 65536-131071):
@@ -1158,13 +1159,13 @@ Used by: DynamoDB (DAX), various in-memory caches
 
 | System | Usage |
 |--------|-------|
-| RocksDB/LevelDB | Per-SSTable Bloom filter; avoids unnecessary reads during compaction and lookups |
+| RocksDB/LevelDB | Per-SSTable Bloom filter; avoids unnecessary reads on point lookups (compaction reads whole files and does not consult it) |
 | Apache Cassandra | Per-SSTable; configurable `bloom_filter_fp_chance` (default 0.01 = 1%) |
 | HBase | Per-HFile block; configurable in column family descriptor |
-| PostgreSQL | Not built-in, but available via extensions; used internally for hash joins |
+| PostgreSQL | No core Bloom index; `contrib/bloom` index AM and BRIN `*_bloom_ops` (v14+). Internally used by `amcheck` (heapallindexed), not by hash joins |
 | ClickHouse | Data skipping indexes using Bloom filters on columns |
 | Ethereum | Bloom filters in block headers for log event search |
-| Chrome | Bloom filter for malicious URL checking (Safe Browsing) |
+| Chrome | Historically a Bloom filter for malicious URL checking (Safe Browsing); replaced by a prefix set around 2012 |
 
 ---
 
@@ -1236,7 +1237,7 @@ Step 1: Search for position (same as search), remembering UPDATE pointers
         at each level where we go DOWN.
 
 Step 2: Determine random height for new node.
-        Flip coins: H, H, T  →  height = 2 (levels 0, 1)
+        Flip coins: H, T  →  height = 2 (levels 0, 1)
 
 Step 3: Insert at each level up to height:
 
@@ -1286,7 +1287,7 @@ Level 0:  HEAD ── 10 ── 20 ──── 40 ──── 50 ── NIL
 │  Insert       │  O(log N)    │  O(N)        │  O(N) expected    │
 │  Delete       │  O(log N)    │  O(N)        │  with O(N log N)  │
 │  Range scan   │  O(log N+K)  │  O(N)        │  worst case       │
-│  Min/Max      │  O(1)        │  O(1)        │  (follow level 0) │
+│  Min / Max    │ O(1)/O(log N)│  O(1)/O(N)   │                   │
 └───────────────┴──────────────┴──────────────┴───────────────────┘
 
 Worst case O(N) happens when all nodes have height 1 (extremely unlikely).
@@ -1331,7 +1332,7 @@ Why skip lists excel at concurrency:
 | LevelDB / RocksDB | MemTable | Lock-free concurrent writes; in-memory sorted structure before flushing to SSTable |
 | WiredTiger (MongoDB) | Internal data structures | Concurrent access patterns |
 | Java | `ConcurrentSkipListMap/Set` | Lock-free sorted concurrent collection |
-| Apache Lucene | Some internal structures | Concurrent access during indexing |
+| Apache Lucene | Posting-list skip data | Jump ahead in long posting lists during AND queries |
 
 ---
 
@@ -1556,11 +1557,12 @@ BRIN vs B+Tree Size Comparison:
   BRIN index (pages_per_range = 128):
     Blocks: ~75,000 pages / 128 = ~586 range entries
     Each entry: 2 x 8 bytes (min/max) + overhead ≈ 24 bytes
-    Total: 586 x 24 ≈ 14 KB  (!!!)
+    Payload: 586 x 24 ≈ 14 KB, but the index is paged: metapage + revmap
+    page + data pages → ~3-6 x 8 KB pages ≈ 24-48 KB on disk  (!!!)
 
   ┌────────────────────────────────────────┐
   │  B+Tree:  141 MB                       │
-  │  BRIN:     14 KB  (10,000x smaller!)   │
+  │  BRIN:  ~24-48 KB  (~3,000-6,000x)     │
   └────────────────────────────────────────┘
 ```
 
@@ -1644,7 +1646,8 @@ CREATE INDEX idx_text ON documents USING spgist(content text_ops);
 -- WHERE content LIKE 'prefix%'
 
 -- Point data (k-d tree)
-CREATE INDEX idx_points ON locations USING spgist(coordinates);
+CREATE INDEX idx_points ON locations USING spgist(coordinates kd_point_ops);
+-- (the default point opclass, quad_point_ops, builds a quadtree instead)
 ```
 
 ---
@@ -1670,12 +1673,12 @@ Term Dictionary + Posting Lists:
   ┌───────────┬──────┬──────────────────────────────────────────────┐
   │   Term     │  DF  │  Posting List                                │
   ├───────────┼──────┼──────────────────────────────────────────────┤
-  │  "bark"   │  1   │  [(doc3, pos:[2], tf:1)]                    │
+  │  "bark"   │  1   │  [(doc3, pos:[3], tf:1)]                    │
   │  "brown"  │  2   │  [(doc1, pos:[3], tf:1), (doc2, pos:[3], tf:1)] │
   │  "cat"    │  1   │  [(doc2, pos:[4], tf:1)]                    │
-  │  "dog"    │  2   │  [(doc1, pos:[9], tf:1), (doc3, pos:[1], tf:1)] │
+  │  "dog"    │  2   │  [(doc1, pos:[9], tf:1), (doc3, pos:[2], tf:1)] │
   │  "fox"    │  3   │  [(doc1, pos:[4], tf:1), (doc2, pos:[9], tf:1), │
-  │           │      │   (doc3, pos:[4], tf:1)]                     │
+  │           │      │   (doc3, pos:[6], tf:1)]                     │
   │  "jump"   │  2   │  [(doc1, pos:[5], tf:1), (doc2, pos:[5], tf:1)] │
   │  "lazi"   │  2   │  [(doc1, pos:[8], tf:1), (doc2, pos:[8], tf:1)] │
   │  "quick"  │  2   │  [(doc1, pos:[2], tf:1), (doc2, pos:[2], tf:1)] │
@@ -1843,7 +1846,7 @@ How B+Tree indexes become bloated over time:
   │██  ░░  │→│░░██░░  │→│  ░░██  │→│██░░░░  │→│  ░░░░██│
   │░░██░░  │  │  ██░░  │  │██  ░░  │  │░░░░██  │  │██░░░░  │
   └────────┘  └────────┘  └────────┘  └────────┘  └────────┘
-  5 pages, ~40% utilization (60% wasted!)
+  5 pages, ~60% utilization (40% wasted!)
 
   ██ = live data
   ░░ = dead/free space
@@ -1861,7 +1864,7 @@ How B+Tree indexes become bloated over time:
 
 ```sql
 -- PostgreSQL: Rebuild an index from scratch
-REINDEX INDEX idx_users_email;           -- Locks the table! (ACCESS EXCLUSIVE)
+REINDEX INDEX idx_users_email;           -- Blocks writes (SHARE on table) + ACCESS EXCLUSIVE on the index
 REINDEX TABLE users;                     -- Rebuilds ALL indexes on the table
 
 -- PostgreSQL 12+: Concurrent reindex (no table lock)
@@ -1891,25 +1894,29 @@ CREATE INDEX CONCURRENTLY idx_users_email ON users(email);
 ```
 How CONCURRENTLY works internally:
 
-  Phase 1: CREATE empty index structure + register in catalog
-           Table is writable. New writes update both old indexes AND new index.
+  Phase 1: CREATE empty index structure + register in catalog (not yet "ready")
+           Table is writable. New writes do NOT insert into the new index yet,
+           but (after waiting out older transactions) they stop making HOT
+           updates that would break it.
 
   Phase 2: FIRST TABLE SCAN
-           Scan entire table, insert all existing rows into new index.
-           Concurrent writes keep updating the index too.
+           Scan entire table (with a snapshot), insert visible rows into new index.
+           Writes during this scan are NOT in the index; when it finishes the
+           index is marked READY and from then on every write maintains it.
 
   Phase 3: SECOND TABLE SCAN (validation pass)
            Re-scan to pick up any rows that changed during Phase 2.
            Handle any conflicts with concurrent transactions.
 
-  Phase 4: MARK index as VALID
+  Phase 4: MARK index as VALID (after waiting out older snapshots)
            Index is now ready for query planning.
 
   ┌──────────────────────────────────────────────────────────────┐
   │  Caveats:                                                    │
   │  - Takes 2-3x longer than regular CREATE INDEX               │
   │  - Can fail and leave an INVALID index                       │
-  │      (check: SELECT * FROM pg_indexes WHERE NOT indisvalid)  │
+  │      (check: SELECT indexrelid::regclass FROM pg_index       │
+  │              WHERE NOT indisvalid)                           │
   │  - Cannot be run inside a transaction block                  │
   │  - Requires waiting for all existing transactions to finish  │
   │  - If it fails, you must DROP the invalid index and retry    │
@@ -2002,8 +2009,8 @@ Index Advisor Strategy:
   │                                                               │
   │  Step 4: Identify DUPLICATE INDEXES                           │
   │    - Index (a, b) makes index (a) redundant                  │
-  │    - But (a) is NOT redundant if used for index-only scans   │
-  │      on column a alone (different covering set)               │
+  │    - But keep (a) if it backs a UNIQUE/PK constraint, or if  │
+  │      its smaller size matters for very hot scans on a         │
   │                                                               │
   │  Step 5: Consider PARTIAL and COVERING indexes                │
   │    - Add WHERE clause to reduce index size                    │
@@ -2012,7 +2019,7 @@ Index Advisor Strategy:
 
 Tools:
   - PostgreSQL: pg_stat_statements, auto_explain, hypopg (hypothetical indexes)
-  - MySQL: EXPLAIN ANALYZE (8.0+), pt-index-usage (Percona)
+  - MySQL: EXPLAIN ANALYZE (8.0.18+), pt-index-usage (Percona)
   - SQL Server: Database Engine Tuning Advisor, Missing Index DMVs
   - General: pgHero, Dexter (auto-index for PostgreSQL)
 ```
@@ -2313,7 +2320,7 @@ Before adding an index, ask these questions:
 │  Range scan         │  O(log N+K)│  N/A       │  O(log N+K)│  N/A         │
 │  Insert             │  O(log N)  │  O(1) avg  │  O(log N)  │  O(k)        │
 │  Delete             │  O(log N)  │  O(1) avg  │  O(log N)  │  N/A*        │
-│  Min/Max            │  O(log N)  │  N/A       │  O(1)      │  N/A         │
+│  Min/Max            │  O(log N)  │  N/A       │O(1)/O(logN)│  N/A         │
 │  Ordered iteration  │  O(N)      │  N/A       │  O(N)      │  N/A         │
 │  Space              │  O(N)      │  O(N)      │  O(N)      │  O(N) bits   │
 └────────────────────┴────────────┴────────────┴────────────┴──────────────┘
