@@ -147,17 +147,19 @@ Byte layout (little-endian, value = 42):
   BIGINT   (8 bytes):  [2A 00 00 00 00 00 00 00]
 
 PostgreSQL stores integers in the platform's native byte order
-(typically little-endian on x86). Index pages store them in
-big-endian for correct sort order in byte-wise comparison.
+(typically little-endian on x86) -- in heap AND index pages.
+B-Tree ordering uses type-specific comparison functions, not memcmp.
 
-InnoDB stores integers in BIG-ENDIAN in index pages (so memcmp
-gives correct ordering) but in little-endian in row data.
+InnoDB stores integers BIG-ENDIAN with the sign bit flipped
+everywhere (the clustered index IS the row data), so memcmp
+gives correct ordering.
 ```
 
 ### Floating Point (IEEE 754)
 
 ```
-FLOAT / REAL:     4 bytes, IEEE 754 single precision
+REAL / FLOAT4:    4 bytes, IEEE 754 single precision
+                  (PG: bare FLOAT means DOUBLE PRECISION; MySQL: 4 bytes)
                   ~7 decimal digits of precision
                   Range: ±3.4 × 10^38
 
@@ -188,23 +190,24 @@ PostgreSQL encoding:
   Stored as an array of base-10000 "digits" (int16 values).
   NUMERIC(10,2) value 12345678.90:
     Sign: positive
-    Weight: 1 (number of base-10000 digits before decimal)
+    Weight: 1 (first digit is ×10000^1; = base-10000 digits before decimal − 1)
     Digits: [1234, 5678, 9000]
 
   ┌───────────────────────────────────────────┐
-  │ Header  │ ndigits │ weight │ sign │ dscale│
-  │ (varlena)│ (2B)    │ (2B)   │ (2B) │ (2B) │
-  ├─────────┴─────────┴────────┴──────┴──────┤
+  │ Header  │ n_header: sign + dscale + weight│
+  │(varlena)│ (2B short form; 4B long form)   │
+  ├─────────┴─────────────────────────────────┤
   │ digit[0]=1234 │ digit[1]=5678 │ digit[2]=9000 │
   └───────────────┴───────────────┴───────────────┘
 
-  Each digit is 2 bytes, stores 0-9999.
+  Each digit is 2 bytes, stores 0-9999. ndigits is not stored --
+  it is derived from the varlena length.
   NUMERIC is EXACT but 5-10x slower than integer/float for math.
 
 InnoDB encoding:
-  Stores DECIMAL as packed BCD (Binary-Coded Decimal).
-  Each decimal digit takes 4 bits (half a byte).
-  DECIMAL(10,2) = 5 bytes for integer part + 1 byte for fractional = 6 bytes total.
+  Stores DECIMAL in a packed binary format (not BCD): every 9 decimal
+  digits take 4 bytes; leftover digits take 1-4 bytes (1-2 digits → 1B).
+  DECIMAL(10,2) = 4 bytes for 8 integer digits + 1 byte for 2 fractional = 5 bytes total.
   More compact than PostgreSQL's representation.
 ```
 
@@ -221,10 +224,12 @@ Storage:
     CHAR(10) "hello"  → stored as "hello     " (10 bytes + varlena header)
     VARCHAR(100) "hello" → stored as "hello" (5 bytes + varlena header)
     TEXT "hello" → identical to VARCHAR internally (5 bytes + varlena header)
-    All three use varlena format. CHAR is space-padded on output only.
+    All three use varlena format. CHAR's padding IS stored on disk
+    (trailing spaces are ignored in comparisons).
 
   InnoDB:
-    CHAR(10) → always 10 bytes on disk (fixed allocation)
+    CHAR(10) → 10 bytes on disk with a single-byte charset; with
+    utf8mb4 (COMPACT/DYNAMIC) stored variable-length, 10-40 bytes
     VARCHAR(100) "hello" → 1-byte length prefix + 5 bytes = 6 bytes
     (length prefix is 2 bytes if max length > 255 bytes)
 
@@ -233,8 +238,8 @@ Storage:
     - MySQL: per-column charset (utf8mb4 = 4 bytes/char max)
 
   Collation: Determines sort order. Affects index ordering.
-    - "a" < "B" in case-sensitive; "a" < "B" or "a" > "B"
-      depending on collation.
+    - "a" > "B" in byte-order ("C") collation (0x61 > 0x42);
+      "a" < "B" in linguistic collations (en_US, ICU).
     - PostgreSQL: uses OS locale (libc) or ICU provider
     - MySQL: collation is per-column (e.g., utf8mb4_unicode_ci)
 ```
@@ -252,7 +257,8 @@ TIMESTAMP (without time zone):
   PostgreSQL: 8 bytes, microseconds since 2000-01-01 00:00:00
               Stored as int64. Range: 4713 BC to 294276 AD.
   MySQL:      4 bytes (TIMESTAMP) = seconds since Unix epoch
-              8 bytes (DATETIME) = packed YYYY-MM-DD HH:MM:SS
+              5 bytes (DATETIME, since 5.6.4) = packed YYYY-MM-DD HH:MM:SS
+              (both + 0-3 bytes for fractional seconds)
 
 TIMESTAMP WITH TIME ZONE:
   PostgreSQL: 8 bytes, same as TIMESTAMP but interpreted as UTC.
@@ -293,13 +299,12 @@ JSON / JSONB:
   PostgreSQL JSONB: stored as decomposed binary format:
     ┌──────────────────────────────────────────────────────┐
     │ Header (type: object, num_pairs: 3)                   │
-    │ JEntry[0]: key offset, value offset                   │
-    │ JEntry[1]: key offset, value offset                   │
-    │ JEntry[2]: key offset, value offset                   │
-    │ Key data: "age\0email\0name\0"                        │
-    │ Value data: (numeric)30 | (string)"a@ex.com" | ...   │
+    │ JEntry[0..2]: one per key (length/offset)             │
+    │ JEntry[3..5]: one per value (type + length/offset)    │
+    │ Key data: "age" "name" "email" (no terminators)       │
+    │ Value data: (numeric)30 | (string)"Alice" | ...       │
     └──────────────────────────────────────────────────────┘
-    Keys are sorted → binary search on key lookup.
+    Keys are sorted (by length, then bytes) → binary search on lookup.
     No reparsing needed. Supports GIN indexing.
 
   MySQL JSON (5.7+): similar binary format, keys sorted.
@@ -311,11 +316,11 @@ JSON / JSONB:
 
 ### Fixed-Length Column Storage
 
-Columns with fixed-size types (INTEGER, BIGINT, DATE, FLOAT, CHAR(N), BOOLEAN) occupy the exact same number of bytes in every row. This enables direct offset calculation.
+Columns with fixed-size types (INTEGER, BIGINT, DATE, FLOAT, BOOLEAN) occupy the exact same number of bytes in every row. This enables direct offset calculation.
 
 ```
 Fixed-length row example:
-  Table: sensors (id INT, temp FLOAT, reading_date DATE, active BOOLEAN)
+  Table: sensors (id INT, temp REAL, reading_date DATE, active BOOLEAN)
 
   Column offsets (after tuple header):
     id:            offset 0,  4 bytes
@@ -329,7 +334,7 @@ Fixed-length row example:
   ┌────────────┬────────────┬──────────────┬────────┐
   │ id (4B)    │ temp (4B)  │ date (4B)    │ act(1B)│
   ├────────────┼────────────┼──────────────┼────────┤
-  │ 00 00 00 01│ 41 C8 00 00│ 00 00 22 E4  │ 01     │
+  │ 01 00 00 00│ 00 00 C8 41│ E4 22 00 00  │ 01     │
   └────────────┴────────────┴──────────────┴────────┘
 ```
 
@@ -361,10 +366,8 @@ PostgreSQL varlena format:
 
   Example: VARCHAR value "hello world" (11 bytes)
   ┌────┬─────────────────────────┐
-  │ 17 │ h e l l o   w o r l d   │  (header = (12 << 1) | 0x01 = 0x19 = 25)
-  └────┴─────────────────────────┘  Wait, let me re-do:
-                                     length including header = 12 bytes
-                                     short header = (12 << 1) | 1 = 25 = 0x19
+  │ 19 │ h e l l o   w o r l d   │  length including header = 12 bytes
+  └────┴─────────────────────────┘  short header = (12 << 1) | 1 = 25 = 0x19
 
 InnoDB variable-length column storage:
 
@@ -412,7 +415,7 @@ PostgreSQL alignment rules:
   Table: t (a bool, b int8, c int2, d int4)
 
   Naive layout:   [a: 1B] [pad: 7B] [b: 8B] [c: 2B] [pad: 2B] [d: 4B]
-  Total: 24 bytes (8 bytes of padding!)
+  Total: 24 bytes (9 bytes of padding!)
 
   Reordered:      [b: 8B] [d: 4B] [c: 2B] [a: 1B] [pad: 1B]
   Total: 16 bytes (1 byte of padding)
@@ -447,7 +450,7 @@ PostgreSQL NULL bitmap:
   │ Tuple header (23B)  │ Null bitmap  │ Column data               │
   │                     │ [1 1 0 1 1 1 │ (col1)(col2)(col4)(col5) │
   │                     │  0 1]        │ (col6)(col8)              │
-  │                     │ = 0xDB       │ cols 3,7 not stored       │
+  │                     │ = 0xBB       │ cols 3,7 not stored       │
   └─────────────────────┴──────────────┘──────────────────────────┘
 
   Size of null bitmap: ceil(num_columns / 8) bytes.
@@ -455,9 +458,11 @@ PostgreSQL NULL bitmap:
   For 20 columns: 3 bytes
   For 100 columns: 13 bytes
 
-  The bitmap is ONLY present if at least one column in the table
-  is defined as nullable. If ALL columns are NOT NULL, the bitmap
-  is omitted entirely, saving ceil(N/8) bytes per row.
+  The bitmap is decided PER TUPLE: it is present only if that row
+  actually contains at least one NULL (HEAP_HASNULL). A row with no
+  NULLs has no bitmap, regardless of how the columns are declared.
+  (The header is padded 23 → 24 bytes, so a bitmap for ≤ 8 columns
+  fits in that padding byte for free.)
 
 InnoDB NULL flags:
 
@@ -475,25 +480,23 @@ InnoDB NULL flags:
 ### Impact of NOT NULL Constraints
 
 ```
-Why NOT NULL saves space (PostgreSQL):
+NOT NULL and space (PostgreSQL):
 
-  All columns nullable (default):
-    - Null bitmap ALWAYS present: ceil(N_cols / 8) bytes per row
-    - Even if no values are actually NULL
-
-  All columns NOT NULL:
-    - Null bitmap OMITTED entirely: saves ceil(N_cols / 8) bytes per row
-    - For a table with 16 columns: saves 2 bytes per row
-    - For 100M rows: saves 200 MB
+  The constraint itself saves NO space. The bitmap depends on the
+  data, not the declaration:
+    - Row with no NULLs: no bitmap (nullable columns or not)
+    - Row with ≥ 1 NULL: bitmap covering ALL columns,
+      ceil(N_cols / 8) bytes (free for ≤ 8 cols, see above)
+    - For a table with 16 columns: a row with a NULL pays
+      2 bytes of bitmap (rounded up to the 8-byte header alignment)
 
   Mixed (some nullable, some not):
-    - Bitmap is present (includes ALL columns)
+    - Bitmap (when present) still has a bit for EVERY column
     - NOT NULL columns always have bit=1 (no saving in bitmap)
-    - But: declaring NOT NULL still skips data storage for nulls
-      and enables query optimizer optimizations
 
   Recommendation: Always declare NOT NULL when the column
-  genuinely cannot be null. It saves space and helps the optimizer.
+  genuinely cannot be null. It enforces data quality and helps
+  the optimizer -- just don't expect it to shrink rows.
 ```
 
 ---
@@ -612,7 +615,7 @@ SQL Server stores data in three allocation units:
   │ Normal data page. Row fits entirely here.       │
   └────────────────────────────────────────────────┘
 
-  ROW-OVERFLOW DATA (varchar/varbinary > 8060):
+  ROW-OVERFLOW DATA (row > 8060 with varchar/varbinary):
   ┌────────────────────────────────────────────────┐
   │ In-row: 24-byte pointer to overflow page        │
   │ Overflow page: rest of the column value         │
@@ -645,7 +648,7 @@ InnoDB Transparent Page Compression (innodb_compression):
 
   innodb_page_compression (Punch Hole, MySQL 5.7+):
   1. Fill a 16 KB page normally
-  2. Compress with LZ4 or Zstd
+  2. Compress with zlib or LZ4 (COMPRESSION='zlib'|'lz4')
   3. Write 16 KB page but "punch holes" in unused trailing space
   4. Filesystem reclaims the holed space (requires sparse file support)
   5. Buffer pool only keeps uncompressed version
@@ -671,8 +674,8 @@ DICTIONARY ENCODING:
   Dictionary:  {0: "USA", 1: "Canada", 2: "France"}
   Encoded:     [0, 0, 1, 0, 2, 1]  ← integers instead of strings
 
-  Savings: 6 strings × avg 5 bytes = 30 bytes
-         → 6 × 1 byte + 14 bytes dict = 20 bytes (33% savings)
+  Savings: 6 strings = 27 bytes (avg 4.5 bytes)
+         → 6 × 1 byte + 15 bytes dict = 21 bytes (~22% savings)
   At scale with millions of rows and few distinct values: 90%+ savings.
 
 RUN-LENGTH ENCODING (RLE):
@@ -705,7 +708,7 @@ BIT-PACKING:
 
 PREFIX COMPRESSION (for sorted string columns):
   ["apple", "application", "apply", "approach"]
-  → [("apple", 5), ("ication", 5), ("y", 4), ("roach", 3)]
+  → [("apple", 0), ("ication", 4), ("y", 4), ("roach", 3)]
      prefix_length means "share first N chars with previous"
 ```
 
@@ -729,7 +732,7 @@ PREFIX COMPRESSION (for sorted string columns):
 | Zstd | Fast (~400 MB/s) | Fast (~1.5 GB/s) | High | RocksDB, PostgreSQL 15+ (WAL), Parquet |
 | Snappy | Very fast (~500 MB/s) | Very fast (~1.5 GB/s) | Low-moderate | Google Bigtable, LevelDB |
 | zlib | Slow (~100 MB/s) | Moderate (~400 MB/s) | High | InnoDB ROW_FORMAT=COMPRESSED, older systems |
-| pglz | Moderate | Moderate | Moderate | PostgreSQL TOAST (built-in, being replaced by LZ4) |
+| pglz | Moderate | Moderate | Moderate | PostgreSQL TOAST (still the default; LZ4 optional since PG 14) |
 
 ---
 
@@ -883,12 +886,12 @@ PARQUET FILE STRUCTURE:
   │ ┌──────────────────────────────────────────────────────────┐ │
   │ │ Column Chunk: "id"                                        │ │
   │ │ ┌──────────┬──────────┬──────────┐                       │ │
-  │ │ │ Data Page│ Data Page│ Dict Page│                       │ │
-  │ │ │ 0        │ 1        │ (opt.)   │                       │ │
+  │ │ │ Dict Page│ Data Page│ Data Page│                       │ │
+  │ │ │ (opt.)   │ 0        │ 1        │                       │ │
   │ │ └──────────┴──────────┴──────────┘                       │ │
   │ │ Column Chunk: "name"                                      │ │
   │ │ ┌──────────┬──────────┬──────────┐                       │ │
-  │ │ │ Data Page│ Data Page│ Dict Page│                       │ │
+  │ │ │ Dict Page│ Data Page│ Data Page│                       │ │
   │ │ └──────────┴──────────┴──────────┘                       │ │
   │ │ Column Chunk: "age"                                       │ │
   │ │ ┌──────────┬──────────┐                                  │ │
@@ -993,9 +996,9 @@ ORC vs Parquet:
   ├──────────────────┼────────────────────┼────────────────────┤
   │ Origin           │ Cloudera + Twitter │ Hortonworks (Hive) │
   │ Row group term   │ Row Group          │ Stripe             │
-  │ Default size     │ 128 MB             │ 256 MB             │
+  │ Default size     │ 128 MB             │ 64 MB              │
   │ Index            │ Min/max per page   │ Min/max + bloom    │
-  │                  │                    │ filter per stripe  │
+  │                  │                    │ filter per 10K rows│
   │ Nested data      │ Dremel (rep/def)   │ Struct decomposition│
   │ Compression      │ Per-page           │ Per-stream         │
   │ ACID support     │ No (immutable)     │ Yes (Hive ACID)    │
@@ -1028,7 +1031,7 @@ Arrow columnar layout (in memory):
     DuckDB, Pandas, Spark, Polars, DataFusion without copying
   - Variable-length (strings): offsets array + data buffer
     offsets: [0, 5, 8, 15, 19, 23, 27]
-    data:    "AliceBobCharleDaveJohnMary"
+    data:    "AliceBobCharlieDaveJohnMary"
 ```
 
 ### DuckDB's Internal Encoding
@@ -1048,7 +1051,8 @@ DuckDB storage:
     • FOR + BitPacking: close-range integers
     • Uncompressed: if nothing helps
 
-  - Lightweight compression (LZ4/Zstd) on top of encoding
+  - Lightweight encodings only (plus FSST for strings) -- no
+    general-purpose LZ4/Zstd layer on top by default
   - Morsel-driven parallelism: each thread processes a
     row group independently, no locks needed
 
