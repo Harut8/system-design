@@ -129,7 +129,7 @@ CLRs are critical: they are **redo-only** records. If the system crashes during 
 | Aspect | PostgreSQL | InnoDB (MySQL) |
 |--------|-----------|----------------|
 | Undo storage | Old row versions stored inline in heap (dead tuples) | Separate undo log segments in undo tablespace |
-| Rollback | Mark old tuple as live, new tuple as dead | Restore from undo log segment |
+| Rollback | No tuple is touched: the XID is marked ABORTED in pg_xact, so its new tuples become invisible and its `xmax` marks are ignored | Restore from undo log segment |
 | Space reclamation | VACUUM must clean dead tuples | Purge thread reclaims undo segments |
 | Crash recovery undo | Minimal (dead tuples are just ignored) | Must replay undo log for uncommitted txns |
 
@@ -150,7 +150,8 @@ CREATE TABLE orders (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- UNIQUE constraint checked at statement end (or deferred to commit)
+-- UNIQUE constraint: PostgreSQL checks each row immediately unless the
+-- constraint is DEFERRABLE (then at statement end, or at commit if deferred)
 ALTER TABLE orders ADD CONSTRAINT uq_order_ref UNIQUE (user_id, created_at);
 ```
 
@@ -163,7 +164,9 @@ ALTER TABLE orders ADD CONSTRAINT uq_order_ref UNIQUE (user_id, created_at);
 │                                                                  │
 │  IMMEDIATE (default):                                            │
 │    Checked after each DML statement within the transaction.      │
-│    Violation → statement fails, transaction can continue.        │
+│    Violation → statement fails. PostgreSQL then aborts the       │
+│    whole txn (unless a SAVEPOINT is used); Oracle/MySQL/         │
+│    SQL Server roll back only the failed statement.               │
 │                                                                  │
 │  DEFERRED:                                                       │
 │    Checked once, at COMMIT time.                                 │
@@ -171,6 +174,7 @@ ALTER TABLE orders ADD CONSTRAINT uq_order_ref UNIQUE (user_id, created_at);
 │    Useful for circular references or bulk loads.                 │
 │                                                                  │
 │  Example:                                                        │
+│    -- only valid if fk_order_user is declared DEFERRABLE         │
 │    SET CONSTRAINTS fk_order_user DEFERRED;                       │
 │    INSERT INTO orders (user_id, ...) VALUES (999, ...);          │
 │    INSERT INTO users (id, ...) VALUES (999, ...);                │
@@ -280,7 +284,7 @@ PostgreSQL settings:
   wal_sync_method = fdatasync   (default on Linux)
   fsync = on                    (NEVER turn this off in production)
   synchronous_commit = on       (can be turned off for speed at cost of
-                                 up to wal_writer_delay ms of data loss)
+                                 up to 3 × wal_writer_delay of data loss)
 ```
 
 **Group Commit Optimization:**
@@ -439,7 +443,7 @@ COMMIT;
 
 **Note:** Non-repeatable read is about a row being *modified*; phantom read is about rows being *added or removed* from a result set. The distinction matters because they require different mechanisms to prevent: row locks vs predicate/gap locks.
 
-**Prevented by:** SERIALIZABLE (and REPEATABLE READ in InnoDB, which uses gap locks).
+**Prevented by:** SERIALIZABLE (and, in practice, REPEATABLE READ in PostgreSQL via its snapshot and in InnoDB via snapshot reads + gap locks; see 3.3).
 
 ### 2.4 Lost Update
 
@@ -666,7 +670,7 @@ INSERT INTO t2 SELECT COUNT(*) FROM t1;
 | Read Skew | Two reads of related data see inconsistent state | REPEATABLE READ / SI |
 | Serialization Anomaly | Any result impossible under serial execution | SERIALIZABLE |
 
-\* InnoDB's REPEATABLE READ uses gap locks, which also prevent phantoms in most cases.
+\* PostgreSQL's REPEATABLE READ (snapshot) and InnoDB's REPEATABLE READ (snapshot + gap locks) also prevent phantoms in most cases.
 \** Depends on the database implementation: PostgreSQL's REPEATABLE READ (SI) detects lost updates and aborts with `40001` (first-updater-wins). InnoDB's REPEATABLE READ does **not**: a plain `SELECT` reads the snapshot, the later `UPDATE` reads the *latest committed* version and silently overwrites -- the lost update happens. InnoDB only prevents it if the read is a locking read (`FOR UPDATE`) or the update is atomic (`SET x = x + 1`).
 
 ### 2.9 Beyond the Classic List
@@ -738,7 +742,7 @@ This is the **default in PostgreSQL and Oracle**.
 
 **How PostgreSQL implements READ COMMITTED:**
 
-Each SQL statement acquires a new snapshot at the start of the statement. The snapshot contains the list of all transaction IDs (XIDs) that are committed at that point. Rows with `xmin` (creating transaction) in the committed set are visible; rows with `xmax` (deleting transaction) in the committed set are invisible.
+Each SQL statement acquires a new snapshot at the start of the statement. The snapshot records the XID bounds (`xmin`, `xmax`) and the list of XIDs still *in progress* at that point; an XID counts as committed-before-the-snapshot if it is below `xmax`, not in that list, and marked committed in pg_xact. Rows whose `xmin` (creating transaction) is committed in that sense are visible; rows whose `xmax` (deleting transaction) is committed in that sense are invisible.
 
 ### 3.3 REPEATABLE READ
 
@@ -850,7 +854,7 @@ SI prevents dirty reads, non-repeatable reads, phantoms, lost updates, and read 
 | PostgreSQL | Snapshot Isolation | SSI (Snapshot + conflict detection) |
 | MySQL/InnoDB | REPEATABLE READ with gap locks | Lock-based serializability |
 | Oracle | N/A (only RC and SERIALIZABLE) | Snapshot Isolation (!) |
-| SQL Server | Lock-based RR (or SI if enabled) | Lock-based (or SI + conflict) |
+| SQL Server | Lock-based RR (SI is a separate `SNAPSHOT` level) | Lock-based (key-range locks) |
 | CockroachDB | N/A | SSI |
 
 **Important:** Oracle's "SERIALIZABLE" is actually Snapshot Isolation and does NOT prevent write skew. This is a well-known discrepancy that has been documented in academic papers.
@@ -863,7 +867,7 @@ SSI adds write-skew detection on top of Snapshot Isolation. It was first describ
 
 1. Run using Snapshot Isolation (no read locks, readers never block writers).
 2. Track rw-antidependencies: when T1 reads a row that T2 later writes (or vice versa).
-3. At commit time, check for "dangerous structures" -- cycles of two consecutive rw-antidependencies.
+3. As conflicts are detected (and again at commit), check for "dangerous structures" -- two consecutive rw-antidependency edges T1 → T2 → T3 through a "pivot" T2 (T1 may equal T3), the shape every SI cycle must contain.
 4. If found, abort one transaction.
 
 ```
@@ -890,7 +894,7 @@ SSI Tracking Structures in PostgreSQL:
   │  (from T_reader's snapshot), an edge is added.    │
   │                                                   │
   │  Dangerous structure detected when:               │
-  │    T1 → T2 → T3 and T3 committed before T1       │
+  │    T1 → T2 → T3 and T3 committed first           │
   │    (pivot: T2 has both in and out edges)           │
   └──────────────────────────────────────────────────┘
 ```
@@ -906,8 +910,8 @@ SSI typically adds 5-10% overhead compared to SI for read-heavy workloads. For w
 | PostgreSQL | READ COMMITTED | Conservative default; avoids blocking. Most web apps work fine with RC. Developers opt in to stronger isolation when needed. |
 | MySQL/InnoDB | REPEATABLE READ | Historical: InnoDB's gap locking made RR cheap. Also, MySQL's binlog-based replication required RR for STATEMENT-based replication to work correctly. |
 | Oracle | READ COMMITTED | Performance-oriented default. Oracle's undo-based MVCC makes RC very efficient. Their "SERIALIZABLE" is actually SI, reflecting a design philosophy that favors throughput. |
-| SQL Server | READ COMMITTED | Follows the SQL standard's recommendation. Offers SNAPSHOT as an opt-in alternative that doesn't block reads. |
-| CockroachDB | SERIALIZABLE | Only offers SERIALIZABLE. Designed for correctness-first in distributed systems. The cost of debugging anomalies in distributed systems is too high. |
+| SQL Server | READ COMMITTED | Cheapest useful lock-based level (note: the SQL standard's own default is SERIALIZABLE). Offers READ_COMMITTED_SNAPSHOT and SNAPSHOT as opt-in alternatives that don't block reads. |
+| CockroachDB | SERIALIZABLE | For years the only level (READ COMMITTED is available as an opt-in since v24.1). Designed for correctness-first in distributed systems. The cost of debugging anomalies in distributed systems is too high. |
 
 ### 3.8 Complete Anomaly Prevention Matrix
 
@@ -950,7 +954,7 @@ The oldest and most well-understood concurrency control protocol. It guarantees 
 │  No lock released       │                     │ No lock acquired        │
 │                                                                        │
 │  ┌───┐ ┌───┐ ┌───┐                      ┌───┐ ┌───┐ ┌───┐             │
-│  │ S │ │ X │ │ S │     LOCK              │-S │ │-X │ │-S │             │
+│  │ S │ │ X │ │ S │     LOCK              │-S │ │-S │ │-X │             │
 │  │ L1│ │ L2│ │ L3│     POINT             │ L1│ │ L3│ │ L2│             │
 │  └───┘ └───┘ └───┘                      └───┘ └───┘ └───┘             │
 │  ◄──────────────────────►◄──────────────────────────────►              │
@@ -1079,7 +1083,10 @@ Wait-For Graph:
           contention on hot rows this check itself becomes the bottleneck;
           innodb_deadlock_detect=OFF + a short innodb_lock_wait_timeout is
           the documented escape hatch.
-  Oracle: Uses a background process that periodically checks.
+  Oracle: The waiting session checks after a short (~3s) enqueue wait
+          (RAC: the LMD background process finds global deadlocks). It
+          rolls back only the victim's current STATEMENT (ORA-00060),
+          not the whole transaction.
 ```
 
 **Deadlock Prevention (alternative to detection):**
@@ -1209,7 +1216,8 @@ pg_xact structure:
 **Visibility Map:**
 
 ```
-Visibility Map (VM): one bit per heap page
+Visibility Map (VM): all-visible bit per heap page (shown below;
+                     9.6+ adds a second, all-frozen bit per page)
 ┌─────────────────────────────────────────────────────────┐
 │  Page 0: 1  (all tuples visible to all active txns)     │
 │  Page 1: 0  (has some dead/invisible tuples)            │
@@ -1233,7 +1241,8 @@ VACUUM Process:
      a. Remove index entries pointing to dead tuple
      b. Mark heap space as reusable (add to free space map)
   3. Update visibility map
-  4. Optionally freeze old tuples (set xmin to FrozenTransactionId)
+  4. Optionally freeze old tuples (9.4+: set the HEAP_XMIN_FROZEN infomask
+     bits; older releases overwrote xmin with FrozenTransactionId)
      to prevent transaction ID wraparound
 
 VACUUM FULL:
@@ -1289,7 +1298,7 @@ InnoDB Read View:
 ┌────────────────────────────────────────────────┐
 │  m_low_limit_id:  105   (next TRX_ID to be    │
 │                          assigned)             │
-│  m_up_limit_id:   100   (oldest active TRX_ID)│
+│  m_up_limit_id:   102   (oldest active TRX_ID)│
 │  m_ids:          [102, 103] (active TRX_IDs)  │
 │  m_creator_trx_id: 104  (this transaction)    │
 └────────────────────────────────────────────────┘
@@ -1846,7 +1855,7 @@ Limitation: Transactions must declare their read/write sets upfront.
 Interactive transactions (read → think → write) are difficult.
 ```
 
-**FaunaDB (now Fauna) and deterministic databases are inspired by Calvin.**
+**FaunaDB (later Fauna; the service shut down in 2025) and other deterministic databases were inspired by Calvin.**
 
 ### 6.5 Spanner: TrueTime and External Consistency
 
@@ -1941,20 +1950,24 @@ Hybrid-Logical Clock:
 PostgreSQL XID (32-bit):
   ┌──────────────────────────────────────────────────────────────┐
   │  XIDs are 32-bit unsigned integers, mod 2^32.                │
-  │  Wrap-around occurs at ~4 billion transactions.              │
+  │  Wrap-around occurs at ~4 billion transactions; comparison   │
+  │  is circular, so only ~2.1 billion (2^31) XIDs are ever      │
+  │  "in the past" -- that is the real limit on tuple age.       │
   │                                                              │
   │  "Freeze" mechanism:                                         │
-  │    Old XIDs are replaced with FrozenTransactionId (2)        │
+  │    Old tuples are marked frozen (9.4+: infomask bits; older  │
+  │    releases overwrote xmin with FrozenTransactionId = 2).    │
   │    Frozen tuples are visible to ALL transactions.            │
   │    VACUUM is responsible for freezing old tuples.            │
   │                                                              │
   │  If VACUUM falls behind → transaction ID wraparound →        │
-  │    database shuts down to prevent data corruption!           │
+  │    database refuses to assign new XIDs (no writes) until a   │
+  │    VACUUM freezes old tuples -- to prevent data corruption!  │
   │                                                              │
   │  On-disk tuple xmin/xmax are STILL 32-bit in every release.  │
   │  FullTransactionId (32-bit epoch + 32-bit xid) exists only   │
   │  in memory/some catalogs. Wraparound is a live risk: monitor │
-  │  age(datfrozenxid) and mxid_age(datminmxid) (Section 9.3).  │
+  │  age(datfrozenxid) and mxid_age(datminmxid) (Section 9.3).   │
   │  Emergency guards: PG14+ vacuum_failsafe_age (default 1.6B)  │
   │  makes VACUUM skip index cleanup to freeze faster.           │
   └──────────────────────────────────────────────────────────────┘
@@ -2069,9 +2082,11 @@ Problems caused by long-running transactions:
      Long txns on replicas hold old snapshots, preventing
      replay of newer WAL records.
 
-  5. Checkpoint Pressure
-     Long txns keep WAL segments pinned, preventing recycling.
-     WAL disk usage grows.
+  5. Log Retention (engine-specific)
+     SQL Server: an open txn blocks transaction-log truncation, so the
+     log grows. PostgreSQL: an open txn does NOT pin WAL (only
+     replication slots / wal_keep_size do), but a logical slot must keep
+     WAL back to the oldest txn still running when it decodes.
 ```
 
 **Solutions:**
@@ -2142,8 +2157,10 @@ Connection Pool Transaction Lifecycle:
   PgBouncer Transaction Pooling Mode:
     Connection is assigned for the duration of a transaction.
     Between transactions, the connection can serve different clients.
-    Limitation: No session-level state (prepared statements,
+    Limitation: No session-level state (SQL-level PREPARE,
     temp tables, SET commands) persists across transactions.
+    (Protocol-level prepared statements work since PgBouncer 1.21
+    via max_prepared_statements.)
 
   ┌─────────────────────────────────────────────────────────────┐
   │  Pooling Modes:                                             │
@@ -2793,8 +2810,9 @@ SELECT datname,
 FROM pg_database ORDER BY multixact_age DESC;
 
 -- SLRU cache health (PG13+): high blks_read = cache thrashing
+-- (PG17+ names; PG13-16 used 'MultiXactOffset', 'MultiXactMember', 'Subtrans')
 SELECT name, blks_hit, blks_read FROM pg_stat_slru
-WHERE name IN ('MultiXactOffset', 'MultiXactMember', 'Subtransaction');
+WHERE name IN ('multixact_offset', 'multixact_member', 'subtransaction');
 
 -- Who holds locks on rows of a table (needs the pgrowlocks extension)
 CREATE EXTENSION IF NOT EXISTS pgrowlocks;
@@ -2841,7 +2859,7 @@ ACCESS EXCL.  (AE) │ X   X   X   X    X   X    X   X
 | EXCLUSIVE | `REFRESH MATERIALIZED VIEW CONCURRENTLY` | No | **Yes** |
 | ACCESS EXCLUSIVE | `DROP`, `TRUNCATE`, `VACUUM FULL`, `CLUSTER`, `REINDEX` (non-concurrent), `REFRESH MATERIALIZED VIEW`, most `ALTER TABLE` (`ADD COLUMN`, `ALTER TYPE`, `SET NOT NULL`...), `LOCK TABLE` (default) | **Yes** | **Yes** |
 
-Rule of thumb: **only ACCESS EXCLUSIVE blocks readers.** Everything with "SHARE" in its name from SHARE upward blocks writers.
+Rule of thumb: **only ACCESS EXCLUSIVE blocks readers.** Everything from SHARE upward (SHARE, SHARE ROW EXCLUSIVE, EXCLUSIVE, ACCESS EXCLUSIVE) blocks writers.
 
 ### 9.5 The Lock Queue Pile-Up (How a 1 ms ALTER TABLE Causes an Outage)
 
@@ -3217,7 +3235,7 @@ Also costly: a row locked or updated in a subtransaction after the parent locked
 
 - Don't put `EXCEPTION` blocks inside loops that write; validate first, or handle errors outside the loop.
 - Avoid driver modes that wrap every statement in a savepoint in high-throughput paths.
-- Diagnose with `SELECT * FROM pg_stat_get_backend_subxact(<backend_id>)` (PG16+: `subxact_count`, `subxact_overflowed`) and `pg_stat_slru` (`name = 'Subtransaction'`). PG17 adds `subtransaction_buffers` to enlarge the cache.
+- Diagnose with `SELECT * FROM pg_stat_get_backend_subxact(<backend_id>)` (PG16+: `subxact_count`, `subxact_overflowed`) and `pg_stat_slru` (`name = 'subtransaction'` on PG17+, `'Subtrans'` before). PG17 adds `subtransaction_buffers` to enlarge the cache.
 
 ---
 
@@ -3315,8 +3333,8 @@ ORDER BY blocked_duration DESC;
 -- PostgreSQL: table bloat estimate
 SELECT
     schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)) AS total_size,
+    relname,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
     n_dead_tup,
     n_live_tup,
     ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
