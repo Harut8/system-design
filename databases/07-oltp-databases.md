@@ -447,9 +447,12 @@ Flow:
   2. Subsequent accesses: hint bits set
      --> Skip CLOG lookup entirely (fast path)
 
-Side effect: Read-only queries can dirty pages (by setting hint bits).
-This is why PostgreSQL generates WAL even for SELECT-heavy workloads.
-(Mitigated by enabling data checksums, which batches hint bit WAL writes.)
+Side effect: read-only queries can dirty pages by setting hint bits.
+Without data checksums, this writes no WAL; the dirty page is just flushed later.
+With data checksums (the default for new clusters since PostgreSQL 18) or
+wal_log_hints = on, the first hint-bit change to a page after each checkpoint
+writes a full-page image to WAL. So SELECT-heavy workloads can generate
+significant WAL right after a checkpoint or a bulk load.
 ```
 
 ### Vacuum
