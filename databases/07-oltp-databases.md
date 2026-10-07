@@ -157,7 +157,7 @@ PostgreSQL Process Architecture
               | CLOG buffers  |  | - Checkpointer |
               | Lock tables   |  | - Bgwriter     |
               | Proc array    |  | - Autovacuum   |
-              +---------------+  | - Stats coll.  |
+              +---------------+  | - WAL senders  |
                                  | - Archiver     |
                                  +-----------------+
 ```
@@ -172,7 +172,7 @@ PostgreSQL Process Architecture
 | **Checkpointer** | Writes dirty pages to disk, creates checkpoint records in WAL |
 | **Background Writer** | Evicts dirty pages from shared_buffers to reduce checkpoint spikes |
 | **Autovacuum Launcher** | Spawns autovacuum workers to clean dead tuples |
-| **Stats Collector** | Aggregates table/index usage statistics for the planner |
+| **Stats Collector** | Aggregated table/index activity counters (`pg_stat_*`, used by autovacuum; planner statistics come from `ANALYZE`). Removed in PostgreSQL 15: backends now write these counters to shared memory |
 | **Archiver** | Copies completed WAL segments to archive storage |
 | **Logical Replication Worker** | Applies logical changes from publisher to subscriber |
 
@@ -333,13 +333,13 @@ After UPDATE of Tuple 2 (no indexed column changed):
 +------+------+------+------+------+--------+--------+--------+--------+
 |Header| LP 1 | LP 2 | LP 3 | LP 4 |Tuple 2'|Tuple 3 |Tuple 2 |Tuple 1 |
 +------+------+------+------+------+--------+--------+--------+--------+
-                 |                     ^
-                 | LP 2 now points to  |
-                 +--- LP 4 (redirect) -+
 
   - Old Tuple 2: t_ctid points to (same_page, LP 4)
   - New Tuple 2': stored on same page, no index entry needed
-  - Index still points to LP 2, which redirects to LP 4
+  - Index still points to LP 2; lookups follow the HOT chain
+    LP 2 -> Tuple 2 --t_ctid--> LP 4 -> Tuple 2'
+  - Later pruning removes old Tuple 2 and turns LP 2 into a
+    redirect to LP 4
   - Massive performance win: avoids index bloat
 ```
 
@@ -368,7 +368,7 @@ PostgreSQL implements MVCC (Multi-Version Concurrency Control) by keeping old ro
 | `t_xmax` | 4B | Transaction ID that **deleted/updated** this tuple (0 if live) |
 | `t_cid` | 4B | Command ID within the transaction (for statement-level visibility) |
 | `t_ctid` | 6B | Tuple ID of the **next version** (points to self if latest) |
-| `t_infomask` | 2B | Status bits: committed, aborted, locked, HOT, etc. |
+| `t_infomask` | 2B | Status bits: committed, aborted, locked, etc. (the HOT flags live in `t_infomask2`) |
 
 #### Visibility Rules
 
@@ -378,9 +378,9 @@ A tuple is visible to a transaction's snapshot if:
 VISIBILITY DECISION TREE
 ==========================
 
-Is t_xmin committed?
+Is t_xmin committed BEFORE our snapshot was taken?
   |
-  +-- NO (xmin aborted or still in progress) --> INVISIBLE
+  +-- NO (xmin aborted, in progress, or committed later) --> INVISIBLE
   |
   +-- YES --> Is t_xmax set (non-zero)?
                 |
@@ -489,7 +489,8 @@ After VACUUM:
               (reusable by        (reusable by
                future INSERTs)     future INSERTs)
 
-Note: Pages are NOT returned to the OS. Table file size does not shrink.
+Note: Freed space is NOT returned to the OS; the table file does not shrink,
+      except that VACUUM can truncate empty pages at the very end of the table.
 ```
 
 #### Regular VACUUM vs VACUUM FULL
@@ -559,15 +560,17 @@ Problem: If a tuple has xmin = 100 and we reach xid = 2,147,483,748,
          Data effectively vanishes.
 
 Solution: FREEZE old tuples
-  - Replace xmin with FrozenTransactionId (= 2)
+  - Mark xmin as frozen (HEAP_XMIN_FROZEN infomask bits since 9.4;
+    older releases overwrote xmin with FrozenTransactionId = 2)
   - Frozen tuples are ALWAYS visible (special-cased)
-  - Autovacuum triggers anti-wraparound when oldest unfrozen xid
-    approaches the danger zone (default: 200 million xids from wrap)
+  - Autovacuum forces an anti-wraparound vacuum when a table's oldest
+    unfrozen xid is older than autovacuum_freeze_max_age (default:
+    200 million xids old -- far ahead of the ~2 billion wrap point)
 ```
 
-**Warning**: If autovacuum cannot keep up (e.g., long-running transactions hold back the horizon, or vacuum is blocked), PostgreSQL will eventually **shut down** to prevent data loss, refusing all new transactions with:
+**Warning**: If autovacuum cannot keep up (e.g., long-running transactions hold back the horizon, or vacuum is blocked), PostgreSQL will eventually **stop assigning new transaction IDs** to prevent data loss (read-only queries still run, but every write fails) with:
 ```
-ERROR: database is not accepting commands to avoid wraparound data loss
+ERROR: database is not accepting commands that assign new transaction IDs to avoid wraparound data loss in database "..."
 ```
 
 ### Query Processing Pipeline
@@ -640,7 +643,7 @@ WHERE o.created_at > '2025-01-01';
 --            (actual time=0.5..3.2 rows=1150 loops=1)
 --   Hash Cond: (o.customer_id = c.id)
 --   Buffers: shared hit=89
---   ->  Bitmap Heap Scan on orders o  (cost=12.00..267.00 rows=1200 width=12)
+--   ->  Seq Scan on orders o  (cost=0.00..267.00 rows=1200 width=12)
 --         Filter: (created_at > '2025-01-01')
 --         Buffers: shared hit=45
 --   ->  Hash  (cost=22.00..22.00 rows=800 width=28)
@@ -705,7 +708,7 @@ Key differences from physical:
 | Mode | Behavior | Trade-off |
 |---|---|---|
 | **Async** (default) | Primary commits immediately; replica may lag | Fast writes, potential data loss on failover |
-| **Sync** (`synchronous_commit = on`) | Primary waits for replica to write WAL to disk | No data loss, higher write latency |
+| **Sync** (`synchronous_standby_names` set, `synchronous_commit = on`) | Primary waits for replica to write WAL to disk | No data loss, higher write latency |
 | **Remote write** (`synchronous_commit = remote_write`) | Primary waits for replica to receive WAL (not fsync) | Compromise: lower latency than sync, better than async |
 | **Remote apply** (`synchronous_commit = remote_apply`) | Primary waits for replica to replay WAL | Read-your-writes on replica, highest latency |
 
@@ -810,7 +813,7 @@ Key difference from PostgreSQL:
   - PostgreSQL: Separate OS processes, shared via mmap/shmem
 
 Thread model advantages:
-  + Lower overhead per connection (~256KB stack vs ~10MB per process)
+  + Lower overhead per connection (~1MB thread_stack vs ~10MB per process)
   + Faster context switching
   + Shared memory without IPC complexity
 
@@ -947,7 +950,7 @@ InnoDB 16KB Page Layout
 
 | Type | Description |
 |---|---|
-| **System tablespace** (`ibdata1`) | Shared; contains undo logs (older versions), change buffer, doublewrite buffer |
+| **System tablespace** (`ibdata1`) | Shared; contains change buffer, plus undo logs and the doublewrite buffer in older versions (doublewrite moved to separate `#ib_*.dblwr` files in 8.0.20) |
 | **File-per-table** (default since 5.6) | Each table gets its own `.ibd` file; easier management, `OPTIMIZE TABLE` reclaims space |
 | **General tablespace** | User-created shared tablespace; group related tables together |
 | **Undo tablespace** (since 8.0) | Dedicated files for undo logs; can be truncated to reclaim space |
@@ -981,6 +984,9 @@ Only works for:
 
 Benefit: Reduces random I/O dramatically for write-heavy workloads
          with many secondary indexes.
+
+Note: Disabled by default since MySQL 8.4 (innodb_change_buffering
+      = none); on SSDs the saved reads rarely pay for the merge cost.
 ```
 
 ### InnoDB MVCC
@@ -1032,11 +1038,11 @@ Read View Contents
   m_ids            = list of active (uncommitted) xids
   m_creator_trx_id = xid of the transaction that created this view
 
-Visibility rule for a row with trx_id T:
+Visibility rule for a row with trx_id T (checked in this order):
+  if T == m_creator_trx_id    --> VISIBLE (our own changes)
   if T < m_up_limit_id        --> VISIBLE (committed before snapshot)
   if T >= m_low_limit_id      --> INVISIBLE (started after snapshot)
   if T in m_ids               --> INVISIBLE (was active at snapshot)
-  if T == m_creator_trx_id    --> VISIBLE (our own changes)
   else                        --> VISIBLE (committed, not in active list)
 ```
 
@@ -1091,12 +1097,15 @@ Key parameters:
   innodb_log_files_in_group = 2    -- number of redo log files
   innodb_flush_log_at_trx_commit:
     = 1  (default) -- fsync on every commit (ACID-safe)
-    = 0  -- flush to OS cache every second (fast, data loss risk)
+    = 0  -- nothing at commit; write + fsync once per second (fast, data loss risk)
     = 2  -- write to OS cache on commit, fsync every second
 
 Since MySQL 8.0.30: redo log is dynamically sized, replacing
 the fixed ib_logfile0/ib_logfile1 approach with #innodb_redo/
-directory containing numbered files.
+directory containing numbered files. Its total size is set by
+innodb_redo_log_capacity (default 100MB, resizable online), which
+supersedes the deprecated innodb_log_file_size and
+innodb_log_files_in_group above.
 ```
 
 #### Doublewrite Buffer
@@ -1212,8 +1221,8 @@ InnoDB Cluster = Group Replication + MySQL Router + MySQL Shell
 | Mode | Source behavior | Data safety |
 |---|---|---|
 | **Async** (default) | Commits immediately, sends binlog async | Potential data loss on crash |
-| **Semi-sync** | Waits for at least 1 replica to acknowledge receiving the event | At most 1 transaction lost on crash |
-| **Semi-sync (after_sync)** | Waits before committing to storage engine | No phantom reads on failover |
+| **Semi-sync (after_commit)** | Commits in the storage engine, then waits for at least 1 replica to acknowledge receiving the event | Transactions committed but not yet acknowledged can be lost on failover, after other sessions already saw them |
+| **Semi-sync (after_sync)** (default since 5.7.2) | Waits for the acknowledgment before committing to storage engine | No phantom reads on failover |
 
 ### MySQL Release Model and the End of 8.0 (2025–2026)
 
@@ -1312,7 +1321,8 @@ Flashback Features (built on undo + redo):
 
 ORA-01555 "Snapshot Too Old":
   - Occurs when undo needed for consistent read has been overwritten
-  - Equivalent to PostgreSQL's "snapshot too old" or serialization failure
+  - PostgreSQL had a similar "snapshot too old" error (old_snapshot_threshold,
+    removed in PostgreSQL 17); it keeps old versions in the heap instead
   - Fix: increase undo_retention and undo tablespace size
 ```
 
@@ -1620,7 +1630,7 @@ Durability options:
 Limitations:
   - Max 2TB per database (memory-bound)
   - Not all T-SQL features supported
-  - LOB types not supported (until SQL Server 2019+)
+  - LOB types not supported (until SQL Server 2016)
   - Foreign keys across memory-optimized and disk-based not supported
 ```
 
@@ -1824,7 +1834,7 @@ TrueTime enables:
 | **Time Model** | HLC + uncertainty | Hybrid Time | TSO (centralized) | TrueTime (GPS+atomic) |
 | **Consistency** | Serializable (default) | Snapshot (YCQL), Serializable (YSQL) | Snapshot Isolation | External consistency |
 | **HTAP Support** | No | No | TiFlash (columnar) | No |
-| **License** | BSL (source-available) | Apache 2.0 (core) | Apache 2.0 | Proprietary (Cloud) |
+| **License** | Proprietary, free tier (CockroachDB Software License since v24.3; BSL before) | Apache 2.0 (core) | Apache 2.0 | Proprietary (Cloud) |
 | **Deployment** | Self-hosted, Cloud | Self-hosted, Cloud | Self-hosted, Cloud | Google Cloud only |
 
 ---
@@ -1885,7 +1895,7 @@ Key characteristics:
 |---|---|---|---|
 | **DELETE journal** (default) | Multiple, blocked during write | One, exclusive lock | Simple single-user apps |
 | **WAL mode** | Multiple, concurrent with writer | One, but does not block readers | Web apps, multi-threaded apps |
-| **WAL2 mode** (experimental) | Multiple | Two concurrent writers | Higher write throughput |
+| **WAL2 mode** (experimental branch) | Multiple, concurrent with writer | One; alternates between two WAL files so the WAL can be checkpointed and reset while readers are active | Write-heavy apps whose WAL keeps growing |
 
 ```sql
 -- Enable WAL mode (persistent, per-database):
@@ -1895,7 +1905,7 @@ PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;       -- fsync only on checkpoint, not every commit
 PRAGMA cache_size=-64000;        -- 64MB page cache
 PRAGMA mmap_size=268435456;      -- 256MB memory-mapped I/O
-PRAGMA journal_size_limit=67108864; -- 64MB WAL size before auto-checkpoint
+PRAGMA journal_size_limit=67108864; -- truncate WAL file back to 64MB after checkpoints
 ```
 
 ### DuckDB (Embedded OLAP -- Contrast)
@@ -1995,7 +2005,7 @@ Trade-offs vs RocksDB:
   + Simpler, no background compaction
   + Consistent read performance (no compaction stalls)
   + Strong isolation (serializable)
-  - Slower writes (in-place B+tree vs append-only LSM)
+  - Slower writes (random B+tree page writes vs append-only LSM)
   - Write amplification from copy-on-write
   - No compression
 ```
@@ -2006,7 +2016,7 @@ Trade-offs vs RocksDB:
 
 ### Connection Pooling
 
-Database connections are expensive: PostgreSQL forks a process (~10MB RSS), MySQL creates a thread (~256KB stack + connection buffers). Without pooling, a 10,000-connection web tier crushes the database.
+Database connections are expensive: PostgreSQL forks a process (~10MB RSS), MySQL creates a thread (~1MB stack + connection buffers). Without pooling, a 10,000-connection web tier crushes the database.
 
 ```
 Connection Pooling Architecture
@@ -2032,7 +2042,7 @@ With pooling (e.g., PgBouncer):
 | Mode | Behavior | Trade-off |
 |---|---|---|
 | **Session** | Client gets a dedicated server connection for the session | Safest, least savings |
-| **Transaction** | Client gets a connection only during a transaction | Best balance; cannot use session-level features (LISTEN, prepared stmts with named handles) |
+| **Transaction** | Client gets a connection only during a transaction | Best balance; cannot use session-level features (LISTEN, session `SET`, advisory locks; protocol-level named prepared statements need PgBouncer 1.21+ with `max_prepared_statements`) |
 | **Statement** | Connection returned after every statement | Maximum sharing; no multi-statement transactions |
 
 #### ProxySQL (MySQL)
@@ -2137,17 +2147,13 @@ SELECT
   blocking.query    AS blocking_query,
   blocking.state    AS blocking_state
 FROM pg_stat_activity blocked
-JOIN pg_locks bl ON bl.pid = blocked.pid AND NOT bl.granted
-JOIN pg_locks gl ON gl.locktype = bl.locktype
-  AND gl.database IS NOT DISTINCT FROM bl.database
-  AND gl.relation IS NOT DISTINCT FROM bl.relation
-  AND gl.page IS NOT DISTINCT FROM bl.page
-  AND gl.tuple IS NOT DISTINCT FROM bl.tuple
-  AND gl.pid != bl.pid
-  AND gl.granted
-JOIN pg_stat_activity blocking ON blocking.pid = gl.pid;
+JOIN pg_stat_activity blocking
+  ON blocking.pid = ANY (pg_blocking_pids(blocked.pid));
+-- pg_blocking_pids() (9.6+) also covers row-lock waits, which are
+-- waits on the other transaction's transactionid lock
 
--- MySQL: Find InnoDB lock waits
+-- MySQL 8.0+: Find InnoDB lock waits
+-- (information_schema.innodb_lock_waits was removed in 8.0)
 SELECT
   r.trx_id              AS waiting_trx_id,
   r.trx_mysql_thread_id AS waiting_thread,
@@ -2155,9 +2161,9 @@ SELECT
   b.trx_id              AS blocking_trx_id,
   b.trx_mysql_thread_id AS blocking_thread,
   b.trx_query           AS blocking_query
-FROM information_schema.innodb_lock_waits w
-JOIN information_schema.innodb_trx b ON b.trx_id = w.blocking_trx_id
-JOIN information_schema.innodb_trx r ON r.trx_id = w.requesting_trx_id;
+FROM performance_schema.data_lock_waits w
+JOIN information_schema.innodb_trx b ON b.trx_id = w.BLOCKING_ENGINE_TRANSACTION_ID
+JOIN information_schema.innodb_trx r ON r.trx_id = w.REQUESTING_ENGINE_TRANSACTION_ID;
 ```
 
 ### Monitoring
@@ -2171,7 +2177,8 @@ PostgreSQL:
   pg_stat_user_tables    -- Table-level stats (seq scans, idx scans, dead tuples)
   pg_stat_user_indexes   -- Index usage (scans, tuples read/fetched)
   pg_stat_activity       -- Current queries, wait events, state
-  pg_stat_bgwriter       -- Checkpoint and background writer stats
+  pg_stat_bgwriter       -- Background writer stats
+  pg_stat_checkpointer   -- Checkpoint stats (PG 17+; were in pg_stat_bgwriter)
   pg_stat_replication    -- Replication lag, WAL send/write/flush/replay
 
 MySQL:
@@ -2195,10 +2202,10 @@ MySQL:
 | **Lock contention** | High wait times, deadlocks | Shorter transactions, optimistic locking, advisory locks |
 | **Sequential scans** | High `seq_scan` count, slow queries | Add appropriate indexes, fix missing WHERE clauses |
 | **Bloated tables** | Table size >> data size | Tune autovacuum, run VACUUM FULL during maintenance window |
-| **Checkpoint spikes** | I/O spikes every `checkpoint_timeout` | Increase `checkpoint_completion_target` (0.9), spread writes |
+| **Checkpoint spikes** | I/O spikes every `checkpoint_timeout` | Raise `max_wal_size` so checkpoints are time-driven; keep `checkpoint_completion_target` = 0.9 (the default since PG 14) to spread writes |
 | **WAL write bottleneck** | High `WALWrite` wait events | Faster disk for pg_wal, `synchronous_commit = off` for non-critical |
 | **Replication lag** | Read replicas return stale data | Add replicas, parallel apply, check slow queries on replica |
-| **TempDB contention** (SQL Server) | PFS/GAM/SGAM page latch waits | Multiple TempDB files, TF 1118 |
+| **TempDB contention** (SQL Server) | PFS/GAM/SGAM page latch waits | Multiple TempDB files (TF 1118 only before SQL Server 2016; its behavior is the TempDB default since) |
 
 ---
 
@@ -2454,7 +2461,7 @@ Multi-layer pooling for massive scale:
 | **Process model** | Process-per-connection | Thread-per-connection |
 | **Table storage** | Heap (unordered) | Clustered index (PK-ordered B+tree) |
 | **MVCC old versions** | In heap (same table) | In undo log (separate) |
-| **Cleanup mechanism** | VACUUM (explicit) | Purge thread (automatic) |
+| **Cleanup mechanism** | VACUUM (run by autovacuum or manually) | Purge thread (automatic) |
 | **Page size** | 8KB (compile-time) | 16KB (configurable) |
 | **Secondary index leaf** | Points to heap TID (ctid) | Stores primary key value |
 | **Replication log** | WAL (physical) or logical decoding | Binary log (logical) + redo log (physical) |
@@ -2480,9 +2487,9 @@ PostgreSQL (postgresql.conf):
 
 MySQL (my.cnf):
   innodb_buffer_pool_size  = 70-80% of RAM
-  innodb_log_file_size     = 1-2GB
+  innodb_redo_log_capacity = 2-4GB (8.0.30+; replaces innodb_log_file_size)
   innodb_flush_log_at_trx_commit = 1 (ACID) or 2 (performance)
-  innodb_flush_method      = O_DIRECT (Linux)
+  innodb_flush_method      = O_DIRECT (Linux; the default since 8.4)
   innodb_io_capacity       = 2000 (SSD) or 200 (HDD)
   innodb_io_capacity_max   = 4000 (SSD) or 400 (HDD)
   max_connections          = 151 (use ProxySQL for more)
