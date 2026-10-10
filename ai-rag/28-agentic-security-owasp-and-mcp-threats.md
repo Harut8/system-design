@@ -274,7 +274,7 @@ stable across editions.**
 > `notes` argument". Your agent obeys, because to the model, the description is part of its
 > instructions.
 
-Protocol mechanics (transports, `initialize`, `tools/list`, sampling, elicitation) are in
+Protocol mechanics (transports, `server/discover`, `tools/list`, MRTR, elicitation) are in
 [`26-mcp-and-agent-protocols.md`](26-mcp-and-agent-protocols.md). This section covers only the
 security consequences.
 
@@ -287,9 +287,8 @@ is "explicitly forbidden" per the Security Best Practices document. From the `20
 clients **MUST** consider tool annotations untrusted unless they come from trusted servers; and
 servers can send `notifications/tools/list_changed`. The authorization page links to the sections
 *Confused Deputy Problem*, *Token Passthrough* and *Scope Minimization* of the Security Best
-Practices page. **That page itself could not be fetched** (the raw source path was not found and
-`modelcontextprotocol.io` was unreachable from the authoring environment), so its descriptions
-below are paraphrased from secondary summaries; read the current revision for normative wording.
+Practices page. The descriptions below are paraphrased; read the current revision of that page for normative
+wording.
 
 ### 3.1 Tool poisoning via descriptions
 
@@ -433,7 +432,7 @@ the gateway for anything holding credentials.
 
 ### 3.8 Other server-initiated channels
 
-Servers can also initiate *sampling* (asking the client's model for a completion) and *elicitation* (asking the user). Both are channels to steer the model or the user: require explicit consent, show the full prompt, never allow credential prompts (details per revision in chapter 26).
+Servers can also ask the client for *sampling* (a completion from the client's model) and *elicitation* (input from the user). Up to 2025-11-25 these were server-initiated requests. In 2026-07-28 they arrive as an `input_required` result under the Multi Round-Trip Requests pattern, and Sampling is deprecated. The transport changed but the risk did not: both are channels to steer the model or the user. Require explicit consent, show the full prompt, and never allow credential prompts (chapter 26 §4).
 
 ---
 
@@ -519,6 +518,8 @@ Chapter 25 covers memory architecture; here is the security view.
 Every memory record carries, at minimum:
 
 ```python
+from dataclasses import dataclass
+
 @dataclass(frozen=True)
 class MemoryRecord:
     id: str
@@ -935,7 +936,7 @@ def minimal_cuts(tools):
 ts = [ToolCaps("read_inbox", True, True, False), ToolCaps("search_crm", True),
       ToolCaps("send_email", exfil_channel=True)]
 trifecta(ts)        # True; legs(ts) -> A: read_inbox, search_crm; B: read_inbox; C: send_email
-minimal_cuts(ts)    # [read_inbox, send_email]
+minimal_cuts(ts)    # [{'read_inbox'}, {'send_email'}]: removing either one breaks it
 trifecta(ts[:2])    # False (no channel)
 ```
 

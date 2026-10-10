@@ -75,12 +75,23 @@ keeps every claim honest by construction.
 | `11-token-accounting-and-cost.md` | Per-request/tenant/model attribution, budget enforcement, unit economics | planned |
 | `12-serving-latency-and-caching.md` | Streaming, prompt caching, batching, model routing, fallback, timeouts | planned |
 | `13-agents-and-tool-calling.md` | Tool schemas, multi-hop retrieval, planning, idempotency, failure handling | planned |
-| `14-agent-evaluation.md` | Trajectory eval, task success, tool-call correctness, cost per resolved task | planned |
+| [`14-agent-evaluation.md`](14-agent-evaluation.md) | Trajectory and environment-state grading, pass^k reliability, harness vs model, public benchmark map (τ²-bench, Terminal-Bench, SWE-bench, GAIA, BrowseComp, OSWorld, BFCL), online eval | **written** |
 | `15-ingestion-pipelines-and-freshness.md` | Parsing at volume, dedup, incremental index updates, backfill, staleness SLOs | planned |
 | `16-multi-tenancy-and-isolation.md` | Per-tenant indexes, noisy neighbours, quota, data isolation | planned |
 | [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md) | Injection defence, output filtering, PII, tool-call authorization | **written** — labs unrun |
 | `18-failure-modes-and-incident-walkthrough.md` | End-to-end: a retrieval regression found, diagnosed, fixed | planned |
 | `19-build-vs-buy.md` | Langfuse / LangSmith / Braintrust / Arize / Helicone landscape and when to build | planned |
+| [`20-langchain-architecture-and-internals.md`](20-langchain-architecture-and-internals.md) | Runnable protocol, LCEL, retrievers, tools, callbacks, package split, lock-in criticism | **written** |
+| [`21-langgraph-deep-dive.md`](21-langgraph-deep-dive.md) | StateGraph, reducers, checkpointing, interrupts, streaming, subgraphs, LangGraph vs Temporal | **written** |
+| [`22-agent-orchestration-patterns.md`](22-agent-orchestration-patterns.md) | Workflows vs agents, ReAct / Plan-and-Execute / Reflexion / LATS, multi-agent topologies, failure handling | **written** |
+| [`23-multi-llm-model-gateway.md`](23-multi-llm-model-gateway.md) | Provider abstraction, routing, fallback, quotas, cost attribution, gateway caching | **written** |
+| [`24-tool-calling-and-enterprise-integration.md`](24-tool-calling-and-enterprise-integration.md) | Tool protocol, registries, authz, idempotency, long-running tools, enterprise wrappers | **written** |
+| [`25-memory-and-state-management.md`](25-memory-and-state-management.md) | History, agent state, long-term memory, multi-tenant memory, GDPR deletion | **written** |
+| [`26-mcp-and-agent-protocols.md`](26-mcp-and-agent-protocols.md) | MCP in production: primitives, spec revisions through 2026-07-28, transports and scaling, OAuth authorization, registry and gateway | **written** |
+| [`27-a2a-and-agent-interoperability.md`](27-a2a-and-agent-interoperability.md) | A2A (Agent Cards, task lifecycle, streaming, push), MCP vs A2A vs AGENTS.md, engineering a remote-agent boundary | **written** |
+| [`28-agentic-security-owasp-and-mcp-threats.md`](28-agentic-security-owasp-and-mcp-threats.md) | OWASP Top 10 for Agentic Applications (ASI01–10), MCP tool poisoning / rug-pull / confused deputy, memory poisoning, sandboxing | **written** |
+| [`29-agent-identity-and-delegated-authorization.md`](29-agent-identity-and-delegated-authorization.md) | Agent as principal, token exchange and `act` chains, down-scoping, DPoP, CIBA, workload identity, PEP/PDP, audit | **written** |
+| [`30-context-engineering-for-agents.md`](30-context-engineering-for-agents.md) | Tool search, writing tools for agents, code execution over tools, sub-agents, Agent Skills, compaction, cache-aware loops | **written** |
 | `appendix-a-glossary.md` | | planned |
 | `appendix-b-metric-definitions.md` | Every eval and cost metric, with its exact formula | planned |
 | `appendix-c-eval-recipe-book.md` | Copy-pasteable eval setups | planned |
@@ -95,6 +106,8 @@ probabilities instead of text. They are not a separate chapter. They are covered
 useful: guardrail classifier tier and tool-call risk scoring in `17` §7.6, first judge tier in
 eval cascades in `08` §11.8, boundary detection and metadata tagging at ingest in `02` §6.5.2,
 and relevance filtering after the reranker in `04` §8.3.
+
+**Agentic protocol and runtime layer (2026-10).** MCP (`26`), A2A and interop (`27`), agentic security per the OWASP agentic Top 10 (`28`), agent identity (`29`), context engineering for agent loops (`30`), and agent evaluation (`14`).
 
 **2026 additions.** Defense by design against prompt injection (adaptive attacks, the Agents Rule
 of Two, the six agent design patterns, CaMeL-style capabilities) in `17` §4.7; agentic search vs

@@ -1080,7 +1080,7 @@ Fetched in this session (primary):
 - A2A releases (v1.0.0, v1.0.1, v0.3.0 notes): https://github.com/a2aproject/A2A/releases
 - A2A specification text (v1.0, raw): https://raw.githubusercontent.com/a2aproject/A2A/main/docs/specification.md
 - A2A proto (normative data model): https://raw.githubusercontent.com/a2aproject/A2A/main/specification/a2a.proto
-- Published spec site (not reachable from my environment; same content): https://a2a-protocol.org/latest/specification/
+- Published spec site: https://a2a-protocol.org/latest/specification/
 - AG-UI repository: https://github.com/ag-ui-protocol/ag-ui
 - AGENTS.md repository: https://github.com/agentsmd/agents.md
 
