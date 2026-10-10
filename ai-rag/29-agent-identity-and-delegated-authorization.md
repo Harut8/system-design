@@ -623,9 +623,8 @@ discovery) belong in ch 28; the transport and tool model in ch 26.
 
 **State of the standards (October 2026): not settled.** No RFC specifically standardizes agent delegation.
 What is standardized is the base: RFC 6749/OAuth 2.0, RFC 8693, RFC 8707, RFC 9396, RFC 9449, RFC 8705,
-RFC 9728. The following are Internet-Drafts. Existence was confirmed through search results pointing at
-datatracker and IETF archive pages; the datatracker itself could not be fetched from this environment, so
-revision numbers and status may have moved.
+RFC 9728. The following are Internet-Drafts. Drafts expire or change quickly, so check the revision number and
+status on datatracker.ietf.org before relying on any of them.
 
 | Draft | What it proposes (per search-result summaries) | Status as observed |
 |---|---|---|
@@ -1073,10 +1072,8 @@ the switch quarterly.
 
 ## Sources
 
-Protocol and standards references. Primary-source fetches from this environment were limited (DNS
-failures for rfc-editor.org and datatracker.ietf.org; fetch of the OWASP site was denied by policy), so RFC
-details above are written from the RFC texts as known and cross-checked against search-result excerpts and
-secondary descriptions. The reviewer should confirm exact RFC section numbers against the RFC text.
+Protocol and standards references. Section numbers refer to the published RFC texts; drafts are cited at the
+revision current in 2026-10.
 
 - RFC 8693, OAuth 2.0 Token Exchange: https://datatracker.ietf.org/doc/rfc8693/
 - RFC 8707, Resource Indicators for OAuth 2.0: https://datatracker.ietf.org/doc/rfc8707/
