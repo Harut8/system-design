@@ -81,6 +81,14 @@ keeps every claim honest by construction.
 | [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md) | Injection defence, output filtering, PII, tool-call authorization | **written** — labs unrun |
 | `18-failure-modes-and-incident-walkthrough.md` | End-to-end: a retrieval regression found, diagnosed, fixed | planned |
 | `19-build-vs-buy.md` | Langfuse / LangSmith / Braintrust / Arize / Helicone landscape and when to build | planned |
+| [`20-langchain-architecture-and-internals.md`](20-langchain-architecture-and-internals.md) | Runnable protocol, LCEL, retrievers, tools, callbacks, package split, lock-in criticism | **written** |
+| [`21-langgraph-deep-dive.md`](21-langgraph-deep-dive.md) | StateGraph, reducers, checkpointing, interrupts, streaming, subgraphs, LangGraph vs Temporal | **written** |
+| [`22-agent-orchestration-patterns.md`](22-agent-orchestration-patterns.md) | Workflows vs agents, ReAct / Plan-and-Execute / Reflexion / LATS, multi-agent topologies, failure handling | **written** |
+| [`23-multi-llm-model-gateway.md`](23-multi-llm-model-gateway.md) | Provider abstraction, routing, fallback, quotas, cost attribution, gateway caching | **written** |
+| [`24-tool-calling-and-enterprise-integration.md`](24-tool-calling-and-enterprise-integration.md) | Tool protocol, registries, authz, idempotency, long-running tools, enterprise wrappers | **written** |
+| [`25-memory-and-state-management.md`](25-memory-and-state-management.md) | History, agent state, long-term memory, multi-tenant memory, GDPR deletion | **written** |
+| `26-mcp-and-agent-protocols.md` | MCP (2026-07-28 stateless core, Tasks, OAuth), A2A, AGENTS.md, MCP gateways | planned — see [`GAPS-2026.md`](GAPS-2026.md) §1–2 |
+| `27-agent-runtime-and-sandboxing.md` | Harnesses, sandbox isolation tiers, long-running sessions, agent SDKs | planned — see [`GAPS-2026.md`](GAPS-2026.md) §6 |
 | `appendix-a-glossary.md` | | planned |
 | `appendix-b-metric-definitions.md` | Every eval and cost metric, with its exact formula | planned |
 | `appendix-c-eval-recipe-book.md` | Copy-pasteable eval setups | planned |
@@ -95,6 +103,8 @@ probabilities instead of text. They are not a separate chapter. They are covered
 useful: guardrail classifier tier and tool-call risk scoring in `17` §7.6, first judge tier in
 eval cascades in `08` §11.8, boundary detection and metadata tagging at ingest in `02` §6.5.2,
 and relevance filtering after the reranker in `04` §8.3.
+
+**Gap audit (2026-10).** [`GAPS-2026.md`](GAPS-2026.md) lists what the agent chapters miss against the 2026 stack (MCP, A2A, OWASP agentic Top 10, agent identity, agent context engineering, sandboxes), ranked and phased.
 
 **2026 additions.** Defense by design against prompt injection (adaptive attacks, the Agents Rule
 of Two, the six agent design patterns, CaMeL-style capabilities) in `17` §4.7; agentic search vs
