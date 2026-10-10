@@ -58,15 +58,15 @@ execution:
 
 | File | Design Section | Description |
 |---|---|---|
-| [`models.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/models.py) | §3.2, §4.4 | Dataclasses for `ToolDefinition`, `ToolVersion`, `Annotation`, `Principal`, `ToolBundle`, and semver utilities. |
-| [`schema.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/schema.py) | §6.1–§6.3 | Zero-dep validator emitting `ValidationError` with `suggested_fix` and executing bounded coercion rules. |
-| [`evolution.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/evolution.py) | §6.4 | Structural schema differ enforcing backward-compatibility rules at publish time. |
-| [`registry.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/registry.py) | §4 | Central registry maintaining state transitions, approval queues, deprecation, and semver range resolution. |
-| [`discovery.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/discovery.py) | §5 | Discovery service with agent-scoped authorization filtering before ranking, health scoring, and fuzzy recovery. |
-| [`mcp.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/mcp.py) | §3.6 | MCP projection (`to_mcp_tool`) and restrictive default ingestion (`from_mcp_tool`). |
-| [`sdk.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/sdk.py) | §3.5 | `@tool(...)` decorator deriving schemas and docstring descriptions from Python functions. |
-| [`run.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/run.py) | All | 7-act interactive terminal report demonstrating all features. |
-| [`test_registry.py`](file:///Users/harut/system-design/ai-rag/labs/tool-registry/test_registry.py) | All | 16 unit tests covering edge cases across all modules. |
+| [`models.py`](models.py) | §3.2, §4.4 | Dataclasses for `ToolDefinition`, `ToolVersion`, `Annotation`, `Principal`, `ToolBundle`, and semver utilities. |
+| [`schema.py`](schema.py) | §6.1–§6.3 | Zero-dep validator emitting `ValidationError` with `suggested_fix` and executing bounded coercion rules. |
+| [`evolution.py`](evolution.py) | §6.4 | Structural schema differ enforcing backward-compatibility rules at publish time. |
+| [`registry.py`](registry.py) | §4 | Central registry maintaining state transitions, approval queues, deprecation, and semver range resolution. |
+| [`discovery.py`](discovery.py) | §5 | Discovery service with agent-scoped authorization filtering before ranking, health scoring, and fuzzy recovery. |
+| [`mcp.py`](mcp.py) | §3.6 | MCP 2026-07-28 projection (`to_mcp_tool`: annotations, `outputSchema`, `_meta`) and restrictive ingestion (`from_mcp_tool`; server hints kept apart in `claimed_annotations`). |
+| [`sdk.py`](sdk.py) | §3.5 | `@tool(...)` decorator deriving schemas and docstring descriptions from Python functions. |
+| [`run.py`](run.py) | All | 7-act interactive terminal report demonstrating all features. |
+| [`test_registry.py`](test_registry.py) | All | 16 unit tests covering edge cases across all modules. |
 
 ---
 
@@ -78,7 +78,7 @@ Running `python3 run.py` executes 7 terminal acts:
 2. **`validation`**: Out-of-bounds input yields structured errors with `field_path`, `constraint`, and `suggested_fix`. Near-miss inputs undergo bounded coercion.
 3. **`evolution`**: Optional field additions pass under MINOR bumps; adding a required field or narrowing constraints is rejected with a breaking violation summary.
 4. **`discovery`**: A search for "customer order history" returns tools for a support agent, but returns 0 results for a billing agent (auth filtered before ranking).
-5. **`mcp`**: Projects `shipping.cancel_order` to MCP (folding annotations into text), and ingests external `salesforce.update_lead` with default `destructive=True, requires_approval=True`.
+5. **`mcp`**: Projects `shipping.cancel_order` to an MCP 2026-07-28 `Tool` (real `annotations`, platform-only flags in `_meta`), and ingests external `salesforce.update_lead`, showing the hints the server claims next to the restrictive defaults actually applied (`destructive=True, requires_approval=True`).
 6. **`sdk`**: `@tool(...)` decorates a Python function and builds a complete `ToolDefinition` from annotations and docstrings.
 7. **`deprecate`**: Demonstrates `ACTIVE → DEPRECATED (with 90-day sunset_at) → RETIRED` lifecycle transitions.
 

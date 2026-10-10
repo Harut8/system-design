@@ -313,7 +313,15 @@ def test_mcp_projection_and_ingestion():
     mcp_dict = MCP.to_mcp_tool(tdef)
 
     assert mcp_dict["name"] == "payments.refund_order"
-    assert "WARNING: This tool performs destructive" in mcp_dict["description"]
+    assert mcp_dict["description"] == tdef.spec.description  # no hints folded into text
+    assert mcp_dict["inputSchema"]["type"] == "object"
+    assert mcp_dict["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,  # empty egress allowlist
+    }
+    assert mcp_dict["_meta"][MCP.META_PREFIX + "requiresApproval"] is True
 
     # Ingest back
     ingested = MCP.from_mcp_tool(mcp_dict, owner_team="external")
@@ -322,6 +330,50 @@ def test_mcp_projection_and_ingestion():
     # Strict defaults applied
     assert ingested.spec.annotations.destructive is True
     assert ingested.spec.annotations.requires_approval is True
+
+
+def test_mcp_read_only_omits_write_hints():
+    mcp_dict = MCP.to_mcp_tool(make_sample_tool(read_only=True, destructive=False))
+    assert mcp_dict["annotations"]["readOnlyHint"] is True
+    assert "destructiveHint" not in mcp_dict["annotations"]
+    assert "idempotentHint" not in mcp_dict["annotations"]
+
+
+def test_mcp_output_schema_round_trips():
+    tdef = make_sample_tool()
+    mcp_dict = MCP.to_mcp_tool(tdef)
+    assert mcp_dict["outputSchema"] == tdef.spec.output_schema
+    assert MCP.from_mcp_tool(mcp_dict).spec.output_schema == tdef.spec.output_schema
+
+
+def test_mcp_ingestion_ignores_claimed_hints():
+    external = {
+        "name": "crm.update_lead",
+        "inputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True, "destructiveHint": "no"},
+    }
+    ingested = MCP.from_mcp_tool(external)
+    assert ingested.spec.annotations.read_only is False
+    assert ingested.spec.annotations.destructive is True
+    claimed = MCP.claimed_annotations(external)
+    assert claimed["readOnlyHint"] is True
+    assert claimed["destructiveHint"] is True  # malformed value falls back to spec default
+    assert claimed["openWorldHint"] is True
+
+
+def test_mcp_tool_without_params_and_name_rules():
+    tdef = make_sample_tool()
+    bare = M.ToolDefinition(
+        metadata=tdef.metadata,
+        spec=M.ToolSpec(description="No params."),
+        version="1.0.0",
+    )
+    assert MCP.to_mcp_tool(bare)["inputSchema"] == {"type": "object", "additionalProperties": False}
+    assert MCP.from_mcp_tool({"name": "ping"}).metadata.namespace == "external"
+    with pytest.raises(ValueError):
+        MCP.from_mcp_tool({"name": "bad name, with spaces"})
+    with pytest.raises(ValueError):
+        MCP.to_mcp_tool(make_sample_tool(name="x" * 130))
 
 
 # ---------------------------------------------------------------------------

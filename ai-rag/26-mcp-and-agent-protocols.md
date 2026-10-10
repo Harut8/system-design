@@ -790,8 +790,9 @@ survives all of them: a tool result is untrusted data
 
 ## 10. Correcting `labs/tool-registry/mcp.py`
 
-[`labs/tool-registry/mcp.py`](labs/tool-registry/mcp.py) was written against an older mental model
-of MCP. Its docstring says: "MCP has no first-class output/error schema or annotations field",
+[`labs/tool-registry/mcp.py`](labs/tool-registry/mcp.py) was first written against an older mental
+model of MCP. It has since been corrected to target 2026-07-28; this section records what was wrong
+and why. The original docstring said: "MCP has no first-class output/error schema or annotations field",
 that a tool has only "name, description, inputSchema", and that "MCP has no standardized
 authz/credop model". Against the specification as of 2026-07-28 (and mostly already by 2025-06-18):
 
@@ -817,12 +818,12 @@ What *is* still correct about the lab's design, and should be kept:
   says annotations from untrusted servers MUST be treated as untrusted. It should additionally
   ingest `outputSchema` and *record* the server's claimed hints for the reviewer.
 
-### 10.1 A corrected projection sketch
+### 10.1 The corrected projection
 
-Verified against the lab's models (`ToolDefinition`, `Annotation`, `ToolSpec`) by running it:
+The core of the corrected module, simplified (the lab file adds tool-name validation, `_meta` for
+platform-only flags, and `claimed_annotations`; `test_registry.py` covers each rule):
 
 ```python
-# Replacement sketch for labs/tool-registry/mcp.py (do not edit the lab file from this chapter).
 from typing import Any
 from models import Annotation, ToolDefinition, ToolMetadata, ToolSpec
 
@@ -867,7 +868,11 @@ def from_mcp_tool(t: dict[str, Any], *, owner_team="unassigned", version="1.0.0"
 ```
 
 
-Update `mcp_round_trip_report` so annotations and `output_schema` are *preserved on the way out* and only the server's claims are *discarded on the way in*, by design; store the `claimed` hints beside the reviewed values so a later diff exposes a server that starts lying.
+In the lab, `mcp_round_trip_report` now shows annotations and `output_schema` *preserved on the way
+out* and the server's claims *discarded on the way in*, by design. `claimed_annotations` keeps the
+claimed hints beside the reviewed values, so a later diff exposes a server that starts lying.
+`requires_approval` and `long_running` travel in `_meta` under a platform prefix: MCP-only clients
+ignore them, and ingestion never trusts them.
 
 ---
 

@@ -272,22 +272,29 @@ def act_mcp() -> None:
     )
 
     mcp_descriptor = MCP.to_mcp_tool(tdef)
-    print("[Projected MCP Tool Descriptor]")
-    print(f"  Name: {mcp_descriptor['name']}")
-    print(f"  Description:\n    {mcp_descriptor['description'].replace(chr(10), chr(10) + '    ')}")
+    print(f"[Projected MCP Tool Descriptor] (MCP {MCP.PROTOCOL_VERSION})")
+    print(f"  Name:        {mcp_descriptor['name']}")
+    print(f"  Title:       {mcp_descriptor['title']}")
+    print(f"  Description: {mcp_descriptor['description']}")
     print(f"  InputSchema: {mcp_descriptor['inputSchema']}")
+    print(f"  Annotations: {mcp_descriptor['annotations']}")
+    print(f"  _meta:       {mcp_descriptor['_meta']}")
 
     # 2. Ingest external MCP descriptor -> Platform ToolDefinition (with restrictive defaults)
     external_mcp = {
         "name": "salesforce.update_lead",
         "description": "Update lead stage in Salesforce CRM.",
         "inputSchema": {"type": "object", "properties": {"lead_id": {"type": "string"}}},
+        # The server claims the tool is harmless; annotations are untrusted hints.
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
     }
     ingested = MCP.from_mcp_tool(external_mcp)
     print("\n[Ingested External MCP Tool]")
     print(f"  Namespace: {ingested.metadata.namespace}")
     print(f"  Name:      {ingested.metadata.name}")
-    print(f"  Annotations (Defaulted to Restrictive):")
+    print(f"  Claimed by server (untrusted): {MCP.claimed_annotations(external_mcp)}")
+    print("  Annotations applied (restrictive until a human reviews):")
+    print(f"    read_only:         {ingested.spec.annotations.read_only}")
     print(f"    destructive:       {ingested.spec.annotations.destructive}")
     print(f"    requires_approval: {ingested.spec.annotations.requires_approval}")
 
