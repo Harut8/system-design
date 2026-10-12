@@ -689,22 +689,51 @@ ANTI-PATTERN 4: FUNCTIONS ON INDEXED COLUMNS
 ```
 ANTI-PATTERN 5: OFFSET PAGINATION
 
-  Problem: OFFSET N reads and discards N rows before returning results.
+  Problem: OFFSET N does not skip rows. It PRODUCES and DISCARDS N rows.
+  The executor walks the index from the start, fetches each heap tuple
+  (MVCC visibility check), and throws it away. Cost is O(offset + limit).
 
-  SELECT * FROM orders ORDER BY created_at DESC LIMIT 20 OFFSET 10000;
-    → DB must sort and skip 10,000 rows to return 20.
-    → Page 500 of results requires reading 10,000 rows.
-    → Gets progressively slower as OFFSET grows.
+  SELECT * FROM orders ORDER BY created_at DESC, id DESC LIMIT 10 OFFSET :k;
 
-  ┌──────────────┬─────────────┐
-  │ OFFSET        │ Time         │
-  ├──────────────┼─────────────┤
-  │ 0            │ 1 ms         │
-  │ 1,000        │ 5 ms         │
-  │ 10,000       │ 50 ms        │
-  │ 100,000      │ 500 ms       │
-  │ 1,000,000    │ 5,000 ms     │
-  └──────────────┴─────────────┘
+  Measured: PostgreSQL 16, 1M rows (135 MB heap), index on
+  (created_at DESC, id DESC), warm cache, median of 7 EXPLAIN (ANALYZE, BUFFERS):
+
+  ┌──────────────────────────────┬──────────────────┬──────────┬───────────┐
+  │ Query                        │ Rows index scan  │ Buffers  │ Time      │
+  │                              │ actually read    │          │           │
+  ├──────────────────────────────┼──────────────────┼──────────┼───────────┤
+  │ LIMIT 10 (page 1)            │           10     │       4  │  0.05 ms  │
+  │ LIMIT 10 OFFSET 10000        │       10,010     │     214  │   1.9 ms  │
+  │ LIMIT 10 OFFSET 100000       │      100,010     │   2,111  │    17 ms  │
+  │ LIMIT 10 OFFSET 900000       │      900,010     │  18,969  │   150 ms  │
+  │ Keyset at the same position  │           10     │       4  │  0.06 ms  │
+  └──────────────────────────────┴──────────────────┴──────────┴───────────┘
+
+  Keyset = WHERE (created_at, id) < ($last_ts, $last_id) ... LIMIT 10.
+  "Rows read" = offset + limit, exactly. Linear, and keyset is flat.
+
+  WHY THE TABLE ABOVE IS THE BEST CASE:
+
+  1. Heap correlation. The table was loaded in created_at order
+     (pg_stats.correlation = -1), so consecutive index entries hit the
+     same heap page: 900k rows cost ~19k buffer visits. Same rows in
+     shuffled physical order (correlation ≈ 0, normal after churn):
+
+       OFFSET 900000  →  903,406 buffers, 739 ms   (one page per row)
+       Keyset         →       13 buffers, 0.16 ms
+
+     Cold cache: 903k random reads × ~100 µs = ~90 s, and the scan
+     evicts the hot working set from shared_buffers on the way.
+
+  2. No index on the sort key. Page 1 is a top-N heapsort (keeps 10 rows,
+     27 kB). A deep page must keep offset+limit rows. Above work_mem the
+     whole input is sorted on disk:
+       ORDER BY amount_cents LIMIT 10              →  61 ms, top-N heapsort
+       ORDER BY amount_cents LIMIT 10 OFFSET 900k  → 474 ms, external merge ~110 MB
+
+  3. The "total" in the API envelope. COUNT(*) over 1M rows = 55 ms per
+     request (parallel index-only scan), >1000x the page itself. PG keeps
+     no cached row count (MVCC: every snapshot may see a different one).
 
   Fix: keyset pagination (cursor-based):
   -- First page:
@@ -717,12 +746,52 @@ ANTI-PATTERN 5: OFFSET PAGINATION
   LIMIT 20;
 
   With an index on (created_at DESC, id DESC):
-    → Every page costs the same: ~1ms regardless of position.
-    → No rows skipped; index seek goes directly to the cursor.
+    → Every page costs the same regardless of position.
+    → B-tree descends straight to the cursor; no rows skipped.
+
+  KEYSET TRAPS (all measured on the same table at position 900k):
+
+    WHERE (created_at, id) < ($t, $id)                       0.06 ms  Index Cond ✅
+    WHERE created_at < $t OR (created_at = $t AND id < $id)   124 ms  Filter     ❌
+    WHERE created_at <= $t AND (created_at < $t OR id < $id) 0.06 ms  Index Cond ✅
+
+    The naive OR form is evaluated as a Filter, so the index is walked
+    from the start: 18,969 buffers, the same as OFFSET 900000. Always check
+    that the cursor shows up as "Index Cond" in EXPLAIN. (MySQL is the
+    reverse: its row-constructor inequality optimization is weak, so use the
+    expanded form with the redundant leading bound and check key_len.)
+
+    Index must match filter + sort. WHERE customer_id = 42 ORDER BY
+    created_at DESC, id DESC LIMIT 10 with only (created_at, id) indexed:
+    parallel seq scan + sort, 25 ms on page 1. With (customer_id,
+    created_at DESC, id DESC): 0.03 ms.
+
+    Without a unique tie-breaker (id), WHERE created_at < $last drops every
+    row sharing the boundary timestamp.
+
+  Mitigation when OFFSET can't be removed: DEFERRED JOIN
+    SELECT o.* FROM orders o
+    JOIN (SELECT id FROM orders ORDER BY created_at DESC, id DESC
+          LIMIT 10 OFFSET 900000) p USING (id)
+    ORDER BY o.created_at DESC, o.id DESC;
+
+    Index-only scan skips through the index, then 10 heap lookups:
+      correlated heap:  150 ms → 120 ms   (18,969 → 3,498 buffers)
+      shuffled heap:    739 ms → 128 ms   (903,406 → 3,498 buffers)
+    Still O(offset) (900k index entries walked), and needs an up-to-date
+    visibility map (VACUUM) or "index-only" falls back to heap fetches.
+
+  Correctness: OFFSET is a position, so inserts/deletes ahead of it shift
+  later pages. Rows get duplicated or silently skipped. Keyset is anchored
+  to a value and is immune.
 
   Trade-off: cannot jump to arbitrary page N. Only next/previous.
-  For most UIs (infinite scroll, "Load More"), this is fine.
+  For most UIs (infinite scroll, "Load More"), this is fine. For the API
+  contract (opaque signed cursors, totals, "page 47", exports), see
+  solutions/api-design-patterns.md §3.4.
 ```
+
+> API-level treatment of the same problem (cursor design, totals without `COUNT(*)`, "jump to page N", exports): [API Design Patterns §3.4](../solutions/api-design-patterns.md#34-pagination-patterns). Reproduce the numbers with lab 15.2 in [LABS.md](LABS.md).
 
 ```
 ANTI-PATTERN 6: LARGE IN LISTS

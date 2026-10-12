@@ -811,8 +811,8 @@ Also do §11.4 (the failure drill) against the setup below. The tasks here are d
   - **Verify:** The ranked output. Add the fix, rerun, and record the before/after total time.
 - [ ] **15.2 Anti-patterns, measured** *(Level: Core)*
   - **Goal:** Put buffers on three of §4's Deadly Dozen.
-  - **Do:** (a) `users(email text)` with a B-tree on `email`, then `WHERE lower(email) = ...` before and after `CREATE INDEX ON users (lower(email))`. (b) `ORDER BY id OFFSET 100000 LIMIT 20` vs keyset `WHERE id > :last ORDER BY id LIMIT 20`. (c) `SELECT count(*) FROM a WHERE id NOT IN (SELECT ref FROM b)` after inserting one `NULL` into `b.ref`, vs `NOT EXISTS`.
-  - **Predict:** Buffers for (a) and (b), and the row count for (c).
+  - **Do:** (a) `users(email text)` with a B-tree on `email`, then `WHERE lower(email) = ...` before and after `CREATE INDEX ON users (lower(email))`. (b) `ORDER BY id OFFSET 100000 LIMIT 20` vs keyset `WHERE id > :last ORDER BY id LIMIT 20`; then on a two-column sort compare `(created_at, id) < ($t, $id)` with the expanded `created_at < $t OR (created_at = $t AND id < $id)`. (c) `SELECT count(*) FROM a WHERE id NOT IN (SELECT ref FROM b)` after inserting one `NULL` into `b.ref`, vs `NOT EXISTS`.
+  - **Predict:** Buffers for (a) and (b), including whether the expanded `OR` keyset form shows up as `Index Cond` or `Filter`, and the row count for (c).
   - **Verify:** Buffers from `EXPLAIN (ANALYZE, BUFFERS)` for (a) and (b). For (c) the NOT IN count is 0 and NOT EXISTS gives the right answer.
 - [ ] **15.3 Break it: stale statistics** *(Level: Core)*
   - **Goal:** Reproduce §3 "When statistics go wrong".
