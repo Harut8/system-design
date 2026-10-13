@@ -364,7 +364,7 @@ Setup: `CREATE TABLE cust AS SELECT g AS id, (g % 50) AS city, (g % 50) * 1000 +
   - **Predict:** Entries per leaf page (16 B per item plus a 4 B line pointer; CREATE INDEX fills leaves to 90%), leaf count, and `level` of the root.
   - **Verify:** `bt_metap.level` and `pgstatindex('k_id')` leaf_pages match your math within 10%. Identify the high key on a leaf page.
 - [ ] **06.2 Random keys cost WAL, not just space** *(Level: Core)*
-  - **Goal:** Extend §2's UUID measurement with WAL volume, which the chapter does not show.
+  - **Goal:** Reproduce §2's steady-state WAL numbers (full-page images after each checkpoint) with checkpoints happening *during* the load, not just before it.
   - **Do:** Two tables: `id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY` and `id uuid PRIMARY KEY DEFAULT gen_random_uuid()`. For each: `SELECT pg_stat_reset_shared('wal');` then insert 3M rows in 30 batches with `CHECKPOINT` after every 10 batches. Read `wal_records, wal_fpi, wal_bytes` from `pg_stat_wal` and `avg_leaf_density` from `pgstatindex`.
   - **Predict:** The ratio of `wal_fpi` between the two.
   - **Verify:** A table of wal_bytes, wal_fpi, index size and leaf density. Explain the FPI gap in one sentence (random leaves are each touched again after every checkpoint).

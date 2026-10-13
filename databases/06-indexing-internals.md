@@ -659,6 +659,100 @@ INSERT INTO ev7 (payload) SELECT 'x' FROM generate_series(1, 3000000);
 UUIDv7 inserted about **1.7× faster** into a **25% smaller** index. The gap widens once the
 index no longer fits in memory, because random inserts then turn into random disk reads.
 
+#### Steady state: the index is larger than memory
+
+The build above starts from an empty table, so most of the index is still in `shared_buffers`
+while it grows. Production tables are different: the index is already bigger than the buffer
+pool, and new rows arrive into it. That is where random keys really hurt.
+
+**Setup.** PostgreSQL 16, `shared_buffers` = 128 MB, 4 vCPU. Build a 5M-row table, `CHECKPOINT`,
+restart (empty buffer pool), then add 500k more rows in one statement. Keys are pre-generated
+into a side table and prewarmed, so neither key generation nor reading the source is measured.
+`payload` is a short text. Two runs each; the ranges are the two runs.
+
+```sql
+CREATE TABLE t (id <key type> PRIMARY KEY, payload text NOT NULL);
+INSERT INTO t SELECT id, 'payload-' || seq FROM keys_build ORDER BY seq;   -- 5M
+CHECKPOINT;  -- then restart
+EXPLAIN (ANALYZE, BUFFERS, WAL)
+INSERT INTO t SELECT id, 'payload-' || seq FROM keys_add ORDER BY seq;     -- +500k
+```
+
+| Key | Add 500k | Pages read from outside `shared_buffers` | Pages dirtied | Dirty pages the backend had to write itself | WAL | Full-page images |
+|---|---|---|---|---|---|---|
+| bigint (sequence) | 1.0 s | 9 | 4,559 | 4,556 | 69 MB | 4 |
+| UUIDv7, monotonic | 1.1 s | 9 | 5,606 | 5,602 | 77 MB | 4 |
+| UUIDv7, random within the ms | 1.3 s | 10 | 6,318–6,366 | 6,314–6,362 | 81 MB | 4 |
+| UUIDv4 | **4.2–4.5 s** | **196,670–204,321** | **204,017–211,177** | **192,766–199,559** | **221 MB** | **24,471–25,234** |
+
+| Key | Build 5M (empty table) | PK index after 5.5M rows | Avg leaf density |
+|---|---|---|---|
+| bigint | 11.8–12.0 s | 118 MB | 90% |
+| UUIDv7, monotonic | 12.5–13.0 s | 165 MB | 90% |
+| UUIDv7, random within the ms | 14.1–14.5 s | 222 MB | 67% |
+| UUIDv4 | 28.5–29.4 s | 218 MB | 68–69% |
+
+**The gap grows with the table.** UUIDv4 versus monotonic UUIDv7: 1.7× when building 3M rows
+(PostgreSQL 18, above), 2.3× when building 5M, **4×** when adding to a 5M-row table.
+
+**Why: every random insert is a cache miss.** The UUIDv4 index is ~27,700 leaf pages (218 MB)
+competing for 16,384 buffers (128 MB) with the heap. A sequential or time-ordered key only
+touches the rightmost leaf, which stays hot; the whole 500k-row insert read **9 pages**. A random
+key goes to an arbitrary leaf that has usually been evicted. One insert then costs:
+
+1. **A read.** 197k–204k pages read for 500k rows, i.e. ~40% of inserts missed the buffer pool.
+   On this box they came from the OS page cache. On a cold or memory-starved host each is a
+   random disk read.
+2. **A dirty page and later a write.** 204k–211k pages dirtied: more than **7 times** the number
+   of leaf pages, because each leaf is dirtied, evicted, read back and dirtied again. The buffer
+   pool is so full of dirty pages that **the backend writes them out itself** (192k–200k writes)
+   before it can reuse a buffer, which puts write I/O on the query's own latency path.
+3. **A full-page image in the WAL.** The first change to a page after a checkpoint logs the whole
+   8 KB page. Random keys touch practically every leaf after each checkpoint: ~25k FPIs and 3.2×
+   the WAL volume of bigint. That is more replication traffic, more archive storage and
+   longer crash recovery.
+
+Then the steady-state costs come on top: the UUIDv4 leaves stay ~68% full, so the same data needs
+~33% more pages, which in turn makes the cache misses more frequent.
+
+**Not every UUIDv7 is monotonic.** The "random within the ms" row is a common hand-rolled
+generator: 48-bit millisecond timestamp, then random bits. In a bulk insert, thousands of keys
+share a millisecond, and inside each millisecond they arrive in random order. Locality is still
+fine (only 10 pages read), but every leaf splits in the middle instead of at the right edge, so
+leaves end up 67% full and the index (222 MB) is **35% larger** than the monotonic one, the same
+size as UUIDv4. RFC 9562 §6.2 lets generators guarantee ordering with sub-millisecond precision or
+a counter in the `rand_a` bits. PostgreSQL 18's `uuidv7()` does this (12-bit sub-millisecond
+fraction), and so do most maintained libraries. Check yours: generate 100k keys in a tight loop
+and verify they are strictly increasing.
+
+```sql
+-- PostgreSQL 16/17: monotonic UUIDv7 from a microsecond clock (method 3 in RFC 9562)
+CREATE FUNCTION uuid_v7m(us bigint) RETURNS uuid LANGUAGE sql VOLATILE AS $$
+  SELECT encode(overlay(set_bit(set_bit(uuid_send(gen_random_uuid()), 52, 1), 53, 1)
+         PLACING substring(int8send(((us / 1000) << 16) | x'7000'::int
+                                    | ((us % 1000) * 4096 / 1000)) FROM 1 FOR 8)
+         FROM 1 FOR 8), 'hex')::uuid
+$$;
+-- us = (extract(epoch FROM clock_timestamp()) * 1e6)::bigint; two calls in the same µs can still
+-- tie, so prefer the app library or PG18's uuidv7() for production.
+```
+
+**bigint is still the smallest.** Monotonic UUIDv7 inserts as fast as a sequence, but its index
+is 40% larger (165 vs 118 MB: 16-byte keys versus 8-byte) and every foreign key that references it
+doubles in width. Use UUIDv7 when you need IDs generated without a round trip to the database
+(clients, multiple writers, merged datasets); use bigint when a single database hands out the IDs.
+
+**What to do if you already have UUIDv4 keys:**
+- Size `shared_buffers` (and the OS cache) to hold the whole PK index. The problem disappears
+  once every leaf stays resident. Watch `pg_statio_user_indexes.idx_blks_read` on the PK and
+  `pg_stat_io` (PG16+) for backend `writes`.
+- Keep the v4 column as the public ID but add a `bigint` or UUIDv7 surrogate as the primary key
+  and the clustering/foreign-key target.
+- Spread the FPI cost: a longer `checkpoint_timeout` / larger `max_wal_size`, and
+  `wal_compression = lz4` or `zstd` (PG15+).
+- Rebuilding the index (`REINDEX CONCURRENTLY`) restores ~90% density, but random inserts split it
+  back to ~70% over time.
+
 Two cautions:
 
 - **UUIDv7 leaks creation time.** Anyone holding the ID can read when the row was created. For
