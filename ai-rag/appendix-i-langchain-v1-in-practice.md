@@ -25,6 +25,8 @@
 > [`24-tool-calling-and-enterprise-integration.md`](24-tool-calling-and-enterprise-integration.md);
 > retries and fallback as a gateway concern in [`23-multi-llm-model-gateway.md`](23-multi-llm-model-gateway.md);
 > compaction strategy in [`30-context-engineering-for-agents.md`](30-context-engineering-for-agents.md).
+> The wider stack (packages, reference stacks, other frameworks) is in
+> [appendix J](appendix-j-production-ai-stack.md).
 
 ## Contents
 

@@ -13,8 +13,8 @@ models. Rules:
 ## How to use this sheet
 
 - Order: Setup → 00 (the harness every later number depends on) → Appendix G → 01 → 02 → 03 → 04 →
-  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H and I while
-  the matching chapter is fresh (02, 03/07, 04, 20/21). Capstones last.
+  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I and J while
+  the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22). Capstones last.
 - Tick `- [ ]` boxes. Do every Core task. Do Stretch tasks once the chapter's Core tasks pass.
 - Keep `lab-notebook.md`: one entry per task with date, prediction, measured result, the gap, and one
   line on why. Keep per-query rows in DuckDB (`results.duckdb`), not in notebook variables.
@@ -1045,6 +1045,39 @@ each node), so a resumed run cannot hide re-execution from you.
 1. `create_agent` sets `recursion_limit=9_999`; add `ModelCallLimitMiddleware` (§2.4).
 2. `"error"`. The default `"continue"` turns the exception into an `AIMessage`, so the outer fallback sees a success (§4).
 3. `ToolStrategy` retries (without limit, by default); `ProviderStrategy` raises `StructuredOutputValidationError` (§5.2–§5.3).
+</details>
+
+---
+
+## Appendix J — The production AI stack  ([chapter](appendix-j-production-ai-stack.md))
+**Time:** ~4 h · **Needs:** pinned `langgraph` + `langgraph-checkpoint-sqlite`/`-postgres`, Docker Postgres, one local MCP server
+
+- [ ] **J.1 Checkpoint growth** *(Level: Core)*
+  - **Goal:** §2.2.
+  - **Do:** a one-node `MessagesState` graph with a checkpointer; 10, 20, 40, 80 turns of a 1 KB
+    message. Measure checkpoint bytes with `PostgresSaver`, then with `ShallowPostgresSaver`.
+  - **Predict:** the ratio from 40 to 80 turns for each saver.
+  - **Verify:** both curves, and the projected size at 1M threads × 30 turns.
+- [ ] **J.2 MCP session cost** *(Level: Core)*
+  - **Do:** call one `stdio` MCP tool 20 times through `MultiServerMCPClient.get_tools()`, then
+    through one explicit `client.session(...)`.
+  - **Predict:** p50 latency per call for each.
+  - **Verify:** both, and the number of server processes started.
+- [ ] **J.3 Same agent, two frameworks** *(Level: Stretch)*
+  - **Do:** build one 2-tool agent with a typed final answer in `create_agent` and in one framework
+    from §7. Inject a tool timeout and an invalid structured answer.
+  - **Verify:** lines of code, what each trace shows, how each handles both failures, and which one
+    you would ship, in three sentences.
+
+**Checkpoint (closed book):**
+1. Why does checkpoint storage grow with the square of thread length?
+2. Which two isolation layers must a shell-running agent have together?
+3. Name the four double-texting strategies.
+<details><summary>Answers</summary>
+
+1. Every super-step stores a new version of the `messages` channel, and each version holds the whole history (§2.2).
+2. Filesystem isolation and network egress control (§4.5).
+3. Reject, enqueue, interrupt, rollback (§5.2).
 </details>
 
 ---

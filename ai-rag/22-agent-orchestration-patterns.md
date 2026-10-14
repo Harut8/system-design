@@ -1520,6 +1520,11 @@ built it.
 | Semantic Kernel | Planner + plugins | Plan-and-execute | Framework/platform-dependent | Azure-ecosystem-native | Outside the Microsoft stack |
 | Custom | Whatever you design | Whatever you need | You build it | You build it | Everything is your maintenance burden |
 
+**2026 update.** Semantic Kernel and AutoGen have been merged into the **Microsoft Agent Framework**
+(agents plus checkpointed graph workflows). PydanticAI, the OpenAI Agents SDK, the Claude Agent SDK,
+Google ADK, LlamaIndex Workflows and DSPy are compared by their core idea in
+[appendix J](appendix-j-production-ai-stack.md) §7.
+
 ### 11.1 When to use a framework versus build your own
 
 This is the same build-vs-buy question `19-build-vs-buy.md` (planned) asks about observability
