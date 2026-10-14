@@ -356,6 +356,29 @@ CREATE TABLE orders (
 -- status/updated changes don't touch the PK index
 ```
 
+**Measured: one extra index turns HOT off** (PostgreSQL 16, 2M rows, PK + 4 secondary
+indexes, `pgbench` 4 clients × 60 s of `UPDATE t SET updated_at = now() WHERE id = :random`):
+
+| | No index on `updated_at` | Index on `updated_at` |
+|---|---|---|
+| HOT updates (`n_tup_hot_upd / n_tup_upd`) | 89% | **0%** |
+| Updates/sec, `synchronous_commit = off` | 11,198 | **7,341** (−35%) |
+| Updates/sec, default settings | 3,688 | **2,858** (−22%) |
+| WAL per update | 1.2 KB | **3.6 KB** |
+| Index growth during the run | +1 MB | **+37 MB** |
+
+With only a primary key, losing HOT cost almost nothing in the same test. A non-HOT update
+inserts a new entry into *every* index, so the penalty scales with how many indexes the
+table already has.
+
+Check your HOT ratio:
+
+```sql
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0 * n_tup_hot_upd / nullif(n_tup_upd, 0), 1) AS hot_pct
+FROM pg_stat_user_tables ORDER BY n_tup_upd DESC LIMIT 10;
+```
+
 ### MVCC Implementation
 
 PostgreSQL implements MVCC (Multi-Version Concurrency Control) by keeping old row versions in the main heap table. This is fundamentally different from MySQL/InnoDB, which stores old versions in a separate undo log.
