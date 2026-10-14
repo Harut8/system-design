@@ -24,8 +24,10 @@
 > (Cursor, Claude Code internals) come from their public engineering posts and docs and are marked
 > *(public)*.
 >
-> **Companion:** [appendix I](appendix-i-langchain-v1-in-practice.md) goes deep on `create_agent`,
-> middleware and structured output. This page is the wider map.
+> **Companions:** [appendix I](appendix-i-langchain-v1-in-practice.md) goes deep on `create_agent`,
+> middleware and structured output; [appendix K](appendix-k-langgraph-runtime-and-platform-in-practice.md)
+> on the Functional API, runtime controls, LangSmith, Deep Agents, the store and MCP adapters. This page
+> is the wider map.
 
 ## Contents
 
@@ -58,8 +60,8 @@
 | `init_chat_model`, `create_agent`, middleware, retries, fallbacks | [appendix I](appendix-i-langchain-v1-in-practice.md) | — |
 | Structured output (provider vs tool strategy, Pydantic, Instructor) | `07` §3–§7, §12; appendix I §5 | — |
 | `StateGraph`, reducers, `MessagesState`, `Command`, `Send`, `ToolNode` | `21` §2–§4, §9 | — |
-| Checkpointing, interrupts, resume, streaming, subgraphs | `21` §5–§8 | storage internals and growth (§2.2) |
-| Retry policies, loop limits, durable execution, LangGraph vs Temporal | `21` §11–§14 | — |
+| Checkpointing, interrupts, resume, streaming, subgraphs | `21` §5–§8 | storage internals and growth (§2.2); durability modes and streaming v2 in appendix K §2 |
+| Retry policies, loop limits, durable execution, LangGraph vs Temporal | `21` §11–§14 | Functional API, retry/timeout/cache defaults in appendix K §1–§2 |
 | Agent patterns: ReAct, router, supervisor, plan-and-execute, reflection | `22` §3, §5 | supervisor *library* status (§2.1) |
 | Packages: checkpoint-postgres/sqlite, store, supervisor, swarm, sdk, cli, mcp-adapters, classic | `20` §12 (0.x split) | **§2** |
 | Document parsing (PyMuPDF, Unstructured, Docling, OCR) and chunking | `02`, appendix D | — |
@@ -76,7 +78,7 @@
 | Memory: short-term, long-term, semantic, episodic, deletion | `25` | — |
 | Context engineering, compaction, sub-agents, skills | `30` | — |
 | Agent evaluation, trajectory grading, SWE-bench / Terminal-Bench | `14` | — |
-| LangSmith, Langfuse, Phoenix, Ragas, DeepEval, promptfoo | planned `19` | **§6** |
+| LangSmith, Langfuse, Phoenix, Ragas, DeepEval, promptfoo | planned `19` | **§6**; LangSmith in practice in [appendix K](appendix-k-langgraph-runtime-and-platform-in-practice.md) §3 |
 | OpenTelemetry GenAI conventions | `../sre-observability/26-llm-and-ai-observability.md` | — |
 | LlamaIndex, PydanticAI, OpenAI Agents SDK, ADK, CrewAI, SK/AutoGen, Haystack, DSPy | `22` §11 (partial, and SK/AutoGen are now merged) | **§7** |
 | Coding agents (Claude Code, Codex, Cursor, Aider) | `05` §5.6 (search only) | **§4** |

@@ -26,7 +26,8 @@
 > retries and fallback as a gateway concern in [`23-multi-llm-model-gateway.md`](23-multi-llm-model-gateway.md);
 > compaction strategy in [`30-context-engineering-for-agents.md`](30-context-engineering-for-agents.md).
 > The wider stack (packages, reference stacks, other frameworks) is in
-> [appendix J](appendix-j-production-ai-stack.md).
+> [appendix J](appendix-j-production-ai-stack.md). Runtime controls, the Functional API, LangSmith, Deep Agents, the store and
+> MCP adapters are in [appendix K](appendix-k-langgraph-runtime-and-platform-in-practice.md).
 
 ## Contents
 

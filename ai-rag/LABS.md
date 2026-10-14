@@ -13,8 +13,8 @@ models. Rules:
 ## How to use this sheet
 
 - Order: Setup → 00 (the harness every later number depends on) → Appendix G → 01 → 02 → 03 → 04 →
-  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I and J while
-  the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22). Capstones last.
+  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I, J and K while
+  the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22, 21). Capstones last.
 - Tick `- [ ]` boxes. Do every Core task. Do Stretch tasks once the chapter's Core tasks pass.
 - Keep `lab-notebook.md`: one entry per task with date, prediction, measured result, the gap, and one
   line on why. Keep per-query rows in DuckDB (`results.duckdb`), not in notebook variables.
@@ -1078,6 +1078,38 @@ each node), so a resumed run cannot hide re-execution from you.
 1. Every super-step stores a new version of the `messages` channel, and each version holds the whole history (§2.2).
 2. Filesystem isolation and network egress control (§4.5).
 3. Reject, enqueue, interrupt, rollback (§5.2).
+</details>
+
+---
+
+## Appendix K — LangGraph runtime and platform  ([chapter](appendix-k-langgraph-runtime-and-platform-in-practice.md))
+**Time:** ~4 h · **Needs:** pinned `langgraph`, `langgraph-checkpoint-sqlite`, `deepagents`, `langsmith` (API key optional)
+
+- [ ] **K.1 Replay and durability** *(Level: Core)*
+  - **Goal:** §1.2 and §2.1.
+  - **Do:** run §7 probes A and B. Then rewrite probe A so the side effect is inside a task.
+  - **Predict:** call counts after resume; for probe B, which nodes re-run for each mode.
+  - **Verify:** both, and one sentence on which mode you would use for a payment workflow.
+- [ ] **K.2 Defaults that do nothing** *(Level: Core)*
+  - **Do:** a node raising `TimeoutError` with `RetryPolicy()`; a task with `CachePolicy` and no
+    `cache=`; a sync node with `timeout=1` that sleeps 3 s.
+  - **Predict:** attempts made, cache hits, whether the timeout fires.
+  - **Verify:** all three, and the one-line fix for each.
+- [ ] **K.3 Eval loop with LangSmith or locally** *(Level: Stretch)*
+  - **Do:** a 30-example dataset, one deterministic evaluator and one judge, `num_repetitions=3`,
+    `max_concurrency` 1 vs 8. Without an API key, reproduce the same loop with `pytest` + DuckDB.
+  - **Verify:** wall time for both concurrency settings, pass^3 per example, and judge agreement on
+    10 hand-labelled examples.
+
+**Checkpoint (closed book):**
+1. What re-runs when a functional-API workflow resumes?
+2. Which built-in exception does `RetryPolicy` not retry by default, and why?
+3. Why can a 5% LangSmith sampling rate hide most failures?
+<details><summary>Answers</summary>
+
+1. The entrypoint body, from the top. Finished tasks return saved results (§1.2).
+2. `TimeoutError`, because it subclasses `OSError`, which `default_retry_on` excludes (§2.2).
+3. It is head sampling by trace ID, decided before the outcome is known (§3.2).
 </details>
 
 ---

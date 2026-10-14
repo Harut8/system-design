@@ -1132,6 +1132,10 @@ provenance gap between "what propose said" and "what the human actually approved
 
 ## 7. Streaming: values, updates, messages, events, custom
 
+> **1.x update.** Stream modes now also include `checkpoints` and `tasks`, and `version="v2"` gives every
+> event one typed shape. Durability modes, the Functional API and current retry/cache defaults are in
+> [appendix K](appendix-k-langgraph-runtime-and-platform-in-practice.md) §1–§2.
+
 > **In plain words.** Streaming lets the UI show progress while the graph runs. Pick what you want to see: the full state each step (`values`), only what changed (`updates`), LLM tokens as they are typed (`messages`), your own progress messages (`custom`), or every internal event (`astream_events`).
 >
 > **Real-world example.** In a 20-turn chat (about 1 KB per message, 3 steps per turn), `values` resends the growing history every step, about 1,260 KB in total; `updates` sends about 60 KB. That is 21 times less data.
@@ -1572,6 +1576,10 @@ prebuilt already has a documented seam for exactly that.
 ---
 
 ## 11. Error handling and retry
+
+> **1.x update.** `RetryPolicy`'s default `retry_on` does not retry `TimeoutError` (an `OSError`
+> subclass), and node timeouts work only for async nodes. Details and a probe in
+> [appendix K](appendix-k-langgraph-runtime-and-platform-in-practice.md) §2.2–§2.3.
 
 > **In plain words.** Failures come in three kinds. Short network glitches: retry automatically. Wrong input or a business rule: route to a repair or fallback step, because retrying the same thing fails again. Real bugs: let them fail loudly.
 >

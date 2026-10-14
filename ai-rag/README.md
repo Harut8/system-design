@@ -102,6 +102,7 @@ keeps every claim honest by construction.
 | [`appendix-h-graphrag.md`](appendix-h-graphrag.md) | GraphRAG, LazyGraphRAG, LightRAG, HippoRAG, RAPTOR: the two query types top-k can't answer, index-cost arithmetic (~1,000× vs vector), what GraphRAG-Bench shows, ACL leakage through summaries, adoption order | **written** |
 | [`appendix-i-langchain-v1-in-practice.md`](appendix-i-langchain-v1-in-practice.md) | LangChain 1.x in practice, read from source: what `create_agent` compiles into, middleware hook order and node-vs-wrapper semantics, the defaults that bite (`recursion_limit=9_999`, retry `on_failure`, summarization `trigger=None`), `ToolStrategy` vs `ProviderStrategy` failure modes, `ToolRuntime` context, best and worst practices, runnable probes | **written** |
 | [`appendix-j-production-ai-stack.md`](appendix-j-production-ai-stack.md) | The production AI stack by layer: the usual senior-AI-engineer roadmap mapped to these chapters, the LangGraph package map with internals (checkpoint tables and quadratic growth, MCP adapter sessions, third-party look-alike packages), reference stacks for enterprise RAG, coding agents (edit formats, search, sandbox layers) and the agent backend (double texting, failure modes), eval/observability tools, and frameworks beyond LangChain | **written** |
+| [`appendix-k-langgraph-runtime-and-platform-in-practice.md`](appendix-k-langgraph-runtime-and-platform-in-practice.md) | LangGraph runtime and platform in practice, read from source and probed: the Functional API (`@entrypoint`/`@task` replay rules), durability modes under a hard kill, `RetryPolicy` defaults (no retry on `TimeoutError`), timeouts, `CachePolicy`, rate limiting, streaming v2, LangSmith (batching, head sampling, redaction, `evaluate`), Deep Agents backends and sub-agents, the store, MCP adapter interceptors and name collisions | **written** |
 
 **Decision models (Jev, TypeSafe AI, 2026-09).** These are models that return typed, calibrated
 probabilities instead of text. They are not a separate chapter. They are covered where they are
@@ -116,7 +117,8 @@ of Two, the six agent design patterns, CaMeL-style capabilities) in `17` §4.7; 
 a vector index in `05` §5.6; reasoning rerankers and BRIGHT in `04` §8.4; nugget-based answer
 evaluation in `08` §10.9; GraphRAG in appendix H; the LangChain 1.x practice layer (`create_agent`,
 middleware, structured output strategies) in appendix I; the whole production stack by layer, with
-reference stacks for enterprise RAG, coding agents and agent backends, in appendix J.
+reference stacks for enterprise RAG, coding agents and agent backends, in appendix J; the LangGraph
+runtime controls, Functional API, LangSmith, Deep Agents, store and MCP adapters in practice in appendix K.
 
 ---
 
