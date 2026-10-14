@@ -1299,7 +1299,8 @@ inspectable, extensible graph object, with persistence attached for free via the
 (With the 1.0 releases of LangChain and LangGraph, the recommended prebuilt is
 `langchain.agents.create_agent`, which builds the same model-node/tools-node loop on LangGraph and adds
 middleware hooks; `langgraph.prebuilt.create_react_agent` still works but is marked deprecated. The
-mechanics described here apply to both.)
+mechanics described here apply to both. What `create_agent` compiles into, its middleware ordering and the defaults that
+bite in production are in [appendix I](appendix-i-langchain-v1-in-practice.md).)
 
 For anything beyond the vanilla ReAct shape — a review step before a risky tool executes, parallel
 tool branches with different failure handling, a supervisor node routing between specialist sub-agents

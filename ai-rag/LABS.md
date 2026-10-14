@@ -13,8 +13,8 @@ models. Rules:
 ## How to use this sheet
 
 - Order: Setup → 00 (the harness every later number depends on) → Appendix G → 01 → 02 → 03 → 04 →
-  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E and H while
-  the matching chapter is fresh (02, 03/07, 04). Capstones last.
+  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H and I while
+  the matching chapter is fresh (02, 03/07, 04, 20/21). Capstones last.
 - Tick `- [ ]` boxes. Do every Core task. Do Stretch tasks once the chapter's Core tasks pass.
 - Keep `lab-notebook.md`: one entry per task with date, prediction, measured result, the gap, and one
   line on why. Keep per-query rows in DuckDB (`results.duckdb`), not in notebook variables.
@@ -1010,6 +1010,41 @@ each node), so a resumed run cannot hide re-execution from you.
 1. Global/sensemaking and multi-hop over entities. Aggregation over structured facts belongs to SQL or Cypher on the real database.
 2. The intersection of the readers of all its sources (§6).
 3. Vanilla RAG was equal or better; graph methods raised evidence recall but cut context relevance (§4).
+</details>
+
+---
+
+## Appendix I — LangChain 1.x in practice  ([chapter](appendix-i-langchain-v1-in-practice.md))
+**Time:** ~3 h · **Needs:** a venv with pinned `langchain` and `langgraph`, no API key (fake models)
+
+- [ ] **I.1 Draw the graph before you print it** *(Level: Core)*
+  - **Goal:** §2–§3: node vs wrapper hooks and the ordering rule.
+  - **Do:** pick 5 prebuilt middleware and an order. On paper, draw every node and edge
+    `create_agent` will build. Then run §10 probe A with that list.
+  - **Predict:** node count, the order of the `after_model` chain, and which middleware have no node.
+  - **Verify:** your drawing against `agent.get_graph().edges`. Turn the edge list into a snapshot test.
+- [ ] **I.2 Make the defaults fail** *(Level: Core)*
+  - **Do:** run §10 probes B and C. Then write one more: `SummarizationMiddleware` without `trigger`
+    over a 200-message history, and count summaries made.
+  - **Predict:** for each probe, the final message and `structured_response`.
+  - **Verify:** all three outputs, and the one-line config change that fixes each.
+- [ ] **I.3 Production skeleton under fault injection** *(Level: Stretch)*
+  - **Goal:** §7 end to end.
+  - **Do:** build §7's agent with fake models and a fake payments client. Inject: a primary-model
+    `TimeoutError`; the model emitting `issue_refund` twice in one turn; a process restart while the
+    refund waits for approval (use `PostgresSaver`); a schema answer that never validates.
+  - **Verify:** the fallback answers; exactly one refund per idempotency key; the approval survives
+    the restart; the run stops at `run_limit` with `structured_response=None`, and your caller handles it.
+
+**Checkpoint (closed book):**
+1. Why does a runaway `create_agent` loop not hit LangGraph's usual step limit?
+2. With `[ModelFallback, ModelRetry]`, what must `on_failure` be for the fallback to ever run, and why?
+3. Which structured-output strategy retries validation errors inside the loop, and which raises?
+<details><summary>Answers</summary>
+
+1. `create_agent` sets `recursion_limit=9_999`; add `ModelCallLimitMiddleware` (§2.4).
+2. `"error"`. The default `"continue"` turns the exception into an `AIMessage`, so the outer fallback sees a success (§4).
+3. `ToolStrategy` retries (without limit, by default); `ProviderStrategy` raises `StructuredOutputValidationError` (§5.2–§5.3).
 </details>
 
 ---

@@ -1875,6 +1875,7 @@ driven, not engineering-driven.
 | **Guidance** | Template language with constrained generation | Fine-grained control over generation; interleaves text and constraints | Complex API; limited provider support |
 | **Marvin** | Lightweight extraction with Pydantic | Simple API for extraction tasks | Less flexible for complex generation patterns |
 | **LangChain OutputParsers** | String-based parsing with Pydantic validation | Part of the LangChain ecosystem; many built-in parsers | String-based parsing is fragile (§2.2); the entire `20` chapter applies |
+| **LangChain 1.x `with_structured_output` / `response_format`** | Native schema enforcement (`ProviderStrategy`) or a forced schema tool (`ToolStrategy`), chosen per model | No string parsing; validation-error retry built into the agent loop | `ToolStrategy` retries without limit and native failures raise with no retry; see [appendix I](appendix-i-langchain-v1-in-practice.md) §5 |
 | **LiteLLM** | Unified API across providers with structured output | Provider abstraction; handles JSON mode differences | Abstraction can hide provider-specific behaviors |
 
 ### 12.2 Instructor in depth

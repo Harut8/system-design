@@ -1496,7 +1496,8 @@ result = agent.invoke(
 
 Version note: with the LangChain/LangGraph 1.0 releases (late 2025), `create_react_agent` is
 deprecated in favor of LangChain's `create_agent`, which builds the same kind of loop on LangGraph. The
-concepts in this section carry over unchanged.
+concepts in this section carry over unchanged. The graph `create_agent` builds, node by node, is in
+[appendix I](appendix-i-langchain-v1-in-practice.md) §2.
 
 `create_react_agent` returns a fully compiled `CompiledStateGraph` — not a black box distinct from
 everything else in this document, but literally the `agent`/`tools` two-node graph from §9.2,

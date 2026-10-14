@@ -100,6 +100,7 @@ keeps every claim honest by construction.
 | [`appendix-f-recall-at-every-layer.md`](appendix-f-recall-at-every-layer.md) | Every "recall" in the pipeline (span survival, token, embedding, ANN, candidate, context, citation, abstention, judge) on one page: what each counts, its answer key, a worked example, and a per-stage leak report | **written** |
 | [`appendix-g-ranking-and-answer-metrics.md`](appendix-g-ranking-and-answer-metrics.md) | Precision, hit rate, MRR, MAP, nDCG variants, faithfulness vs correctness, RAGAS names, scores vs metrics, pp vs %, κ — one worked list, every metric computed, and a per-stage cheat sheet | **written** |
 | [`appendix-h-graphrag.md`](appendix-h-graphrag.md) | GraphRAG, LazyGraphRAG, LightRAG, HippoRAG, RAPTOR: the two query types top-k can't answer, index-cost arithmetic (~1,000× vs vector), what GraphRAG-Bench shows, ACL leakage through summaries, adoption order | **written** |
+| [`appendix-i-langchain-v1-in-practice.md`](appendix-i-langchain-v1-in-practice.md) | LangChain 1.x in practice, read from source: what `create_agent` compiles into, middleware hook order and node-vs-wrapper semantics, the defaults that bite (`recursion_limit=9_999`, retry `on_failure`, summarization `trigger=None`), `ToolStrategy` vs `ProviderStrategy` failure modes, `ToolRuntime` context, best and worst practices, runnable probes | **written** |
 
 **Decision models (Jev, TypeSafe AI, 2026-09).** These are models that return typed, calibrated
 probabilities instead of text. They are not a separate chapter. They are covered where they are
@@ -112,7 +113,8 @@ and relevance filtering after the reranker in `04` §8.3.
 **2026 additions.** Defense by design against prompt injection (adaptive attacks, the Agents Rule
 of Two, the six agent design patterns, CaMeL-style capabilities) in `17` §4.7; agentic search vs
 a vector index in `05` §5.6; reasoning rerankers and BRIGHT in `04` §8.4; nugget-based answer
-evaluation in `08` §10.9; GraphRAG in appendix H.
+evaluation in `08` §10.9; GraphRAG in appendix H; the LangChain 1.x practice layer (`create_agent`,
+middleware, structured output strategies) in appendix I.
 
 ---
 
