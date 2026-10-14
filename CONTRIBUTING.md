@@ -16,6 +16,19 @@ Corrections and improvements are welcome. The most useful contributions, roughly
 - Bigger changes (a new section or chapter): open an issue first so we can agree on scope.
 - Keep the existing style: plain Markdown, one chapter per file, numbered filename prefixes.
 
+## External links
+
+Prefer primary sources: papers, RFCs, official docs, source code. Third-party learning resources
+(practice questions, courses, blog posts) are accepted when all of these hold:
+
+- The linked content is free to read without an account.
+- It adds substance beyond what the guide already says; the guide must still make sense without it.
+- You disclose any affiliation with the site in the PR description.
+- It sits on its own line at the end of a section, prefixed with *Further practice:*, never inline
+  in an explanation. One link per contribution.
+
+Maintainers may remove links that break, move behind a login, or change their terms.
+
 ## Previewing the site
 
 ```bash
