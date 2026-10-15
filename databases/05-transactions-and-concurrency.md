@@ -3364,3 +3364,4 @@ ORDER BY n_dead_tup DESC;
 | *A Read-Only Transaction Anomaly Under Snapshot Isolation* (Fekete, O'Neil, O'Neil, 2004) | Why read-only transactions are not automatically safe under SI |
 | *Weak Consistency: A Generalized Theory...* (Adya, 1999) | G0/G1/G2 phenomena -- the precise definitions behind isolation levels |
 | Jepsen analyses (jepsen.io) | Empirical isolation bugs in real databases |
+| [Appendix A — SurrealKV](appendix-a-surrealkv.md) §3 | SI with first-committer-wins implemented as a lock-free ring of published write sets instead of a lock table: 56-bit sequence numbers as snapshots, Bloom-filtered conflict checks, false aborts from undecided predecessors, and the write skew it leaves open |

@@ -18,6 +18,12 @@ A comprehensive guide to Log-Structured Merge Trees -- the dominant write-optimi
 10. LSM Tree Optimizations and Research *(not yet written)*
 11. Comparison Tables *(not yet written)*
 
+**Appendix A — [SurrealKV](appendix-a-surrealkv.md):** a 2026 engine that changes three parts of the
+design below at once — an adaptive radix tree in a fixed arena instead of a skiplist memtable, a
+lock-free commit ring plus a single flusher instead of a leader-written batch group, and versioning
+that reuses the sequence numbers and compaction rules already there. Read it after §2–§6 for a worked
+example of this chapter's trade-offs, with the vendor's own measurements and the limits they admit.
+
 ---
 
 ## 1. B-Trees vs LSM Trees: Fundamental Trade-offs
