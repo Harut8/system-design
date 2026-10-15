@@ -473,6 +473,9 @@ posture onto another's iteration speed.
 2. Trace volume grows 20× after agents launch and storage cost follows. *(Sampling by value, tail sampling, tiered storage.)*
 3. A customer asks you to delete all traces containing their data. *(Tenant- and subject-keyed storage, crypto-shredding.)*
 4. An eval dataset leaks into a fine-tuning set. How do you detect contamination?
+5. An operator reconnects while the collector replays trace events and a child span arrives before its parent. How should the UI reconstruct one consistent trace without replaying an approved action? *(Use stable event IDs for idempotent merges; retain orphan spans until their parent arrives; show whether the view is live or stale; keep a transport resume cursor separate from the durable run checkpoint; refresh server-authoritative action state before offering retry.)*
+
+> *Further practice:* [AI Agent Run Inspector — free question and full reference answer](https://frontendatlas.com/system-design/ai-agent-run-inspector)
 
 **Must answer (security, privacy, operations):**
 
