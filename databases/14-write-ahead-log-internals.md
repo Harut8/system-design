@@ -1253,6 +1253,13 @@ COMMAND LOGGING (VoltDB):
 
 LSM-tree engines (RocksDB, LevelDB, Cassandra, HBase) use WAL differently from B-tree engines. The WAL protects the MemTable, not data pages.
 
+> A worked example of this section plus §14's group commit in one engine:
+> [Appendix A — SurrealKV](appendix-a-surrealkv.md) §4 and §11. One standing task appends a whole
+> group of commits in one call with at most one `fsync`, each committed transaction is one CRC-checked
+> record in a 32 KiB-block log, one log segment belongs to one memtable generation, and the paper
+> states what a failed `fsync` leaves behind -- including that a commit which returned an error can
+> still take effect at the next open.
+
 ```
 LSM WAL vs. B-TREE WAL:
 

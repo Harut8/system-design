@@ -1161,6 +1161,55 @@ Also do §11 (build MiniTSDB). The tasks below measure and break what you built.
 
 ---
 
+## Appendix A — SurrealKV  ([chapter](appendix-a-surrealkv.md))
+**Time:** ~4 h · **Needs:** Rust toolchain + the `surrealkv` crate, Python, `rocksdict`, and `strace` (Linux) or `dtruss` (macOS, needs sudo)
+
+- [ ] **A.1 Price one `fsync` across a group** *(Level: Core)*
+  - **Goal:** Measure the mechanism behind the appendix §14.5 claim that the 26.8× durable-write win is a group-commit win (chapter [14](14-write-ahead-log-internals.md) §14).
+  - **Do:** A Rust binary that opens a `surrealkv` tree and runs 20k single-key transactions with `Immediate` durability, spread over 1, 2, 8, 32 and 64 threads. Count the process's `fsync`/`fdatasync` calls with `strace -f -c -e trace=fsync,fdatasync` (or `dtruss -c`). Repeat with `Eventual`.
+  - **Predict:** fsyncs per committed transaction at each thread count, and where throughput stops rising.
+  - **Verify:** A table of threads → ops/s → fsyncs per commit for both modes. The `Immediate` curve should approach `Eventual`'s as the group fills; explain the remaining gap (the paper measured 1.4× on creates).
+- [ ] **A.2 Reproduce one row of the paper's benchmark** *(Level: Core)*
+  - **Goal:** See how much of a vendor benchmark survives a different machine (appendix §14.1, §14.6).
+  - **Do:** Clone `crud-bench` and run `CRUD_BENCH_CONFIG=config/memory.toml ./run.sh -d surrealkv --no-build --optimised -s 500000 -c 128 -t 48`, then the same for `-d rocksdb`, each with and without `-sync`. Record your core count, drive and whether the dataset fit in RAM.
+  - **Predict:** Your read ratio and your sync-create ratio against the paper's 8.3× and 26.8×.
+  - **Verify:** Both ratios, plus one sentence per deviation naming the cause (cores, drive, `-c`/`-t` scaling, page cache). State which of the paper's own threats to validity your run reproduces.
+- [ ] **A.3 Build the commit ring and find its false aborts** *(Level: Core)*
+  - **Goal:** Internalise ring validation (appendix §3.2) without Rust.
+  - **Do:** In Python, model the ring: 65,536 slots, each holding a sorted key list plus a 4,096-bit Bloom filter of its keys; a committer claims a slot, then checks every slot since its window began, filter first and exact search on a hit, counting an undecided slot as a conflict. Drive it with 100k transactions of 1, 10 and 100 keys over a 1M-key space, at 8, 64 and 512 concurrent transactions, with 10% of commits abandoned undecided.
+  - **Predict:** Comparisons per validation as a function of concurrent commits (`w` in appendix §13), and the share of aborts that are false (Bloom false positives + undecided predecessors).
+  - **Verify:** Both numbers for all nine combinations, and the write-set size at which the 4,096-bit filter's false-positive rate stops being negligible.
+- [ ] **A.4 The value-log prefix hazard** *(Level: Core)*
+  - **Goal:** Reproduce appendix §9's space-amplification edge.
+  - **Do:** Open a tree with value separation on (threshold 1 KiB). Write one 64 KiB value under key `aaa`, then 200k × 64 KiB values under rotating keys so several 256 MiB value-log files roll. Record `du -sh` on the data directory. Now delete every key *except* `aaa`, force compaction, and record `du -sh` again. Repeat the whole run deleting `aaa` as well.
+  - **Predict:** Bytes reclaimed in each case.
+  - **Verify:** Both directory sizes. Explain why the first run reclaims almost nothing, in terms of "deleted only as a prefix of files".
+- [ ] **A.5 Does the radix memtable care about key length?** *(Level: Stretch)*
+  - **Goal:** Test the appendix §5 claim that ART lookup cost tracks key length, not key count, against a skiplist memtable.
+  - **Do:** Load 2M memtable-resident keys at 16 B, 64 B and 256 B key lengths (shared 8-byte prefix) into `surrealkv` and into `rocksdict` with a write buffer large enough that nothing flushes. Time 1M point reads of present keys in each of the six combinations.
+  - **Predict:** How each engine's read throughput changes from 16 B to 256 B keys, and which degrades more.
+  - **Verify:** Six timings, the ratio per key length, and one sentence on how much of the gap is index shape versus per-operation transaction overhead (every SurrealKV read is a transaction).
+- [ ] **A.6 Tear the log and read the recovery report** *(Level: Stretch)*
+  - **Goal:** Exercise appendix §11.2's failure table.
+  - **Do:** Commit 10k transactions with `Eventual`, kill -9, then truncate the newest log segment mid-record and reopen. Then repeat, but corrupt 8 bytes in the *middle* of that segment with intact records after it, and reopen in the default, strict and salvage modes.
+  - **Predict:** Which of the four opens succeed, and what each reports.
+  - **Verify:** The outcome of each open, the quarantine file for the torn tail, and the segment/offset/records-at-stake in the refusal message. Say which of these four outcomes would be an outage for a service and which would not.
+
+**Checkpoint (closed book):**
+1. Why does SurrealKV beat RocksDB by 26.8× on durable creates but lose to it by ~2× on unsynced ones?
+2. Why can an aborted transaction cause another transaction to abort?
+3. What does the default `Eventual` durability actually promise, and what does it not?
+4. Why is a read by time in a versioned tree not a seek?
+<details><summary>Answers</summary>
+
+1. Group commit: one flusher appends a group of up to 4 MiB and calls `fsync` at most once for it, so with 128 concurrent clients the only expensive operation is amortised. With no `fsync` there is nothing to amortise, and the same single flusher applies every group to the memtable on one core, where RocksDB applies concurrently.
+2. Validation counts a ring entry whose owner has not yet decided as a conflict, so an earlier commit that later aborts can abort a later one for nothing.
+3. The group is written to the OS before the commit returns, so a committed transaction survives a crash of the *process*. It does not survive a crash of the machine, and nothing syncs the log on a timer.
+4. The tree is ordered by sequence number and the time is 8 bytes inside the value, so there is no time index to seek in: `get_at` applies a rule over every version of the key the snapshot can see.
+</details>
+
+---
+
 ## Capstone projects
 
 - [ ] **C1 — A crash-safe key-value engine** (2–3 days; chapters 00, 01, 06 or 13, 14)
