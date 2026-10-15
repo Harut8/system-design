@@ -880,6 +880,21 @@ ANTI-PATTERN 9: NOT EXISTS vs. NOT IN WITH NULLs
   );
   -- Correct behavior AND usually same or better performance.
   -- NOT EXISTS can short-circuit; NOT IN must materialize the subquery.
+
+  Even with NO NULLs, NOT IN can fall off a performance cliff:
+
+  MEASURED (PostgreSQL 16, a = 1M rows, b = 500k rows, no NULLs, 1 worker):
+
+    NOT EXISTS                         Hash Anti Join          0.66 s
+    NOT IN, work_mem = 64MB            hashed SubPlan          0.54 s
+    NOT IN, work_mem = 4MB (default)   plain SubPlan           ~18 ms per outer row
+                                       1,000 rows: 18 s, 4,000 rows: 75 s
+                                       full 1M rows: ~5 hours (stopped)
+
+  Why: because of NULL semantics, PostgreSQL cannot rewrite NOT IN as an anti-join.
+  It runs the subquery as a SubPlan instead. If the result fits in work_mem it is
+  hashed (fast). If not, every outer row is compared against the materialized list
+  (quadratic). NOT EXISTS always gets a real anti-join.
 ```
 
 ```
