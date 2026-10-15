@@ -72,12 +72,12 @@ keeps every claim honest by construction.
 | [`08-evaluation-methodology.md`](08-evaluation-methodology.md) | Golden sets, recall@k / MRR / nDCG, faithfulness, LLM-as-judge calibration, significance | **written** — labs unrun |
 | `09-eval-infrastructure-and-ci.md` | Eval as a pipeline: datasets, versioning, regression gates, dashboards | planned |
 | `10-llm-observability-and-tracing.md` | OTEL GenAI semconv, span design, trace↔eval linkage, sampling | planned |
-| `11-token-accounting-and-cost.md` | Per-request/tenant/model attribution, budget enforcement, unit economics | planned |
-| `12-serving-latency-and-caching.md` | Streaming, prompt caching, batching, model routing, fallback, timeouts | planned |
+| `11-token-accounting-and-cost.md` | Unit economics: cost per answer, session, tenant and feature; the attribution join (usage × trace × eval); showback vs chargeback; forecasting; commitment and batch-lane planning. *Budget enforcement moved to appendix L* (§2's envelope, §4's ceilings) | planned, rescoped |
+| `12-serving-latency-and-caching.md` | The serving path: streaming, TTFT and inter-token budgets, concurrency and batching, timeouts and hedging, response and semantic cache placement, warm-up and cold start. *Prompt-caching mechanics stay in `06` §12; the cost arithmetic and cache-TTL break-even are in appendix L §5; routing and fallback in `23` §4–§5* | planned, rescoped |
 | `13-agents-and-tool-calling.md` | Tool schemas, multi-hop retrieval, planning, idempotency, failure handling | planned |
 | [`14-agent-evaluation.md`](14-agent-evaluation.md) | Trajectory and environment-state grading, pass^k reliability, harness vs model, public benchmark map (τ²-bench, Terminal-Bench, SWE-bench, GAIA, BrowseComp, OSWorld, BFCL), online eval | **written** |
 | `15-ingestion-pipelines-and-freshness.md` | Parsing at volume, dedup, incremental index updates, backfill, staleness SLOs | planned |
-| `16-multi-tenancy-and-isolation.md` | Per-tenant indexes, noisy neighbours, quota, data isolation | planned |
+| `16-multi-tenancy-and-isolation.md` | Data isolation: per-tenant indexes vs one filtered index, noisy neighbours at the index and reranker layer, residency, per-tenant deletion and GDPR, per-tenant eval slices. *Quotas, fairness and the two-ceiling problem are in `23` §6 and appendix L §4* | planned, rescoped |
 | [`17-safety-guardrails-and-prompt-injection.md`](17-safety-guardrails-and-prompt-injection.md) | Injection defence, output filtering, PII, tool-call authorization | **written** — labs unrun |
 | `18-failure-modes-and-incident-walkthrough.md` | End-to-end: a retrieval regression found, diagnosed, fixed | planned |
 | `19-build-vs-buy.md` | Langfuse / LangSmith / Braintrust / Arize / Helicone landscape and when to build | planned |
@@ -103,6 +103,7 @@ keeps every claim honest by construction.
 | [`appendix-i-langchain-v1-in-practice.md`](appendix-i-langchain-v1-in-practice.md) | LangChain 1.x in practice, read from source: what `create_agent` compiles into, middleware hook order and node-vs-wrapper semantics, the defaults that bite (`recursion_limit=9_999`, retry `on_failure`, summarization `trigger=None`), `ToolStrategy` vs `ProviderStrategy` failure modes, `ToolRuntime` context, best and worst practices, runnable probes | **written** |
 | [`appendix-j-production-ai-stack.md`](appendix-j-production-ai-stack.md) | The production AI stack by layer: the usual senior-AI-engineer roadmap mapped to these chapters, the LangGraph package map with internals (checkpoint tables and quadratic growth, MCP adapter sessions, third-party look-alike packages), reference stacks for enterprise RAG, coding agents (edit formats, search, sandbox layers) and the agent backend (double texting, failure modes), eval/observability tools, and frameworks beyond LangChain | **written** |
 | [`appendix-k-langgraph-runtime-and-platform-in-practice.md`](appendix-k-langgraph-runtime-and-platform-in-practice.md) | LangGraph runtime and platform in practice, read from source and probed: the Functional API (`@entrypoint`/`@task` replay rules), durability modes under a hard kill, `RetryPolicy` defaults (no retry on `TimeoutError`), timeouts, `CachePolicy`, rate limiting, streaming v2, LangSmith (batching, head sampling, redaction, `evaluate`), Deep Agents backends and sub-agents, the store, MCP adapter interceptors and name collisions | **written** |
+| [`appendix-l-control-plane-guardrails-budgets-and-gateways.md`](appendix-l-control-plane-guardrails-budgets-and-gateways.md) | The control plane as one system: the five chokepoints, the request envelope (absolute deadlines, one shared ledger, sub-agent inheritance), admission control and deadline-aware shedding, priority classes mapped to provider service tiers (priority, flex, batch), the 429 contract and the two ceilings, token optimization ordered by payoff with the cache-TTL break-even, guardrail placement and the 2026 managed products, tool governance as a budget control, AI vs MCP vs agentic gateways (Agent Router, agentgateway, ContextForge, Docker MCP Gateway, LiteLLM), and two reference configurations — three engineers and an enterprise | **written** |
 
 **Decision models (Jev, TypeSafe AI, 2026-09).** These are models that return typed, calibrated
 probabilities instead of text. They are not a separate chapter. They are covered where they are
@@ -118,7 +119,15 @@ a vector index in `05` §5.6; reasoning rerankers and BRIGHT in `04` §8.4; nugg
 evaluation in `08` §10.9; GraphRAG in appendix H; the LangChain 1.x practice layer (`create_agent`,
 middleware, structured output strategies) in appendix I; the whole production stack by layer, with
 reference stacks for enterprise RAG, coding agents and agent backends, in appendix J; the LangGraph
-runtime controls, Functional API, LangSmith, Deep Agents, store and MCP adapters in practice in appendix K.
+runtime controls, Functional API, LangSmith, Deep Agents, store and MCP adapters in practice in appendix K;
+the control plane — envelope, admission control, degradation ladder, 429 semantics, token-cost
+arithmetic, guardrail products and the AI/MCP/agentic gateway layer — in appendix L.
+
+**Rescope note (2026-10).** Appendix L absorbed the control-plane half of three planned chapters,
+so `11`, `12` and `16` were narrowed to what is left and is still worth its own page: unit
+economics and chargeback (`11`), the serving path and cache placement (`12`), and data isolation
+per tenant (`16`). Existing cross-references to `12` for caching still hold — it keeps caching as
+a serving-layer concern and delegates the prompt-cache mechanics to `06` §12.
 
 ---
 

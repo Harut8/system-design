@@ -13,8 +13,8 @@ models. Rules:
 ## How to use this sheet
 
 - Order: Setup → 00 (the harness every later number depends on) → Appendix G → 01 → 02 → 03 → 04 →
-  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I, J and K while
-  the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22, 21). Capstones last.
+  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I, J, K and L
+  while the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22, 21, 17/23/24). Capstones last.
 - Tick `- [ ]` boxes. Do every Core task. Do Stretch tasks once the chapter's Core tasks pass.
 - Keep `lab-notebook.md`: one entry per task with date, prediction, measured result, the gap, and one
   line on why. Keep per-query rows in DuckDB (`results.duckdb`), not in notebook variables.
@@ -1110,6 +1110,57 @@ each node), so a resumed run cannot hide re-execution from you.
 1. The entrypoint body, from the top. Finished tasks return saved results (§1.2).
 2. `TimeoutError`, because it subclasses `OSError`, which `default_retry_on` excludes (§2.2).
 3. It is head sampling by trace ID, decided before the outcome is known (§3.2).
+</details>
+
+---
+
+## Appendix L — The control plane  ([chapter](appendix-l-control-plane-guardrails-budgets-and-gateways.md))
+**Time:** ~5 h · **Needs:** Python 3.12 only (a fake provider), optionally Docker for an MCP gateway
+
+- [ ] **L.1 Envelope and the copied-ledger bug** *(Level: Core)*
+  - **Goal:** §2.
+  - **Do:** implement `Envelope`; run a parent + 2 sub-agents × 3 tool calls against a fake client
+    that charges 1,000 in / 200 out per call, once with the ledger shared and once with a fresh
+    ledger per child.
+  - **Predict:** total charged tokens and call count for each.
+  - **Verify:** both, and add the assertion that catches the copied ledger.
+- [ ] **L.2 Charge-after vs reserve-then-settle** *(Level: Core)*
+  - **Goal:** §8.3.
+  - **Do:** both limiters on a 100k-tokens-per-minute bucket; 20 concurrent requests of 10k input and
+    `max_tokens=4000`, 19 returning 200 output tokens and one returning 4,000.
+  - **Predict:** peak overshoot above the ceiling and rejection count for each.
+  - **Verify:** both, plus one sentence on which you would put in front of a provider allocation.
+- [ ] **L.3 Deadline-aware shedding vs FIFO** *(Level: Core)*
+  - **Goal:** §3.2.
+  - **Do:** fake server, 8 s p95, 4 workers, 2× offered load for 60 s, 30 s client deadlines; compare
+    unbounded FIFO, capped FIFO and deadline-aware LIFO.
+  - **Predict:** goodput and wasted tokens for each.
+  - **Verify:** all three, and wasted spend as a percentage.
+- [ ] **L.4 Cache TTL break-even and the tool-definition tax** *(Level: Core)*
+  - **Goal:** §5.2 and §7.2.
+  - **Do:** reproduce the break-even in code with your provider's current multipliers; then token-count
+    50 real tool schemas full, hot-5, and deferred.
+  - **Predict:** the crossover `n`, and tokens per request for each tool configuration.
+  - **Verify:** both against the closed form and a token counter, not character counts.
+- [ ] **L.5 Guardrail arrangement and 429 discipline** *(Level: Stretch)*
+  - **Goal:** §6.4 and §4.1.
+  - **Do:** one local classifier as an input rail, measured inline, in parallel and in shadow; then a
+    fake provider returning `retry-after` 429s and, separately, a spend-cap 429 with no `retry-after`.
+  - **Predict:** added p95 per arrangement; requests sent and whether each client terminates.
+  - **Verify:** both, and assert your fail-open/fail-closed table holds when the classifier raises.
+
+**Also do:** chapter §12's L.8 (MCP gateway tool filtering), L.9 (price the degradation ladder on the
+golden set) and L.10 (context editing against the cache) once the Core tasks pass.
+
+**Checkpoint (closed book):**
+1. Why must a deadline be absolute rather than per hop?
+2. From how many reuses within an hour does a 1-hour cache TTL beat a 5-minute one?
+3. Which two 429s must never share a retry policy?
+<details><summary>Answers</summary>
+
+1. Relative per-hop timeouts compose multiplicatively: 30 s × 4 retries × 10 tools × 2 depths = 40 min on a 30 s request (§2.2).
+2. From the second: `1.25n = 2 + 0.1(n − 1)` gives `n ≈ 1.65` (§5.2).
+3. A quota-reset 429 (backoff and retry) and a spend-cap or hard-limit 429, which carries no `retry-after` and will not clear (§4.1).
 </details>
 
 ---
