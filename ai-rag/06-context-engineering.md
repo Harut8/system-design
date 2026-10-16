@@ -46,6 +46,13 @@
 > reservation has only ~500 tokens left for chain-of-thought and can produce worse answers than one
 > that retrieved five mediocre chunks and left room to think. The retrieval team sees a recall regression; the context
 > engineer sees arithmetic. The arithmetic wins.
+>
+> **Companion:** [`appendix-m-how-the-labs-do-it.md`](appendix-m-how-the-labs-do-it.md) reads this
+> chapter's mechanisms back out of shipped products: the five-rung ladder, Claude Projects'
+> automatic switch to retrieval at the window boundary, the three providers' caching policies
+> compared as priced systems (§2 there), server-side compaction on both Anthropic and OpenAI,
+> why no provider ships prompt compression, and §10 there computes long-context-vs-retrieval
+> rather than arguing it.
 
 ---
 

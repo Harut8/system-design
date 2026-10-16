@@ -41,6 +41,13 @@
 > only the handful of facts relevant to *this* turn should. Get this separation right and the rest of
 > this chapter is implementation detail. Get it wrong and no amount of prompt engineering fixes a system
 > that is, structurally, a context window slowly filling with noise.
+>
+> **Companion:** [`appendix-m-how-the-labs-do-it.md`](appendix-m-how-the-labs-do-it.md) §5–§6 read
+> the shipped memory systems: the four-stage pipeline all three assistants converged on,
+> ChatGPT's asynchronous "dreaming" consolidation, Claude's categorized entries, Gemini's
+> personal context, the enterprise governance surface a B2B buyer asks for, bi-temporal validity
+> windows, and why the agent-memory frameworks' published benchmark numbers differ by sixty
+> points on the same set.
 
 ---
 

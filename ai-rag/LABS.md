@@ -13,8 +13,9 @@ models. Rules:
 ## How to use this sheet
 
 - Order: Setup → 00 (the harness every later number depends on) → Appendix G → 01 → 02 → 03 → 04 →
-  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I, J, K and L
-  while the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22, 21, 17/23/24). Capstones last.
+  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I, J, K, L
+  and M while the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22, 21, 17/23/24, 06/25/30).
+  Capstones last.
 - Tick `- [ ]` boxes. Do every Core task. Do Stretch tasks once the chapter's Core tasks pass.
 - Keep `lab-notebook.md`: one entry per task with date, prediction, measured result, the gap, and one
   line on why. Keep per-query rows in DuckDB (`results.duckdb`), not in notebook variables.
@@ -1161,6 +1162,81 @@ golden set) and L.10 (context editing against the cache) once the Core tasks pas
 1. Relative per-hop timeouts compose multiplicatively: 30 s × 4 retries × 10 tools × 2 depths = 40 min on a 30 s request (§2.2).
 2. From the second: `1.25n = 2 + 0.1(n − 1)` gives `n ≈ 1.65` (§5.2).
 3. A quota-reset 429 (backoff and retry) and a spend-cap or hard-limit 429, which carries no `retry-after` and will not clear (§4.1).
+</details>
+
+---
+
+## Appendix M — How the labs and the AI products do it  ([chapter](appendix-m-how-the-labs-do-it.md))
+**Time:** ~6 h · **Needs:** Python 3.12, one provider API key with prompt caching, a token counter
+
+- [ ] **M.1 Measure your effective window** *(Level: Core)*
+  - **Goal:** §10, and `06` §5.
+  - **Do:** one ~400k-token document, 30 questions with answers planted at 10/30/50/70/90% depth;
+    ask each at 50k, 100k, 200k and 400k of surrounding filler. Run a needle-in-a-haystack probe
+    on the same model for comparison.
+  - **Predict:** the depth × length accuracy surface, and the length at which it breaks.
+  - **Verify:** per-cell accuracy; name your effective window (largest length within 2 points of
+    the 50k result at every depth) and explain the gap against the NIAH score.
+- [ ] **M.2 The caching break-even, measured** *(Level: Core)*
+  - **Goal:** §2.2 and §2.3.
+  - **Do:** a 60k-token stable prefix over 200 questions, run uncached, short-TTL and long-TTL;
+    then insert `datetime.now()` above the breakpoint and rerun.
+  - **Predict:** `n*` from the closed form for your provider's current multipliers.
+  - **Verify:** `cache_read_input_tokens` / `cache_creation_input_tokens` and billed cost per
+    question; show that the broken-prefix run costs **more** than the uncached run.
+- [ ] **M.3 The hysteretic ladder** *(Level: Core)*
+  - **Goal:** §1.3.
+  - **Do:** implement `choose_path`; add 20 documents one at a time across the window boundary,
+    then delete 15. Repeat with a one-way switch.
+  - **Predict:** where each implementation sits after the deletions, and the cost gap over the
+    final 50 questions.
+  - **Verify:** assert the mode switches up **and** back down, that the model is told which mode
+    it is in, and that the mode appears in the trace.
+- [ ] **M.4 Clear vs compact vs notes** *(Level: Stretch)*
+  - **Goal:** §3, and `30` §11.
+  - **Do:** a 50-turn tool-heavy loop in four configurations — baseline, clearing (`keep = 3`),
+    compaction, clearing + structured notes — over 20 tasks.
+  - **Predict:** the ranking on final window size, summed input tokens, cache hit rate and success.
+  - **Verify:** all four columns. The surprise is in the cache column; explain it.
+- [ ] **M.5 A memory eval you can defend** *(Level: Stretch)*
+  - **Goal:** §5, §6.3.
+  - **Do:** 60 two-session conversations from your own domain, 10 of them containing a correction;
+    evaluate no-memory, last-N-turns, a flat fact list and a fact list with supersession, all at an
+    identical retrieved-token budget.
+  - **Predict:** which system wins overall, and which wins the corrections slice.
+  - **Verify:** recall of the correct fact, and the rate at which a superseded fact is retrieved.
+- [ ] **M.6 Compression, honestly** *(Level: Stretch)*
+  - **Goal:** §4.4.
+  - **Do:** 40 questions whose answers hinge on a negation, a unit or a numeric qualifier;
+    compress their contexts at 1.0 / 0.75 / 0.5 / 0.33 / 0.2.
+  - **Predict:** which ratio first loses a point of faithfulness.
+  - **Verify:** tokens, correctness, faithfulness **and** span survival; then compute what a cache
+    hit would have saved on the same workload and state which lever you would ship.
+- [ ] **M.7 Fan-out over reads vs writes** *(Level: Stretch)*
+  - **Goal:** §9.2.
+  - **Do:** a read-only task (summarize 8 documents on one question) and a write-heavy task (apply
+    a rename across 8 files), each single-agent and 8-way fan-out, at **matched** token budgets.
+  - **Predict:** both outcomes, including the number of mutually inconsistent edits.
+  - **Verify:** success rate, token spend, and the inconsistency count for the write task.
+- [ ] **M.8 Sticky vs per-request routing** *(Level: Stretch)*
+  - **Goal:** §8.5.
+  - **Do:** simulate 500 multi-turn conversations across two models behind a prefix cache; route
+    per request by cheapest-model heuristic, then sticky per conversation.
+  - **Predict:** whether the cheaper-per-request router is cheaper overall.
+  - **Verify:** cache hit rate and total cost for both.
+
+**Checkpoint (closed book):**
+1. A file-handle API saves you what, exactly — and what does it not save?
+2. Why does prompt compression fight prompt caching?
+3. Your corpus is 400k tokens, you retrieve 4k, and you get a 100% cache hit rate. How many times
+   the retrieval bill is the long-context bill?
+4. When is multi-agent fan-out the wrong architecture, in one variable?
+<details><summary>Answers</summary>
+
+1. Upload bandwidth and re-parsing. It does **not** save input tokens — the document is still in the prompt every turn, so you need `cache_control` as well (§1.1).
+2. A compressor's output is a function of its input, so compressed prefixes are unstable prefixes. Caching pays ~10× for stable bytes; compression pays ~3× for bytes you just destabilized (§4.2).
+3. About 8×: you still pay 0.1 × 400,000 = 40,000 plus overhead against ~5,000. Caching makes long context affordable, not competitive (§10.1).
+4. When the sub-tasks **write** to shared state. Fan out over reads, serialize over writes (§9.2).
 </details>
 
 ---

@@ -10,6 +10,12 @@
 > covers only in-loop notes). Useful: [`05-query-understanding.md`](05-query-understanding.md) (§5.6
 > agentic search), [`23-multi-llm-model-gateway.md`](23-multi-llm-model-gateway.md), and the lab
 > [`labs/tool-registry/`](labs/tool-registry/README.md) used in §3 and Lab 2.
+>
+> **Companion:** [`appendix-m-how-the-labs-do-it.md`](appendix-m-how-the-labs-do-it.md) reads these
+> same primitives back out of shipped products — Claude Projects' automatic retrieval switch, the
+> three providers' caching policies side by side, server-side compaction on both Anthropic and
+> OpenAI, why no provider ships prompt compression, the labs' own RAG defaults, Cursor's gateway and
+> index, and the Anthropic/Cognition orchestration disagreement reconciled.
 
 ---
 
