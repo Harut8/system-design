@@ -349,6 +349,12 @@ documents."
 
 ### 3.4 Tables — the hardest case, and the one with a concrete fix
 
+> **Companion:** this section solves *serialization*. The retrieval half — routing aggregates to
+> SQL instead of letting the model do arithmetic, indexing the row and returning the table, why
+> hybrid matters more on tables than anywhere else, and why table-QA scores measured with oracle
+> context tell you nothing — is
+> [`appendix-n-multimodal-retrieval-and-generation.md`](appendix-n-multimodal-retrieval-and-generation.md) §3.
+
 A table's meaning lives in the *association* between a cell, its column header, and its row label.
 Flatten it in scan order and you get `"Q1 2024 1,204 1,190 14 Q2 2024 1,318 1,275 43"` — a string
 that will embed to something adjacent to "numbers about quarters" and answer no question at all.

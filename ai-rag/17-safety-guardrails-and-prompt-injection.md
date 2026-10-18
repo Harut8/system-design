@@ -39,6 +39,11 @@
 
 ---
 
+> **Companion:** the pixel and waveform channels — instructions painted into an image or spoken
+> into a clip, which no character-level filter can see — are
+> [`appendix-n-multimodal-retrieval-and-generation.md`](appendix-n-multimodal-retrieval-and-generation.md) §8,
+> along with C2PA provenance in §6.5. The defenses there chain back to this chapter's §4.7 and §5.
+
 ## Contents
 
 0. [Start here — the whole chapter in plain words](#start-here--the-whole-chapter-in-plain-words)

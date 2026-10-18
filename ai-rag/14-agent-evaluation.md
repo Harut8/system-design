@@ -110,6 +110,13 @@ CI on regressions with budgets (§15).
 
 ## 1. What makes agent eval different
 
+> **Companion:** [`appendix-o-training-agents-rlvr-and-the-alternatives.md`](appendix-o-training-agents-rlvr-and-the-alternatives.md)
+> is what happens when you point this chapter's machinery at *training* rather than measuring:
+> the verifier as the actual product, reward hacking with the documented numbers, why the eval
+> must be frozen before the training pipeline exists, and the four-arm baseline that ends most
+> training projects. This chapter's §4 (state vs transcript grading), §6 (pass^k), §7 (cost per
+> resolved task) and §8 (harness vs model) are its load-bearing dependencies.
+
 > **In plain words.** A retrieval or QA eval is a function check: one input, one output, one grade.
 > An agent eval is a small simulation: many steps, a changing world, sometimes a pretend user.
 > Four things go wrong that never did before: errors pile up, actions leave marks, the user is a

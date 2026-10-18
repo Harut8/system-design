@@ -1687,6 +1687,13 @@ selection generally.
 
 ## 11. Multilingual and multimodal
 
+> **Companion:** [`appendix-n-multimodal-retrieval-and-generation.md`](appendix-n-multimodal-retrieval-and-generation.md)
+> is the long version of this section's second half: the modality gap measured rather than
+> asserted (§2), late interaction over page patches with its storage arithmetic (§1), audio and
+> video embedding spaces (§4–§5), and MIEB as the leaderboard that actually covers images (§2.4).
+> §10 there on when *not* to fine-tune an embedding model has its agent-side twin in
+> [`appendix-o-training-agents-rlvr-and-the-alternatives.md`](appendix-o-training-agents-rlvr-and-the-alternatives.md).
+
 > **In plain words.** Multilingual models put the same meaning in different languages close together, so a French question can find an English document. Multimodal models put images, PDFs and text in one space, so a text question can find a chart without reading the text out of it first. Both have limits you must test.
 >
 > **Real-world example.** `gemini-embedding-2` charges 258 tokens per PDF page from an 8,192-token budget, so at most 31 pages fit (31 × 258 = 7,998), before any text. A 40-page PDF silently loses at least its last 9 pages.

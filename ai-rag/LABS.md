@@ -13,9 +13,9 @@ models. Rules:
 ## How to use this sheet
 
 - Order: Setup → 00 (the harness every later number depends on) → Appendix G → 01 → 02 → 03 → 04 →
-  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I, J, K, L
-  and M while the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22, 21, 17/23/24, 06/25/30).
-  Capstones last.
+  Appendix F → 05 → 06 → 07 → 08 → 17 → 20 → 21 → 22 → 24 → 23 → 25. Do Appendices D, E, H, I, J, K, L,
+  M, N and O while the matching chapter is fresh (02, 03/07, 04, 20/21, 21/22, 21, 17/23/24, 06/25/30,
+  01/02/17, 14). Capstones last.
 - Tick `- [ ]` boxes. Do every Core task. Do Stretch tasks once the chapter's Core tasks pass.
 - Keep `lab-notebook.md`: one entry per task with date, prediction, measured result, the gap, and one
   line on why. Keep per-query rows in DuckDB (`results.duckdb`), not in notebook variables.
@@ -1237,6 +1237,159 @@ golden set) and L.10 (context editing against the cache) once the Core tasks pas
 2. A compressor's output is a function of its input, so compressed prefixes are unstable prefixes. Caching pays ~10× for stable bytes; compression pays ~3× for bytes you just destabilized (§4.2).
 3. About 8×: you still pay 0.1 × 400,000 = 40,000 plus overhead against ~5,000. Caching makes long context affordable, not competitive (§10.1).
 4. When the sub-tasks **write** to shared state. Fan out over reads, serialize over writes (§9.2).
+</details>
+
+---
+
+## Appendix N — Multimodal retrieval and generation  ([chapter](appendix-n-multimodal-retrieval-and-generation.md))
+**Time:** ~7 h · **Needs:** Python 3.12, a multimodal embedding API, an ASR model with word timestamps, DuckDB
+
+- [ ] **N.1 The modality ratio** *(Level: Core)*
+  - **Goal:** §0.1 — the exercise that blocks the most expensive mistake in the appendix.
+  - **Do:** 100 real questions over a visually rich corpus; extract text with your current parser;
+    label by hand whether each gold answer is derivable from the extracted text alone.
+  - **Predict:** the ratio.
+  - **Verify:** report it, then name which of the three architectures it selects and why.
+- [ ] **N.2 Storage arithmetic, then quantization** *(Level: Core)*
+  - **Goal:** §1.2, §1.3.
+  - **Do:** index 500 pages three ways — text chunks, single-vector multimodal, late-interaction
+    patches at float32 — and measure bytes on disk including index overhead. Then quantize the
+    patch vectors to int8.
+  - **Predict:** the three byte counts, and the nDCG@5 delta from quantization.
+  - **Verify:** all four numbers, the error in your prediction, and a decision on whether late
+    interaction earns its bill on your corpus.
+- [ ] **N.3 Measure your modality gap** *(Level: Core)*
+  - **Goal:** §2.2, §2.3.
+  - **Do:** 200 (caption, image) matching pairs plus a second matching caption each; run
+    `modality_gap` on one dual-encoder and one single-encoder model; then build one mixed index and
+    one pair of separate indexes with RRF.
+  - **Predict:** the sign and rough size of the gap for each model.
+  - **Verify:** the gap, and modality share in top-10 for both index designs against the gold share.
+- [ ] **N.4 Row index, table return, SQL route** *(Level: Core)*
+  - **Goal:** §3.1–§3.4.
+  - **Do:** 30 tables, 60 questions (20 single-fact, 20 aggregate, 20 narrative) against three
+    configurations — whole-table chunks; row sentences with the table as parent; the same plus an
+    aggregate route to DuckDB.
+  - **Predict:** accuracy per question class per configuration.
+  - **Verify:** the 3×3 grid. Check whether the SQL route is the only configuration that gets
+    aggregates right at all.
+- [ ] **N.5 Audio citations you can trust** *(Level: Stretch)*
+  - **Goal:** §4.1–§4.3.
+  - **Do:** 20 recordings through the full pipeline (VAD → ASR with word timestamps → diarize →
+    chunk). Measure `keyword_recall` per entity class, citation offset error in ms against
+    hand-labelled gold, and answer correctness on 40 questions. Then re-encode the audio after
+    timestamping.
+  - **Predict:** which entity class has the worst keyword recall.
+  - **Verify:** all three metrics, plus the citation drift the re-encode introduces.
+- [ ] **N.6 Voice latency budget** *(Level: Stretch)*
+  - **Goal:** §6.2, §6.3.
+  - **Do:** build STT→LLM→TTS with every stage instrumented; add retrieval; add the filler-utterance
+    technique; specify and test a barge-in policy.
+  - **Predict:** where your budget goes, before measuring.
+  - **Verify:** p50/p95 per stage and end-to-end, plus perceived vs actual latency on five people.
+- [ ] **N.7 Pixel-borne injection, end to end** *(Level: Stretch)*
+  - **Goal:** §8.
+  - **Do:** four test images (typographic at 100%, at 1% opacity, 6-point margin text, benign
+    control) with a harmless observable instruction, through your real pipeline. Then add
+    OCR-then-text-rail, render normalization, and tool gating on untrusted-input turns.
+  - **Predict:** which your current guardrails catch (the answer should be: none).
+  - **Verify:** detection per technique per control, and that tool gating blocks the consequence
+    even when detection fails.
+- [ ] **N.8 Render vs rows** *(Level: Stretch)*
+  - **Goal:** §6.4.
+  - **Do:** the same analytics answer as a generated raster chart and as client-rendered rows, with
+    a planted arithmetic error. Show each format to five reviewers.
+  - **Predict:** how many catch the error in each format.
+  - **Verify:** the ratio.
+
+**Checkpoint (closed book):**
+1. Your corpus is 200k pages. What does a float32 ColPali-style index cost in storage, and what are
+   the two mitigations you reach for first?
+2. Why does a single mixed text+image index return almost no images, and what is the scale-free fix?
+3. A user asks "how many contracts expire in Q3" and gets a wrong number with correct citations.
+   What failed, and why didn't faithfulness monitoring catch it?
+4. Why must ASR produce *word*-level timestamps rather than segment-level?
+5. Name the one thing a native speech-to-speech architecture takes away from you.
+<details><summary>Answers</summary>
+
+1. ~512 KB/page × 200,000 ≈ 100 GB raw vectors before index overhead (§1.2). First: int8 quantization (~4×, reported near-lossless). Second: two-stage — pooled single vector for recall, MaxSim only over the top candidates.
+2. The modality gap: in a dual-encoder space text-text similarity is systematically higher than text-image, so every image competes from behind. Fix: separate indexes and fuse *ranks* with RRF, which is scale-free (§2.3).
+3. Routing. Counting and filtering are not retrieval — the model did arithmetic over whatever chunks returned. Faithfulness passes because every number it cited really is in the context (§3.1).
+4. So the citation points at the phrase rather than a 30-second window. Reviewers stop checking window-level citations, and word offsets cannot be recovered after the ASR stage (§4.1, §4.3).
+5. An inspectable text stage — the only place a guardrail, a redaction pass or a verbatim log can live. Tool calls also don't compose cleanly with full-duplex speech (§6.2).
+</details>
+
+---
+
+## Appendix O — Training agents: RLVR and the alternatives  ([chapter](appendix-o-training-agents-rlvr-and-the-alternatives.md))
+**Time:** ~5 h (no GPUs needed for the Core tasks) · **Needs:** Python 3.12, an agent with an observable final state
+
+- [ ] **O.1 Lever attribution before anything else** *(Level: Core)*
+  - **Goal:** §0, and `14` §8.
+  - **Do:** 40 failing tasks across four arms — baseline; better model/unchanged harness; same
+    model/fixed tool descriptions; same model/retry-with-feedback harness.
+  - **Predict:** which arm moves the number most.
+  - **Verify:** success rate and cost per resolved task for all four, plus one paragraph naming
+    which lever your failures actually live in.
+- [ ] **O.2 Write a verifier, then try to cheat it** *(Level: Core)*
+  - **Goal:** §2.2, §3.2.
+  - **Do:** write `verify()` with hard gates, final-state correctness and process constraints for
+    one task. Then spend 60 minutes passing it without doing the task.
+  - **Predict:** how many exploits you'll find.
+  - **Verify:** every exploit, and how you closed it. Most people underestimate by half.
+- [ ] **O.3 Verify at inference, measured** *(Level: Core)*
+  - **Goal:** §4.3.
+  - **Do:** best-of-n with feedback over your verifier, n ∈ {1, 2, 4, 8}.
+  - **Predict:** where the success curve flattens.
+  - **Verify:** success rate, cost per resolved task and p95 latency per n; state the n you'd ship.
+- [ ] **O.4 The GRPO group-signal property** *(Level: Core, no GPUs)*
+  - **Goal:** §1.2.
+  - **Do:** 50 tasks × 16 sampled attempts each, scored by your verifier; compute `mean(r)` and
+    `std(r)` per task.
+  - **Predict:** the fraction of tasks with `std ≈ 0` (always or never solved — zero training signal).
+  - **Verify:** the distribution, and the size of the curated learnable-band subset. That fraction
+    is your real training-set size.
+- [ ] **O.5 Break-even arithmetic on your own numbers** *(Level: Core)*
+  - **Goal:** §7.1.
+  - **Do:** fill in `rlvr_breakeven` with a quoted training cost, your measured per-request costs
+    from arms A and B, and an honest re-training cadence.
+  - **Predict:** the order of magnitude of the break-even request count.
+  - **Verify:** the number against your actual annual volume; approve or decline in one paragraph.
+- [ ] **O.6 The four-arm comparison** *(Level: Stretch)*
+  - **Goal:** §7.2.
+  - **Do:** arms A–C on 100 tasks (D only if you have a training pipeline).
+  - **Predict:** whether C gets close enough to make D hard to justify.
+  - **Verify:** success rate, cost per resolved task, p95 latency, with `14` §13's sample-size
+    arithmetic so you know which gaps are real.
+- [ ] **O.7 Reward-hacking detection harness** *(Level: Stretch)*
+  - **Goal:** §3.2, §8.
+  - **Do:** two independently written verifiers A and B for one task; five hand-written attempts
+    (three genuine, two deliberate exploits of A); then the four-curve chart.
+  - **Predict:** that A accepts the exploits and B rejects them.
+  - **Verify:** both, and plot the five points. The deliverable is a harness that exists *before*
+    you need it.
+- [ ] **O.8 Grader isolation audit** *(Level: Stretch)*
+  - **Goal:** §3.2, and `28`.
+  - **Do:** enumerate every path by which your agent could reach scoring code, test files, expected
+    outputs or the eval set — filesystem, network, tool surface, env vars, error messages echoing
+    expected values.
+  - **Predict:** how many paths you'll find.
+  - **Verify:** close them, and write the test that fails if any reopens.
+
+**Checkpoint (closed book):**
+1. Name two levers that survive a model upgrade and one that doesn't.
+2. In GRPO, why does a prompt whose 16 samples all score identically teach nothing?
+3. You have a verifier. What is the cheapest thing to do with it, and why is it usually better than
+   training?
+4. Your verifier pass rate is climbing beautifully. Why is that not evidence of anything?
+5. Does RLVR pay off because the task is hard, or because the volume is high?
+<details><summary>Answers</summary>
+
+1. Survive: the tool surface, the context design, the harness. Doesn't: a trained checkpoint — every base-model release obsoletes it (§0).
+2. The advantage is the reward normalized against the group's mean and spread. With `std(r) ≈ 0` the advantage is undefined or meaningless, so there is no gradient — the prompt is pure compute burn (§1.2).
+3. Verify at inference: best-of-n with the failure notes fed back. Days instead of weeks, survives model upgrades, reward hacking is visible per request rather than baked into weights, and the capability lives in readable code (§4.3).
+4. Because acceptance and correctness can diverge — a reported configuration hit 99.4% acceptance at 2.2% correctness. You need a held-out verifier and an independent correctness measure on the same axes (§3.1, §8).
+5. Volume. It converts a recurring per-request cost into a one-time training cost plus upkeep; the break-even lands in the millions of requests per year on plausible numbers (§7.1).
 </details>
 
 ---
