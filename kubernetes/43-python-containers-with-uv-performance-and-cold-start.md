@@ -47,7 +47,7 @@ If you read chapter 39 (Dockerfile best practices), this chapter is the language
 
 Run through the data:
 
-- `python:3.12` (Debian-based, full image): ~1.0 GB compressed, ~1.05 GB uncompressed.
+- `python:3.12` (Debian-based, full image): ~380 MB compressed, ~1.0 GB uncompressed.
 - `python:3.12-slim`: ~45 MB compressed, ~125 MB uncompressed. Drops dev headers, docs, locales.
 - `python:3.12-alpine`: ~20 MB compressed, ~55 MB uncompressed. **musl libc.**
 - `gcr.io/distroless/python3-debian12`: ~25 MB compressed, ~70 MB uncompressed. No shell, no package manager.
@@ -56,10 +56,10 @@ Then your dependencies pile on. `pip install fastapi sqlalchemy psycopg2-binary`
 
 The problems compound:
 
-- **Slow `pip install`.** pip's resolver is correct but single-threaded and SAT-solver-slow. On a 50-dep project, a clean resolve can take 20–60 seconds.
+- **Slow `pip install`.** pip's backtracking resolver is correct but single-threaded, and downloads and installs serially. On a 50-dep project, a clean resolve can take 20–60 seconds.
 - **No content-addressed cache by default.** pip's wheel cache is per-user, not content-addressed; reinstalling the same package may or may not hit the cache.
 - **`__pycache__` written at first import.** Cold start pays the `.py` → `.pyc` compilation tax every time, unless you precompile.
-- **Import time dominated by `site-packages` scanning.** `import pandas` parses 1,800+ files before returning control. `import django` reads ~700.
+- **Import time dominated by module loading.** `import pandas` executes several hundred modules (numpy, dateutil, pytz, its own submodules) before returning control, and *parses* every one of them too if there is no usable `.pyc`.
 - **No native standard for lockfiles.** `pip freeze`, `requirements.txt`, `Pipfile.lock`, `poetry.lock`, `pdm.lock`, `pip-tools` — six conventions, none built in.
 - **musl vs glibc wheels split.** Many wheels are `manylinux2014` only; on Alpine, pip falls back to source builds. Now you need `gcc`, `python3-dev`, library headers — image triples in size.
 - **Two-step builds without tooling support.** Out of the box, building a wheel-only image (no compilers in production) requires hand-rolled stages.
@@ -85,7 +85,7 @@ Why this matters in a container:
 
 - **CI builds drop 30–90 seconds.** At 50 builds/day, that's a meaningful CI cost.
 - **Cache mounts get utilized better.** `uv` has a sane, content-addressed global cache (typically `/root/.cache/uv`) that BuildKit cache mounts handle cleanly.
-- **Reproducibility is built-in.** `uv.lock` is hashed, deterministic, and resolved with a real SAT-style resolver.
+- **Reproducibility is built-in.** `uv.lock` is hashed, deterministic, and resolved with a PubGrub resolver; hashes are verified on install.
 - **Bytecode compilation is one flag.** `uv sync --compile-bytecode` or `uv pip install --compile-bytecode` precompiles `.pyc` at install time.
 - **No interpreter required to bootstrap `uv`.** `uv` is a static Rust binary; you don't need a Python in the image to install Python. (`uv python install 3.12` will fetch a CPython if you don't have one.)
 
@@ -94,8 +94,10 @@ Why this matters in a container:
 ```
 uvx ruff check .
 uvx black --check .
-uvx pytest tests/
+uvx pip-audit
 ```
+
+`uvx` tools run in an isolated environment that does **not** contain your project or its dependencies. That's right for linters and formatters, which only read source, and wrong for anything that imports your code: `uvx pytest` or `uvx mypy` will fail on `import yourapp`. Run those from the project environment with `uv run pytest` (see §11).
 
 In a Dockerfile build stage, `uvx` lets you run code-formatters, linters, test-runners, and migration tools **without polluting the image** — the tool runs in an ephemeral venv that lives in `uv`'s cache, never in the final image. Compare to the bad pattern of `pip install pytest && pytest && pip uninstall pytest` (which leaves layer cruft regardless of the uninstall).
 
@@ -122,7 +124,7 @@ uv run python -m app             # run inside the venv without `source`
 
 For Docker, the key insight: `uv sync` is **fully deterministic** given `pyproject.toml` + `uv.lock` + a Python version. Two identical `uv sync` invocations on the same lockfile produce identical site-packages directories, byte for byte (modulo `.pyc` mtimes, which we'll fix in §8 and §17).
 
-**`uv` and `--locked`:** in CI, always use `uv sync --locked` (or `--frozen`). `--locked` errors if `uv.lock` would have to change to satisfy `pyproject.toml`; `--frozen` skips re-resolving entirely. Either guarantees you're installing what the lockfile says.
+**`uv` and `--locked`:** in CI, always use `uv sync --locked` (or `--frozen`). `--locked` errors if `uv.lock` would have to change to satisfy `pyproject.toml`; `--frozen` skips the freshness check entirely and installs the lockfile as-is. Both install exactly what the lockfile says; only `--locked` also proves the lockfile still matches `pyproject.toml`, so prefer it in CI.
 
 ```dockerfile
 RUN uv sync --locked --no-dev --no-install-project
@@ -146,14 +148,13 @@ The honest comparison for production:
 | `python:3.12-slim-bookworm` | ~45 MB | glibc | Yes | **Default for build stage.** Reasonable for runtime if you need a shell. |
 | `python:3.12-alpine` | ~20 MB | musl (often missing) | Yes | Avoid unless you've audited every wheel. |
 | `gcr.io/distroless/python3-debian12` | ~25 MB | glibc | No | **Production runtime default**, but it is Debian's **Python 3.11**: the builder must match (§25). |
-| `gcr.io/distroless/cc-debian12` + uv-managed Python | ~45 MB | glibc | No | Distroless with the interpreter version *you* choose. Used in §19. |
+| `gcr.io/distroless/cc-debian12` + uv-managed Python | ~40 MB | glibc | No | Distroless with the interpreter version *you* choose. Used in §19. |
 | `cgr.dev/chainguard/python:latest` | ~30 MB | glibc | No | Chainguard's distroless equivalent. Aggressively CVE-tracked. |
-| `python:3.12-slim` + `uv` (no python in final) | varies | n/a | yes | If you're shipping a script. |
 | `ghcr.io/astral-sh/uv:python3.12-bookworm-slim` | ~85 MB | glibc | Yes | Bundles `uv` + Python; convenient for build stages. |
 
 The Alpine warnings are not theoretical. Specific failures you'll encounter:
 
-- **`psycopg2-binary` has no musl wheel.** Falls back to source build → needs `libpq-dev`, `gcc`.
+- **Wheel coverage lags on musl.** Recent `psycopg2-binary`, `numpy` and `cryptography` do publish `musllinux` wheels, but older pins, smaller packages, and new Python versions often don't. Any gap falls back to a source build → `gcc`, headers, and minutes per build.
 - **`numpy`, `pandas`, `scipy`, `scikit-learn`** ship `manylinux` wheels first; `musllinux` wheels are newer and sometimes incomplete for older versions.
 - **`cryptography`** has musl wheels but requires `rustc` to build older versions.
 - **DNS** behaves differently (single-label, parallel queries — see ch 39 §3).
@@ -223,7 +224,7 @@ What's happening, line by line:
 - `# syntax=docker/dockerfile:1.7`: pin BuildKit frontend.
 - `FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder`: starts from Astral's image which has both `uv` and Python 3.12 already, on Debian slim. Saves an `apt install` step.
 - `UV_COMPILE_BYTECODE=1`: tells `uv` to compile `.py` → `.pyc` at install time. (Equivalent to passing `--compile-bytecode`.)
-- `UV_LINK_MODE=copy`: forces `uv` to *copy* wheel contents into the venv rather than hardlink. Hardlinks are faster but break when the cache mount is on a different filesystem than the project — which it always is in BuildKit. Without this, you sometimes see `OSError: [Errno 18] Invalid cross-device link`.
+- `UV_LINK_MODE=copy`: forces `uv` to *copy* wheel contents into the venv rather than hardlink. Hardlinks are faster but impossible when the cache mount is on a different filesystem than the project — which it always is in BuildKit. Without this, uv tries, fails, and falls back to copying with a `Failed to hardlink files` warning on every build; setting it makes the intent explicit and the logs clean.
 - `UV_PYTHON_DOWNLOADS=never`: `uv` won't try to download a Python interpreter; it uses the one in the image. Saves bytes and avoids surprises.
 - `PYTHONDONTWRITEBYTECODE=1`: don't write `.pyc` at *runtime* (we already did it at build time).
 - `PYTHONUNBUFFERED=1`: flush stdout/stderr after every write. Critical for container logging: without this, your logs are buffered until the process exits or fills the buffer.
@@ -234,7 +235,7 @@ What's happening, line by line:
 - Final stage: distroless Python, copies the prebuilt `.venv` and source. No `uv`, no `pip`, no shell in the runtime image.
 - `USER nonroot`: distroless ships a `nonroot` user at UID 65532. Use it.
 
-Resulting image: ~75–90 MB for a typical FastAPI/SQLAlchemy service. Compare to ~400 MB for a `python:3.12 + pip install` build of the same code.
+Resulting image: ~75–90 MB compressed for a typical FastAPI/SQLAlchemy service. Compare to ~450–550 MB compressed (over 1 GB uncompressed) for a `python:3.12 + pip install` build of the same code.
 
 ---
 
@@ -263,11 +264,11 @@ Cache hit rates in practice:
 
 Two important details:
 
-**1. `UV_LINK_MODE=copy` is required for cache mounts to work reliably.**
+**1. Set `UV_LINK_MODE=copy` with cache mounts.**
 
-`uv`'s default link mode is `hardlink` on Linux: when installing a wheel into a venv, it creates hardlinks from the cache to the venv. Hardlinks are fast and disk-efficient — but **they require the source and destination to be on the same filesystem.** In BuildKit, the cache mount is a separate filesystem from the build's working directory. Hardlinking fails with `EXDEV: Invalid cross-device link`.
+`uv`'s default link mode is `hardlink` on Linux: when installing a wheel into a venv, it creates hardlinks from the cache to the venv. Hardlinks are fast and disk-efficient — but **they require the source and destination to be on the same filesystem.** In BuildKit, the cache mount is a separate filesystem from the build's working directory, so hardlinking fails with `EXDEV` and uv falls back to copying, with a warning.
 
-Set `UV_LINK_MODE=copy` (or pass `--link-mode=copy`) to force copy. Loses the hardlink speedup but gains correctness. Net result: still much faster than pip.
+Set `UV_LINK_MODE=copy` (or pass `--link-mode=copy`) to copy from the start: same result, no failed attempt, no warning. Copying is also what you want anyway, since the final image must contain real files, not links into a cache that won't exist at runtime. Net result: still much faster than pip.
 
 **2. Cache mount sharing across stages.**
 
@@ -302,7 +303,7 @@ In a new project, use `uv sync`. In a legacy project with `requirements.txt`, yo
 ```
 uv init --no-readme --no-pin-python
 # Hand-edit pyproject.toml to add dependencies, or:
-uv add $(cat requirements.txt)
+uv add -r requirements.txt     # handles comments, markers, and extras
 uv lock
 ```
 
@@ -354,7 +355,7 @@ container start (350ms)
 + ... = ~250ms before first request
 ```
 
-Real numbers from a FastAPI service: cold start drops from ~1.2 s to ~0.4 s with bytecode compilation. **Just flip the flag.** It costs nothing at build time except a small disk increase (~10–20% more bytes for the `.pyc` files alongside `.py`).
+Real numbers from a FastAPI service: cold start drops from ~1.2 s to ~0.4 s with bytecode compilation. **Just flip the flag.** It costs some build time (seconds, parallelized) and image size (the `.pyc` files are roughly as large as the `.py` sources they sit next to). Both are paid once per build instead of on every pod start. Two traps can silently undo it: running with `PYTHONOPTIMIZE`, and an editable project install (§25).
 
 A related trick — `PYTHONDONTWRITEBYTECODE=1` at runtime — prevents Python from writing *new* `.pyc` files at runtime. Combined with read-only root filesystems (`readOnlyRootFilesystem: true` in K8s), this means:
 
@@ -377,7 +378,7 @@ Run `dive` on a typical Python service image. The breakdown:
 | Python interpreter | 25–30 MB | Already minimal |
 | `site-packages` (dependencies) | 50–200 MB | Yes (next sections) |
 | Your code | 0.5–5 MB | Already minimal |
-| `__pycache__` | 10–30 MB | Keep for cold-start; alternative: strip `.py` |
+| `__pycache__` | 10–30 MB | Keep for cold start (see note below on stripping `.py`) |
 
 The dependency layer is where the savings are. Specific patterns:
 
@@ -403,7 +404,9 @@ Many wheels ship native extensions (`.so` files) with debug symbols. `strip` the
 RUN find /app/.venv -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null || true
 ```
 
-Saves 20–50 MB for ML-heavy images. The `|| true` is because some `.so`s can't be stripped further; we don't want the find to fail the build.
+Saves 20–50 MB for ML-heavy images (many manylinux wheels are already stripped; measure). Two cautions: `strip` comes from `binutils`, which slim and uv images **don't include**, so with `2>/dev/null || true` the step silently does nothing until you `apt-get install binutils` in the builder; and the `|| true` also hides real failures, so check the size before and after once.
+
+**Sourceless images (shipping `.pyc` without `.py`).** It's tempting to delete the `.py` files and keep `__pycache__`. That doesn't work: `__pycache__/*.pyc` files are only used when the matching `.py` exists. Sourceless distribution needs the legacy layout, `python -m compileall -b` (writes `module.pyc` next to the source), then deleting the `.py`. You lose readable tracebacks and save roughly the source size. Rarely worth it, and not an IP-protection mechanism (bytecode decompiles).
 
 **Remove `__pycache__` for unused Python versions.**
 
@@ -459,7 +462,18 @@ Variant tags:
 
 **Use `:nonroot` in production.** It maps to `runAsUser: 65532` in your pod spec.
 
-Healthchecks in distroless: there's no `curl`. Two options:
+Healthchecks in distroless: there's no `curl`. **On Kubernetes this mostly doesn't matter:** `httpGet`, `tcpSocket` and `grpc` probes are executed by the kubelet, not inside the container, so they need nothing in the image and cost no in-container CPU. Prefer them:
+
+```yaml
+readinessProbe:
+  httpGet: { path: /healthz/ready, port: 8000 }
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /healthz, port: 8000 }
+  periodSeconds: 10
+```
+
+The `curl` problem is real for Docker `HEALTHCHECK` (Compose, ECS) and for `exec` probes. Two options there:
 
 **1. Use a Python-based healthcheck.**
 
@@ -486,7 +500,7 @@ livenessProbe:
     command: ["/healthcheck", "http://127.0.0.1:8000/healthz"]
 ```
 
-`grpc_health_probe` does this for gRPC.
+`grpc_health_probe` does this for gRPC (on Kubernetes 1.24+, the native `grpc:` probe replaces it).
 
 ---
 
@@ -501,19 +515,17 @@ Use cases inside a Dockerfile:
 RUN --mount=type=cache,target=/root/.cache/uv \
     uvx ruff check src/
 
-# Run tests
-COPY tests ./tests
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uvx pytest -q tests/
-
-# Generate type stubs
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uvx mypy --install-types --non-interactive src/
-
 # Pin tool version explicitly
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uvx --from "ruff==0.6.4" ruff check src/
+    uvx ruff@0.6.4 check src/
+
+# Audit the locked dependencies for known CVEs
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv export --locked --no-dev --format requirements-txt > /tmp/req.txt \
+ && uvx pip-audit -r /tmp/req.txt --disable-pip
 ```
+
+What **not** to run with `uvx`: tests and type checkers. `uvx pytest` runs pytest in an environment without your project or its dependencies, so collection fails on the first `import`. `uvx mypy` can't see your dependencies' types. Those belong to the project environment (`uv run`, below).
 
 None of these tools end up in the final image because:
 
@@ -539,7 +551,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN uv run pytest
 ```
 
-But in a production-image-only build, you don't want dev deps installed. Use `uvx` for one-off tool runs in test stages.
+Do this in a separate `test` stage (§18) so dev dependencies never reach the runtime image. `uvx` is for tools that don't import your code; `uv run` in a test stage is for tools that do.
 
 ---
 
@@ -596,19 +608,37 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
 
-# Runtime: no compilers, only runtime libs
-FROM gcr.io/distroless/python3-debian12:nonroot
-# Copy runtime shared libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libpq.so.5 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libxml2.so.2 /usr/lib/x86_64-linux-gnu/
+# Runtime: no compilers, only runtime libs.
+# Same Debian release and same Python minor version as the builder.
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 libxml2 libxslt1.1 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/.venv /app/.venv
 COPY src /app/src
 WORKDIR /app
-USER nonroot
+USER 65532
+ENV PATH="/app/.venv/bin:${PATH}"
 ENTRYPOINT ["python", "-m", "src.main"]
 ```
 
-The runtime image gets only the `.so` files it needs, not the dev packages. Use `ldd /app/.venv/lib/python3.12/site-packages/somepackage/_internals.cpython-312-x86_64-linux-gnu.so` to discover which libs each native extension needs.
+The runtime image gets the runtime library packages, not the `-dev` packages and compilers. Use `ldd /app/.venv/lib/python3.12/site-packages/somepackage/_internals.cpython-312-x86_64-linux-gnu.so` to discover which libs each native extension needs.
+
+Why not hand-copy the `.so` files into distroless? It's a common recipe and it's fragile: `libpq.so.5` alone pulls in Kerberos, LDAP, and SASL libraries; `libxml2` pulls in ICU and liblzma; hard-coded `/usr/lib/x86_64-linux-gnu/` paths break the arm64 build; and nothing tells you when a Debian security update changes the set. If you need distroless here, copy the **full `ldd` closure** with a script and test the image by importing every native module in CI (`python -c "import psycopg2, lxml.etree"`).
+
+### PyTorch and other CUDA-sized wheels
+
+The default `torch` wheel on Linux pulls in the CUDA runtime (several GB). For CPU-only inference, point uv at PyTorch's CPU index; images drop by 2–4 GB:
+
+```toml
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+```
 
 ---
 
@@ -656,14 +686,14 @@ This caps glibc arenas at 2. RSS savings can be 20–40% on multi-threaded apps.
 
 ### `PYTHONUNBUFFERED=1` and logging
 
-Without this, stdout/stderr are line-buffered when attached to a TTY, block-buffered when not (pipes, files, container log streams). In a container, your stdout is piped to the container runtime → block-buffered → logs disappear until the buffer is full.
+Without this, stdout is line-buffered when attached to a TTY and block-buffered when not (pipes, files, container log streams). In a container, stdout is piped to the container runtime → block-buffered → `print()` output appears late, out of order relative to stderr, and is **lost entirely** on SIGKILL/OOMKill. (stderr, where `logging` writes by default, has been line-buffered since 3.9, which is why logs often look fine while prints don't.)
 
 Always set `PYTHONUNBUFFERED=1`. Costs nothing.
 
 ### `PYTHONOPTIMIZE`
 
 - `PYTHONOPTIMIZE=1`: removes `assert` statements and sets `__debug__` to False. Small startup speedup, smaller `.pyc` files.
-- `PYTHONOPTIMIZE=2`: also removes docstrings. ~5–10% memory savings on doc-heavy libraries.
+- `PYTHONOPTIMIZE=2`: also removes docstrings. ~5–10% memory savings on doc-heavy libraries, and it breaks anything that reads `__doc__` at runtime: FastAPI's OpenAPI descriptions, Click/Typer help text, PLY grammars, some plugin systems.
 
 If you rely on assertions in production code, don't use this. **And if you set it, you must compile bytecode at the same level:** `uv --compile-bytecode` produces level-0 `.pyc`s only, so `PYTHONOPTIMIZE=1` makes the interpreter ignore them and recompile from source on every start (§25). The gold-standard Dockerfile leaves it off.
 
@@ -677,7 +707,7 @@ ENV PYTHONOPTIMIZE=1
 If you use gunicorn with `--preload`, the master process imports all your code once, then forks workers. The workers share memory via copy-on-write (COW) — until they touch a page, which then gets duplicated. For Django/Flask apps, this can save **30–60% RSS** across all workers.
 
 ```
-gunicorn --workers 4 --preload --worker-class uvicorn.workers.UvicornWorker app:application
+gunicorn --workers 4 --preload --worker-class uvicorn_worker.UvicornWorker app:application
 ```
 
 The catch: any code that opens connections, file descriptors, or starts threads at import time will share them across workers, which is broken. Defer such initialization to a `post_fork` hook or worker startup.
@@ -689,7 +719,7 @@ The catch: any code that opens connections, file descriptors, or starts threads 
 Cold start is dominated by **imports**. Profile your imports:
 
 ```
-PYTHONPROFILEIMPORTTIME=1 python -X importtime -m yourapp 2> import.log
+python -X importtime -m yourapp 2> import.log      # or PYTHONPROFILEIMPORTTIME=1
 ```
 
 The log shows hierarchical time spent in each import. Read it; you'll be surprised what's expensive.
@@ -743,24 +773,37 @@ Once you have precompiled `.pyc`s in the image, you don't want runtime to write 
 
 ### `python -S` (skip site)
 
-Python's `site.py` runs at startup, scanning `site-packages` and processing `.pth` files. For ultra-lean services, `python -S -m yourapp` skips this. You then have to manually adjust `sys.path` (`uv` venvs do this via the activation scripts). Saves ~30 ms. Use it if you've optimized everything else and want the last drop.
+Python's `site.py` runs at startup, scanning `site-packages` and processing `.pth` files. For ultra-lean services, `python -S -m yourapp` skips this. But `site.py` is also what puts the venv's `site-packages` on `sys.path` (via `pyvenv.cfg`; activation scripts only change `PATH`), so with `-S` none of your dependencies import until you set `PYTHONPATH=/app/.venv/lib/python3.12/site-packages` yourself, and `.pth`-based editable installs stop working. Saves ~10–30 ms. Only worth it for CLIs started thousands of times; for a long-running service it's noise.
 
-### Threading initialization
+### Instrumentation and plugin discovery
 
-`import threading` doesn't start threads, but `import concurrent.futures` doesn't either; however, libraries like `urllib3` initialize connection pools (with locks) at import. Largely unavoidable; just be aware.
+Auto-instrumentation (`opentelemetry-instrument`, APM agents) and entry-point plugin discovery (`importlib.metadata.entry_points()`, pytest-style plugin scanning) import extra packages and scan every installed distribution's metadata at startup. Measure them with `-X importtime` like any other import; enable only the instrumentations you use.
 
 ### "Warm up" the process before declaring it ready
 
 If your app has expensive first-request paths (loading an ML model, opening DB connection pools, JIT compiling a regex), do them at startup, not at first request. Mark readiness only after warm-up completes. Otherwise the first request after pod start is slow, which gets routed to a probe-failing pod, which marks as not-ready, which causes oscillation under autoscaling.
 
 ```python
-async def startup():
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Response
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.ready = False
     await db.connect()
     await load_model()
     app.state.ready = True
+    yield
+    await db.disconnect()
+
+
+app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/healthz/ready")
-def ready():
+def ready() -> Response:
     return Response(status_code=200 if app.state.ready else 503)
 ```
 
@@ -770,7 +813,7 @@ Set Kubernetes `readinessProbe` to hit `/healthz/ready`. Pod doesn't get traffic
 
 For a typical FastAPI service: target **< 500 ms** from `docker run` to "first request served." Hitting that:
 
-- ~100 ms image pull (if cached on node; otherwise much more).
+- ~0 ms image pull if the image is already on the node; otherwise seconds, which is why image size matters for scale-out.
 - ~100 ms container setup.
 - ~200 ms Python interpreter + imports (with precompiled .pyc).
 - ~50 ms app startup (DB connection, warm-up).
@@ -787,16 +830,16 @@ For HTTP/web services in containers, the server choice affects memory, CPU, and 
 |---|---|---|---|
 | `gunicorn` | WSGI (sync) | Yes (`--workers`) | Django, Flask, classic WSGI apps |
 | `uvicorn` | ASGI (async) | Single process (use `--workers` carefully) | FastAPI, Starlette, async Django |
-| `gunicorn + uvicorn.workers.UvicornWorker` | ASGI (async) | Yes (gunicorn manages, uvicorn handles) | FastAPI in prod |
+| `gunicorn + uvicorn_worker.UvicornWorker` | ASGI (async) | Yes (gunicorn manages, uvicorn handles) | FastAPI with several processes per pod |
 | `granian` | ASGI/WSGI/RSGI (Rust-backed) | Yes | Performance-critical Python web apps |
 | `hypercorn` | ASGI | Yes | HTTP/2, HTTP/3 needs |
 | `daphne` | ASGI | Yes | Django Channels (WebSockets) |
 
-The right default for FastAPI in 2026: **gunicorn with uvicorn workers**, or **granian**.
+The right default for FastAPI on Kubernetes: **one uvicorn (or granian) process per pod, scaled by replicas** (see below). Use **gunicorn with uvicorn workers** when you need several processes per pod: `--preload` memory sharing, or isolation between workers. The worker class moved out of uvicorn: `uvicorn.workers` is deprecated since uvicorn 0.30, so install the `uvicorn-worker` package and use `uvicorn_worker.UvicornWorker`.
 
 ```dockerfile
 ENTRYPOINT ["gunicorn", \
-    "-k", "uvicorn.workers.UvicornWorker", \
+    "-k", "uvicorn_worker.UvicornWorker", \
     "--workers", "4", \
     "--worker-tmp-dir", "/dev/shm", \
     "--bind", "0.0.0.0:8000", \
@@ -807,8 +850,8 @@ ENTRYPOINT ["gunicorn", \
 
 Notes:
 
-- `--worker-tmp-dir /dev/shm`: gunicorn writes worker heartbeat files. By default `/tmp` (disk); `/dev/shm` (tmpfs) is faster and avoids disk I/O. Distroless doesn't have `/tmp` writable by default — mount one or use this.
-- `--workers 4`: usually `2 * CPU + 1` but in containers cap based on memory and request profile. Async workers can handle hundreds of concurrent requests each, so don't over-provision workers.
+- `--worker-tmp-dir /dev/shm`: gunicorn writes worker heartbeat files. By default `/tmp`, which may be on the container's overlay disk; `/dev/shm` (tmpfs) avoids heartbeat stalls when the disk is slow. With `readOnlyRootFilesystem: true`, `/tmp` isn't writable unless you mount an `emptyDir` there, and gunicorn won't start without this flag or that mount.
+- `--workers 4`: usually `2 * CPU + 1`, where CPU means the pod's limit, never `os.cpu_count()` (§21). In containers, cap based on memory and request profile. Async workers can handle hundreds of concurrent requests each, so don't over-provision workers.
 - `--preload`: master imports app, forks workers. COW memory savings (see §13).
 - `--access-logfile -`: log to stdout.
 
@@ -869,17 +912,20 @@ This is the recommended pattern. Bytecode is precompiled, sits in the image, run
 **Strategy B: Allow writes, write at first import.**
 
 ```dockerfile
-ENV PYTHONDONTWRITEBYTECODE=0
+# Don't set PYTHONDONTWRITEBYTECODE at all: any non-empty value, even "0", disables writes.
+ENV PYTHONPYCACHEPREFIX=/var/cache/pycache
 ```
 
 ```yaml
 volumeMounts:
   - name: pycache
-    mountPath: /app/.venv/lib/python3.12/site-packages
+    mountPath: /var/cache/pycache
 volumes:
   - name: pycache
     emptyDir: {}
 ```
+
+`PYTHONPYCACHEPREFIX` (3.8+) redirects every `.pyc` write to a separate tree, so the root filesystem can stay read-only. Don't mount the `emptyDir` *over* `site-packages`: an empty volume there hides every installed package.
 
 Not recommended in production. The first request pays the compilation cost. Subsequent requests (same pod) are fast. New pods start cold.
 
@@ -896,31 +942,34 @@ If you must use Strategy B (e.g., dynamic plugins loaded at runtime), at least d
 For bit-identical image digests (advanced, see ch 39 §13):
 
 ```dockerfile
-ENV SOURCE_DATE_EPOCH=1700000000 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    UV_COMPILE_BYTECODE=1 \
+ENV UV_COMPILE_BYTECODE=0 \
     UV_LINK_MODE=copy
 
-# Compile bytecode with deterministic mtime
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
-RUN find /app/.venv -name "*.pyc" -exec touch -t 202311140000 {} +
+# Hash-based .pyc: content depends only on the source, not on install-time mtimes.
+RUN .venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash .venv/lib
 ```
 
-`SOURCE_DATE_EPOCH` is the SDE convention for reproducible builds; many tools honor it. For Python `.pyc` files, the mtime is part of the file (used to detect stale bytecode). Forcing a consistent mtime makes `.pyc` outputs identical across builds.
+```
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+  docker buildx build --output type=image,name=app,rewrite-timestamp=true .
+```
+
+Two separate problems. **Inside** a timestamp-mode `.pyc`, the header embeds the *source* file's mtime, which differs per install; hash-based `.pyc`s embed a hash of the source instead, so they're identical across builds, and `unchecked-hash` also skips the freshness check at import (§25). **Around** the files, every layer tarball records file mtimes; BuildKit's `rewrite-timestamp=true` clamps them to `SOURCE_DATE_EPOCH`. Don't put `SOURCE_DATE_EPOCH` in an `ENV` line: it flips `py_compile`'s default to `checked-hash`, which hashes every source file on every import (§25), and `touch`ing the `.pyc` files afterwards changes neither problem.
 
 Most teams don't need bit-identical images. They need **dependency-identical** images, which `uv.lock` + `--locked` gives you for free.
 
 ### Lockfile hygiene
 
 - Commit `uv.lock` to git. **Always.**
-- `uv.lock` should be in your `.dockerignore` exclude (you do want it copied into the build).
-- Run `uv lock` periodically (e.g., monthly via a renovation bot) to absorb security fixes.
+- Make sure `.dockerignore` does **not** exclude `uv.lock` (the build needs it). It **should** exclude `.venv/`, `__pycache__/`, `.git/`, `.env`, and test caches; see §27.
+- Run `uv lock --upgrade` periodically (Renovate and Dependabot both understand `uv.lock`) to absorb security fixes.
 - In CI, fail fast if `uv.lock` is stale:
 
 ```yaml
 - name: Verify lockfile
-  run: uv lock --locked       # fails if pyproject.toml needs uv.lock to change
+  run: uv lock --check        # fails if pyproject.toml needs uv.lock to change
 ```
 
 This catches the bug where a contributor added a dependency to `pyproject.toml` but forgot to `uv lock`.
@@ -966,7 +1015,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
 ```
 
-`cache-to type=gha,mode=max` exports all stages' caches; `cache-from type=gha` restores them. Combined with `uv`'s own cache mount, builds drop from minutes to ~30 seconds on cached deps.
+`cache-to type=gha,mode=max` exports all stages' layers; `cache-from type=gha` restores them. On hosted runners that layer cache is what makes rebuilds fast: the `uv` cache *mount* starts empty on every fresh runner and is not exported (§27). With an unchanged `uv.lock`, the dependency layer is a cache hit and the build takes ~30 seconds; after a lockfile change, it re-downloads everything. Note also that `linux/arm64` on an amd64 runner builds under QEMU emulation, which is 5–20× slower; use a native arm64 runner per platform when builds get long.
 
 ### Testing in the same Dockerfile
 
@@ -1005,7 +1054,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev    # remove dev deps for the final venv
 ```
 
-Tests run as part of the build; failures abort the build. Dev deps are uninstalled afterward.
+Tests run as part of the build; failures abort the build. `uv sync` is exact by default, so the last step removes the dev dependencies. Don't then copy the whole `/app` to the runtime stage: `tests/` and pytest's caches are still there. Copy only `.venv` and `src`.
 
 ---
 
@@ -1029,9 +1078,13 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_INSTALL_DIR=/python \
     UV_PYTHON_PREFERENCE=only-managed \
+    UV_PYTHON=3.12 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# binutils only for `strip` below; the builder stage never ships.
+RUN apt-get update && apt-get install -y --no-install-recommends binutils \
+ && rm -rf /var/lib/apt/lists/*
 RUN uv python install 3.12
 
 WORKDIR /app
@@ -1058,6 +1111,11 @@ RUN find /app/.venv -type d -name tests -prune -exec rm -rf {} + \
  && find /app/.venv -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null || true \
  && find /app/.venv -path "*/locale/*" \( -name "*.mo" -o -name "*.po" \) -delete
 
+# Slim the interpreter: no pip, IDLE, or Tk at runtime (~20 MB).
+RUN find /python \( -name ensurepip -o -name idlelib -o -name tkinter -o -name turtledemo \
+        -o -name pip -o -name 'pip-*.dist-info' -o -name 'tcl9*' -o -name 'tk9*' \
+        -o -name 'libtcl*' -o -name '_tkinter*.so' \) -prune -exec rm -rf {} +
+
 # ============================================================================
 # Stage 2: Test (optional, run via --target test)
 # ============================================================================
@@ -1066,7 +1124,7 @@ FROM builder AS test
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked        # bring in dev deps
 COPY tests ./tests
-RUN uv run pytest -q tests/
+RUN uv run python -m pytest -q tests/   # -m puts /app on sys.path, so `import src.main` works
 
 # ============================================================================
 # Stage 3: Runtime
@@ -1105,7 +1163,9 @@ Annotations:
 - **`--no-install-project`** in the first sync gives a clean dependency layer; project install in the second sync is fast and re-runs only when source changes.
 - **`--locked`** ensures `uv.lock` is the source of truth (build fails if it's stale).
 - **Strip tests/dist-info/locales** trims ~30–80 MB.
-- **`strip --strip-unneeded`** on `.so` files removes debug info.
+- **`strip --strip-unneeded`** on `.so` files removes debug info (needs `binutils`, installed in the builder only).
+- **Slim the interpreter:** the managed CPython is ~120 MB uncompressed (the `python3.12` binary is statically linked, ~30 MB, and ships next to a ~30 MB `libpython`), about twice Debian's. Deleting pip, IDLE, and Tk recovers ~20 MB. That size is the price of choosing your Python version; don't `strip` the interpreter itself (it's already stripped; ~3 MB gain).
+- **`UV_PYTHON=3.12`** pins the interpreter for both `uv python install` and `uv sync`, so a `requires-python = ">=3.12"` can't make uv download a newer version behind your back.
 - **uv-managed interpreter on `distroless/cc`**: the venv's `python` symlink resolves to `/python/...` in both stages, so the `.pyc` version tag and the binary always match. `python3-debian12` would give you Debian's 3.11 instead (§25).
 - **`compileall --invalidation-mode unchecked-hash src`**: the project is installed editable, so `--compile-bytecode` never touched it (§25).
 - **Distroless nonroot** runtime; no shell, no pip, no curl. Smallest reasonable surface.
@@ -1117,19 +1177,76 @@ Annotations:
 
 Expected result for a FastAPI service with ~30 deps:
 
-- Image size: **70–90 MB compressed.**
+- Image size: **70–90 MB compressed.** (Measured for this exact Dockerfile with only `fastapi` + `uvicorn`: 45 MB compressed, 192 MB uncompressed; `import src.main` in ~0.4 s from a read-only root, vs ~1.2 s with `-O`, which ignores the level-0 `.pyc`s.)
 - Cold start (from `docker run` to first response): **~300–500 ms.**
 - RSS under idle: **~80 MB.**
 - RSS under load: **~150–200 MB.**
 
 Compare to the "naive" version (`python:3.12` + `pip install`):
 
-- Image size: ~600–800 MB.
+- Image size: ~450–550 MB compressed (over 1 GB uncompressed).
 - Cold start: ~1.5–2.5 s.
 - RSS under idle: ~120 MB.
 - RSS under load: ~200–300 MB.
 
 **4–10× smaller image, 3–5× faster cold start, 20–30% lower RSS.** Same code.
+
+### The matching pod spec
+
+The image assumes a pod that is read-only, non-root, and tells Python how much CPU and memory it really has (§21, §22):
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: api } }
+  template:
+    metadata: { labels: { app: api } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: ghcr.io/acme/api@sha256:...      # pin by digest
+          ports: [{ containerPort: 8000 }]
+          env:
+            - name: PYTHON_CPU_COUNT
+              valueFrom: { resourceFieldRef: { resource: limits.cpu, divisor: "1" } }
+            - name: OMP_NUM_THREADS
+              valueFrom: { resourceFieldRef: { resource: limits.cpu, divisor: "1" } }
+            - name: MEMORY_LIMIT_BYTES
+              valueFrom: { resourceFieldRef: { resource: limits.memory } }
+          resources:
+            requests: { cpu: 500m, memory: 192Mi }
+            limits:   { cpu: "1", memory: 384Mi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          startupProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 1
+            failureThreshold: 30                  # measured under the CPU limit, not on a laptop
+          readinessProbe:
+            httpGet: { path: /healthz/ready, port: 8000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+          lifecycle:
+            preStop: { sleep: { seconds: 5 } }   # let endpoints drain before SIGTERM (§24)
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+```
 
 ---
 
@@ -1151,18 +1268,20 @@ For a quick check that you're not adding bloat: `dive` shows "wasted space" — 
 ### Cold start
 
 ```
-time docker run --rm -it myapp:latest python -c "from src.main import app"
+time docker run --rm --read-only --entrypoint python myapp:latest -c "from src.main import app"
 ```
 
-Roughly captures import time. For real cold start, time from container start to first 200 OK from the readiness probe:
+`--entrypoint` is required because the image's `ENTRYPOINT` would otherwise receive `python -c ...` as arguments; `--read-only` reproduces the production filesystem, so missing `.pyc`s show up as slow imports. This roughly captures import time. For real cold start, time from pod creation to Ready, with a readiness probe that hits a real endpoint (without one, the pod is Ready the moment the process starts, and you measure nothing):
 
 ```bash
 # In a test cluster
+# pod.yaml: the image's own ENTRYPOINT, plus an httpGet readinessProbe on /healthz/ready
 START=$(date +%s.%N)
-kubectl run test --image=myapp:latest --restart=Never -- python -m uvicorn src.main:app
-kubectl wait --for=condition=ready pod/test --timeout=60s
+kubectl apply -f pod.yaml
+kubectl wait --for=condition=Ready pod/coldstart --timeout=120s
 END=$(date +%s.%N)
 echo "Cold start: $(echo "$END - $START" | bc) seconds"
+kubectl get events --field-selector involvedObject.name=coldstart   # Pulling -> Pulled = pull time
 ```
 
 ### Memory
@@ -1176,14 +1295,16 @@ cat /sys/fs/cgroup/memory/memory.usage_in_bytes   # cgroup v1
 import resource; resource.getrusage(resource.RUSAGE_SELF).ru_maxrss   # in KB
 ```
 
-Memory profiling tools: `memray`, `tracemalloc`, `py-spy`. `memray` is the modern choice — accurate, low overhead, produces good flame graphs.
+Memory profiling tools: `memray` (the modern choice: tracks native allocations too, low overhead, good flame graphs) and `tracemalloc` (stdlib, Python allocations only). `py-spy` is a CPU sampling profiler, not a memory one, but it answers the companion question: where startup time goes (`py-spy record -- python -m yourapp`). `ru_maxrss` is the *peak* RSS (KiB on Linux); for the number the OOM killer uses, read `memory.current` and `memory.peak` (cgroup v2).
 
 ### Import time
 
 ```
 python -X importtime -c "import src.main" 2> imports.log
-# Sort by cumulative time:
-awk -F'|' '{print $2, $4}' imports.log | sort -n
+# Slowest 20 by cumulative time (columns: self | cumulative | package):
+sort -t'|' -k2 -n imports.log | tail -20
+# Or visualize the tree:
+uvx tuna imports.log
 ```
 
 Anything above 50 ms per import deserves investigation.
@@ -1521,6 +1642,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ```
 
 - **`uv cache prune --ci`** before saving a CI-level cache (e.g. `actions/cache` on `~/.cache/uv` for non-Docker jobs): drops pre-built wheels that are faster to re-download than to restore, keeps the ones built from source.
+- **Private package indexes without leaking the token.** `ARG`/`ENV` values are stored in the image config and `docker history`. Pass credentials as a BuildKit secret, which exists only for that `RUN`:
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=uv_index_token,env=UV_INDEX_INTERNAL_PASSWORD \
+    UV_INDEX_INTERNAL_USERNAME=__token__ \
+    uv sync --locked --no-dev --no-install-project
+```
+
+```
+docker buildx build --secret id=uv_index_token,env=INTERNAL_PYPI_TOKEN .
+```
+
+  (`UV_INDEX_<NAME>_USERNAME` / `_PASSWORD` match an index named `internal` in `[[tool.uv.index]]`; the `env=` form of secret mounts needs Dockerfile syntax 1.10+.)
+- **`.dockerignore` is part of the cache key.** Without it, `COPY . .` sends `.git/`, the developer's `.venv/` (with host-platform binaries that overwrite the built ones), `__pycache__/`, and `.env` secrets into the build, and any change to them busts the layer cache. Minimum: `.venv/ **/__pycache__/ .git/ .env .pytest_cache/ .mypy_cache/ .ruff_cache/ dist/ build/`.
+- **Base images go stale.** Pin bases by digest for reproducibility and let Renovate/Dependabot bump the digest, so Debian and CPython security patches arrive as reviewable PRs instead of never. Scan the result in CI (`trivy image`, `grype`); see ch 39 for signing and SBOMs.
 - **Multi-arch:** building `linux/arm64` under QEMU on an amd64 runner is 5–20× slower and turns any sdist build into minutes. Use native arm64 runners and merge manifests; `uv.lock` is universal, so the same lock serves both.
 
 ---
@@ -1540,6 +1677,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 | Free-threaded `3.13t`/`3.14t` image is slower and bigger | Single-thread overhead, per-object locking, extensions without free-threading support re-enable the GIL (with a warning) | Only for proven thread-parallel CPU work; check `sys._is_gil_enabled()` at startup; `PYTHON_GIL=0` forces it off. See [`../python-mastery/26-free-threading.md`](../python-mastery/26-free-threading.md) |
 | `py-spy`/`perf` can't attach in the pod | Missing `SYS_PTRACE` / `PERFMON` capability; no frame-pointer info | Ephemeral debug container with `--profile=sysadmin` sharing the process namespace; Python 3.12+ `-X perf` for readable `perf` stacks. See [`../python-mastery/32-profiling.md`](../python-mastery/32-profiling.md), [`../python-mastery/12-observing-a-process.md`](../python-mastery/12-observing-a-process.md) |
 | Logs arrive out of order or late | Block-buffered stdout | `PYTHONUNBUFFERED=1` (§13) |
+| Image works on CI, fails locally with `Exec format error` or wrong-arch `.so` imports | `COPY . .` copied the developer's host `.venv` (macOS/arm64 binaries) over the built one | `.dockerignore` with `.venv/`, `__pycache__/`, `.git/`, `.env`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/` (§27) |
+| Private index token visible in `docker history` | Credential passed as `ARG`/`ENV` | `--mount=type=secret` (§27) |
 | Pod killed during startup on a busy node | Startup CPU-throttled under a small limit | §21: measure startup under the limit, size the `startupProbe` from that |
 
 ---
@@ -1567,10 +1706,11 @@ This chapter tells you which dial to turn. The `python-mastery/` track explains 
 - **Use `uv`** (not pip, not poetry) for Python dependency management in containers. 10–100× faster, deterministic lockfile, BuildKit-friendly cache.
 - **Use `uvx`** for one-shot CLI tools inside the build (ruff, pytest, mypy) — they don't pollute the image.
 - **Multi-stage build with `python-bookworm-slim` (or `astral-sh/uv`) as builder, distroless as runtime.** 70–100 MB images are routine.
-- **Cache mounts on `/root/.cache/uv`** with `UV_LINK_MODE=copy`. Required for correctness; gives most of the speedup.
+- **Cache mounts on `/root/.cache/uv`** with `UV_LINK_MODE=copy` (avoids the failed-hardlink fallback). Fast local rebuilds; on ephemeral CI, the exported layer cache does the work (§27).
 - **`UV_COMPILE_BYTECODE=1` + `PYTHONDONTWRITEBYTECODE=1` + `readOnlyRootFilesystem: true`** — precompile at build, ban writes at runtime, ~300–500 ms cold start savings.
 - **Strip tests, locales, `.dist-info` cruft, and debug symbols from native `.so`s** — 30–80 MB image savings.
-- **Avoid Alpine for Python** unless you've audited every wheel's musl availability. Use `python:3.12-slim-bookworm` build, distroless runtime.
+- **Avoid Alpine for Python** unless you've audited every wheel's musl availability. Build on Debian slim, run on distroless with the same Python version.
+- **`.dockerignore` the host `.venv/`, `.git/`, `.env`; pass index tokens as BuildKit secrets, never `ARG`/`ENV`** (§27).
 - **`MALLOC_ARENA_MAX=2`** in multi-threaded apps for 20–40% RSS reduction.
 - **`PYTHONUNBUFFERED=1`, `PYTHONHASHSEED=random`** — always. **`PYTHONOPTIMIZE` only if you compiled `.pyc` at that level**, or it disables them (§25).
 - **Builder and runtime must run the same Python minor version.** `distroless/python3-debian12` is 3.11; ship a uv-managed interpreter on `distroless/cc` instead.
@@ -1582,7 +1722,7 @@ This chapter tells you which dial to turn. The `python-mastery/` track explains 
 - **New projects: uv over Poetry**; existing Poetry repos: `--only main --no-root` dependency layer, Poetry in the builder only, or `uvx migrate-to-uv` (§26).
 - **Lazy-import heavy modules** (boto3, pandas, ML libs) from request handlers, not at app startup.
 - **One uvicorn per pod, scale via replicas** for async services; gunicorn+uvicorn workers with `--preload` for COW memory savings if you want multi-process per pod.
-- **Healthchecks via tiny Go probe or `python -c "import urllib.request,sys; urllib.request.urlopen(...)"`** — no curl in distroless.
+- **Kubernetes `httpGet`/`grpc` probes** need nothing in the image; only Docker `HEALTHCHECK`/`exec` probes need a tiny Go probe or a `python -c` one-liner (no curl in distroless).
 - **Commit `uv.lock`. Use `--locked` in CI.** Fail builds if lockfile is stale.
 - **Measure before claiming improvement.** Image size with `dive`, cold start by timing pod-ready, memory by `memray` or cgroup files.
 
