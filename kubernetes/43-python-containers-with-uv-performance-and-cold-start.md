@@ -193,11 +193,11 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
 
-# Now copy the project and install it
+# Now copy the project and install it as a regular (non-editable) package
 COPY src ./src
 COPY README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev
+    uv sync --locked --no-dev --no-editable
 
 # ----- runtime ----------------------------------------------------------
 FROM gcr.io/distroless/python3-debian12:nonroot
@@ -208,14 +208,28 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Copy the built venv from the builder
+# Copy the built venv from the builder; the project lives inside it
 COPY --from=builder --chown=nonroot:nonroot /app/.venv /app/.venv
-COPY --from=builder --chown=nonroot:nonroot /app/src /app/src
 
 USER nonroot
 EXPOSE 8000
-ENTRYPOINT ["python", "-m", "src.main"]
+ENTRYPOINT ["python", "-m", "app.main"]
 ```
+
+The project uses the standard `src` layout, with a real package name and a build backend so `uv sync` can install it:
+
+```
+pyproject.toml        # [project] name = "app" ... and:
+                      # [build-system]
+                      # requires = ["uv_build>=0.8,<0.12"]
+                      # build-backend = "uv_build"
+uv.lock
+src/app/__init__.py
+src/app/main.py       # app = FastAPI()
+tests/test_main.py    # from app.main import app
+```
+
+Without a `[build-system]` table, uv treats the project as a virtual project and never installs it, so `import app` only works when the working directory happens to be on `sys.path`.
 
 > **Version trap.** `distroless/python3-debian12` ships Debian's Python **3.11**. With a 3.12 builder, the venv's `python` symlink points at `/usr/local/bin/python3.12`, which doesn't exist in the runtime image, and the `cpython-312` `.pyc`s would be ignored anyway. Either match the builder to the runtime (`ghcr.io/astral-sh/uv:python3.11-bookworm-slim`) or ship your own interpreter as §19 does. See §25.
 
@@ -231,8 +245,8 @@ What's happening, line by line:
 - `COPY pyproject.toml uv.lock` before source: cache layer for dependencies.
 - `--mount=type=cache,target=/root/.cache/uv`: BuildKit cache mount on `uv`'s global cache. Massive speedup across builds.
 - `uv sync --locked --no-dev --no-install-project`: install dependencies but not the project itself yet.
-- `COPY src` then second `uv sync`: now the project is installed (in editable or non-editable mode, depending on pyproject config).
-- Final stage: distroless Python, copies the prebuilt `.venv` and source. No `uv`, no `pip`, no shell in the runtime image.
+- `COPY src` then second `uv sync --no-editable`: the project is built and installed into `.venv/lib/python3.12/site-packages/app/` like any dependency, so `UV_COMPILE_BYTECODE` compiles it too, and the runtime stage needs only `.venv`. (The default, editable, would leave a `.pth` pointing at `/app/src`: the source would have to be copied separately and would never be precompiled; see §25.)
+- Final stage: distroless Python, copies the prebuilt `.venv` (which now contains the app). No `uv`, no `pip`, no shell in the runtime image.
 - `USER nonroot`: distroless ships a `nonroot` user at UID 65532. Use it.
 
 Resulting image: ~75–90 MB compressed for a typical FastAPI/SQLAlchemy service. Compare to ~450–550 MB compressed (over 1 GB uncompressed) for a `python:3.12 + pip install` build of the same code.
@@ -530,7 +544,7 @@ What **not** to run with `uvx`: tests and type checkers. `uvx pytest` runs pytes
 None of these tools end up in the final image because:
 
 1. `uvx` installs into a separate venv (cache-mounted, ephemeral).
-2. The final stage copies only `/app/.venv` and `/app/src`, not the `uvx` cache.
+2. The final stage copies only `/app/.venv`, not the `uvx` cache.
 
 This is much cleaner than the legacy:
 
@@ -607,6 +621,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-editable
 
 # Runtime: no compilers, only runtime libs.
 # Same Debian release and same Python minor version as the builder.
@@ -615,11 +632,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 libxml2 libxslt1.1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/.venv /app/.venv
-COPY src /app/src
 WORKDIR /app
 USER 65532
 ENV PATH="/app/.venv/bin:${PATH}"
-ENTRYPOINT ["python", "-m", "src.main"]
+ENTRYPOINT ["python", "-m", "app.main"]
 ```
 
 The runtime image gets the runtime library packages, not the `-dev` packages and compilers. Use `ldd /app/.venv/lib/python3.12/site-packages/somepackage/_internals.cpython-312-x86_64-linux-gnu.so` to discover which libs each native extension needs.
@@ -698,7 +714,7 @@ Always set `PYTHONUNBUFFERED=1`. Costs nothing.
 If you rely on assertions in production code, don't use this. **And if you set it, you must compile bytecode at the same level:** `uv --compile-bytecode` produces level-0 `.pyc`s only, so `PYTHONOPTIMIZE=1` makes the interpreter ignore them and recompile from source on every start (§25). The gold-standard Dockerfile leaves it off.
 
 ```dockerfile
-# Only together with: python -m compileall -o 1 /app/.venv/lib /app/src
+# Only together with: python -m compileall -q -j 0 -o 1 /app/.venv/lib
 ENV PYTHONOPTIMIZE=1
 ```
 
@@ -1094,15 +1110,11 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
 
-# Project layer
+# Project layer: non-editable, so the app is installed (and compiled) into the venv
 COPY src ./src
 COPY README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev
-
-# uv compiled site-packages; the editable project source is ours to compile.
-# unchecked-hash: the image is immutable, so skip the per-import freshness check.
-RUN .venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash src
+    uv sync --locked --no-dev --no-editable
 
 # Slim the venv
 RUN find /app/.venv -type d -name tests -prune -exec rm -rf {} + \
@@ -1122,14 +1134,14 @@ RUN find /python \( -name ensurepip -o -name idlelib -o -name tkinter -o -name t
 FROM builder AS test
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked        # bring in dev deps
+    uv sync --locked --no-editable   # bring in dev deps; tests import the installed `app`
 COPY tests ./tests
-RUN uv run python -m pytest -q tests/   # -m puts /app on sys.path, so `import src.main` works
+RUN uv run --no-sync pytest -q tests/
 
 # ============================================================================
 # Stage 3: Runtime
 #   - Distroless cc (glibc + libstdc++, no Python), nonroot.
-#   - Only the interpreter, the built venv, and source.
+#   - Only the interpreter and the built venv (which contains the app).
 #   - No shell, no package manager.
 # ============================================================================
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
@@ -1145,15 +1157,13 @@ WORKDIR /app
 
 COPY --from=builder /python /python
 COPY --from=builder --chown=nonroot:nonroot /app/.venv /app/.venv
-COPY --from=builder --chown=nonroot:nonroot /app/src /app/src
 
 USER nonroot
 EXPOSE 8000
 
 # Bind to 0.0.0.0 inside the pod; service maps the port.
-ENTRYPOINT ["python", "-m", "uvicorn", "src.main:app", \
+ENTRYPOINT ["python", "-m", "uvicorn", "app.main:app", \
             "--host", "0.0.0.0", "--port", "8000", \
-            "--log-config", "/app/src/log-config.json", \
             "--no-access-log"]
 ```
 
@@ -1161,13 +1171,14 @@ Annotations:
 
 - **Cache mounts** on the global `uv` cache mean repeated builds reuse downloaded wheels.
 - **`--no-install-project`** in the first sync gives a clean dependency layer; project install in the second sync is fast and re-runs only when source changes.
+- **`uv run --no-sync`** in the test stage runs pytest against the environment exactly as synced, instead of letting `uv run` re-sync (and switch the project back to editable).
 - **`--locked`** ensures `uv.lock` is the source of truth (build fails if it's stale).
 - **Strip tests/dist-info/locales** trims ~30–80 MB.
 - **`strip --strip-unneeded`** on `.so` files removes debug info (needs `binutils`, installed in the builder only).
 - **Slim the interpreter:** the managed CPython is ~120 MB uncompressed (the `python3.12` binary is statically linked, ~30 MB, and ships next to a ~30 MB `libpython`), about twice Debian's. Deleting pip, IDLE, and Tk recovers ~20 MB. That size is the price of choosing your Python version; don't `strip` the interpreter itself (it's already stripped; ~3 MB gain).
 - **`UV_PYTHON=3.12`** pins the interpreter for both `uv python install` and `uv sync`, so a `requires-python = ">=3.12"` can't make uv download a newer version behind your back.
 - **uv-managed interpreter on `distroless/cc`**: the venv's `python` symlink resolves to `/python/...` in both stages, so the `.pyc` version tag and the binary always match. `python3-debian12` would give you Debian's 3.11 instead (§25).
-- **`compileall --invalidation-mode unchecked-hash src`**: the project is installed editable, so `--compile-bytecode` never touched it (§25).
+- **`--no-editable`** installs the project into `site-packages` like a dependency: `UV_COMPILE_BYTECODE` compiles it, the runtime copies one directory, and `import app` never depends on the working directory (§25). Project layout is shown in §5.
 - **Distroless nonroot** runtime; no shell, no pip, no curl. Smallest reasonable surface.
 - **`MALLOC_ARENA_MAX=2`** for memory hygiene.
 - **No `PYTHONOPTIMIZE`**: it would make the interpreter ignore every level-0 `.pyc` we just compiled (§25).
@@ -1177,7 +1188,7 @@ Annotations:
 
 Expected result for a FastAPI service with ~30 deps:
 
-- Image size: **70–90 MB compressed.** (Measured for this exact Dockerfile with only `fastapi` + `uvicorn`: 45 MB compressed, 192 MB uncompressed; `import src.main` in ~0.4 s from a read-only root, vs ~1.2 s with `-O`, which ignores the level-0 `.pyc`s.)
+- Image size: **70–90 MB compressed.** (Measured for this exact Dockerfile with only `fastapi` + `uvicorn`: 45 MB compressed, 192 MB uncompressed; `import app.main` in ~0.4 s from a read-only root, vs ~1.2 s with `-O`, which ignores the level-0 `.pyc`s.)
 - Cold start (from `docker run` to first response): **~300–500 ms.**
 - RSS under idle: **~80 MB.**
 - RSS under load: **~150–200 MB.**
@@ -1268,7 +1279,7 @@ For a quick check that you're not adding bloat: `dive` shows "wasted space" — 
 ### Cold start
 
 ```
-time docker run --rm --read-only --entrypoint python myapp:latest -c "from src.main import app"
+time docker run --rm --read-only --entrypoint python myapp:latest -c "from app.main import app"
 ```
 
 `--entrypoint` is required because the image's `ENTRYPOINT` would otherwise receive `python -c ...` as arguments; `--read-only` reproduces the production filesystem, so missing `.pyc`s show up as slow imports. This roughly captures import time. For real cold start, time from pod creation to Ready, with a readiness probe that hits a real endpoint (without one, the pod is Ready the moment the process starts, and you measure nothing):
@@ -1300,7 +1311,7 @@ Memory profiling tools: `memray` (the modern choice: tracks native allocations t
 ### Import time
 
 ```
-python -X importtime -c "import src.main" 2> imports.log
+python -X importtime -c "import app.main" 2> imports.log
 # Slowest 20 by cumulative time (columns: self | cumulative | package):
 sort -t'|' -k2 -n imports.log | tail -20
 # Or visualize the tree:
@@ -1542,13 +1553,13 @@ __pycache__/models.cpython-312.opt-2.pyc    # -OO / PYTHONOPTIMIZE=2
 `uv --compile-bytecode` (like `pip`) compiles at level 0 only. Run with `PYTHONOPTIMIZE=1` and the interpreter looks for `.opt-1.pyc`, doesn't find it, and **compiles from source**. With `PYTHONDONTWRITEBYTECODE=1` and a read-only root filesystem it can't cache the result, so *every* start pays the full compile: you've shipped the `.pyc`s and switched them off. Pick one:
 
 - Run at level 0 (what the gold-standard Dockerfile in §19 now does). The startup win from `-O` is small; asserts are cheap.
-- Or compile everything at the level you run: `python -m compileall -q -j 0 -o 1 /app/.venv/lib /app/src` (repeat `-o` for several levels).
+- Or compile everything at the level you run: `python -m compileall -q -j 0 -o 1 /app/.venv/lib` (with a non-editable install the app is in there too; repeat `-o` for several levels).
 
 Check it in the built image: `python -X importtime -c 'import yourapp' 2>&1 | tail -1` should be identical with and without `--read-only`.
 
 ### Surprise 2: your own code isn't compiled
 
-`uv sync` installs your project **editable** by default: site-packages holds a `.pth` pointing at `/app/src`, and `--compile-bytecode` compiles site-packages, not `/app/src`. The dependencies start fast; your app's own modules compile on every start. Either `uv sync --no-editable` (the project becomes a normal installed package and only `.venv` needs copying to the runtime stage), or `compileall` the source tree yourself.
+`uv sync` installs your project **editable** by default: site-packages holds a `.pth` pointing at `/app/src`, and `--compile-bytecode` compiles site-packages, not `/app/src`. The dependencies start fast; your app's own modules compile on every start. Use `uv sync --no-editable` (the project becomes a normal installed package, compiled with the rest, and only `.venv` needs copying to the runtime stage; this is what §5 and §19 do). If you must keep an editable install, `compileall` the source tree yourself:
 
 ### Surprise 3: invalidation modes, and `SOURCE_DATE_EPOCH`
 
