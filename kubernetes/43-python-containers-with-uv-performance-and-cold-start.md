@@ -4,7 +4,7 @@ Python is the worst language to containerize well and the most common language t
 
 This chapter is about flipping every one of those defaults. The thesis: **with `uv` as the package manager, distroless or `python:3.12-slim` as the base, multi-stage builds, AOT-compiled `.pyc`, and tuned interpreter flags, a Python service can be packaged into a 50–100 MB image that cold-starts in 200–400 ms and uses 30–40% less RSS than the naive equivalent.** Every dial along the way matters; most teams turn none of them.
 
-If you read chapter 39 (Dockerfile best practices), this chapter is the language-specific deep dive that ties it to Python's particular pathologies. It assumes you're already comfortable with multi-stage builds, BuildKit cache mounts, and distroless bases — we'll go past those, into Python-specific territory.
+If you read chapter 39 (Dockerfile best practices), this chapter is the language-specific deep dive that ties it to Python's particular pathologies. It assumes you're already comfortable with multi-stage builds, BuildKit cache mounts, and distroless bases — we'll go past those, into Python-specific territory. Sections 21–28 cover the advanced, surprising parts: what `os.cpu_count()` and the memory APIs see inside a cgroup, fork/COW and the GC, PID 1 signals, bytecode invalidation modes, Poetry vs uv, and build-cache deep cuts. For the machine underneath each dial, see the [`python-mastery/`](../python-mastery/README.md) track (§29 maps the two).
 
 ---
 
@@ -30,7 +30,16 @@ If you read chapter 39 (Dockerfile best practices), this chapter is the language
 18. [CI/CD Patterns for `uv` Builds](#18-cicd-patterns-for-uv-builds)
 19. [The Gold-Standard Dockerfile, Fully Annotated](#19-the-gold-standard-dockerfile-fully-annotated)
 20. [Measuring: How to Tell If You Actually Improved Anything](#20-measuring-how-to-tell-if-you-actually-improved-anything)
-21. [TL;DR](#21-tldr)
+21. [CPU: What Python Thinks It Has vs What the cgroup Gives It](#21-cpu-what-python-thinks-it-has-vs-what-the-cgroup-gives-it)
+22. [Memory: Limits Python Can't See, OOMKills It Can't Catch](#22-memory-limits-python-cant-see-oomkills-it-cant-catch)
+23. [Fork, Copy-on-Write, and the Garbage Collector](#23-fork-copy-on-write-and-the-garbage-collector)
+24. [PID 1, Signals, and Graceful Shutdown](#24-pid-1-signals-and-graceful-shutdown)
+25. [Bytecode Deep Cuts: Optimization Levels, Invalidation Modes, Version Tags](#25-bytecode-deep-cuts-optimization-levels-invalidation-modes-version-tags)
+26. [Poetry vs uv (vs pip) in Containers](#26-poetry-vs-uv-vs-pip-in-containers)
+27. [Build Cache Deep Cuts](#27-build-cache-deep-cuts)
+28. [The Surprise Catalog](#28-the-surprise-catalog)
+29. [Cross-References: `python-mastery/`](#29-cross-references-python-mastery)
+30. [TL;DR](#30-tldr)
 
 ---
 
@@ -136,7 +145,8 @@ The honest comparison for production:
 | `python:3.12` | ~1 GB | Both | Yes | Never for runtime. Sometimes for build stage. |
 | `python:3.12-slim-bookworm` | ~45 MB | glibc | Yes | **Default for build stage.** Reasonable for runtime if you need a shell. |
 | `python:3.12-alpine` | ~20 MB | musl (often missing) | Yes | Avoid unless you've audited every wheel. |
-| `gcr.io/distroless/python3-debian12` | ~25 MB | glibc | No | **Production runtime default.** |
+| `gcr.io/distroless/python3-debian12` | ~25 MB | glibc | No | **Production runtime default**, but it is Debian's **Python 3.11**: the builder must match (§25). |
+| `gcr.io/distroless/cc-debian12` + uv-managed Python | ~45 MB | glibc | No | Distroless with the interpreter version *you* choose. Used in §19. |
 | `cgr.dev/chainguard/python:latest` | ~30 MB | glibc | No | Chainguard's distroless equivalent. Aggressively CVE-tracked. |
 | `python:3.12-slim` + `uv` (no python in final) | varies | n/a | yes | If you're shipping a script. |
 | `ghcr.io/astral-sh/uv:python3.12-bookworm-slim` | ~85 MB | glibc | Yes | Bundles `uv` + Python; convenient for build stages. |
@@ -149,7 +159,7 @@ The Alpine warnings are not theoretical. Specific failures you'll encounter:
 - **DNS** behaves differently (single-label, parallel queries — see ch 39 §3).
 - **Threading** stack sizes are smaller; deep recursion in Python (e.g., parsing nested JSON) can crash.
 
-The two-line rule: **build in `python:3.12-slim-bookworm` (or the `astral-sh/uv` image); ship in `gcr.io/distroless/python3-debian12:nonroot`.** Everything else is a deviation that should be justified.
+The two-line rule: **build in `python:3.12-slim-bookworm` (or the `astral-sh/uv` image); ship in distroless `:nonroot`, with the same Python minor version in both stages.** Everything else is a deviation that should be justified.
 
 When *not* to use distroless:
 
@@ -205,6 +215,8 @@ USER nonroot
 EXPOSE 8000
 ENTRYPOINT ["python", "-m", "src.main"]
 ```
+
+> **Version trap.** `distroless/python3-debian12` ships Debian's Python **3.11**. With a 3.12 builder, the venv's `python` symlink points at `/usr/local/bin/python3.12`, which doesn't exist in the runtime image, and the `cpython-312` `.pyc`s would be ignored anyway. Either match the builder to the runtime (`ghcr.io/astral-sh/uv:python3.11-bookworm-slim`) or ship your own interpreter as §19 does. See §25.
 
 What's happening, line by line:
 
@@ -425,7 +437,7 @@ A common "minimize" pattern is to install only what you import. It works, but: d
 
 `gcr.io/distroless/python3-debian12` includes:
 
-- The CPython interpreter (3.12 currently).
+- **Debian's** CPython interpreter: **3.11** on `debian12` (3.13 on `debian13`), not the version you pick. If your builder uses a different minor version, the venv won't run on it (§25). The gold-standard Dockerfile in §19 avoids this by shipping a uv-managed interpreter on `distroless/cc`.
 - The CPython standard library.
 - glibc, ca-certificates, tzdata, /etc/passwd with a `nonroot` user.
 
@@ -606,7 +618,7 @@ Python's memory characteristics in containers:
 
 - **Resident set size (RSS)** is what the kernel counts toward cgroup limits.
 - Python rarely returns memory to the OS, so RSS grows toward the high-water mark and stays there.
-- The default allocator (`pymalloc`) has per-thread arenas; multi-threaded apps consume more memory than single-threaded equivalents.
+- Objects ≤ 512 bytes come from `pymalloc` arenas; everything larger (and every C extension) goes to glibc `malloc`, whose **per-thread** arenas make multi-threaded apps consume more memory than single-threaded equivalents (§22).
 
 ### Sizing: how much memory does a Python process need?
 
@@ -653,9 +665,10 @@ Always set `PYTHONUNBUFFERED=1`. Costs nothing.
 - `PYTHONOPTIMIZE=1`: removes `assert` statements and sets `__debug__` to False. Small startup speedup, smaller `.pyc` files.
 - `PYTHONOPTIMIZE=2`: also removes docstrings. ~5–10% memory savings on doc-heavy libraries.
 
-If you rely on assertions in production code, don't use this. If you only use asserts in tests, `PYTHONOPTIMIZE=1` is a nice tweak.
+If you rely on assertions in production code, don't use this. **And if you set it, you must compile bytecode at the same level:** `uv --compile-bytecode` produces level-0 `.pyc`s only, so `PYTHONOPTIMIZE=1` makes the interpreter ignore them and recompile from source on every start (§25). The gold-standard Dockerfile leaves it off.
 
 ```dockerfile
+# Only together with: python -m compileall -o 1 /app/.venv/lib /app/src
 ENV PYTHONOPTIMIZE=1
 ```
 
@@ -1004,17 +1017,22 @@ Putting everything together for a typical FastAPI service:
 # syntax=docker/dockerfile:1.7
 # ============================================================================
 # Stage 1: Builder
-#   - Astral's uv-prebuilt image (Debian slim + Python 3.12 + uv).
+#   - Astral's uv image (Debian slim + uv); pin it by digest in real use.
+#   - Installs a uv-managed CPython into /python, so builder and runtime run
+#     the exact same interpreter binary (no distroless 3.11-vs-3.12 mismatch).
 #   - Installs deps with cache mount, compiles bytecode at install time.
 #   - Strips tests, docs, locales from site-packages.
 # ============================================================================
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:bookworm-slim AS builder
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON_INSTALL_DIR=/python \
+    UV_PYTHON_PREFERENCE=only-managed \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+
+RUN uv python install 3.12
 
 WORKDIR /app
 
@@ -1028,6 +1046,10 @@ COPY src ./src
 COPY README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
+
+# uv compiled site-packages; the editable project source is ours to compile.
+# unchecked-hash: the image is immutable, so skip the per-import freshness check.
+RUN .venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash src
 
 # Slim the venv
 RUN find /app/.venv -type d -name tests -prune -exec rm -rf {} + \
@@ -1048,21 +1070,22 @@ RUN uv run pytest -q tests/
 
 # ============================================================================
 # Stage 3: Runtime
-#   - Distroless Python, nonroot.
-#   - Only the built venv + source.
+#   - Distroless cc (glibc + libstdc++, no Python), nonroot.
+#   - Only the interpreter, the built venv, and source.
 #   - No shell, no package manager.
 # ============================================================================
-FROM gcr.io/distroless/python3-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
+# No PYTHONOPTIMIZE: the .pyc files above are level 0, and -O would ignore them (§25).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONOPTIMIZE=1 \
     PYTHONHASHSEED=random \
     MALLOC_ARENA_MAX=2 \
     PATH="/app/.venv/bin:${PATH}"
 
 WORKDIR /app
 
+COPY --from=builder /python /python
 COPY --from=builder --chown=nonroot:nonroot /app/.venv /app/.venv
 COPY --from=builder --chown=nonroot:nonroot /app/src /app/src
 
@@ -1083,9 +1106,11 @@ Annotations:
 - **`--locked`** ensures `uv.lock` is the source of truth (build fails if it's stale).
 - **Strip tests/dist-info/locales** trims ~30–80 MB.
 - **`strip --strip-unneeded`** on `.so` files removes debug info.
+- **uv-managed interpreter on `distroless/cc`**: the venv's `python` symlink resolves to `/python/...` in both stages, so the `.pyc` version tag and the binary always match. `python3-debian12` would give you Debian's 3.11 instead (§25).
+- **`compileall --invalidation-mode unchecked-hash src`**: the project is installed editable, so `--compile-bytecode` never touched it (§25).
 - **Distroless nonroot** runtime; no shell, no pip, no curl. Smallest reasonable surface.
 - **`MALLOC_ARENA_MAX=2`** for memory hygiene.
-- **`PYTHONOPTIMIZE=1`** drops asserts, small startup win.
+- **No `PYTHONOPTIMIZE`**: it would make the interpreter ignore every level-0 `.pyc` we just compiled (§25).
 - **`PYTHONHASHSEED=random`** explicit (defensive, also the default).
 - **Single uvicorn process per pod**, scale via replicas.
 - **`--no-access-log`** for low CPU overhead; ship access logs from a sidecar if needed.
@@ -1175,7 +1200,369 @@ Don't trust "I made it smaller" without numbers. Don't trust "it's faster now" w
 
 ---
 
-## 21. TL;DR
+## 21. CPU: What Python Thinks It Has vs What the cgroup Gives It
+
+The most expensive surprise in containerized Python is a number: `os.cpu_count()`. On a 64-core node, inside a pod with `limits.cpu: 2`, it returns **64**. A CPU *limit* is a CFS bandwidth quota (`cpu.max`), not a set of CPUs; every core stays visible, you just get throttled once the cgroup has burned 2 CPU-seconds per second.
+
+Three different questions, three different answers:
+
+| API | What it reads | Respects `cpuset` / affinity | Respects CFS quota (`limits.cpu`) |
+|---|---|---|---|
+| `os.cpu_count()` | CPUs online on the host | No | No |
+| `len(os.sched_getaffinity(0))` | CPUs this process may be scheduled on | Yes | No |
+| `os.process_cpu_count()` (3.13+) | Same as affinity | Yes | No |
+| `PYTHON_CPU_COUNT=N` / `-X cpu_count=N` (3.13+) | Whatever you set | Overrides all three above | Overrides all three above |
+
+Affinity only shrinks when the kubelet's **static CPU manager policy** pins a Guaranteed-QoS pod with integer CPUs to dedicated cores. In every other pod, affinity is the whole node too. CPython deliberately does not parse cgroups ([gh-109595](https://github.com/python/cpython/issues/109595)): the spec is complex and the answer can change at runtime. So the only reliable answer is the one you tell it.
+
+### Who calls it behind your back
+
+| Consumer | Default sizing | Knob |
+|---|---|---|
+| `ThreadPoolExecutor` (incl. asyncio's default executor, so every `getaddrinfo` and `to_thread`) | `min(32, cpu + 4)` | `max_workers=`, or `PYTHON_CPU_COUNT` |
+| `ProcessPoolExecutor`, `multiprocessing.Pool` | `cpu` processes | `max_workers=` / `processes=` |
+| gunicorn / uvicorn workers | 1 unless set; docs suggest `2 × cpu + 1` | `WEB_CONCURRENCY` (both honor it), `--workers` |
+| NumPy/SciPy via OpenBLAS, MKL; scikit-learn | one thread per visible core | `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `OMP_NUM_THREADS` |
+| PyTorch intra-op threads | physical cores | `torch.set_num_threads()`, `OMP_NUM_THREADS` |
+| Polars, PyArrow, DuckDB | visible cores | `POLARS_MAX_THREADS`, `pyarrow.set_cpu_count()`, `SET threads` |
+| glibc malloc arenas | `8 × cores` | `MALLOC_ARENA_MAX` (§13) |
+
+The failure mode is not a crash. It is **CFS throttling**: 64 OpenBLAS threads on a 2-CPU quota burn the whole 100 ms period's budget in ~3 ms, then the cgroup is frozen for the remaining ~97 ms. p50 looks fine, p99 has 100 ms steps in it, and `container_cpu_cfs_throttled_periods_total` climbs. A `ProcessPoolExecutor()` with no arguments on that same node forks 64 workers, each with its own copy of your imports, and the pod OOMs instead.
+
+### The fix: tell Python the truth via the Downward API
+
+```yaml
+env:
+  - name: PYTHON_CPU_COUNT          # 3.13+: fixes os.cpu_count() and every default derived from it
+    valueFrom:
+      resourceFieldRef:
+        resource: limits.cpu
+        divisor: "1"                # rounds UP: 500m -> 1, 1500m -> 2
+  - name: OMP_NUM_THREADS
+    valueFrom:
+      resourceFieldRef: { resource: limits.cpu, divisor: "1" }
+  - name: OPENBLAS_NUM_THREADS
+    valueFrom:
+      resourceFieldRef: { resource: limits.cpu, divisor: "1" }
+  - name: WEB_CONCURRENCY
+    value: "1"                      # async service: one process per pod, scale with replicas
+```
+
+Two caveats: if the pod has **no CPU limit**, `limits.cpu` resolves to the node's allocatable CPU, so you are back to 64; teams that drop CPU limits (a defensible choice, to avoid throttling) must set these to a fixed number instead. And on Python ≤ 3.12 `PYTHON_CPU_COUNT` is ignored; read the quota yourself:
+
+```python
+import math
+import os
+
+
+def effective_cpus() -> int:
+    """CPUs this process can actually burn: min(affinity, cgroup v2 quota)."""
+    n = len(os.sched_getaffinity(0))
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            n = min(n, max(1, math.ceil(int(quota) / int(period))))
+    except (OSError, ValueError):
+        pass
+    return n
+```
+
+### Cold start is CPU-bound, and the limit applies to it
+
+Imports, `.pyc` unmarshalling, and warm-up are pure CPU. A service that starts in 400 ms with a full core starts in ~1.6 s at `limits.cpu: 250m`, and the `startupProbe` you tuned on a laptop fails. Either give requests/limits headroom for startup, set the `startupProbe` from a measurement taken *under the limit*, or (Kubernetes 1.33+, in-place pod resize) start with more CPU and resize down after ready.
+
+Deeper: how the scheduler sees threads and processes, [`../python-mastery/06-processes-threads-scheduling.md`](../python-mastery/06-processes-threads-scheduling.md); why the GIL makes extra threads useless for CPU-bound Python but not for BLAS, [`../python-mastery/24-the-gil.md`](../python-mastery/24-the-gil.md).
+
+---
+
+## 22. Memory: Limits Python Can't See, OOMKills It Can't Catch
+
+### Python sees the host's RAM
+
+`os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")` and `psutil.virtual_memory().total` report **the node's** memory, not the cgroup's. Anything that sizes a cache "as 25% of RAM" (some ML loaders, in-process LRU caches, a homegrown batcher) sizes it against 256 GB inside a 1 GB pod. Read the limit, or inject it:
+
+```python
+def memory_limit_bytes() -> int | None:
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            v = f.read().strip()
+        return None if v == "max" else int(v)
+    except OSError:
+        return None
+```
+
+```yaml
+env:
+  - name: MEMORY_LIMIT_BYTES
+    valueFrom:
+      resourceFieldRef: { resource: limits.memory }
+```
+
+### `MemoryError` will not save you
+
+When the cgroup hits `memory.max`, the kernel OOM killer sends **SIGKILL**. No exception, no traceback, no `atexit`, no flushed logs; the container exits 137 and `kubectl describe` says `OOMKilled`. `MemoryError` only happens when a single `malloc` fails, which in a cgroup almost never happens first. If you want a graceful failure, it has to be a **self-imposed** limit below the cgroup's: reject work when `memory.current` crosses ~85% of `memory.max`, or recycle the worker (below).
+
+### What the kubelet actually counts
+
+- `memory.current` includes **page cache** your process caused (files read, logs written to a file in the container, `tmpfs`).
+- The kubelet evicts and the dashboards alert on **working set** = `memory.current − inactive_file`. That is the number to compare against the limit, not `ps` RSS.
+- RSS **double-counts shared pages** across processes. With 4 gunicorn workers sharing a preloaded app, summing RSS over-reports. Use PSS (`/proc/<pid>/smaps_rollup`) per process and `memory.current` for the pod.
+- `emptyDir: { medium: Memory }` and `/dev/shm` writes are RAM charged to the pod.
+
+### Fragmentation: RSS that never comes back
+
+Python almost never returns memory to the OS, for two independent reasons:
+
+1. **pymalloc** (objects ≤ 512 bytes) carves 1 MiB arenas (3.10+) into 16 KiB pools. An arena is released only when *every* object in it is freed. One long-lived dict entry pins the megabyte.
+2. **glibc malloc** (everything bigger, plus every C extension) only trims the top of the heap; holes in the middle stay resident. Per-thread arenas multiply this (§13).
+
+The levers, cheapest first:
+
+- `MALLOC_ARENA_MAX=2` (already in §13).
+- **Recycle workers:** `gunicorn --max-requests 2000 --max-requests-jitter 200`. Crude, bounded, works for any leak or fragmentation source. The jitter stops all workers restarting at once.
+- **Swap the allocator** for C-extension-heavy apps: `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2` (copy the `.so` into a distroless image from the builder). jemalloc's decay returns memory on its own; typical RSS reduction is 10–30% on pandas/numpy-heavy services. Measure; it occasionally costs CPU. CPython's free-threaded build already uses bundled mimalloc.
+- `ctypes.CDLL("libc.so.6").malloc_trim(0)` after a known large, transient allocation (a batch job, a big report). A targeted hammer, not a default.
+
+Diagnosis ladder and allocator internals: [`../python-mastery/08-allocators.md`](../python-mastery/08-allocators.md) (§5 on arenas, §6 on why memory doesn't come back, §12 on installing jemalloc/mimalloc); RSS vs PSS vs working set: [`../python-mastery/07-virtual-memory.md`](../python-mastery/07-virtual-memory.md); cutting RSS you can explain: [`../python-mastery/35-memory-optimization.md`](../python-mastery/35-memory-optimization.md).
+
+### Transparent huge pages
+
+If the node runs THP in `always` mode, sparse heaps get backed by 2 MiB pages and RSS jumps for no code change. Most distros default to `madvise`, which is fine. If you see unexplained RSS growth after a node image upgrade, check `/sys/kernel/mm/transparent_hugepage/enabled` before blaming the app.
+
+---
+
+## 23. Fork, Copy-on-Write, and the Garbage Collector
+
+§13 promised that `gunicorn --preload` shares memory across workers via copy-on-write. In CPython that promise leaks, because **reading an object writes to it**: every reference taken increments `ob_refcnt` in the object header, dirtying its page, and the kernel copies the page into the child. A full GC pass is worse: it walks every tracked object and writes GC bookkeeping into each one. A preloaded Django app that shares 80% of its pages right after fork can be down to 20% shared an hour later.
+
+What helps:
+
+- **Python 3.12+ immortal objects** (PEP 683): `None`, `True`, small ints, interned strings, and many static objects no longer have their refcount written. Free improvement from upgrading.
+- **`gc.freeze()`** (3.7+) moves every object currently tracked into a permanent generation the collector never scans, so GC in the children doesn't dirty the parent's pages. The documented recipe is disable early in the parent, freeze right before fork, re-enable in the child:
+
+```python
+# gunicorn.conf.py
+import gc
+
+preload_app = True
+max_requests = 2000
+max_requests_jitter = 200
+
+gc.disable()                      # master: no collections creating holes while importing
+
+
+def pre_fork(server, worker):     # runs in the master, immediately before each fork
+    gc.freeze()
+
+
+def post_fork(server, worker):    # runs in each worker
+    gc.enable()
+```
+
+Measure with the sum of `Shared_*` in `/proc/<worker>/smaps_rollup`, before and after an hour of traffic. Instagram, who upstreamed `gc.freeze()`, reported a measurable capacity gain per host from it.
+
+### The `multiprocessing` start method changed under you
+
+- **Python 3.12** emits a `DeprecationWarning` when you `fork()` a process that has threads, because the child inherits locks held by threads that no longer exist (the classic logging/`malloc` deadlock).
+- **Python 3.14** changed the default start method on Linux from `fork` to **`forkserver`**. Code that relied on children inheriting a preloaded model, an open DB pool, or module globals now pays a fresh import per worker, and anything passed to a worker must be picklable. If you depend on fork semantics, say so: `multiprocessing.get_context("fork")`, and accept the threads caveat.
+
+The fork mechanics, the deadlock reproduced, and the 3.14 change: [`../python-mastery/10-signals-fork-exec.md`](../python-mastery/10-signals-fork-exec.md) (§8–§10). Why refcounting writes on read: [`../python-mastery/15-refcounting-and-ownership.md`](../python-mastery/15-refcounting-and-ownership.md). The collector walked line by line: [`../python-mastery/22-garbage-collection.md`](../python-mastery/22-garbage-collection.md).
+
+---
+
+## 24. PID 1, Signals, and Graceful Shutdown
+
+Whatever `ENTRYPOINT` starts is **PID 1** in the container's PID namespace, and the kernel treats PID 1 specially: a signal whose disposition is the default is **dropped**, even when sent from outside (only `SIGKILL`/`SIGSTOP` are forced). CPython installs a handler for `SIGINT` but not for `SIGTERM`. So:
+
+| Entrypoint | What `kubectl delete pod` does |
+|---|---|
+| `python worker.py`, no SIGTERM handler | SIGTERM ignored → nothing happens for `terminationGracePeriodSeconds` (30 s) → SIGKILL. Every rollout takes 30 s per pod and in-flight work is cut. |
+| `CMD python app.py` (shell form) | `/bin/sh -c` is PID 1 and doesn't forward signals; same 30 s, and Python never hears about it. In distroless there is no shell, so the container doesn't even start. |
+| `uvicorn` / `gunicorn` / `granian` (exec form) | They install SIGTERM handlers: stop accepting, drain, exit. Correct. |
+| Anything that spawns subprocesses | PID 1 must also **reap zombies**. Python only reaps children it `wait()`s on. |
+
+Rules:
+
+1. **Always exec form** (`ENTRYPOINT ["python", "-m", ...]`).
+2. For plain scripts and job runners, handle SIGTERM explicitly:
+
+```python
+import signal
+import sys
+
+def _terminate(signum, frame):
+    raise SystemExit(0)           # unwinds: finally blocks, context managers, atexit run
+
+signal.signal(signal.SIGTERM, _terminate)
+```
+
+3. If the process spawns children it doesn't reap, run under an init: `docker run --init`, `shareProcessNamespace`, or copy `tini` into the image and `ENTRYPOINT ["/tini", "--", "python", ...]`.
+4. **Draining is not just the signal.** Endpoint removal propagates to kube-proxy/ingress *after* SIGTERM is sent, so a pod that exits instantly still drops requests. Add `lifecycle.preStop: { sleep: { seconds: 5 } }` (Kubernetes 1.30+ native sleep; no shell needed) and keep the server's graceful timeout below `terminationGracePeriodSeconds`.
+
+How CPython defers handlers to the eval loop (and why a long C call delays your SIGTERM): [`../python-mastery/10-signals-fork-exec.md`](../python-mastery/10-signals-fork-exec.md) (§3, §4, §13 on reaping, §15 on graceful shutdown assembled).
+
+---
+
+## 25. Bytecode Deep Cuts: Optimization Levels, Invalidation Modes, Version Tags
+
+§8 says "flip `UV_COMPILE_BYTECODE=1` and you're done." Three ways it silently isn't:
+
+### Surprise 1: `PYTHONOPTIMIZE` looks for different files
+
+`.pyc` files are tagged by optimization level:
+
+```
+__pycache__/models.cpython-312.pyc          # level 0 (default)
+__pycache__/models.cpython-312.opt-1.pyc    # -O  / PYTHONOPTIMIZE=1
+__pycache__/models.cpython-312.opt-2.pyc    # -OO / PYTHONOPTIMIZE=2
+```
+
+`uv --compile-bytecode` (like `pip`) compiles at level 0 only. Run with `PYTHONOPTIMIZE=1` and the interpreter looks for `.opt-1.pyc`, doesn't find it, and **compiles from source**. With `PYTHONDONTWRITEBYTECODE=1` and a read-only root filesystem it can't cache the result, so *every* start pays the full compile: you've shipped the `.pyc`s and switched them off. Pick one:
+
+- Run at level 0 (what the gold-standard Dockerfile in §19 now does). The startup win from `-O` is small; asserts are cheap.
+- Or compile everything at the level you run: `python -m compileall -q -j 0 -o 1 /app/.venv/lib /app/src` (repeat `-o` for several levels).
+
+Check it in the built image: `python -X importtime -c 'import yourapp' 2>&1 | tail -1` should be identical with and without `--read-only`.
+
+### Surprise 2: your own code isn't compiled
+
+`uv sync` installs your project **editable** by default: site-packages holds a `.pth` pointing at `/app/src`, and `--compile-bytecode` compiles site-packages, not `/app/src`. The dependencies start fast; your app's own modules compile on every start. Either `uv sync --no-editable` (the project becomes a normal installed package and only `.venv` needs copying to the runtime stage), or `compileall` the source tree yourself.
+
+### Surprise 3: invalidation modes, and `SOURCE_DATE_EPOCH`
+
+How a `.pyc` proves it is fresh (PEP 552):
+
+| Mode | Check on every import | Cost | Use |
+|---|---|---|---|
+| `timestamp` (default) | `stat()` the `.py`, compare mtime + size | one syscall per module | dev |
+| `checked-hash` | **read and hash the whole `.py`** | full source read + SipHash per module | rarely |
+| `unchecked-hash` | nothing | zero | **immutable images** |
+
+Two traps. Setting `SOURCE_DATE_EPOCH` (common in reproducible-build pipelines) silently flips `py_compile`'s default to `checked-hash`, so startup gets *slower* the moment you make builds reproducible. And anything that rewrites mtimes after compilation (BuildKit's `rewrite-timestamp=true`, some image-squashing tools, `COPY` from a stage that `touch`ed files) makes `timestamp` `.pyc`s stale, and they're recompiled at runtime. In an image, sources never change after build, so the correct mode is:
+
+```dockerfile
+RUN python -m compileall -q -j 0 --invalidation-mode unchecked-hash /app/src
+```
+
+### Surprise 4: the version tag must match the runtime interpreter
+
+`cpython-312` in the filename is the interpreter's magic number. Compile with 3.12 in the builder and run on a 3.11 runtime, and every `.pyc` is ignored (and the venv's `python` symlink points at a binary that doesn't exist, so it won't start at all). This is the classic distroless trap: `gcr.io/distroless/python3-debian12` ships **Debian's** Python, which is **3.11**, not whatever your builder used. §19 fixes it by shipping a uv-managed interpreter on `distroless/cc`, so builder and runtime run the same binary by construction.
+
+### Smaller dials
+
+- **Frozen stdlib (3.11+):** core startup modules are deep-frozen into the binary; that's why bare `python -c pass` is ~15 ms. Don't disable it (`-X frozen_modules=off` is for debugging the stdlib).
+- **Lazy imports in the language:** PEP 810 (`lazy import x`, accepted for Python 3.15) makes §14's hand-written lazy imports a keyword. Until you're on it, the function-local import and PEP 562 `__getattr__` patterns stand.
+- **zipapps (`shiv`, `pex`):** one file, convenient for CLIs, but imports from a zip can't use cached `.pyc` unless the archive includes them, and C extensions must be extracted at first run. For services, a venv in an image is faster.
+
+What a code object and a `.pyc` actually contain: [`../python-mastery/19-bytecode-and-code-objects.md`](../python-mastery/19-bytecode-and-code-objects.md).
+
+---
+
+## 26. Poetry vs uv (vs pip) in Containers
+
+Poetry is the most common thing teams are migrating *from*. It's a reasonable tool; the question is what it costs in a Dockerfile.
+
+| | `pip` + `requirements.txt` | Poetry 2.x | uv |
+|---|---|---|---|
+| Lockfile | none native; `pip-compile`/`uv pip compile` for a hashed, per-platform file | `poetry.lock`, cross-platform, hashed | `uv.lock`, cross-platform, hashed |
+| Resolve speed (cold, ~100 deps) | n/a | tens of seconds | ~1 s |
+| Install speed | serial download+install | parallel, Python-speed | parallel, Rust-speed, 10–100× pip |
+| Tool footprint in the builder | already there | Poetry + ~40 deps (~70 MB), must be pinned | one static binary, `COPY --from=ghcr.io/astral-sh/uv` |
+| Manages the Python interpreter | no | no | yes (`uv python install`) |
+| BuildKit cache-mount pattern | `--mount=type=cache,target=/root/.cache/pip` | `POETRY_CACHE_DIR` + mount | `/root/.cache/uv` + `UV_LINK_MODE=copy` |
+| Bytecode at install | `--compile` (default on for pip) | not by default; `compileall` after | `--compile-bytecode` |
+| PEP 621 `[project]` table | n/a | yes, since 2.0 | yes |
+| Export to `requirements.txt` | n/a | `poetry-plugin-export` (unbundled since 2.0) | `uv export` |
+| Plugin ecosystem, publishing workflows | n/a | mature | thinner |
+
+### If you're staying on Poetry, do it right
+
+```dockerfile
+FROM python:3.12-slim-bookworm AS builder
+ARG POETRY_VERSION=2.1.3
+ENV POETRY_NO_INTERACTION=1 \
+    POETRY_VIRTUALENVS_IN_PROJECT=1 \
+    POETRY_CACHE_DIR=/tmp/poetry-cache
+RUN pip install --no-cache-dir "poetry==${POETRY_VERSION}"   # builder only, never in runtime
+
+WORKDIR /app
+COPY pyproject.toml poetry.lock ./
+RUN --mount=type=cache,target=/tmp/poetry-cache \
+    poetry install --only main --no-root --no-directory       # dependency layer
+COPY src ./src
+RUN poetry install --only main \
+ && .venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash .venv/lib src
+```
+
+The common mistakes: `POETRY_VIRTUALENVS_CREATE=false` (installs into the system site-packages alongside Poetry's own dependencies, which then ship in the image and can conflict with yours), installing Poetry in the runtime stage, `poetry install` without `--no-root` before the source is copied (busts the dependency layer on every code change), and forgetting `poetry check --lock` in CI so a stale lock reaches the build.
+
+### Recommendation and tradeoff
+
+**New services: uv.** The resolver and installer are an order of magnitude faster, the lockfile is equivalent, and uv manages the interpreter, which removes the builder/runtime version-mismatch class of bug (§25). **Existing Poetry repos:** the migration is mechanical (`uvx migrate-to-uv` rewrites `pyproject.toml` and generates `uv.lock`); do it when build time or CI minutes hurt. If the team depends on Poetry plugins or its publish flow, keeping Poetry for development and using `poetry export` → `uv pip install --require-hashes` in the Dockerfile gets most of the speed without changing developer habits, at the cost of two tools and an export step to keep in sync.
+
+---
+
+## 27. Build Cache Deep Cuts
+
+§6 covered the uv cache mount. What bites in real pipelines:
+
+- **Cache mounts don't travel.** `--mount=type=cache` lives on the builder's local disk. `--cache-to type=registry` / `type=gha` export *layers*, never cache mounts. On ephemeral CI runners the mount is empty on every run; the layer cache (lockfile-first ordering, §5) is what actually saves you there. Use `--cache-to type=gha,mode=max` (or `type=registry,mode=max`) so the intermediate dependency layer is exported, not just the final stage.
+- **Without a mount, the cache ships.** `RUN uv sync` with no cache mount writes hundreds of MB of wheels into `/root/.cache/uv` *in that layer*. Either mount it or pass `--no-cache`. Verify with `dive`.
+- **Concurrent builds on one builder** can race on the same cache. `--mount=type=cache,target=/root/.cache/uv,sharing=locked`, or give each Python version its own `id=uv-py312`.
+- **Non-root builds:** if the stage runs as a non-root `USER`, the mount is owned by root unless you set `uid=`/`gid=` on it, and uv falls back to no cache with a warning you won't read.
+- **Bind-mount inputs instead of `COPY`ing them** when they're only needed for one step; it avoids a layer and keeps the step's cache key exact:
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-dev --no-install-project
+```
+
+- **`uv cache prune --ci`** before saving a CI-level cache (e.g. `actions/cache` on `~/.cache/uv` for non-Docker jobs): drops pre-built wheels that are faster to re-download than to restore, keeps the ones built from source.
+- **Multi-arch:** building `linux/arm64` under QEMU on an amd64 runner is 5–20× slower and turns any sdist build into minutes. Use native arm64 runners and merge manifests; `uv.lock` is universal, so the same lock serves both.
+
+---
+
+## 28. The Surprise Catalog
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `PermissionError` / `Read-only file system` writing to `~/.cache`, `~/.config` | Libraries write under `$HOME` (matplotlib, Hugging Face, numba, `pip`, Jupyter); `readOnlyRootFilesystem: true` | `emptyDir` at `/tmp`; `HOME=/tmp` or per-library `MPLCONFIGDIR`, `HF_HOME`, `NUMBA_CACHE_DIR`, `XDG_CACHE_HOME` |
+| `tempfile` fails under read-only root | `/tmp` is on the read-only layer | `emptyDir` at `/tmp` (counts toward ephemeral storage, or memory if `medium: Memory`) |
+| `Bus error` / `No space left on device` in PyTorch `DataLoader` or `multiprocessing.shared_memory` | `/dev/shm` is 64 MB by default | `emptyDir: { medium: Memory, sizeLimit: 1Gi }` mounted at `/dev/shm` (charged to the pod's memory) |
+| Every outbound HTTP call is 20–100 ms slower than locally | Kubernetes `ndots:5`: `api.example.com` is tried against every search domain first; each miss is a DNS round trip on the asyncio default executor | Fully qualify (`api.example.com.`) or `dnsConfig.options: [{name: ndots, value: "2"}]`; cache DNS in the client |
+| `ZoneInfoNotFoundError` | No system tzdata in the base image | `tzdata` from PyPI as a dependency (zoneinfo falls back to it) |
+| `UnicodeEncodeError` writing logs/files | `LANG` unset → `C` locale on old images | `ENV PYTHONUTF8=1` (UTF-8 mode becomes the default in 3.15, PEP 686) |
+| `SSL: CERTIFICATE_VERIFY_FAILED` behind a corporate proxy | `requests`/`httpx` use `certifi`'s bundle, not the OS store you added the CA to | `truststore.inject_into_ssl()`, or `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` pointing at the system bundle |
+| Wheels fail to install on Alpine or arm64 | No `musllinux`/`aarch64` wheel; sdist build needs a compiler | Debian-based images; check `uv.lock` wheel tags for every target platform before choosing a base |
+| Free-threaded `3.13t`/`3.14t` image is slower and bigger | Single-thread overhead, per-object locking, extensions without free-threading support re-enable the GIL (with a warning) | Only for proven thread-parallel CPU work; check `sys._is_gil_enabled()` at startup; `PYTHON_GIL=0` forces it off. See [`../python-mastery/26-free-threading.md`](../python-mastery/26-free-threading.md) |
+| `py-spy`/`perf` can't attach in the pod | Missing `SYS_PTRACE` / `PERFMON` capability; no frame-pointer info | Ephemeral debug container with `--profile=sysadmin` sharing the process namespace; Python 3.12+ `-X perf` for readable `perf` stacks. See [`../python-mastery/32-profiling.md`](../python-mastery/32-profiling.md), [`../python-mastery/12-observing-a-process.md`](../python-mastery/12-observing-a-process.md) |
+| Logs arrive out of order or late | Block-buffered stdout | `PYTHONUNBUFFERED=1` (§13) |
+| Pod killed during startup on a busy node | Startup CPU-throttled under a small limit | §21: measure startup under the limit, size the `startupProbe` from that |
+
+---
+
+## 29. Cross-References: `python-mastery/`
+
+This chapter tells you which dial to turn. The `python-mastery/` track explains the machine underneath each dial:
+
+| Topic in this chapter | Where it's explained from first principles |
+|---|---|
+| Thread/process sizing, CFS throttling (§21) | [`06-processes-threads-scheduling.md`](../python-mastery/06-processes-threads-scheduling.md), [`24-the-gil.md`](../python-mastery/24-the-gil.md) |
+| RSS vs PSS vs working set (§22) | [`07-virtual-memory.md`](../python-mastery/07-virtual-memory.md) |
+| `MALLOC_ARENA_MAX`, jemalloc/mimalloc, fragmentation (§13, §22) | [`08-allocators.md`](../python-mastery/08-allocators.md), [`35-memory-optimization.md`](../python-mastery/35-memory-optimization.md) |
+| `--preload`, COW, `gc.freeze()`, start methods (§13, §23) | [`10-signals-fork-exec.md`](../python-mastery/10-signals-fork-exec.md), [`15-refcounting-and-ownership.md`](../python-mastery/15-refcounting-and-ownership.md), [`22-garbage-collection.md`](../python-mastery/22-garbage-collection.md) |
+| PID 1, SIGTERM, graceful shutdown (§24) | [`10-signals-fork-exec.md`](../python-mastery/10-signals-fork-exec.md) |
+| `.pyc`, optimization levels, code objects (§8, §25) | [`19-bytecode-and-code-objects.md`](../python-mastery/19-bytecode-and-code-objects.md) |
+| Native wheels and what a `.so` extension is (§12) | [`17-c-api-and-extensions.md`](../python-mastery/17-c-api-and-extensions.md) |
+| Free-threaded images (§28) | [`26-free-threading.md`](../python-mastery/26-free-threading.md) |
+| Measuring cold start and RSS honestly (§20) | [`31-measurement-methodology.md`](../python-mastery/31-measurement-methodology.md), [`32-profiling.md`](../python-mastery/32-profiling.md), [`12-observing-a-process.md`](../python-mastery/12-observing-a-process.md) |
+
+---
+
+## 30. TL;DR
 
 - **Use `uv`** (not pip, not poetry) for Python dependency management in containers. 10–100× faster, deterministic lockfile, BuildKit-friendly cache.
 - **Use `uvx`** for one-shot CLI tools inside the build (ruff, pytest, mypy) — they don't pollute the image.
@@ -1185,7 +1572,14 @@ Don't trust "I made it smaller" without numbers. Don't trust "it's faster now" w
 - **Strip tests, locales, `.dist-info` cruft, and debug symbols from native `.so`s** — 30–80 MB image savings.
 - **Avoid Alpine for Python** unless you've audited every wheel's musl availability. Use `python:3.12-slim-bookworm` build, distroless runtime.
 - **`MALLOC_ARENA_MAX=2`** in multi-threaded apps for 20–40% RSS reduction.
-- **`PYTHONUNBUFFERED=1`, `PYTHONOPTIMIZE=1`, `PYTHONHASHSEED=random`** — always.
+- **`PYTHONUNBUFFERED=1`, `PYTHONHASHSEED=random`** — always. **`PYTHONOPTIMIZE` only if you compiled `.pyc` at that level**, or it disables them (§25).
+- **Builder and runtime must run the same Python minor version.** `distroless/python3-debian12` is 3.11; ship a uv-managed interpreter on `distroless/cc` instead.
+- **Compile your own code too** (`--no-editable` or `compileall`), with `--invalidation-mode unchecked-hash`.
+- **`os.cpu_count()` lies in a pod.** Set `PYTHON_CPU_COUNT` (3.13+), `OMP_NUM_THREADS`, `WEB_CONCURRENCY` from the Downward API, or thread pools and BLAS size themselves to the node and get CFS-throttled (§21).
+- **OOMKill is SIGKILL, not `MemoryError`.** Watch working set vs `memory.max`; recycle workers with `--max-requests` + jitter; consider jemalloc for C-heavy apps (§22).
+- **`--preload` + `gc.freeze()`** to keep copy-on-write pages shared; mind the 3.14 `forkserver` default (§23).
+- **Exec-form entrypoint and a SIGTERM handler** (or a server that has one); PID 1 ignores unhandled signals (§24).
+- **New projects: uv over Poetry**; existing Poetry repos: `--only main --no-root` dependency layer, Poetry in the builder only, or `uvx migrate-to-uv` (§26).
 - **Lazy-import heavy modules** (boto3, pandas, ML libs) from request handlers, not at app startup.
 - **One uvicorn per pod, scale via replicas** for async services; gunicorn+uvicorn workers with `--preload` for COW memory savings if you want multi-process per pod.
 - **Healthchecks via tiny Go probe or `python -c "import urllib.request,sys; urllib.request.urlopen(...)"`** — no curl in distroless.
