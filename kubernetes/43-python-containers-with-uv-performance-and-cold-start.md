@@ -1353,13 +1353,33 @@ Affinity only shrinks when the kubelet's **static CPU manager policy** pins a Gu
 |---|---|---|
 | `ThreadPoolExecutor` (incl. asyncio's default executor, so every `getaddrinfo` and `to_thread`) | `min(32, cpu + 4)` | `max_workers=`, or `PYTHON_CPU_COUNT` |
 | `ProcessPoolExecutor`, `multiprocessing.Pool` | `cpu` processes | `max_workers=` / `processes=` |
-| gunicorn / uvicorn workers | 1 unless set; docs suggest `2 × cpu + 1` | `WEB_CONCURRENCY` (both honor it), `--workers` |
+| gunicorn / uvicorn workers | 1 unless set; the classic formula from gunicorn's docs, `2 × cpu + 1`, is usually implemented as `multiprocessing.cpu_count() * 2 + 1` | `WEB_CONCURRENCY` (both honor it), `--workers` |
 | NumPy/SciPy via OpenBLAS, MKL; scikit-learn | one thread per visible core | `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `OMP_NUM_THREADS` |
 | PyTorch intra-op threads | physical cores | `torch.set_num_threads()`, `OMP_NUM_THREADS` |
 | Polars, PyArrow, DuckDB | visible cores | `POLARS_MAX_THREADS`, `pyarrow.set_cpu_count()`, `SET threads` |
 | glibc malloc arenas | `8 × cores` | `MALLOC_ARENA_MAX` (§13) |
 
 The failure mode is not a crash. It is **CFS throttling**: 64 OpenBLAS threads on a 2-CPU quota burn the whole 100 ms period's budget in ~3 ms, then the cgroup is frozen for the remaining ~97 ms. p50 looks fine, p99 has 100 ms steps in it, and `container_cpu_cfs_throttled_periods_total` climbs. A `ProcessPoolExecutor()` with no arguments on that same node forks 64 workers, each with its own copy of your imports, and the pod OOMs instead.
+
+### Measured: the quota is invisible, the throttling is not
+
+Python 3.13.16, process in a cgroup with `cpu.cfs_quota_us = 50000` (cgroup v1; `cpu.max = 50000 100000` on v2), i.e. 0.5 CPU, on a 2-core host:
+
+- `os.cpu_count()` = 2, `os.process_cpu_count()` = 2. The quota is invisible to both.
+- The quota is real: a CPU-bound loop took **5.6 s wall for 2.8 s of CPU**, with `nr_throttled = 56` (one throttled 100 ms period for almost every period it ran).
+- gunicorn with `workers = multiprocessing.cpu_count() * 2 + 1` started **5** Uvicorn workers. Each FastAPI worker: ~68 MB RSS / ~49 MB PSS. Total PSS with master: 264 MB.
+- Extrapolated to a 64-core node: **129 workers × ~49 MB ≈ 6.3 GB**, for a pod that was given half a CPU.
+
+Reproduced in Docker (`--cpus=0.5`, Python 3.13.14, 4-core host, a minimal FastAPI app): `cpu_count()` = `process_cpu_count()` = 4; the same loop took 5.6 s wall for 2.8 s CPU with `nr_throttled = 57`; gunicorn started 9 workers at ~48 MB RSS / ~31 MB PSS each, 300 MB PSS total. Adding `--cpuset-cpus=0,1` changed `process_cpu_count()` to 2 while `cpu_count()` stayed 4: affinity is visible, quota never is.
+
+Read your own pod's numbers with `cat /sys/fs/cgroup/cpu.stat` (v2: `nr_throttled`, `throttled_usec`) and PSS per worker from `/proc/<pid>/smaps_rollup`.
+
+### Common objections
+
+- **"gunicorn defaults to 1 worker."** True. The problem is the formula from its docs, which many configs implement with `multiprocessing.cpu_count()`; that's the code path measured above.
+- **"Use the static CPU manager."** It does shrink affinity, so `process_cpu_count()` becomes correct, but only for Guaranteed pods with whole-CPU requests on nodes configured for it. Every Burstable pod, and every fractional limit, still sees the whole node.
+- **"500m rounds up to 1."** Yes: the Downward API with `divisor: "1"` rounds up, so a 500m limit gives `PYTHON_CPU_COUNT=1`. That's the safe direction: one worker on half a CPU, not zero, not 129.
+- **"We're on Python < 3.13."** `PYTHON_CPU_COUNT` doesn't exist there, and is silently ignored. Set `WEB_CONCURRENCY` and the thread-count variables (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `POLARS_MAX_THREADS`) explicitly; they work on every Python version. For pools you create in code, size them with `effective_cpus()` below.
 
 ### The fix: tell Python the truth via the Downward API
 
@@ -1380,7 +1400,7 @@ env:
     value: "1"                      # async service: one process per pod, scale with replicas
 ```
 
-Two caveats: if the pod has **no CPU limit**, `limits.cpu` resolves to the node's allocatable CPU, so you are back to 64; teams that drop CPU limits (a defensible choice, to avoid throttling) must set these to a fixed number instead. And on Python ≤ 3.12 `PYTHON_CPU_COUNT` is ignored; read the quota yourself:
+Two caveats: if the pod has **no CPU limit**, `limits.cpu` resolves to the node's allocatable CPU, so you are back to 64; teams that drop CPU limits (a defensible choice, to avoid throttling) must set these to a fixed number instead. And on Python ≤ 3.12 `PYTHON_CPU_COUNT` is ignored, so the explicit variables above carry the whole fix; for pools sized in code, read the quota yourself:
 
 ```python
 import math
@@ -1388,15 +1408,21 @@ import os
 
 
 def effective_cpus() -> int:
-    """CPUs this process can actually burn: min(affinity, cgroup v2 quota)."""
+    """CPUs this process can actually burn: min(affinity, cgroup quota)."""
     n = len(os.sched_getaffinity(0))
     try:
-        with open("/sys/fs/cgroup/cpu.max") as f:
+        with open("/sys/fs/cgroup/cpu.max") as f:          # cgroup v2
             quota, period = f.read().split()
-        if quota != "max":
-            n = min(n, max(1, math.ceil(int(quota) / int(period))))
-    except (OSError, ValueError):
-        pass
+    except OSError:
+        try:                                               # cgroup v1
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+                quota = f.read().strip()
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+                period = f.read().strip()
+        except OSError:
+            return n
+    if quota not in ("max", "-1"):
+        n = min(n, max(1, math.ceil(int(quota) / int(period))))
     return n
 ```
 
