@@ -498,6 +498,51 @@ Both have ~50-60ms "average" latency. Service B is a disaster for 1% of users.
 
 **Coordinated omission**: most load testing tools (wrk, ab, JMeter in default mode) undercount tail latency. When the server is slow, the tool sends fewer requests, missing the worst-case measurements. Gil Tene's HdrHistogram and wrk2 correct for this. If your load test shows p99 = 50ms but production shows p99 = 2000ms, coordinated omission is the likely explanation.
 
+### Fan-out Multiplies the Tail
+
+> **In plain words.** If one request has to wait for many backend calls, it is as slow as the slowest of them. A call that is slow only 1% of the time becomes the *normal* experience once a request makes 100 such calls.
+
+A search, a feed or a dashboard often sends one user request to many backends in parallel (shards, replicas, microservices) and waits for all of them. If each call is independently slow with probability *p*, the user request is slow when **at least one** call is slow:
+
+```
+P(user request slow) = 1 - (1 - p)^N
+
+p = 1%,     N = 100    →  1 - 0.99^100     ≈ 63%
+p = 0.01%,  N = 2,000  →  1 - 0.9999^2000  ≈ 18%   (almost 1 in 5)
+```
+
+Both numbers are from Dean & Barroso, *The Tail at Scale* (CACM, 2013). Every backend meets a "p99 = fast" target, and most users still wait for the slow path.
+
+**Measured.** 100 backend servers on localhost (separate TCP ports). Each reply takes a few ms, but 1% of replies are delayed by 1 s, standing in for a GC pause or a queue spike. Each user request calls all 100 in parallel. 2,000 user requests, 200,000 calls:
+
+| | Single backend call | User request (waits for all 100) |
+|---|---|---|
+| Slower than 1 s | 1.01% | **63.8%** (formula: 63.4%) |
+| Median (p50) | 7 ms | **1,004 ms** |
+
+A Monte Carlo run (200k user requests, 1% of calls slow) matches the formula at every fan-out width: N = 10 → 9.7%, N = 50 → 39.4%, N = 100 → 63.4%, N = 500 → 99.3%.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+N, U = 100, 200_000
+calls = np.where(rng.random((U, N)) < 0.01, 1000, 10)  # ms: 1% of calls take 1 s
+print((calls.max(axis=1) >= 1000).mean())               # ≈ 0.634
+```
+
+**The formula assumes slowness is random and independent per call.** If the cause is *one bad server* that is always slow, the math changes: a request that touches all 100 servers is slow **100%** of the time, and a request that touches 10 random servers out of 100 is slow 10% of the time. Find out whether your tail is "every server, occasionally" (GC, compaction, noisy neighbours) or "one server, always" (bad disk, hot shard). The fixes are different.
+
+**What to do about it:**
+
+| Fix | How it works | Cost |
+|---|---|---|
+| **Hedged requests** ([`33` §2.6](33-resilience-patterns-circuit-breakers.md#26-hedged-requests)) | If a call has not answered by about its p95, send a copy to another replica and take the first reply | A few % extra calls. In simulation (N = 100, hedge at 50 ms): slow user requests 63% → 1%, extra calls 1%. The paper measured BigTable p99.9 1,800 ms → 74 ms for 2% more requests |
+| **Fewer calls per request** | Bigger shards, batching, caching results for the hot path | Changes the data layout |
+| **Partial results** | Return when 95% of backends answered (search can skip a shard) | Answers are sometimes incomplete |
+| **Eject the slow server** | Outlier detection in the load balancer for the "one server, always" case | Needs enough replicas to absorb its traffic |
+
+**SLO consequence:** a backend's latency SLO must be set from the fan-out it serves. To keep a 100-way request under 1 s for 99% of users, each call must be under 1 s about 99.99% of the time (0.9999^100 ≈ 99.0%), not 99%.
+
 ---
 
 ## 5. SLOs: Service Level Objectives
@@ -1116,6 +1161,7 @@ Serial product = 0.9995 x 0.9999 x 0.9999 x 0.9995 ≈ 99.88%, short of target. 
 | Chance of no failure in a month with MTBF 730 h? | e^(-720/730) ≈ 37% | §2 |
 | Active-passive: primary 99.9%, failover works 95%? | 1 - 0.001 x 0.05 = 99.995% | §8 |
 | Why not average latency? | one slow request in 100 hides in the mean; use p99 | §4 |
+| Each call slow 1% of the time, request fans out to 100. Share of slow requests? | 1 - 0.99^100 ≈ 63%; hedge at p95 or cut fan-out | §4 |
 
 ### Debugging prompts
 
@@ -1230,6 +1276,7 @@ Quick index: too many hard dependencies → Case 1 · pages on every blip → Ca
 - Beyer, B., Murphy, N.R., Rensin, D., Kawahara, K., Thorne, S. (2018). *The Site Reliability Workbook*. O'Reilly.
 - "SLOs, SLIs, SLAs, oh my — CRE life lessons." Google Cloud Blog (2017).
 - Tene, G. "How NOT to Measure Latency." Strange Loop 2015.
+- Dean, J., Barroso, L.A. (2013). "The Tail at Scale." *Communications of the ACM* 56(2), 74–80.
 - Google Cloud Architecture Framework: Reliability Pillar (2024).
 - AWS Well-Architected Framework: Reliability Pillar (2024).
 - Nygard, M. (2018). *Release It! Design and Deploy Production-Ready Software*, 2nd Edition. Pragmatic Bookshelf.

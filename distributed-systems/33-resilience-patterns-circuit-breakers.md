@@ -549,6 +549,8 @@ gRPC STATUS CODE RETRY CLASSIFICATION:
 
 Hedged requests are a technique from Google's "The Tail at Scale" paper (Dean & Barroso, 2013). Instead of waiting for a single request to timeout and then retrying, you send a second copy of the request to a different backend after a short delay (e.g., the p95 latency). The first response wins; the slower request is cancelled.
 
+In the paper, a BigTable benchmark reading 1,000 keys spread over 100 servers cut the 99.9th-percentile latency from 1,800 ms to 74 ms by hedging after 10 ms, while sending only 2% more requests. Why fan-out makes the tail matter so much in the first place: [`35` §4, Fan-out Multiplies the Tail](35-reliability-math-slos-and-error-budgets.md#fan-out-multiplies-the-tail).
+
 ```
 HEDGED REQUESTS:
 
