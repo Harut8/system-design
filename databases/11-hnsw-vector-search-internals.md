@@ -846,7 +846,9 @@ Definition: Size of the dynamic candidate list during search at layer 0.
 │   512    │  ~99-99.5%     │  ~3 ms       │  ~3000-6000              │
 │  1024    │  ~99.9%        │  ~6 ms       │  ~6000-12000             │
 └──────────┴────────────────┴──────────────┴──────────────────────────┘
-  (Numbers approximate, for SIFT1M dataset with M=16, d=128)
+  (Numbers approximate, for SIFT1M dataset with M=16, d=128; illustrative, not measured here.
+   Measured curve on 342k real 300-d embeddings: ef 10 → 69%, 40 → 87%, 100 → 93%, 400 → 97%;
+   see ../ai-rag/03-indexing-and-vector-stores.md §7.5)
 
 Key insight: efSearch is the PRIMARY knob for recall vs latency tradeoff.
   → Can be changed per query (unlike efConstruction)
@@ -1293,6 +1295,8 @@ Dataset: SIFT1M — 1,000,000 vectors, d=128, L2 distance
 Machine: Single core, modern x86 CPU (typical benchmark setup)
 
 HNSW Parameters: M=16, efConstruction=200
+(Approximate reference figures, not re-measured here. Recall at a given efSearch depends heavily
+ on the dataset; always measure against your own ground truth.)
 
 ┌───────────┬────────────┬────────────┬────────────┬───────────────────┐
 │  efSearch  │  Recall@10 │  QPS       │  Latency   │  Dist. Comps      │
@@ -1491,9 +1495,12 @@ Safety-Critical (maximum recall):
 │  Insertion order affects│  Randomize insertion order                 │
 │  graph quality          │  Or use batch insertion with shuffling     │
 ├─────────────────────────┼─────────────────────────────────────────────┤
-│  Filtered search is     │  Pre-filter + HNSW, or HNSW + post-filter │
-│  not natively supported │  Or use partitioned HNSW per filter value  │
-│                         │  (active research area)                    │
+│  Filtered search is     │  Post-filter shrinks results: pgvector     │
+│  not natively supported │  default + 1%-selective WHERE returned 0.4 │
+│                         │  of 10 rows (measured). Use iterative scan │
+│                         │  (pgvector ≥ 0.8), exact scan over the     │
+│                         │  matching rows, filter-aware graphs        │
+│                         │  (ACORN, Qdrant), or partition per value   │
 ├─────────────────────────┼─────────────────────────────────────────────┤
 │  Build time can be long │  Use parallel construction                 │
 │  for large datasets     │  Batch insertions with thread pools        │
@@ -1516,17 +1523,18 @@ Safety-Critical (maximum recall):
 │  Database          │  HNSW    │  Implementation Notes                   │
 │                    │  Variant │                                         │
 ├────────────────────┼──────────┼─────────────────────────────────────────┤
-│  Pinecone          │  Custom  │  Proprietary HNSW with PQ, SSD tiering │
-│  Weaviate          │  hnswlib │  HNSW+PQ, disk-backed, ACORN filtering │
+│  Pinecone          │  Propr.  │  Proprietary index; internals not public│
+│  Weaviate          │  Custom  │  Own HNSW in Go, PQ/BQ, ACORN filtering │
 │  Milvus/Zilliz     │  Custom  │  HNSW, IVF-HNSW, GPU-accelerated       │
 │  Qdrant            │  Custom  │  HNSW with payload filtering, on-disk   │
 │  pgvector          │  Custom  │  PostgreSQL extension, in-process HNSW  │
 │  Elasticsearch     │  Lucene  │  HNSW in Apache Lucene (Java)           │
-│  ChromaDB          │  hnswlib │  Python wrapper around hnswlib          │
+│  ChromaDB          │  hnswlib │  hnswlib fork (single node); SPANN in   │
+│                    │  fork    │  distributed / Chroma Cloud             │
 │  Redis (RediSearch)│  Custom  │  HNSW integrated in Redis module        │
 │  Vespa             │  Custom  │  HNSW with real-time updates            │
 │  LanceDB           │  Custom  │  Disk-native HNSW with Lance format     │
-│  Oracle 26c        │  Custom  │  HNSW in Oracle Database kernel         │
+│  Oracle 23ai/26ai  │  Custom  │  HNSW in-memory neighbor graph index    │
 └────────────────────┴──────────┴─────────────────────────────────────────┘
 
 Nearly every major vector database uses HNSW as the default index type.

@@ -805,6 +805,9 @@ is not random. Graph traversal fails hardest on:
 - queries whose true neighbours are in a part of the graph reachable only through nodes your filter
   excluded (§7).
 
+Measured on pgvector 0.8.1 defaults (§7.5): mean recall@10 = 0.87, but **33% of queries missed at
+least one true neighbour**. Even at `ef_search = 400` (mean 0.976), 15% still missed one.
+
 Report the fraction of queries below a per-query recall floor alongside the mean — e.g. "mean
 recall@10 = 0.96; 4% of queries below 0.8". That second number is what turns into user-visible
 "the search just doesn't find that document" reports, and the mean will never show it to you.
@@ -1214,7 +1217,9 @@ results = [r for r in results if r.tenant_id == 4471]   # ← may return zero ro
 ```
 
 Correct only when the filter is weakly selective. At 1% selectivity, expect ~0.1 surviving results
-out of 10. The failure mode is *silent under-return*, not an error, and it is worst exactly for the
+out of 10. pgvector post-filters the `hnsw.ef_search` candidates (40 by default), so there it is
+~0.4 of 10; measured: 0.4, with 68% of queries returning **zero rows** (§7.5). The failure mode is
+*silent under-return*, not an error, and it is worst exactly for the
 smallest tenants — who then report "search doesn't work for us" while it works fine for everyone
 else. Retrieving `k / selectivity` candidates to compensate means retrieving 1,000 candidates for
 0.1% selectivity, which is no longer a cheap query.
@@ -1344,6 +1349,69 @@ Then report a table, not a number:
 If your production traffic is 80% in the 0.1–1% band, the unfiltered row is decoration. Weight the
 bands by your actual query mix — which requires knowing your actual query mix, which is itself worth
 the twenty minutes it takes to find out.
+
+### 7.5 Measured: pgvector 0.8.1 defaults, with and without a filter
+
+> **In plain words.** With default settings, a plain top-10 query missed about 1 in 8 of the true nearest neighbours. Add a `WHERE` that matches 1% of rows and the same query returned **0.4 rows on average instead of 10**: two out of three queries returned nothing. No error, no warning.
+
+**Setup.** PostgreSQL 16, pgvector 0.8.1, 341,918 real 300-dimension embeddings (spaCy
+`en_core_web_lg` word vectors, normalised, cosine distance), 1,000 held-out query vectors, exact
+top-10 computed by brute force as ground truth. Index built with the defaults
+(`m = 16, ef_construction = 64`, 3 min 45 s on 2 vCPUs, 534 MB). Latency is server-side
+(`EXPLAIN ANALYZE`), warm cache.
+
+**Unfiltered** (`ORDER BY embedding <=> $1 LIMIT 10`):
+
+| `hnsw.ef_search` | recall@10 | queries missing ≥ 1 of the true top 10 | p50 latency |
+|---|---|---|---|
+| **40 (default)** | **87.2%** | **33%** | 1.8 ms |
+| 100 | 93.1% | 24% | 3.0 ms |
+| 200 | 95.9% | 19% | 5.1 ms |
+| 400 | 97.6% | 15% | 10.2 ms |
+| exact (sequential scan) | 100% | 0% | 212 ms |
+
+The same data in hnswlib (`M = 16, ef_construction = 100`) gave 69.4% at `ef = 10`, 86.8% at 40,
+92.8% at 100, so the curve is a property of the data and the graph, not of pgvector. Word vectors
+are a hard dataset for ANN (GloVe-like data is among the hardest in ann-benchmarks); sentence
+embeddings usually score higher at the same settings. Measure yours (§3.1).
+
+**Filtered** (`WHERE category = $1`, 100 categories, each about 1% of rows, 3.4k rows; ground truth
+= exact top-10 among matching rows only, §7.4):
+
+| Strategy | rows returned (of 10) | queries returning 0 rows | recall@10 | p50 latency |
+|---|---|---|---|---|
+| **default** | **0.4** | **68%** | **4.0%** | 1.5 ms |
+| default + B-tree on `category` | 0.4 | 68% | 4.1% | 1.6 ms (planner still picks HNSW) |
+| `hnsw.iterative_scan = relaxed_order` | 10 | 0% | 89.7% | 29.9 ms |
+| `hnsw.iterative_scan = strict_order` | 10 | 0% | 76.8% | — |
+| exact: B-tree bitmap scan + sort (HNSW disabled for the query) | 10 | 0% | **100%** | 9.7 ms |
+
+What the numbers say:
+
+- **The default filtered query is broken, and adding a B-tree does not fix it.** The planner does
+  not know that HNSW post-filters, so it keeps choosing the vector index. 0.4 rows is exactly
+  `ef_search × selectivity` = 40 × 1%.
+- **Iterative scan fixes the row count**, at about 20× the latency and with relaxed ordering
+  (re-sort in a materialized CTE if order matters).
+- **For a selective filter, exact search over the matching rows was both faster and perfect**:
+  3.4k rows × 300 dimensions is a trivial brute force. §7.2 puts the exact-scan regime below
+  ~0.1%; at this corpus size it already wins at 1%, which is why those thresholds are orders of
+  magnitude, not constants. What matters is the number of matching rows. In production, steer the
+  planner with a partial index per value, or partitioning (§7.3), rather than
+  `enable_indexscan = off`.
+- **Pick the strategy per selectivity band**, which is the point of §7.4.
+
+```sql
+-- the failure, in one query
+SET hnsw.ef_search = 40;                  -- the default
+SELECT count(*) FROM (
+  SELECT id FROM items WHERE category = 7
+  ORDER BY embedding <=> $1 LIMIT 10
+) t;                                      -- measured: usually 0 or 1, not 10
+
+-- fix 1: keep scanning until enough rows pass the filter (pgvector >= 0.8)
+SET hnsw.iterative_scan = relaxed_order;
+```
 
 ---
 
