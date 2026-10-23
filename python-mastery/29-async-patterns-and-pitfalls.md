@@ -273,6 +273,11 @@ it was cancelled or ran to completion:
 `gather` does not cancel siblings on failure. It raises the first exception to *you*
 while everything else keeps running, unsupervised, with nobody holding a reference.
 
+**And any later exception is lost without a trace.** Measured on 3.13.16 and 3.14.6: one child
+fails at 10 ms, a second child fails at 30 ms. The caller sees only the first. The second is
+marked as retrieved by `gather`'s own callback, so there is not even a
+"Task exception was never retrieved" log line: the loop's exception handler received **nothing**.
+
 ### 4.1 The orphan, measured
 
 A background task ticking every 20 ms, alongside a task that fails after 10 ms:
@@ -290,12 +295,38 @@ mutating state.
 
 Under `TaskGroup`, the same sibling is cancelled at the moment of failure.
 
+The same thing as a request handler, measured:
+
+```python
+async def reserve():  await asyncio.sleep(0.01); raise RuntimeError("inventory service down")
+async def charge():   await asyncio.sleep(0.05); log("CARD CHARGED")
+
+try:
+    await asyncio.gather(reserve(), charge())
+except RuntimeError:
+    log("handler returned 500 to the client")
+```
+
+```
+0.01s handler returned 500 to the client
+0.05s CARD CHARGED
+```
+
+The client sees an error, retries, and gets charged twice. With `TaskGroup`, `charge()` is
+cancelled at 0.01 s (and if it must not be interrupted half-way, that is a job for an idempotency
+key or §6's `shield`, not for luck).
+
+**What `gather` does get right: cancellation from above.** If the task awaiting `gather` is
+cancelled, `gather` cancels every child that has not finished, with `return_exceptions=False`
+and `True` alike (measured: both children reported `CancelledError` after their first tick). The
+orphan problem is specifically *a child failing*, not *the caller being cancelled*.
+
 ### 4.2 The exception-handling difference
 
 `TaskGroup` raises an `ExceptionGroup`, which is not a drop-in for what `gather` raised:
 
 ```python
-# gather: first exception wins, others are discarded
+# gather: first exception wins, later ones are silently dropped (not even logged)
 try:
     await asyncio.gather(a(), b(), c())
 except ValueError:
@@ -327,9 +358,12 @@ results = await asyncio.gather(*(fetch(u) for u in urls), return_exceptions=True
 ok = [r for r in results if not isinstance(r, BaseException)]
 ```
 
-Note what you have accepted: if the caller of *this* function is cancelled, these tasks
-are still not supervised. Wrap the whole thing in a `TaskGroup` or a timeout scope that
-owns them.
+Note what you have accepted: with `return_exceptions=True` an exception becomes a list
+element, so **nothing is raised**, and a `results` list nobody inspects hides every failure
+(measured: `[ValueError('db write failed'), 'ok']`, no exception, no log). Always split the
+results as above and log or count the failures. Cancelling the caller *does* cancel these
+tasks (§4.1).
+Bound the whole fan-out with a timeout scope so a slow child cannot hold it open forever.
 
 **Default to `TaskGroup`. Reach for `gather` deliberately, with `return_exceptions=True`,
 when partial success is meaningful.**
