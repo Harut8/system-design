@@ -2871,7 +2871,8 @@ Rule of thumb: **only ACCESS EXCLUSIVE blocks readers.** Everything from SHARE u
 > Remember it like this
 > ├─ queue order is strict: new requests wait behind the QUEUED lock
 > ├─ a fast DDL behind a slow query = everyone waits for the slow query
-> ├─ always: SET lock_timeout + retry with jitter
+> ├─ always: SHORT lock_timeout (100-500 ms) + retry with jitter
+> ├─ while the DDL waits, it blocks everyone, so the timeout IS the outage length
 > └─ prefer CONCURRENTLY / NOT VALID + VALIDATE / INSTANT variants
 > ```
 
@@ -2889,15 +2890,40 @@ t=2   T3..T500: ordinary SELECT/INSERT on orders
           → connection pool exhausted → site down
 ```
 
-**The fix: never run DDL without `lock_timeout`, and retry.**
+**Measured (PostgreSQL 16, 1M-row table, pgbench: 16 clients doing primary-key `SELECT`s, ~35k tps).**
+Uncontended, `ALTER TABLE orders ADD COLUMN note text` takes **1–3 ms**. Then: a 12-second report
+query starts at t = 5 s, and the same `ALTER` starts at t = 8 s.
+
+| Migration session | What happened to traffic | ALTER |
+|---|---|---|
+| no `lock_timeout` (default) | **0 tps from t = 9 s to t = 17 s**: every `SELECT` queued behind the ALTER until the report finished | waited 9.1 s, then ran in ~1 ms |
+| `lock_timeout = '2s'`, retry every 1 s | **three separate 2-second freezes** to 0 tps, one per attempt | failed 3×, succeeded on attempt 4 when the report ended |
+| `lock_timeout = '200ms'`, retry every 1 s | **never reached 0**: throughput dipped from ~35k to ~21–25k tps while retrying | failed 7×, succeeded on attempt 8 |
+
+The lesson the table adds: **`lock_timeout` does not stop the pile-up, it caps it.** While the
+ALTER is waiting, it is in the queue and blocks everyone behind it, so the timeout value *is* the
+length of each freeze. A "safe" 3 s is still a 3 s outage per attempt.
+
+**The fix: a short `lock_timeout`, retries, and no long transactions on the table.**
 
 ```sql
--- Migration session
-SET lock_timeout = '3s';          -- give up quickly instead of blocking the queue
+-- 1. Before migrating: anything long-running on this table will make every attempt fail
+SELECT pid, now() - xact_start AS age, state, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE xact_start < now() - interval '30 seconds' AND pid <> pg_backend_pid()
+ORDER BY age DESC;
+
+-- 2. Migration session
+SET lock_timeout = '200ms';       -- each failed attempt delays traffic by at most this much
 SET statement_timeout = '15min';  -- for the actual work, if it rewrites
 ALTER TABLE orders ADD COLUMN note text;
--- On 55P03 (lock_not_available): sleep with jitter, retry N times.
+-- On 55P03 (lock_not_available): sleep 1-5 s with jitter, retry N times, then alert a human.
 ```
+
+Keep reports and analytics off the primary (a replica), or give them a `statement_timeout`, so
+that "wait for the long query to finish" has an upper bound. While a migration is stuck,
+`SELECT pid, pg_blocking_pids(pid), wait_event_type, left(query, 60) FROM pg_stat_activity WHERE
+cardinality(pg_blocking_pids(pid)) > 0;` shows who is waiting on whom.
 
 **Zero-downtime migration toolkit (PostgreSQL):**
 
