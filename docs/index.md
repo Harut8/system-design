@@ -95,6 +95,17 @@ repository alongside them.
 
     [:octicons-arrow-right-24: Reading map](ai-rag/README.md)
 
+-   :material-shield-account:{ .lg .middle } __Identity & Access__
+
+    ---
+
+    Passwords and passkeys, sessions, JWT and JWKS, OAuth and PKCE, OpenID
+    Connect, `.well-known` discovery, token storage, SAML and SCIM,
+    authorization models, workload identity, and identity for AI agents:
+    MCP authorization, A2A, registries, gateways and human approval.
+
+    [:octicons-arrow-right-24: 19 chapters](identity/README.md)
+
 -   :material-hammer-wrench:{ .lg .middle } __Design Practice__
 
     ---

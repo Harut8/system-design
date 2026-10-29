@@ -12,6 +12,7 @@ nav:
   - SRE & Observability: sre-observability
   - GPU Observability: gpu-observability
   - AI & RAG: ai-rag
+  - Identity & Access: identity
   - Design Tasks: tasks
   - Design Solutions: solutions
   - Design Primitives: primitives

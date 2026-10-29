@@ -15,6 +15,11 @@
 > trust domains) and [`28-agentic-security-owasp-and-mcp-threats.md`](28-agentic-security-owasp-and-mcp-threats.md)
 > (the threat catalogue this chapter's controls answer).
 >
+> **Identity foundations:** the [`identity/`](../identity/README.md) track covers the general protocols this chapter
+> builds on (OAuth and PKCE, OIDC, JWT/JWKS, `.well-known` discovery, token storage) and continues the agent topics in
+> [`identity/13`](../identity/13-mcp-and-agent-protocol-authorization.md)–[`15`](../identity/15-agent-tool-permissions-hitl-and-long-running-loops.md)
+> (in-process vs local vs remote tools, registries and gateways, approvals and tokens expiring mid-run).
+>
 > **Feeds into:** `14-agent-evaluation.md` (authorization-boundary tests are a trajectory-scoring axis),
 > `30-context-engineering-for-agents.md` (what credentials and identity facts may enter the context window),
 > and any multi-tenant RAG-plus-agents design (§11 here: document-level permissions at retrieval time).

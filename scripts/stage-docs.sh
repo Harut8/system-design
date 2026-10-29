@@ -22,6 +22,7 @@ CONTENT_DIRS=(
   databases
   distributed-systems
   gpu-observability
+  identity
   implementation
   k8s-learn
   kubernetes

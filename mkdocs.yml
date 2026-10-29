@@ -1,7 +1,8 @@
 site_name: System Design Notes
 site_description: >-
   System design from the internals up: CPython, storage engines, distributed
-  systems, Kubernetes, SRE and GPU observability, and RAG, with hands-on labs.
+  systems, Kubernetes, SRE and GPU observability, RAG, and identity (OAuth,
+  OIDC, MCP and agent authorization), with hands-on labs.
 site_url: https://harut8.github.io/system-design/
 repo_url: https://github.com/Harut8/system-design
 repo_name: Harut8/system-design

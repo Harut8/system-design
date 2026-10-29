@@ -23,7 +23,7 @@ survives production. Why an `UPDATE` in Postgres is really an `INSERT`. What the
 between `kubectl apply` and a running container. Where the GIL is actually dropped. Why
 your p99 alert pages at 3 a.m. for nothing.
 
-- **220+ chapters across 8 tracks**, from CPU caches to RAG evaluation, written from primary sources (papers, source code, RFCs)
+- **240+ chapters across 9 tracks**, from CPU caches to RAG evaluation, written from primary sources (papers, source code, RFCs)
 - **Labs for every track**: predict a number, measure it on your laptop with Docker, then break something on purpose
 - **21 design problems** with full solutions, and **reference implementations at four scales** (10k → 100k → 1m → 10m)
 - Spaced-repetition questions at the end of each lab section (redo after a day, a week, a month)
@@ -38,6 +38,7 @@ your p99 alert pages at 3 a.m. for nothing.
 | **Own reliability / on-call** | [SRE mental models](sre-observability/00-mental-models.md) → [OpenTelemetry](sre-observability/02-opentelemetry-deep-dive.md) → [Alerting](sre-observability/12-alerting.md) → [SLO engineering](sre-observability/13-slo-engineering.md) → [On-call](sre-observability/14-on-call.md) |
 | **Run GPU / LLM infrastructure** | [GPU mental models](gpu-observability/00-mental-models.md) → [DCGM exporter](gpu-observability/02-dcgm-exporter-deep-dive.md) → [Utilization efficiency](gpu-observability/05-gpu-allocation-and-utilization-efficiency.md) → [LLM inference](gpu-observability/14-llm-inference-observability.md) |
 | **Build RAG that holds up in production** | [RAG mental models](ai-rag/00-mental-models.md) → [Chunking](ai-rag/02-chunking-and-document-processing.md) → [Hybrid retrieval](ai-rag/04-retrieval-hybrid-and-reranking.md) → [Evaluation](ai-rag/08-evaluation-methodology.md) |
+| **Get authentication and authorization right (incl. AI agents and MCP)** | [Identity mental models](identity/00-mental-models.md) → [OAuth and PKCE](identity/04-oauth2-foundations-and-flows.md) → [OIDC](identity/05-openid-connect.md) → [Storing tokens](identity/08-storing-credentials-and-tokens-at-rest.md) → [MCP authorization](identity/13-mcp-and-agent-protocol-authorization.md) → [Agent identity](identity/14-agent-identity-delegation-registries-and-gateways.md) |
 | **Know what your Python actually does** | [CPU execution model](python-mastery/00-cpu-execution-model.md) → [Refcounting](python-mastery/15-refcounting-and-ownership.md) → [Eval loop](python-mastery/20-eval-loop.md) → [The GIL](python-mastery/24-the-gil.md) → [Free-threading](python-mastery/26-free-threading.md) |
 
 ## Contents
@@ -52,6 +53,7 @@ your p99 alert pages at 3 a.m. for nothing.
 | [`sre-observability/`](sre-observability/ROADMAP.md) | OpenTelemetry, instrumentation, telemetry storage and query layers, SLO engineering, on-call, cardinality and cost | 47 |
 | [`gpu-observability/`](gpu-observability/README.md) | DCGM internals, GPU cluster telemetry, utilization efficiency, failure detection, LLM inference and training observability | 23 |
 | [`ai-rag/`](ai-rag/README.md) | Embeddings, chunking, vector indexes, hybrid retrieval and reranking, evaluation methodology, agents and orchestration, plus labs | 21 + labs |
+| [`identity/`](identity/README.md) | AuthN/AuthZ end to end: passwords and passkeys, sessions, JWT/JWKS, OAuth 2.x and PKCE, OIDC, `.well-known` discovery, hardening (PAR, DPoP, token exchange, FAPI), credential and token storage, SAML/SCIM, RBAC/ReBAC/policy engines, workload identity (mTLS, SPIFFE), MCP and A2A authorization, agent identity, registries and gateways, human-in-the-loop, Okta/Auth0/Entra/Keycloak mapped to protocols | 19 + labs |
 | [`tasks/`](tasks/README.md) · [`solutions/`](solutions/README.md) | 21 interview-style design problems, Mid to Staff level, each with a full solution and an interview kit | 21 |
 | [`implementation/`](implementation/) | Runnable reference implementations of the same design at 10k, 100k, 1m and 10m scale (FastAPI, Postgres, Redis, Docker Compose) | 4 designs |
 | [`primitives/`](primitives/README.md) | The reusable decisions extracted from the worked solutions, so the next design costs less than the last | — |
@@ -66,7 +68,8 @@ sheet ends with multi-day capstones. They run on a laptop with Docker; anything 
 
 [databases](databases/LABS.md) · [distributed-systems](distributed-systems/LABS.md) ·
 [python-mastery](python-mastery/LABS.md) · [kubernetes](kubernetes/LABS.md) (with [`k8s-learn/`](k8s-learn/README.md) for the API basics) ·
-[sre-observability](sre-observability/LABS.md) · [ai-rag](ai-rag/LABS.md) · [gpu-observability](gpu-observability/tasks.md)
+[sre-observability](sre-observability/LABS.md) · [ai-rag](ai-rag/LABS.md) · [gpu-observability](gpu-observability/tasks.md) ·
+[identity](identity/LABS.md)
 
 ## Building the site locally
 
