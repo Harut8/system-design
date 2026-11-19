@@ -251,7 +251,8 @@ needs change — which, per the cache-invalidation table (§10.1), invalidates t
 > timestamps, thread ids. Anthropic's example shows the same answer in a concise form takes 72.
 
 Source: Anthropic, "Writing effective tools for agents". Every number below is as the post states
-it.
+it. For the full API style guide (field formats, error design, idempotency, RBAC), see
+[`31-mcp-tool-design-best-practices.md`](31-mcp-tool-design-best-practices.md).
 
 ### 4.1 Namespacing and consolidation
 

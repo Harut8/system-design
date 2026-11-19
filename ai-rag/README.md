@@ -92,6 +92,7 @@ keeps every claim honest by construction.
 | [`28-agentic-security-owasp-and-mcp-threats.md`](28-agentic-security-owasp-and-mcp-threats.md) | OWASP Top 10 for Agentic Applications (ASI01–10), MCP tool poisoning / rug-pull / confused deputy, memory poisoning, sandboxing | **written** |
 | [`29-agent-identity-and-delegated-authorization.md`](29-agent-identity-and-delegated-authorization.md) | Agent as principal, token exchange and `act` chains, down-scoping, DPoP, CIBA, workload identity, PEP/PDP, audit | **written** |
 | [`30-context-engineering-for-agents.md`](30-context-engineering-for-agents.md) | Tool search, writing tools for agents, code execution over tools, sub-agents, Agent Skills, compaction, cache-aware loops | **written** |
+| [`31-mcp-tool-design-best-practices.md`](31-mcp-tool-design-best-practices.md) | MCP tool design as an API style guide for agents: REST vs MCP, granularity, names and descriptions, field cookbook (e-mail, display names, BCP 47 languages, phone, dates, money, ids), output design, error taxonomy and messages, idempotency and confirmation, RBAC inside tools, REST wrapping, versioning, tool evals; lab `labs/mcp-tool-design/` | **written** — lab passes |
 | `appendix-a-glossary.md` | | planned |
 | `appendix-b-metric-definitions.md` | Every eval and cost metric, with its exact formula | planned |
 | `appendix-c-eval-recipe-book.md` | Copy-pasteable eval setups | planned |
@@ -114,7 +115,7 @@ useful: guardrail classifier tier and tool-call risk scoring in `17` §7.6, firs
 eval cascades in `08` §11.8, boundary detection and metadata tagging at ingest in `02` §6.5.2,
 and relevance filtering after the reranker in `04` §8.3.
 
-**Agentic protocol and runtime layer (2026-10).** MCP (`26`), A2A and interop (`27`), agentic security per the OWASP agentic Top 10 (`28`), agent identity (`29`), context engineering for agent loops (`30`), and agent evaluation (`14`).
+**Agentic protocol and runtime layer (2026-10).** MCP (`26`), A2A and interop (`27`), agentic security per the OWASP agentic Top 10 (`28`), agent identity (`29`), context engineering for agent loops (`30`), MCP tool design best practices (`31`), and agent evaluation (`14`).
 
 **2026 additions.** Defense by design against prompt injection (adaptive attacks, the Agents Rule
 of Two, the six agent design patterns, CaMeL-style capabilities) in `17` §4.7; agentic search vs

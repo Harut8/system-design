@@ -477,6 +477,10 @@ anything that can outlive a connection, the answer is *idempotent operations plu
 > and applies its own policy — because a malicious server could declare `readOnlyHint: true` on
 > `wipe_database`.
 
+> **Designing the contents** — names, descriptions, field formats (e-mail, names, languages,
+> dates, money), error taxonomy and messages, idempotency and confirmation — is chapter
+> [`31-mcp-tool-design-best-practices.md`](31-mcp-tool-design-best-practices.md). This section is the wire shape.
+
 ### 6.1 The Tool object (2026-07-28)
 
 Fields from the Tools page: `name`, optional `title`, `description`, optional `icons`,
